@@ -8,26 +8,45 @@
 
 Deterministic. Zero-LLM. Pure CPU, zero I/O, byte-identical output for identical inputs. Provider-agnostic: **Anthropic** content blocks, **OpenAI** `tool_calls`, and **Gemini** `parts`.
 
-Extracted from a production multi-agent system (the Voxxo Swarm), where it folds context continuously across every model and thousands of session-rebirths.
+Extracted from a production multi-agent system (the Voxxo Swarm), where it folds context continuously across every model and long-running agent workloads.
 
 - The core engine passes **277 deterministic tests** across rolling fold, recall, freeze, and integration.
-- Every performance number below is **measured and reproducible** — run `npx tsx examples/benchmark.ts` yourself.
+- Every number below is **measured, not estimated** — production cache rates from the Claude provider usage ledger, reproducible live against Claude (`ANTHROPIC_API_KEY=… npx tsx examples/benchmark-live.ts`, real model + real summarizer) and offline with exact `o200k_base` BPE token counts (`npx tsx examples/benchmark.ts`, deterministic, no key).
 
 ---
 
-## Performance & Economics (The "God Chart")
+## Performance & Economics
 
-A 16-turn agent session, priced with public **Claude Sonnet 4.6** list pricing. Each strategy is held to a **comparable final context size** (last column) so the comparison is fair — Warp Drive's wins are not "it just keeps more context." Every number is measured from the real prepared message views; reproduce it with `npx tsx examples/benchmark.ts`.
+### Measured in production — real Claude workloads, provider cache telemetry
 
-| Strategy | Input Cost | Cache Hit | Extra LLM Calls | Fact Retention | Context Size |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| Truncation (Rolling Window) | $0.0496 | 28% | 0 | 44% (7/16) | 4.9K |
-| LLM Summarization | $0.0686 | 43% | 6 | 44% (7/16) | 4.3K |
-| **Context Warp Drive** (Deterministic) | **$0.0203** | **60%** | **0** | **94% (15/16)** | 5.3K |
+The numbers that matter are from the production multi-agent system this engine powers — real Claude workloads running the fold/freeze engine continuously across **hundreds of turns**, measured from the provider's own usage ledger (cache-read tokens ÷ total input tokens):
 
-*   **Cost:** Warp Drive is the cheapest — **70% below LLM summarization** (zero model calls) and below truncation too, because the byte-identical frozen prefix keeps **60% of the context served from cache** ($0.30/MTok reads instead of $3.75/MTok writes).
-*   **Zero model calls:** summarization made **6 extra model round-trips** here — each adds real cost, latency, and non-determinism. Warp Drive and truncation make none.
-*   **Fact retention:** at the same context budget Warp Drive recalls **15 of 16** buried identifiers vs **7 of 16** for both baselines — and with no model call. The Coordinate Closet is budget-scored: it conserves the *most salient* identifiers from folded turns, not literally everything (the benchmark prints exactly which one it dropped).
+| Production Claude workload | Measured turns | Cache-read hit | Fresh input | Cache-read input |
+| :--- | :---: | :---: | :---: | :---: |
+| Opus 4.8 agent | 691 | **89.6%** | 32.9M tok | 292.6M tok |
+| Opus agent | 510 | **93.2%** | 32.6M tok | 602.5M tok |
+
+**~90% of all input tokens are served from cache** across these high-turn Claude workloads — that is the byte-identical frozen-fold prefix doing its job, turn after turn, at $0.30/MTok cache reads instead of $3.00/MTok fresh input (Sonnet rates). A re-summarizing compactor rewrites the prefix and can never sustain this; truncation slides the window and breaks it. This is the entire economic argument, measured live.
+
+### Reproduce it yourself — live, against Claude
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... npx tsx examples/benchmark-live.ts   # default claude-haiku-4-5
+```
+
+Real Claude calls every turn with Anthropic `cache_control` breakpoints, a **real Claude summarizer** (told to preserve every identifier — a fair fight), and the provider's own `cache_read_input_tokens` / `cache_creation_input_tokens`. A short 16-turn demo *understates* the production cache rate (caching needs a ≥1024-token prefix and CWD's advantage compounds over long sessions) — but it shows the mechanism on real telemetry, with CWD reading from cache while truncation and summarization rebuild their prefix.
+
+### Offline deterministic demo (no API key, byte-identical every run)
+
+`npx tsx examples/benchmark.ts` — a 16-turn outage-debugging session, exact `o200k_base` BPE token counts (a portable proxy; Claude's tokenizer isn't public), `claude-haiku-4-5` list pricing. This is the CI smoke test; the cache column is a turn-over-turn byte-prefix proxy and the summarizer is a transparent deterministic stand-in (it drops ids buried past its head cutoff — the failure mode the Coordinate Closet exists to avoid).
+
+| Strategy | Input Cost | Cache Hit (prefix proxy) | Extra LLM Calls | Fact Retention |
+| :--- | :---: | :---: | :---: | :---: |
+| Truncation (rolling window) | $0.0172 | 28% | 0 | 44% (7/16) |
+| LLM Summarization (stand-in) | $0.0228 | 43% | 6 | 44% (7/16) |
+| **Context Warp Drive** | **$0.0066** | 60% | 0 | **94% (15/16)** |
+
+CWD is cheapest (**−71% vs summarization, −62% vs truncation** at Claude-haiku rates), makes zero extra model calls, and beats truncation decisively on retention. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + a hot cache.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI.
 
 ---
 

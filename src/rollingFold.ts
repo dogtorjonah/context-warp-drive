@@ -330,6 +330,17 @@ export const FOLD_EPOCH_STAMP_PREFIX = '[Fold epoch #';
 export const EPISODIC_RECALL_PREFIX = '[Episodic recall —';
 
 /**
+ * Consumer-injected synthetic continuity note: a `[User Message Vault]` /
+ * `[/User Message Vault]` block carrying bounded excerpts of earlier operator
+ * messages, appended to a live user turn so a reborn or compacted session keeps
+ * the operator's recent wording. The fold engine treats it as synthetic — never
+ * a real turn boundary, and stripped before genuine user text is extracted — so
+ * injected excerpts are never mistaken for fresh operator prose.
+ */
+export const USER_MESSAGE_VAULT_PREFIX = '[User Message Vault]';
+export const USER_MESSAGE_VAULT_END = '[/User Message Vault]';
+
+/**
  * Prefix of tombstone lines inside the fold block marking spans whose detail
  * was evicted to the episodic store (E10). Lives INSIDE the block (never
  * standalone injected text), so it needs no isSyntheticContextText arm; it
@@ -370,7 +381,23 @@ export function isSyntheticContextText(text: string): boolean {
     || text.startsWith(RECALL_CARD_PREFIX)
     || text.startsWith(RECALL_HINT_PREFIX)
     || text.startsWith(FOLD_EPOCH_STAMP_PREFIX)
+    || text.startsWith(USER_MESSAGE_VAULT_PREFIX)
     || text.startsWith(EPISODIC_RECALL_PREFIX);
+}
+
+export function stripUserMessageVaultBlocks(text: string): string {
+  let result = text;
+  for (let guard = 0; guard < 20; guard += 1) {
+    const start = result.indexOf(USER_MESSAGE_VAULT_PREFIX);
+    if (start < 0) break;
+    const end = result.indexOf(USER_MESSAGE_VAULT_END, start + USER_MESSAGE_VAULT_PREFIX.length);
+    if (end < 0) break;
+    const removeEnd = end + USER_MESSAGE_VAULT_END.length;
+    const before = result.slice(0, start).replace(/[ \t]*\n{0,2}$/, '');
+    const after = result.slice(removeEnd).replace(/^\n{0,2}[ \t]*/, '');
+    result = before && after ? `${before}\n\n${after}` : `${before}${after}`;
+  }
+  return result;
 }
 
 function isUserTurnBoundary(msg: FoldMessage): boolean {
@@ -650,19 +677,22 @@ export function extractUserText(turnMessages: FoldMessage[]): string {
   for (const msg of turnMessages) {
     if (msg.role !== 'user') continue;
     if (typeof msg.content === 'string' && msg.content.trim()) {
-      texts.push(msg.content);
+      const cleaned = stripUserMessageVaultBlocks(msg.content).trim();
+      if (cleaned) texts.push(cleaned);
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
         // Only genuine text blocks — tool_result blocks are tool output.
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-          texts.push(block.text);
+          const cleaned = stripUserMessageVaultBlocks(block.text).trim();
+          if (cleaned) texts.push(cleaned);
         }
       }
     } else if (Array.isArray((msg as any).parts)) {
       for (const part of (msg as any).parts as any[]) {
         if (part?.functionResponse) continue; // tool output, not user text
         if (typeof part?.text === 'string' && part.text.trim()) {
-          texts.push(part.text);
+          const cleaned = stripUserMessageVaultBlocks(part.text).trim();
+          if (cleaned) texts.push(cleaned);
         }
       }
     }

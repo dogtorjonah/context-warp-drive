@@ -19,6 +19,10 @@ import {
   extractVerbatimContextLabel,
   LABEL_MAX_CHARS,
   isSyntheticContextText,
+  stripUserMessageVaultBlocks,
+  USER_MESSAGE_VAULT_PREFIX,
+  USER_MESSAGE_VAULT_END,
+  extractUserText,
   formatFoldEpochStamp,
   formatFoldTombstoneLine,
   mergeEvictionSpans,
@@ -1620,6 +1624,41 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
 // ══════════════════════════════════════════════════════════════════════
 // Fold-recall synthetic text exclusion (see foldRecall.ts)
 // ══════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════
+// User Message Vault — synthetic continuity note inside user turns
+// ══════════════════════════════════════════════════════════════════════
+
+describe('User Message Vault synthetic filtering', () => {
+  const vault = `${USER_MESSAGE_VAULT_PREFIX}\nold operator copy\n${USER_MESSAGE_VAULT_END}`;
+
+  test('standalone vault text is synthetic and never a turn boundary', () => {
+    expect(isSyntheticContextText(vault)).toBe(true);
+
+    const msgs: FoldMessage[] = [
+      userMsg(vault),
+      assistantMsg('continuing'),
+      userMsg('real request'),
+      assistantMsg('ok'),
+    ];
+
+    expect(detectTurns(msgs)).toHaveLength(1);
+  });
+
+  test('vault blocks are stripped before extracting genuine user text', () => {
+    const mixed = `real request\n\n${vault}`;
+
+    expect(stripUserMessageVaultBlocks(mixed)).toBe('real request');
+    expect(extractUserText([userMsg(mixed)])).toBe('real request');
+  });
+
+  test('incomplete vault marker mentions stay user-authored text', () => {
+    const text = `literal marker mention ${USER_MESSAGE_VAULT_PREFIX}`;
+
+    expect(stripUserMessageVaultBlocks(text)).toBe(text);
+    expect(extractUserText([userMsg(text)])).toBe(text);
+  });
+});
 
 describe('recall-card turn boundary exclusion', () => {
   const CARD = '[Recalled from fold — Read project/src/foo.ts | trigger: path-touch project/src/foo.ts | 5,000 chars folded]\nrecalled body text here\n[End fold recall]';

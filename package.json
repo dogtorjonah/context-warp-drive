@@ -63,7 +63,9 @@
     "build": "tsup",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench": "tsx examples/benchmark.ts",
+    "bench:real": "tsx examples/benchmark-live.ts"
   },
   "engines": {
     "node": ">=18"
@@ -77,8 +79,12 @@
     }
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.104.2",
     "@types/node": "^22.0.0",
+    "js-tiktoken": "^1.0.21",
+    "openai": "^6.42.0",
     "tsup": "^8.3.0",
+    "tsx": "^4.22.4",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   }

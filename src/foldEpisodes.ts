@@ -90,6 +90,12 @@ export interface Episode {
   workspace: string;
   instanceId: string;
   lineageRoot?: string;
+  /**
+   * Authoring agent's stable display name at capture time (e.g. "turbo-ocelot").
+   * Absent on legacy rows and before capture persistence wires it; attribution
+   * rendering falls back to lineageRoot/instanceId when absent.
+   */
+  authorName?: string;
   startedAt: string;
   endedAt: string;
   closedBy: EpisodeClosedBy;
@@ -179,6 +185,15 @@ export interface ChainCardOptions {
   fullPreviousCount?: number;
   /** How many previous chapters render as warm one-liners. */
   warmCount?: number;
+  /**
+   * Caller's own-lineage instance-id set (own id + lineage/predecessor ids).
+   * A chapter whose authoring instanceId is NOT in this set renders as foreign
+   * (peer-lineage banner + attributed voice). Supplying ownLineage OR selfName
+   * activates attribution; with neither, voice renders bare for backward-compat.
+   */
+  ownLineage?: ReadonlySet<string>;
+  /** Caller's friendly display name, used to label own-lineage voice lines. */
+  selfName?: string;
 }
 
 export const DEFAULT_EPISODE_GROUPING = {
@@ -790,13 +805,45 @@ function voiceTimeSuffix(annotation: EpisodeAnnotation): string {
   return stamp ? ` ${stamp}` : '';
 }
 
-function renderVoiceLine(annotation: EpisodeAnnotation): string {
+/**
+ * Attribution context: the caller's own-lineage instance-id set and friendly
+ * display name. Threaded into card rendering so every voice line and foreign
+ * chapter can be labeled with WHO authored it — the identity-bleed guard for
+ * cross-lineage recall in multi-agent deployments.
+ */
+type AttributionOpts = Pick<ChainCardOptions, 'ownLineage' | 'selfName'>;
+
+/**
+ * Voice/identity attribution label for an episode, or '' when attribution is
+ * inactive. Attribution activates only when the caller supplies identity
+ * context (selfName or ownLineage); with neither, voice renders bare (legacy
+ * single-agent backward-compat — byte-identical output). When active: a
+ * persisted authorName wins; else own-lineage voice takes the caller's friendly
+ * selfName; foreign (or unnamed-own) voice takes the stable lineageRoot,
+ * falling back to the rotating instanceId. Always returns a non-empty label
+ * once active, so a foreign voice can never silently read as the caller's own.
+ */
+function episodeAuthorLabel(episode: Episode, opts: AttributionOpts): string {
+  if (opts.selfName === undefined && opts.ownLineage === undefined) return '';
+  if (episode.authorName) return episode.authorName;
+  const isOwn = !opts.ownLineage || opts.ownLineage.has(episode.instanceId);
+  if (isOwn) return opts.selfName ?? episode.lineageRoot ?? episode.instanceId;
+  return episode.lineageRoot ?? episode.instanceId;
+}
+
+/** True when a chapter's author is outside the caller's own lineage. */
+function isForeignChapter(episode: Episode, opts: Pick<ChainCardOptions, 'ownLineage'>): boolean {
+  return opts.ownLineage !== undefined && !opts.ownLineage.has(episode.instanceId);
+}
+
+function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   const text = truncateVerbatim(annotation.text, VOICE_TEXT_CAP_CHARS);
   const at = voiceTimeSuffix(annotation);
-  if (annotation.kind.startsWith('star:')) return `  ⭐${annotation.kind.slice(5)}:"${text}"${at}`;
-  if (annotation.kind === 'changelog') return `  ✎:"${text}"${at}`;
-  if (annotation.kind.startsWith('narration')) return `  🗣:"${text}"${at}`;
-  return `  💬:"${text}"${at}`;
+  const who = label ? ` ${label}` : '';
+  if (annotation.kind.startsWith('star:')) return `  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}`;
+  if (annotation.kind === 'changelog') return `  ✎${who}:"${text}"${at}`;
+  if (annotation.kind.startsWith('narration')) return `  🗣${who}:"${text}"${at}`;
+  return `  💬${who}:"${text}"${at}`;
 }
 
 function renderMembersLine(episode: Episode): string {
@@ -814,12 +861,13 @@ function renderChapterBody(
   episode: Episode,
   sinceDeltas: readonly string[],
   maxVoiceInlays: number,
+  voiceLabel: string,
 ): string[] {
   const lines: string[] = [];
   lines.push(renderMembersLine(episode));
   if (episode.trace.length > 0) lines.push(`  trace: ${episode.trace}`);
   for (const inlay of selectVoiceInlays(episode.annotations, maxVoiceInlays)) {
-    lines.push(renderVoiceLine(inlay));
+    lines.push(renderVoiceLine(inlay, voiceLabel));
   }
   for (const delta of sinceDeltas) {
     lines.push(`  Δ ${delta}`);
@@ -827,15 +875,17 @@ function renderChapterBody(
   return lines;
 }
 
-function warmLine(episode: Episode): string {
-  return `  prev ${formatEpisodeDate(episode.endedAt)}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`;
+function warmLine(episode: Episode, opts: AttributionOpts): string {
+  const peer = isForeignChapter(episode, opts) ? ` (peer ${episodeAuthorLabel(episode, opts)})` : '';
+  return `  prev ${formatEpisodeDate(episode.endedAt)}${peer}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`;
 }
 
-function fullPreviousChapterLines(episode: Episode, maxVoiceInlays: number): string[] {
-  return [
-    `  prev full ${formatEpisodeDate(episode.endedAt)}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`,
-    ...renderChapterBody(episode, [], maxVoiceInlays),
-  ];
+function fullPreviousChapterLines(episode: Episode, maxVoiceInlays: number, opts: AttributionOpts): string[] {
+  const voiceLabel = episodeAuthorLabel(episode, opts);
+  const lines = [`  prev full ${formatEpisodeDate(episode.endedAt)}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`];
+  if (isForeignChapter(episode, opts)) lines.push(`  ↞ from ${voiceLabel} (peer lineage)`);
+  lines.push(...renderChapterBody(episode, [], maxVoiceInlays, voiceLabel));
+  return lines;
 }
 
 /**
@@ -867,15 +917,19 @@ export function formatChainCard(
   const warm = ordered.slice(Math.max(0, warmEnd - warmCount), warmEnd).reverse();
   const cold = ordered.slice(0, Math.max(0, warmEnd - warmCount));
 
+  const hotLabel = episodeAuthorLabel(hot, opts);
   const header = `[Episode recall ${targetPath} — ${formatEpisodeDate(hot.endedAt)}, "${truncateVerbatim(hot.summary, HEADER_SUMMARY_CAP_CHARS)}"]`;
-  const body = renderChapterBody(hot, sinceDeltas, maxVoice);
+  const body = [
+    ...(isForeignChapter(hot, opts) ? [`  ↞ from ${hotLabel} (peer lineage)`] : []),
+    ...renderChapterBody(hot, sinceDeltas, maxVoice, hotLabel),
+  ];
 
   const bookendLines: string[] = [];
   if (opts.bookends?.before) bookendLines.push(`  ↞ before: ${opts.bookends.before}`);
   if (opts.bookends?.after) bookendLines.push(`  after: ↠ ${opts.bookends.after}`);
 
-  const fullPreviousLines = fullPrevious.map((episode) => fullPreviousChapterLines(episode, maxVoice));
-  const warmLines = warm.map(warmLine);
+  const fullPreviousLines = fullPrevious.map((episode) => fullPreviousChapterLines(episode, maxVoice, opts));
+  const warmLines = warm.map((episode) => warmLine(episode, opts));
   const coldLine = cold.length > 0
     ? `  older: ${cold.length} chapter${cold.length === 1 ? '' : 's'} ${formatEpisodeDate(cold[0].endedAt)} → ${formatEpisodeDate(cold[cold.length - 1].endedAt)}`
     : undefined;
@@ -947,12 +1001,16 @@ export function formatWalkPromotionCard(
   chapter: Episode,
   position: WalkPosition,
   sinceDeltas: readonly string[],
-  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays'> = {},
+  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays' | 'ownLineage' | 'selfName'> = {},
 ): string {
   const budget = opts.charBudget ?? CHAIN_CARD_DEFAULT_BUDGET_CHARS;
   const maxVoice = opts.maxVoiceInlays ?? 2;
+  const label = episodeAuthorLabel(chapter, opts);
   const header = `[Episode recall — walking back, chapter ${position.index}/${position.total}, ${formatEpisodeDate(chapter.endedAt)}, "${truncateVerbatim(chapter.summary, HEADER_SUMMARY_CAP_CHARS)}"]`;
-  const body = renderChapterBody(chapter, sinceDeltas, maxVoice);
+  const body = [
+    ...(isForeignChapter(chapter, opts) ? [`  ↞ from ${label} (peer lineage)`] : []),
+    ...renderChapterBody(chapter, sinceDeltas, maxVoice, label),
+  ];
   const pointer = formatPointerLine(chapter);
 
   const assemble = (bodyLines: string[]): string => [header, ...bodyLines, pointer].join('\n');
