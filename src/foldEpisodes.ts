@@ -1115,6 +1115,13 @@ export interface EpisodicInjectionState {
   episodicPinsInjected: number;
   /** Chars emitted via active-path pin blocks (NOT included in episodicChars). */
   episodicPinChars: number;
+  /**
+   * Boundaries where the inhale + pin were skipped because a pure bookkeeping
+   * tool dispatched (see isEpisodicBookkeepingTool). The exhale of already-earned
+   * cards still runs on those boundaries — this counts only the suppressed NEW
+   * fires, the noise-reduction signal for the bookkeeping-suppression A/B.
+   */
+  episodicBookkeepingSuppressed: number;
 }
 
 export function createEpisodicInjectionState(): EpisodicInjectionState {
@@ -1130,6 +1137,7 @@ export function createEpisodicInjectionState(): EpisodicInjectionState {
     episodicSkippedAtPressure: 0,
     episodicPinsInjected: 0,
     episodicPinChars: 0,
+    episodicBookkeepingSuppressed: 0,
   };
 }
 
@@ -1247,6 +1255,82 @@ export function refreshEpisodicZones(
 export interface ActiveEpisodicPathCardOptions {
   maxCards?: number;
   excludeRenderedCards?: readonly string[];
+  /**
+   * Cross-boundary pin idempotency: header lines already resident in the
+   * post-fold send view. A pin whose byte-stable header line is in this set is
+   * SKIPPED — a live copy still occupies the window, so re-pasting the full card
+   * would only duplicate it. When the copy finally folds away its header leaves
+   * the set and the pin re-pastes in full, restoring resident working memory.
+   * Distinct from excludeRenderedCards (within-boundary exact full-card dedupe):
+   * a resident copy may be the COMPACTED form, so idempotency keys on the header
+   * line, never the full rendered text.
+   */
+  excludeHeaderLines?: ReadonlySet<string>;
+}
+
+/**
+ * Byte-stable header line of a rendered episodic card — its first line, e.g.
+ * `[Episode recall <path> — <date>, "..."]`. The header carries no churning
+ * counters (deliberate, for injection-cache stability), so it is a stable key
+ * for cross-boundary active-pin idempotency.
+ */
+export function episodicCardHeaderLine(card: EpisodicRecallCardLike): string {
+  const nl = card.renderedCard.indexOf('\n');
+  return nl === -1 ? card.renderedCard : card.renderedCard.slice(0, nl);
+}
+
+/** Header-line shapes a rendered episodic CARD can start with (hot/walk recall + completed chain). Excludes the `[Episodic recall …` block wrappers by construction. */
+export const EPISODIC_CARD_HEADER_PREFIX_RE = /^\[Episode (?:recall|chain) /;
+
+/**
+ * Collect the episodic card header lines present in a rendered view text (the
+ * post-fold send view's concatenated message text). This is the resident-pin
+ * set for idempotent active-path pins: a header here means a live copy already
+ * occupies the window, so re-pasting it is pure duplication. Block wrappers
+ * (`[Episodic recall …]`) start with "Episodic" and are deliberately not matched.
+ * Pure CPU; cheap-exits when no episodic card text is present.
+ */
+export function collectResidentEpisodicHeaders(viewText: string): Set<string> {
+  const out = new Set<string>();
+  if (!viewText || viewText.indexOf('[Episode ') === -1) return out;
+  for (const line of viewText.split('\n')) {
+    if (EPISODIC_CARD_HEADER_PREFIX_RE.test(line)) out.add(line);
+  }
+  return out;
+}
+
+/**
+ * Pure coordination / bookkeeping tools that incidentally carry file paths but
+ * do NOT represent the agent reading, editing, or searching code. Episodic
+ * recall keys off touched/mentioned paths; firing the inhale or re-paging the
+ * active pin on these keeps a zone artificially hot and floods tool boundaries
+ * with cards during pure paperwork (claim/release, rail bookkeeping, atlas
+ * commit, chat, waves). A seam consults isEpisodicBookkeepingTool to skip the
+ * INHALE + PIN (never the exhale of already-earned cards) on these boundaries.
+ * Investigation tools (read/grep/glob, codebase search) are deliberately ABSENT
+ * — recall SHOULD fire when the agent explores code.
+ */
+export const EPISODIC_BOOKKEEPING_TOOLS: ReadonlySet<string> = new Set<string>([
+  'task_rail',
+  'partner_claim_file',
+  'partner_release_file',
+  'partner_file_claims',
+  'atlas_commit',
+  'chatroom',
+  'tap_star',
+  'raw_signal',
+  'inbox_send',
+  'wave_advance',
+  'wave_complete',
+  'wave_complete_implementation',
+  'wave_set_next_directive',
+  'agent_slots',
+  'slot_report',
+]);
+
+/** True when the dispatched tool is pure bookkeeping (see EPISODIC_BOOKKEEPING_TOOLS) — the seam skips the episodic inhale + pin on it. */
+export function isEpisodicBookkeepingTool(toolName: string | null | undefined): boolean {
+  return typeof toolName === 'string' && EPISODIC_BOOKKEEPING_TOOLS.has(toolName);
 }
 
 /**
@@ -1270,6 +1354,10 @@ export function activeEpisodicPathCards(
     if (!card) continue;
     if (!zoneMatchesTouchedPath(targetPath, zone, touched)) continue;
     if (excluded.has(card.renderedCard)) continue;
+    // Cross-boundary idempotency: a live copy of this card's header is already
+    // resident in the send view, so re-pasting it would only duplicate. Skip
+    // until it folds away (its header leaves the set) and the pin re-pastes full.
+    if (options.excludeHeaderLines && options.excludeHeaderLines.has(episodicCardHeaderLine(card))) continue;
     out.push(cloneEpisodicCard(card));
     if (out.length >= maxCards) break;
   }

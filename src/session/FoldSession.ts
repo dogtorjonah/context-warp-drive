@@ -25,10 +25,14 @@
 import {
   foldContext,
   detectTurns,
+  computeEvictableThroughOrdinal,
   DEFAULT_FOLD_CONFIG,
+  DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
   type FoldMessage,
   type FoldConfig,
   type FoldResult,
+  type FoldEvictionInput,
+  type FoldEvictionSpan,
 } from '../rollingFold.ts';
 import {
   createFoldFreezeState,
@@ -58,8 +62,25 @@ export interface FoldSessionOptions {
    * recomputes the fold every call (no cache reuse).
    */
   readonly freeze?: boolean | FoldFreezeConfig;
+  /**
+   * E10 sawtooth eviction for the standing fold block. Enabled by default for
+   * prepare(), because FoldSession's contract is full raw append-only history:
+   * hosts can compose foldRecall with that raw history to page tombstoned
+   * detail back in. Pass false to keep the fold block monotonic, or tune the
+   * threshold.
+   */
+  readonly eviction?: boolean | { readonly thresholdChars?: number };
   /** Clock injection for deterministic tests. Defaults to Date.now. */
   readonly now?: () => number;
+}
+
+export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
+  /**
+   * Highest raw message index whose content is durable enough to tombstone.
+   * Defaults to messages.length (all supplied raw history). Hosts with async
+   * episodic persistence can pass a lower cursor until their store confirms.
+   */
+  readonly durableCursorIndex?: number;
 }
 
 export interface FoldStats {
@@ -78,6 +99,9 @@ export interface FoldStats {
   /** Lifetime hot reuses since the last epoch, and total epochs (freeze telemetry). */
   readonly hotReuses: number;
   readonly epochs: number;
+  /** E10 sawtooth telemetry, present on fresh folds when eviction is enabled. */
+  readonly newlyEvictedTurns?: number;
+  readonly evictedSpanCount?: number;
 }
 
 export interface FoldOutcome {
@@ -99,7 +123,13 @@ export class FoldSession {
   private readonly freezeEnabled: boolean;
   private readonly freezeConfig: FoldFreezeConfig;
   private readonly freezeState: FoldFreezeState;
+  private readonly evictionEnabled: boolean;
+  private readonly evictionThresholdChars: number;
   private readonly clock: () => number;
+  private foldEpochs = 0;
+  private foldEvictedSpans: FoldEvictionSpan[] = [];
+  private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
+  private lastPreparedRawCount = 0;
 
   constructor(options: FoldSessionOptions = {}) {
     this.foldConfig = options.foldConfig ?? DEFAULT_FOLD_CONFIG;
@@ -112,6 +142,15 @@ export class FoldSession {
     } else {
       this.freezeEnabled = true;
       this.freezeConfig = DEFAULT_FOLD_FREEZE_CONFIG;
+    }
+    if (options.eviction === false) {
+      this.evictionEnabled = false;
+      this.evictionThresholdChars = DEFAULT_FOLD_EVICT_THRESHOLD_CHARS;
+    } else {
+      this.evictionEnabled = true;
+      this.evictionThresholdChars = typeof options.eviction === 'object'
+        ? options.eviction.thresholdChars ?? DEFAULT_FOLD_EVICT_THRESHOLD_CHARS
+        : DEFAULT_FOLD_EVICT_THRESHOLD_CHARS;
     }
     this.freezeState = createFoldFreezeState();
     this.clock = options.now ?? Date.now;
@@ -138,6 +177,46 @@ export class FoldSession {
     return foldContext(messages, this.resolveTurnsToFold(messages, turnsToFold), this.foldConfig);
   }
 
+  private resetEvictionState(): void {
+    this.foldEpochs = 0;
+    this.foldEvictedSpans = [];
+    this.foldEpochFrontiers = [];
+  }
+
+  private buildFoldEvictionInput(
+    messages: FoldMessage[],
+    durableCursorIndex: number,
+    upcomingEpoch: number,
+    now: number,
+  ): FoldEvictionInput | undefined {
+    if (!this.evictionEnabled || this.evictionThresholdChars <= 0) return undefined;
+    const hasSpans = this.foldEvictedSpans.length > 0;
+    const evictableThroughOrdinal = computeEvictableThroughOrdinal(
+      detectTurns(messages),
+      durableCursorIndex,
+      this.foldEpochFrontiers,
+      upcomingEpoch,
+    );
+    if (evictableThroughOrdinal <= 0 && !hasSpans) return undefined;
+    return {
+      evictedSpans: this.foldEvictedSpans,
+      evictableThroughOrdinal,
+      thresholdChars: this.evictionThresholdChars,
+      nowIso: new Date(now).toISOString(),
+    };
+  }
+
+  private commitEvictionEpoch(result: FoldResult, epoch: number): void {
+    this.foldEpochs = Math.max(this.foldEpochs, epoch);
+    this.foldEpochFrontiers.push({ epoch, turnsFolded: result.turnsFolded });
+    if (this.foldEpochFrontiers.length > 16) {
+      this.foldEpochFrontiers.splice(0, this.foldEpochFrontiers.length - 16);
+    }
+    if (result.evictedSpans) {
+      this.foldEvictedSpans = result.evictedSpans.map(span => ({ ...span }));
+    }
+  }
+
   /**
    * Prepare the message array to send this turn. Reuses the byte-identical frozen
    * prefix while the provider cache is hot; recomputes the fold only at an epoch.
@@ -146,12 +225,24 @@ export class FoldSession {
    * @param context optional thinning mode + currently-claimed paths (paths whose
    *   tool results should never fold). Both default to empty.
    */
-  prepare(messages: FoldMessage[], context: Partial<FoldFreezeContext> = {}): FoldOutcome {
+  prepare(messages: FoldMessage[], context: FoldPrepareContext = {}): FoldOutcome {
     const now = this.clock();
     const totalTurns = detectTurns(messages).length;
+    const durableCursorIndex = context.durableCursorIndex ?? messages.length;
+    if (messages.length < this.lastPreparedRawCount) {
+      this.resetEvictionState();
+    }
+    this.lastPreparedRawCount = messages.length;
 
     if (!this.freezeEnabled) {
-      const result = foldContext(messages, this.resolveTurnsToFold(messages), this.foldConfig);
+      const upcomingEpoch = this.foldEpochs + 1;
+      const result = foldContext(
+        messages,
+        this.resolveTurnsToFold(messages),
+        this.foldConfig,
+        this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
+      );
+      this.commitEvictionEpoch(result, upcomingEpoch);
       return {
         messages: result.messages,
         cacheHot: false,
@@ -180,8 +271,18 @@ export class FoldSession {
       };
     }
 
-    const result = foldContext(messages, this.resolveTurnsToFold(messages), this.foldConfig);
+    if (decision.reason === 'history-rewound' || decision.reason === 'boundary-mismatch') {
+      this.resetEvictionState();
+    }
+    const upcomingEpoch = this.foldEpochs + 1;
+    const result = foldContext(
+      messages,
+      this.resolveTurnsToFold(messages),
+      this.foldConfig,
+      this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
+    );
     commitFoldFreeze(this.freezeState, messages, result.messages, ctx, now);
+    this.commitEvictionEpoch(result, this.freezeState.epochs);
     return {
       messages: result.messages,
       cacheHot: false,
@@ -191,12 +292,21 @@ export class FoldSession {
   }
 
   /** Freeze-layer telemetry: hot reuses since last epoch, lifetime epochs, frozen size. */
-  get telemetry(): { hotReuses: number; epochs: number; frozenViewChars: number; frozenRawCount: number } {
+  get telemetry(): {
+    hotReuses: number;
+    epochs: number;
+    frozenViewChars: number;
+    frozenRawCount: number;
+    evictedSpanCount: number;
+    evictedTurnCount: number;
+  } {
     return {
       hotReuses: this.freezeState.hotReuses,
       epochs: this.freezeState.epochs,
       frozenViewChars: this.freezeState.frozenViewChars,
       frozenRawCount: this.freezeState.frozenRawCount,
+      evictedSpanCount: this.foldEvictedSpans.length,
+      evictedTurnCount: this.foldEvictedSpans.reduce((sum, span) => sum + span.turnCount, 0),
     };
   }
 
@@ -210,6 +320,8 @@ export class FoldSession {
       savingsPercent: result.savingsPercent,
       hotReuses: this.freezeState.hotReuses,
       epochs: this.freezeState.epochs,
+      newlyEvictedTurns: result.newlyEvictedTurns,
+      evictedSpanCount: result.evictedSpans?.length,
     };
   }
 }

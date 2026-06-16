@@ -13,4 +13,4 @@ export * from './foldTerms.ts';
 export * from './contextWindow.ts';
 
 export { FoldSession } from './session/FoldSession.ts';
-export type { FoldSessionOptions, FoldOutcome, FoldStats } from './session/FoldSession.ts';
+export type { FoldSessionOptions, FoldPrepareContext, FoldOutcome, FoldStats } from './session/FoldSession.ts';
