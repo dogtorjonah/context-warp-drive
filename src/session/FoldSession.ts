@@ -229,6 +229,15 @@ export class FoldSession {
     const now = this.clock();
     const totalTurns = detectTurns(messages).length;
     const durableCursorIndex = context.durableCursorIndex ?? messages.length;
+    // Rewind self-heal. A SHRINK in raw count (turns removed) drops now-stale
+    // eviction ordinals before they can mis-tombstone the wrong turns. EDGE
+    // (no-freeze path only): this length check cannot see a SAME-LENGTH in-place
+    // history replacement — only the freeze path's evaluateFoldFreeze boundary
+    // role/char/hash guard detects that and forces a recompute (which resets the
+    // eviction frame). With freeze:false, a same-length rewrite would leave
+    // tombstone ordinals aligned to the OLD turns; this is safe only because
+    // FoldSession's contract is append-only raw history. Hosts that mutate history
+    // in place must keep freeze enabled (the default) to stay eviction-correct.
     if (messages.length < this.lastPreparedRawCount) {
       this.resetEvictionState();
     }

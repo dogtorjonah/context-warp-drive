@@ -1115,6 +1115,8 @@ export interface EpisodicInjectionState {
   episodicPinsInjected: number;
   /** Chars emitted via active-path pin blocks (NOT included in episodicChars). */
   episodicPinChars: number;
+  /** Target paths whose completed-chain pointer was already shown during the current live zone. */
+  completedChainTargetPaths: Set<string>;
   /**
    * Boundaries where the inhale + pin were skipped because a pure bookkeeping
    * tool dispatched (see isEpisodicBookkeepingTool). The exhale of already-earned
@@ -1137,6 +1139,7 @@ export function createEpisodicInjectionState(): EpisodicInjectionState {
     episodicSkippedAtPressure: 0,
     episodicPinsInjected: 0,
     episodicPinChars: 0,
+    completedChainTargetPaths: new Set(),
     episodicBookkeepingSuppressed: 0,
   };
 }
@@ -1144,7 +1147,10 @@ export function createEpisodicInjectionState(): EpisodicInjectionState {
 /** Drop expired zones; their chapterIds leave the served-set (walk cursor reset). */
 export function expireEpisodicZones(state: EpisodicInjectionState): void {
   for (const [path, zone] of state.zones) {
-    if (zone.expiresAtBoundary <= state.boundarySeq) state.zones.delete(path);
+    if (zone.expiresAtBoundary <= state.boundarySeq) {
+      state.zones.delete(path);
+      state.completedChainTargetPaths.delete(path);
+    }
   }
 }
 
@@ -1155,6 +1161,11 @@ export function episodicServedChapterIds(state: EpisodicInjectionState): number[
     for (const id of zone.chapterIds) ids.add(id);
   }
   return Array.from(ids).sort((a, b) => a - b);
+}
+
+/** Chain targets whose walk-complete pointer has already been injected while the zone is live. */
+export function episodicCompletedChainPaths(state: EpisodicInjectionState): string[] {
+  return Array.from(state.completedChainTargetPaths).sort();
 }
 
 function cloneEpisodicCard(card: EpisodicRecallCardLike): EpisodicRecallCardLike {
@@ -1223,6 +1234,8 @@ export function noteEpisodicInjection(
       chapterIds: Array.from(merged).sort((a, b) => a - b),
       ...(activeCard ? { activeCard } : {}),
     });
+    if (card.kind === 'pointer') state.completedChainTargetPaths.add(card.targetPath);
+    else state.completedChainTargetPaths.delete(card.targetPath);
     if (card.kind === 'mention') state.episodeCardsInjected++;
     else state.chainCardsInjected++;
     state.episodicChars += card.renderedCard.length;
