@@ -108,7 +108,12 @@ const history = [
 ];
 
 // Every turn, before you call the model:
-const { messages, cacheHot, stats } = session.prepare(history);
+const { messages, cacheHot, stats } = session.prepare(history, {
+  // Optional but recommended: pass real provider/relay input-token telemetry
+  // from the previous turn. At 240k by default, FoldSession forces a fresh
+  // fold epoch instead of hot-reusing into an oversized prompt.
+  measuredInputTokens: previousUsage?.input_tokens,
+});
 
 // `messages` is the compacted view to send. When `cacheHot` is true the prefix is
 // byte-identical to last turn, so the provider prompt cache is reused.
@@ -116,7 +121,7 @@ await callYourModel(messages); // Anthropic / OpenAI / Gemini — the message sh
 console.log(`sent ${messages.length} msgs · cacheHot=${cacheHot} · savings=${stats.savingsPercent ?? 0}%`);
 ```
 
-That's the whole headline. For continuous always-lean folding, pass `ALWAYS_ON_FOLD_CONFIG`; to match your provider's real cache TTL, set `freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 }`.
+That's the whole headline. For continuous always-lean folding, pass `ALWAYS_ON_FOLD_CONFIG`; to match your provider's real cache TTL, set `freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 }`. The measured-token pressure guard defaults to `DEFAULT_FOLD_PRESSURE_CEILING_TOKENS` (240,000); pass `pressureCeiling: false` to disable it or `pressureCeiling: 120_000` to tune it.
 
 See [`examples/anthropic-loop.ts`](./examples/anthropic-loop.ts) and [`examples/openai-loop.ts`](./examples/openai-loop.ts) for full tool loops.
 
@@ -164,6 +169,7 @@ The engine reads three message shapes natively — pass your history through unc
 // Core fold engine (zero deps) — also at "context-warp-drive/fold"
 import {
   FoldSession,           // the orchestrator (fold + freeze)
+  DEFAULT_FOLD_PRESSURE_CEILING_TOKENS,
   foldContext,           // rolling fold (page-out)
   ALWAYS_ON_FOLD_CONFIG, DEFAULT_FOLD_CONFIG, type FoldConfig, type FoldMessage, type FoldResult,
   evaluateFoldFreeze, commitFoldFreeze, createFoldFreezeState, // freeze layer

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   ALWAYS_ON_FOLD_CONFIG,
+  DEFAULT_FOLD_PRESSURE_CEILING_TOKENS,
   FOLD_TOMBSTONE_PREFIX,
   FoldSession,
   type FoldMessage,
@@ -122,5 +123,45 @@ describe('FoldSession E10 sawtooth eviction', () => {
     const block = extractFoldBlock(prepared);
     expect(block).not.toContain(FOLD_TOMBSTONE_PREFIX);
     expect(session.telemetry.evictedTurnCount).toBe(0);
+  });
+
+  test('measuredInputTokens at the pressure ceiling forces an epoch during hot reuse', () => {
+    let now = Date.parse('2026-06-16T00:00:00.000Z');
+    const session = new FoldSession({
+      foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+      freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 1_000_000 },
+      pressureCeiling: 10,
+      now: () => {
+        now += 1_000;
+        return now;
+      },
+    });
+    const messages = turn(0);
+
+    const first = session.prepare(messages);
+    expect(first.cacheHot).toBe(false);
+    expect(first.stats.pressureCeilingTokens).toBe(10);
+    expect(first.stats.pressureCeilingTriggered).toBe(false);
+
+    const hot = session.prepare(messages, { measuredInputTokens: 9 });
+    expect(hot.cacheHot).toBe(true);
+    expect(hot.stats.pressureCeilingTokens).toBe(10);
+    expect(hot.stats.pressureCeilingTriggered).toBe(false);
+
+    const forced = session.prepare(messages, { measuredInputTokens: 10 });
+    expect(forced.cacheHot).toBe(false);
+    expect(forced.stats.epochReason).toBe('pressure-ceiling');
+    expect(forced.stats.pressureCeilingTokens).toBe(10);
+    expect(forced.stats.pressureCeilingTriggered).toBe(true);
+    expect(session.telemetry.epochs).toBe(2);
+  });
+
+  test('the default pressure ceiling is the 240k measured-token guard', () => {
+    const session = new FoldSession();
+    const messages = turn(0);
+    const prepared = session.prepare(messages, { measuredInputTokens: DEFAULT_FOLD_PRESSURE_CEILING_TOKENS - 1 });
+
+    expect(prepared.stats.pressureCeilingTokens).toBe(DEFAULT_FOLD_PRESSURE_CEILING_TOKENS);
+    expect(prepared.stats.pressureCeilingTriggered).toBe(false);
   });
 });

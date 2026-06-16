@@ -1,9 +1,9 @@
 /**
- * FoldSession — the reference orchestrator that wires the context-warp-drive engine
+ * FoldSession — the reference orchestrator that wires the context-warp engine
  * into any function-calling agent loop.
  *
- * It distills the production compaction seam into one provider-agnostic helper:
- * every turn you hand it your full provider-shaped
+ * It distills the relay's production seam (`fcBaseSession.applyCompaction`) into
+ * one provider-agnostic helper: every turn you hand it your full provider-shaped
  * message history; it returns the compacted view to send AND keeps the provider
  * prompt cache hot by reusing a byte-identical frozen prefix between epochs.
  *
@@ -46,6 +46,15 @@ import {
 } from '../foldFreeze.ts';
 
 const EMPTY_CLAIMED: ReadonlySet<string> = new Set<string>();
+export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = 240_000;
+
+export interface FoldPressureCeilingConfig {
+  /**
+   * Absolute measured input-token ceiling. FoldSession never estimates tokens:
+   * hosts pass measured provider/relay input tokens via prepare().
+   */
+  readonly tokens?: number;
+}
 
 export interface FoldSessionOptions {
   /**
@@ -70,6 +79,12 @@ export interface FoldSessionOptions {
    * threshold.
    */
   readonly eviction?: boolean | { readonly thresholdChars?: number };
+  /**
+   * Absolute pressure guard for large-window models. Enabled by default at
+   * 240k measured input tokens; pass false to disable or a number/config to
+   * tune. The host must pass measuredInputTokens to prepare() for it to fire.
+   */
+  readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
   /** Clock injection for deterministic tests. Defaults to Date.now. */
   readonly now?: () => number;
 }
@@ -81,6 +96,12 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    * episodic persistence can pass a lower cursor until their store confirms.
    */
   readonly durableCursorIndex?: number;
+  /**
+   * Measured provider/relay input tokens for the prompt about to be sent. This
+   * must be real telemetry, not an estimate; when it reaches the pressure
+   * ceiling, FoldSession forces a fresh fold epoch instead of hot-reusing.
+   */
+  readonly measuredInputTokens?: number;
 }
 
 export interface FoldStats {
@@ -102,6 +123,9 @@ export interface FoldStats {
   /** E10 sawtooth telemetry, present on fresh folds when eviction is enabled. */
   readonly newlyEvictedTurns?: number;
   readonly evictedSpanCount?: number;
+  /** Absolute measured-token ceiling telemetry when the pressure guard is enabled. */
+  readonly pressureCeilingTokens?: number;
+  readonly pressureCeilingTriggered?: boolean;
 }
 
 export interface FoldOutcome {
@@ -125,6 +149,7 @@ export class FoldSession {
   private readonly freezeState: FoldFreezeState;
   private readonly evictionEnabled: boolean;
   private readonly evictionThresholdChars: number;
+  private readonly pressureCeilingTokens: number | null;
   private readonly clock: () => number;
   private foldEpochs = 0;
   private foldEvictedSpans: FoldEvictionSpan[] = [];
@@ -151,6 +176,14 @@ export class FoldSession {
       this.evictionThresholdChars = typeof options.eviction === 'object'
         ? options.eviction.thresholdChars ?? DEFAULT_FOLD_EVICT_THRESHOLD_CHARS
         : DEFAULT_FOLD_EVICT_THRESHOLD_CHARS;
+    }
+    if (options.pressureCeiling === false) {
+      this.pressureCeilingTokens = null;
+    } else {
+      const configured = typeof options.pressureCeiling === 'number'
+        ? options.pressureCeiling
+        : options.pressureCeiling?.tokens ?? DEFAULT_FOLD_PRESSURE_CEILING_TOKENS;
+      this.pressureCeilingTokens = Number.isFinite(configured) && configured > 0 ? configured : null;
     }
     this.freezeState = createFoldFreezeState();
     this.clock = options.now ?? Date.now;
@@ -217,6 +250,23 @@ export class FoldSession {
     }
   }
 
+  private isPressureCeilingTriggered(measuredInputTokens: number | undefined): boolean {
+    return this.pressureCeilingTokens !== null
+      && typeof measuredInputTokens === 'number'
+      && Number.isFinite(measuredInputTokens)
+      && measuredInputTokens >= this.pressureCeilingTokens;
+  }
+
+  private pressureStats(
+    pressureCeilingTriggered: boolean,
+  ): Partial<Pick<FoldStats, 'pressureCeilingTokens' | 'pressureCeilingTriggered'>> {
+    if (this.pressureCeilingTokens === null) return {};
+    return {
+      pressureCeilingTokens: this.pressureCeilingTokens,
+      pressureCeilingTriggered,
+    };
+  }
+
   /**
    * Prepare the message array to send this turn. Reuses the byte-identical frozen
    * prefix while the provider cache is hot; recomputes the fold only at an epoch.
@@ -229,6 +279,7 @@ export class FoldSession {
     const now = this.clock();
     const totalTurns = detectTurns(messages).length;
     const durableCursorIndex = context.durableCursorIndex ?? messages.length;
+    const pressureCeilingTriggered = this.isPressureCeilingTriggered(context.measuredInputTokens);
     // Rewind self-heal. A SHRINK in raw count (turns removed) drops now-stale
     // eviction ordinals before they can mis-tombstone the wrong turns. EDGE
     // (no-freeze path only): this length check cannot see a SAME-LENGTH in-place
@@ -256,7 +307,10 @@ export class FoldSession {
         messages: result.messages,
         cacheHot: false,
         result,
-        stats: this.statsFromResult(totalTurns, false, result),
+        stats: {
+          ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
+          ...(pressureCeilingTriggered ? { epochReason: 'pressure-ceiling' } : {}),
+        },
       };
     }
 
@@ -266,7 +320,7 @@ export class FoldSession {
     };
     const decision = evaluateFoldFreeze(this.freezeState, messages, ctx, now, this.freezeConfig);
 
-    if (decision.action === 'reuse') {
+    if (decision.action === 'reuse' && !pressureCeilingTriggered) {
       touchFoldFreeze(this.freezeState, now);
       return {
         messages: decision.view,
@@ -276,11 +330,13 @@ export class FoldSession {
           cacheHot: true,
           hotReuses: this.freezeState.hotReuses,
           epochs: this.freezeState.epochs,
+          ...this.pressureStats(false),
         },
       };
     }
 
-    if (decision.reason === 'history-rewound' || decision.reason === 'boundary-mismatch') {
+    const recomputeReason = decision.action === 'recompute' ? decision.reason : undefined;
+    if (recomputeReason === 'history-rewound' || recomputeReason === 'boundary-mismatch') {
       this.resetEvictionState();
     }
     const upcomingEpoch = this.foldEpochs + 1;
@@ -292,11 +348,17 @@ export class FoldSession {
     );
     commitFoldFreeze(this.freezeState, messages, result.messages, ctx, now);
     this.commitEvictionEpoch(result, this.freezeState.epochs);
+    const epochReason = pressureCeilingTriggered
+      ? recomputeReason ? `pressure-ceiling+${recomputeReason}` : 'pressure-ceiling'
+      : recomputeReason;
     return {
       messages: result.messages,
       cacheHot: false,
       result,
-      stats: { ...this.statsFromResult(totalTurns, false, result), epochReason: decision.reason },
+      stats: {
+        ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
+        ...(epochReason ? { epochReason } : {}),
+      },
     };
   }
 
@@ -319,7 +381,12 @@ export class FoldSession {
     };
   }
 
-  private statsFromResult(totalTurns: number, cacheHot: boolean, result: FoldResult): FoldStats {
+  private statsFromResult(
+    totalTurns: number,
+    cacheHot: boolean,
+    result: FoldResult,
+    pressureCeilingTriggered = false,
+  ): FoldStats {
     return {
       totalTurns,
       cacheHot,
@@ -331,6 +398,7 @@ export class FoldSession {
       epochs: this.freezeState.epochs,
       newlyEvictedTurns: result.newlyEvictedTurns,
       evictedSpanCount: result.evictedSpans?.length,
+      ...this.pressureStats(pressureCeilingTriggered),
     };
   }
 }

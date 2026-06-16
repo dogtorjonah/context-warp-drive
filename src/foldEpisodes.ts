@@ -4,12 +4,12 @@
  * An episode is the durable memory of one work burst: which files were touched
  * together (the blast radius / activation zone), in what order (the
  * structural-verbatim branch trace), and what the agent itself said at the time
- * (voice annotations mined verbatim from glyph-grammar-tagged tool inputs,
+ * (voice annotations mined verbatim from atlas_commit / tap_star / typed chat,
  * plus tier-B narration distilled deterministically from burst-final
  * assistant prose — see extractNarrationLines).
- * Episodes are derived at fold-epoch boundaries, persisted by a caller-provided
- * store, and recalled as chain cards when any member of a zone is touched
- * again. Trigger semantics are zone-based, never lock-and-key:
+ * Episodes are derived at fold-epoch boundaries, persisted by the worker pool
+ * (fold-episodes.sqlite), and recalled as chain cards when any member of a zone
+ * is touched again. Trigger semantics are zone-based, never lock-and-key:
  * touching ONE member recalls the WHOLE zone.
  *
  * INVARIANTS
@@ -24,15 +24,15 @@
  *   the agent's own contemporaneous words, selected by a deterministic shape
  *   gate (never an LLM), provenance-marked as kind 'narration' (🗣), and
  *   ranked below every deliberate voice channel unless promoted by a declared
- *   register glyph (🏁/⚠️).
+ *   SOP register glyph (🏁/⚠️).
  *   The only derived line is the episode summary header,
- *   built from the agent's own changelog/task words first, structural facts
+ *   built from the agent's own changelog/rail words first, structural facts
  *   (top member paths) as the last fallback.
  * - Gradient law: the hot chapter renders full (members + trace + voice +
  *   since-then deltas), warm chapters render one-liners, cold chapters collapse
  *   to a single line. The same compression law applies at every chain level.
  * - Episodes must outlive their source transcripts: persist `trace` and
- *   `annotations` denormalized at write time.
+ *   `annotations` denormalized at write time (aa-ledger ENOENT lesson).
  *   Nothing in this module reaches back to transcript files at render time.
  */
 
@@ -51,7 +51,7 @@ export type EpisodeAnnotationKind =
   | 'chat'
   /**
    * Tier-B voice: burst-final assistant prose through the deterministic verdict
-   * gate. Three trust tiers, set by the register the agent DECLARED
+   * gate. Three trust tiers, set by the register the agent DECLARED (SOP P23
    * first-glyph): a 🏁-declared verdict and a ⚠️-declared hazard are promoted
    * into the deliberate tier (they rank with star:result / star:gotcha and a
    * declared hazard feeds the chain-surfacing boost), because a declared
@@ -70,7 +70,7 @@ export interface EpisodeAnnotation {
   kind: EpisodeAnnotationKind;
   /** VERBATIM agent-authored text, ≤ VOICE_TEXT_CAP_CHARS at write time. */
   text: string;
-  /** Optional file path this annotation was about (e.g. a changelog target). */
+  /** Optional file path this annotation was about (e.g. atlas_commit target). */
   path?: string;
 }
 
@@ -102,6 +102,8 @@ export interface Episode {
   /** One-line header; see deriveEpisodeSummary fallback chain. */
   summary: string;
   gitHead?: string;
+  railId?: string;
+  railStep?: string;
   /**
    * TRUE when the capturing session was force-siloed (sealed experiment /
    * blinded research arm) at the moment of record. Siloed rows are visible
@@ -175,6 +177,21 @@ export interface WalkPosition {
   total: number;
 }
 
+export interface WalkSpineCitation {
+  chapter: Episode;
+  /**
+   * 'origin' = the TRUE chain root: rendered as a full anchor (inline gist +
+   * `| reopen:` pointer) — the rehydratable north star that rides every walk
+   * card from step one. 'waypoint' = an intermediate breadcrumb: compact and
+   * VIEW-ONLY (inline gist + distance-from-now, no reopen pointer).
+   */
+  kind: 'origin' | 'waypoint';
+  /** Waypoints only: chapters-back from the served chapter (the walk's "now"). */
+  backDistance?: number;
+  /** Optional explicit role override; else derived from the chapter annotations. */
+  label?: string;
+}
+
 export interface ChainCardOptions {
   /** Pre-rendered session-adjacent one-liners (resolved at recall by the store). */
   bookends?: { before?: string; after?: string };
@@ -231,7 +248,7 @@ const ANNOTATION_PRIORITY: Record<EpisodeAnnotationKind, number> = {
   'star:result': 3,
   'star:discovery': 4,
   'star:handoff': 5,
-  // DECLARED commentary glyphs are promoted INTO the deliberate tier:
+  // DECLARED commentary (SOP P23 glyphs) is promoted INTO the deliberate tier:
   // a ⚠️-declared hazard and a 🏁-declared verdict are deliberate acts on par
   // with pinned stars, so they outrank a routine changelog blurb / ambient chat
   // line for an inlay slot. A declared hazard sits just under the gotcha star
@@ -252,10 +269,12 @@ const ANNOTATION_PRIORITY: Record<EpisodeAnnotationKind, number> = {
  * System binaries, device paths, package internals, and bare segment-less
  * tokens (e.g. 'app') make degenerate zones — /bin/bash as a member would
  * re-engage its zone on every shell command, poisoning walk calibration and
- * recall ranking alike; directories and repository roots cause the same
- * problem, and import edges only contain files, so directory members would
- * asymmetrically inflate recall. Members must be FILES: the final path segment
- * needs an extension (deliberate loss: extensionless files like
+ * recall ranking alike (measured: /bin/bash was the longest "chain" in the
+ * first replay smoke, 28 chapters; directories like `relay/src` and the repo
+ * root topped the first backfill smoke the same way — and import-edges only
+ * contain files, so directory members would asymmetrically inflate the
+ * episodic tier in any head-to-head). Members must be FILES: the final path
+ * segment needs an extension (deliberate loss: extensionless files like
  * Makefile/LICENSE — rare as recall targets, cheap vs the noise). Shell-token
  * characters disqualify outright: the full-corpus backfill showed 65% of
  * distinct members (26,129/40,111) were whole command strings whose final
@@ -718,13 +737,13 @@ export function buildBranchTrace(steps: readonly TraceStep[], capChars = BRANCH_
 
 /**
  * One-line episode header. Fallback chain (most-verbatim first):
- * changelog heads → star result/decision notes → task title words →
+ * changelog heads → star result/decision notes → rail step/title words →
  * narration verdict lines → top member paths.
  */
 export function deriveEpisodeSummary(
   input: {
     annotations?: readonly EpisodeAnnotation[];
-    taskTitle?: string;
+    railTitle?: string;
     members: readonly EpisodeMember[];
   },
   capChars = SUMMARY_CAP_CHARS,
@@ -739,8 +758,8 @@ export function deriveEpisodeSummary(
     const head = starResults[0].text.split('\n')[0].trim();
     if (head.length > 0) return truncateVerbatim(head, capChars);
   }
-  if (input.taskTitle && input.taskTitle.trim().length > 0) {
-    return truncateVerbatim(input.taskTitle.trim(), capChars);
+  if (input.railTitle && input.railTitle.trim().length > 0) {
+    return truncateVerbatim(input.railTitle.trim(), capChars);
   }
   const narrationLines = (input.annotations ?? []).filter((a) => a.kind.startsWith('narration'));
   if (narrationLines.length > 0) {
@@ -809,7 +828,7 @@ function voiceTimeSuffix(annotation: EpisodeAnnotation): string {
  * Attribution context: the caller's own-lineage instance-id set and friendly
  * display name. Threaded into card rendering so every voice line and foreign
  * chapter can be labeled with WHO authored it — the identity-bleed guard for
- * cross-lineage recall in multi-agent deployments.
+ * cross-lineage recall.
  */
 type AttributionOpts = Pick<ChainCardOptions, 'ownLineage' | 'selfName'>;
 
@@ -1001,7 +1020,13 @@ export function formatWalkPromotionCard(
   chapter: Episode,
   position: WalkPosition,
   sinceDeltas: readonly string[],
-  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays' | 'ownLineage' | 'selfName'> = {},
+  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays' | 'ownLineage' | 'selfName'> & {
+    /**
+     * Origin-anchored breadcrumb trail (nearest waypoint → … → origin).
+     * Optional and additive: absent ⇒ byte-identical pre-breadcrumb grammar.
+     */
+    spines?: readonly WalkSpineCitation[];
+  } = {},
 ): string {
   const budget = opts.charBudget ?? CHAIN_CARD_DEFAULT_BUDGET_CHARS;
   const maxVoice = opts.maxVoiceInlays ?? 2;
@@ -1009,6 +1034,9 @@ export function formatWalkPromotionCard(
   const header = `[Episode recall — walking back, chapter ${position.index}/${position.total}, ${formatEpisodeDate(chapter.endedAt)}, "${truncateVerbatim(chapter.summary, HEADER_SUMMARY_CAP_CHARS)}"]`;
   const body = [
     ...(isForeignChapter(chapter, opts) ? [`  ↞ from ${label} (peer lineage)`] : []),
+    ...(opts.spines && opts.spines.length > 0
+      ? opts.spines.map((crumb) => formatBreadcrumb(chapter, crumb))
+      : []),
     ...renderChapterBody(chapter, sinceDeltas, maxVoice, label),
   ];
   const pointer = formatPointerLine(chapter);
@@ -1031,6 +1059,90 @@ export function formatWalkPromotionCard(
     rendered = assemble(state);
   }
   return rendered;
+}
+
+/**
+ * Render one breadcrumb on a walk card. The trail anchors to two FIXED poles —
+ * NOW (the served chapter, named in the card header) and ORIGIN (the true chain
+ * root) — with optional log-spaced waypoints between. Every line is
+ * self-describing: a waypoint announces its distance-back ("4 back"), the origin
+ * announces itself ("origin"), and both carry a time delta — so an AI consumer
+ * never has to reverse-engineer the walk axis (the exact failure this whole
+ * change fixes). The gist is ALWAYS inline, so a breadcrumb delivers its value
+ * with zero tool calls; only the origin carries a `| reopen:` pointer for
+ * optional deep-dive. Waypoints are view-only (compact, no pointer).
+ */
+function formatBreadcrumb(current: Episode, crumb: WalkSpineCitation): string {
+  const delta = formatRelativeWalkDelta(current.endedAt, crumb.chapter.endedAt);
+  const gist = nonDegenerateGist(crumb.chapter);
+  if (crumb.kind === 'origin') {
+    const pointer = formatPointerLine(crumb.chapter).replace(/^  ⌖ verbatim: /, '');
+    const prefix = `  ↞ origin [${delta}] `;
+    const suffix = ` | reopen: ${pointer}`;
+    const room = Math.max(1, 180 - prefix.length - suffix.length);
+    return `${prefix}${truncateVerbatim(gist, room)}${suffix}`;
+  }
+  const role = crumb.label ?? walkSpineRole(crumb.chapter);
+  const back = crumb.backDistance ?? 0;
+  const prefix = `  ↳ ${back} back [${delta}] ${role}: `;
+  const room = Math.max(1, 160 - prefix.length);
+  return `${prefix}${truncateVerbatim(gist, room)}`;
+}
+
+/** Annotation-derived role for a waypoint (the origin is labeled by kind, not here). */
+function walkSpineRole(chapter: Episode): string {
+  if (chapter.annotations.some((a) => a.kind === 'star:gotcha' || a.kind === 'narration:hazard')) return 'gotcha';
+  if (chapter.annotations.some((a) => a.kind === 'star:pivot')) return 'pivot';
+  if (chapter.annotations.some((a) => a.kind === 'star:decision')) return 'decision';
+  return 'context';
+}
+
+/**
+ * A breadcrumb's value is its inline gist, so it must never render a dead line.
+ * A chapter's raw summary is sometimes degenerate — empty, or a bare path/file
+ * list like "foldEpisodes.ts, foldEpisodes.test.ts (+5)" — which tells an AI
+ * reader nothing about what the chapter was. When that happens, fall back to the
+ * chapter's strongest agent-authored annotation prose (ANNOTATION_PRIORITY
+ * order: gotcha/decision/pivot/result/discovery/handoff ahead of declared
+ * hazard/verdict, then changelog/chat/untagged narration). Last resort: the raw
+ * summary itself (a path list still beats an empty line).
+ */
+function nonDegenerateGist(chapter: Episode): string {
+  const summary = (chapter.summary ?? '').trim();
+  if (summary && !isDegenerateGist(summary)) return summary;
+  const best = chapter.annotations
+    .filter((a) => typeof a.text === 'string' && a.text.trim().length > 0 && !isDegenerateGist(a.text))
+    .sort((a, b) => ANNOTATION_PRIORITY[a.kind] - ANNOTATION_PRIORITY[b.kind])[0];
+  if (best) return best.text.trim();
+  return summary || '(no summary)';
+}
+
+/** A gist is degenerate when it is empty or reads as a bare path/file list (no prose). */
+function isDegenerateGist(value: string): boolean {
+  const text = value.trim();
+  if (text.length === 0) return true;
+  // Drop trailing more-counts like "(+5)" so they do not dilute the ratio.
+  const tokens = text.split(/[,\s]+/).filter((t) => t.length > 0 && !/^\(\+?\d+\)?$/.test(t));
+  if (tokens.length === 0) return true;
+  const pathLike = tokens.filter(
+    (t) => t.includes('/') || t.includes('\\') || /\.[a-z0-9]{1,6}$/i.test(t),
+  ).length;
+  return pathLike >= Math.ceil(tokens.length * 0.8);
+}
+
+function formatRelativeWalkDelta(currentIso: string, spineIso: string): string {
+  const currentMs = Date.parse(currentIso);
+  const spineMs = Date.parse(spineIso);
+  if (!Number.isFinite(currentMs) || !Number.isFinite(spineMs)) return formatEpisodeDate(spineIso);
+  const diffMs = spineMs - currentMs;
+  const prefix = diffMs <= 0 ? 'T-' : 'T+';
+  const absMs = Math.abs(diffMs);
+  const dayMs = 24 * 3_600_000;
+  if (absMs >= dayMs) return `${prefix}${Math.max(1, Math.round(absMs / dayMs))}d`;
+  const hourMs = 3_600_000;
+  if (absMs >= hourMs) return `${prefix}${Math.max(1, Math.round(absMs / hourMs))}h`;
+  const minuteMs = 60_000;
+  return `${prefix}${Math.max(1, Math.round(absMs / minuteMs))}m`;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1066,7 +1178,7 @@ export interface EpisodicRecallCardLike {
   renderedCard: string;
   chapterIds: number[];
   memberPaths: string[];
-  kind: 'chain' | 'walk' | 'mention' | 'pointer';
+  kind: 'chain' | 'walk' | 'mention' | 'pointer' | 'term' | 'rail';
 }
 
 export interface EpisodicZoneResidency {
@@ -1096,7 +1208,7 @@ export interface EpisodicInjectionState {
   zones: Map<string, EpisodicZoneResidency>;
   /** Raw-history index after the last assistant-text mention scan. */
   mentionScanIndex: number;
-  // ── Episodic-recall lifetime counters ──
+  // ── Breathing-ledger lifetime counters ([<engine>-fold-episodes] log line) ──
   /** Touch-tier cards injected (kind chain/walk/pointer). */
   chainCardsInjected: number;
   /** Mention-tier hot cards injected (kind mention). */
@@ -1110,7 +1222,7 @@ export interface EpisodicInjectionState {
    * Active-path pin cards re-emitted as working memory while a zone stays live.
    * Deliberately separate from chainCardsInjected/episodicChars: pins re-page an
    * already-served hot card, so folding them into the served-set counters would
-   * double-count. Bounded only by WARP_FOLD_EPISODES_PIN_BUDGET_CHARS.
+   * double-count. Bounded only by VOXXO_FOLD_EPISODES_PIN_BUDGET_CHARS.
    */
   episodicPinsInjected: number;
   /** Chars emitted via active-path pin blocks (NOT included in episodicChars). */
@@ -1320,8 +1432,8 @@ export function collectResidentEpisodicHeaders(viewText: string): Set<string> {
  * with cards during pure paperwork (claim/release, rail bookkeeping, atlas
  * commit, chat, waves). A seam consults isEpisodicBookkeepingTool to skip the
  * INHALE + PIN (never the exhale of already-earned cards) on these boundaries.
- * Investigation tools (read/grep/glob, codebase search) are deliberately ABSENT
- * — recall SHOULD fire when the agent explores code.
+ * Investigation tools (atlas_query/atlas_graph, read/grep/glob) are deliberately
+ * ABSENT — recall SHOULD fire when the agent explores code.
  */
 export const EPISODIC_BOOKKEEPING_TOOLS: ReadonlySet<string> = new Set<string>([
   'task_rail',

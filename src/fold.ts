@@ -12,5 +12,11 @@ export * from './foldRecall.ts';
 export * from './foldTerms.ts';
 export * from './contextWindow.ts';
 
-export { FoldSession } from './session/FoldSession.ts';
-export type { FoldSessionOptions, FoldPrepareContext, FoldOutcome, FoldStats } from './session/FoldSession.ts';
+export { DEFAULT_FOLD_PRESSURE_CEILING_TOKENS, FoldSession } from './session/FoldSession.ts';
+export type {
+  FoldPrepareContext,
+  FoldPressureCeilingConfig,
+  FoldSessionOptions,
+  FoldOutcome,
+  FoldStats,
+} from './session/FoldSession.ts';
