@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.atlas/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.log
+.DS_Store

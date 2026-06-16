@@ -1,0 +1,85 @@
+{
+  "name": "context-warp-drive",
+  "version": "0.1.0",
+  "description": "Infinite Context Warp Engine — deterministic, zero-LLM rolling-fold context compaction with Coordinate Closet, cache-hot freeze, ambient page-in recall, durable episodic memory, and register-glyph grammar. Keep long function-calling agent sessions under the context ceiling without summarization calls, while keeping provider prompt caches hot. Provider-agnostic: Anthropic content blocks, OpenAI tool_calls, and Gemini parts.",
+  "license": "MIT",
+  "type": "module",
+  "author": "Jonah (Voxxo Swarm)",
+  "homepage": "https://github.com/dogtorjonah/context-warp-drive",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dogtorjonah/context-warp-drive.git"
+  },
+  "keywords": [
+    "llm",
+    "context-window",
+    "context-compaction",
+    "rolling-fold",
+    "prompt-cache",
+    "function-calling",
+    "agents",
+    "anthropic",
+    "openai",
+    "gemini",
+    "episodic-memory",
+    "deterministic",
+    "infinite-context"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./fold": {
+      "types": "./dist/fold.d.ts",
+      "import": "./dist/fold.js",
+      "require": "./dist/fold.cjs"
+    },
+    "./episodes": {
+      "types": "./dist/episodes.d.ts",
+      "import": "./dist/episodes.js",
+      "require": "./dist/episodes.cjs"
+    },
+    "./glyphs": {
+      "types": "./dist/glyphs.d.ts",
+      "import": "./dist/glyphs.js",
+      "require": "./dist/glyphs.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "docs",
+    "examples",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "better-sqlite3": ">=11"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
