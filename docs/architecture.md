@@ -68,9 +68,21 @@ Every stage is **zero-LLM, zero-I/O, byte-identical for identical inputs** (the 
 ## Provenance
 
 Context Warp Drive was extracted from the production multi-agent system it was built
-for, where it runs live on every long-horizon agent session. The `src/` engine here is
-that same deterministic fold/freeze/recall core, carved out as a standalone,
-dependency-free library (the only optional dependency is `better-sqlite3`, a peer for
-the reference episodic store). Fold output is byte-identical to the in-production
-engine — the property that keeps the provider prompt cache hot across turns — so what
-you run here is what runs in production, not a simplified port.
+for, where the fold/freeze/recall architecture runs live on long-horizon agent
+sessions. This repository is the portable public package derived from that engine,
+not a byte-for-byte copy of Voxxo Swarm's private integration layer.
+
+The byte-identical invariant in this package is local: identical package inputs
+produce identical folded views, and a hot frozen prefix is reused byte-for-byte
+between epochs so provider prompt caches can hit. It is not a claim that every
+public source file renders the same output as the production monorepo for
+Voxxo-specific workloads.
+
+The standalone dialect deliberately neutralizes private integration seams:
+`VOXXO_*` environment names become `WARP_*`, package examples avoid Voxxo paths,
+recovery text says "raw history" instead of "self-tap", and voice mining is keyed
+on generic glyph-grammar input shapes rather than named Voxxo tools. Known
+production-only non-parity areas include Atlas lookup metadata-preserving fold
+markers, Atlas/chatroom/tap_star/task_rail skeleton labels, rail episode fields,
+and walk-spine/rail recall cards. Treat those as integration features to port
+explicitly, not as hidden guarantees of the public package.

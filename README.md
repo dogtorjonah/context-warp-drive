@@ -13,6 +13,8 @@ Extracted from a production multi-agent system (the Voxxo Swarm), where it folds
 - The core engine passes **277 deterministic tests** across rolling fold, recall, freeze, and integration.
 - Every number below is **measured, not estimated** — production cache rates from the Claude provider usage ledger, reproducible live against Claude (`ANTHROPIC_API_KEY=… npx tsx examples/benchmark-live.ts`, real model + real summarizer) and offline with exact `o200k_base` BPE token counts (`npx tsx examples/benchmark.ts`, deterministic, no key).
 
+**Provenance note:** this public package is production-derived, not a byte-for-byte mirror of Voxxo Swarm's private integration layer. The standalone repo intentionally uses generic `WARP_*` environment names, package-neutral examples, raw-history recovery wording, and tool-agnostic voice mining. Voxxo-only integration surfaces are not part of the public parity contract unless they are explicitly documented here: Atlas lookup metadata-preserving fold markers, Atlas/chatroom/tap_star/task_rail skeleton labels, rail episode fields, and walk-spine/rail recall cards are known non-parity areas.
+
 ---
 
 ## Performance & Economics
