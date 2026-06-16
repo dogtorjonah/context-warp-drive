@@ -1,13 +1,33 @@
 # Context Warp Drive
 
+[![npm version](https://img.shields.io/npm/v/context-warp-drive.svg)](https://www.npmjs.com/package/context-warp-drive) [![CI](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
+**Stop summarizing your agent's memory.** Every compaction call burns a model round-trip, rewrites your prefix so the provider prompt cache goes cold, and quietly drops the exact identifiers your agent needs. Fold it deterministically instead.
+
 **The Infinite Context Warp Engine.** Keep long function-calling agent sessions under the context window **without LLM summarization calls** and **without ending the session** — while keeping provider prompt caches **hot** — and page folded content back in the moment the agent touches it again.
 
 Deterministic. Zero-LLM. Pure CPU, zero I/O, byte-identical output for identical inputs. Provider-agnostic: **Anthropic** content blocks, **OpenAI** `tool_calls`, and **Gemini** `parts`.
 
-Extracted from a production multi-agent system (the Voxxo Swarm), where it runs continuously across every model:
+Extracted from a production multi-agent system (the Voxxo Swarm), where it folds context continuously across every model and thousands of session-rebirths.
 
-- **8,000+ rebirths** in production · **~87%** measured continuity-recovery floor · **~94%** cache-read at boundaries
 - The core engine passes **277 deterministic tests** across rolling fold, recall, freeze, and integration.
+- Every performance number below is **measured and reproducible** — run `npx tsx examples/benchmark.ts` yourself.
+
+---
+
+## Performance & Economics (The "God Chart")
+
+A 16-turn agent session, priced with public **Claude Sonnet 4.6** list pricing. Each strategy is held to a **comparable final context size** (last column) so the comparison is fair — Warp Drive's wins are not "it just keeps more context." Every number is measured from the real prepared message views; reproduce it with `npx tsx examples/benchmark.ts`.
+
+| Strategy | Input Cost | Cache Hit | Extra LLM Calls | Fact Retention | Context Size |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Truncation (Rolling Window) | $0.0496 | 28% | 0 | 44% (7/16) | 4.9K |
+| LLM Summarization | $0.0686 | 43% | 6 | 44% (7/16) | 4.3K |
+| **Context Warp Drive** (Deterministic) | **$0.0203** | **60%** | **0** | **94% (15/16)** | 5.3K |
+
+*   **Cost:** Warp Drive is the cheapest — **70% below LLM summarization** (zero model calls) and below truncation too, because the byte-identical frozen prefix keeps **60% of the context served from cache** ($0.30/MTok reads instead of $3.75/MTok writes).
+*   **Zero model calls:** summarization made **6 extra model round-trips** here — each adds real cost, latency, and non-determinism. Warp Drive and truncation make none.
+*   **Fact retention:** at the same context budget Warp Drive recalls **15 of 16** buried identifiers vs **7 of 16** for both baselines — and with no model call. The Coordinate Closet is budget-scored: it conserves the *most salient* identifiers from folded turns, not literally everything (the benchmark prints exactly which one it dropped).
 
 ---
 
@@ -18,7 +38,7 @@ Every long agent session hits the same wall: the context window fills up. The us
 - **Truncation** drops the middle of your history — the agent forgets what it was doing.
 - **LLM summarization ("compaction")** costs a model call, adds latency, is non-deterministic, and **busts your provider prompt cache** every time it rewrites the prefix.
 
-Context Warp Drive does neither. It **deterministically folds** old turns into compact structural skeletons (one line per tool call + retained reasoning), **conserves exact identifiers** (UUIDs, SHAs, paths, ports) in a Coordinate Closet, **freezes** the folded prefix so it's reused byte-identical while the provider cache is warm, and **pages folded content back in** automatically when the agent re-touches a path. No model calls. No truncation. Cache stays hot.
+Context Warp Drive does neither. It **deterministically folds** old turns into compact structural skeletons (one line per tool call + retained reasoning), **conserves the salient exact identifiers** (UUIDs, SHAs, paths, ports) in a budget-scored Coordinate Closet, **freezes** the folded prefix so it's reused byte-identical while the provider cache is warm, and **pages folded content back in** automatically when the agent re-touches a path. No model calls. No truncation. Cache stays hot.
 
 ---
 

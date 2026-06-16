@@ -1328,7 +1328,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     expect(foldBlock).toBeDefined();
     const content = foldBlock!.content as string;
     expect(content).toContain(uuid); // belt carries it in the skeleton
-    expect(content).not.toContain('COORDINATE CLOSET'); // closet stays empty
+    expect(content).not.toContain('⌖⌖⌖ COORDINATE CLOSET'); // closet stays empty
   });
 
   test('keep admits a value once across turns (KV form conserved by keep itself)', () => {
@@ -1391,7 +1391,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     );
     expect(foldBlock).toBeDefined();
     // Keep-line marker, not the bare word
-    expect((foldBlock!.content as string)).not.toContain('COORDINATE CLOSET');
+    expect((foldBlock!.content as string)).not.toContain('⌖⌖⌖ COORDINATE CLOSET');
   });
 
   test('id-free transcript with verbatimKeepChars: 0 → output unchanged from pre-closet format', () => {
@@ -1406,8 +1406,8 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     expect(block0).toBeDefined();
     expect(block4k).toBeDefined();
     // Neither should have a Coordinate Closet line; content must be byte-identical
-    expect(block0!.content as string).not.toContain('COORDINATE CLOSET');
-    expect(block4k!.content as string).not.toContain('COORDINATE CLOSET');
+    expect(block0!.content as string).not.toContain('⌖⌖⌖ COORDINATE CLOSET');
+    expect(block4k!.content as string).not.toContain('⌖⌖⌖ COORDINATE CLOSET');
     expect(block0!.content).toBe(block4k!.content);
   });
 
