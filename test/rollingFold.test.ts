@@ -32,6 +32,7 @@ import {
   FOLD_BLOCK_PREAMBLE,
   FOLD_TOMBSTONE_PREFIX,
   ALWAYS_ON_FOLD_CONFIG,
+  DEFAULT_FOLD_BAND_TOKENS,
   DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
   DEFAULT_FOLD_CONFIG,
   DEFAULT_ASSISTANT_TEXT_BUDGET,
@@ -2155,7 +2156,7 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
 });
 
 describe('resolveFoldBandBudgets / resolveFoldConfigForBand (E10b target band)', () => {
-  test('canonical 100K-token band reproduces today\'s constants EXACTLY (default-equivalence proof)', () => {
+  test('explicit 100K-token base band reproduces today\'s constants EXACTLY (base-equivalence proof)', () => {
     const band = resolveFoldBandBudgets(100_000);
     expect(band.bandChars).toBe(400_000);
     expect(band.fullRetentionChars).toBe(DEFAULT_ASSISTANT_TEXT_BUDGET.fullRetentionChars); // 50_000
@@ -2166,11 +2167,20 @@ describe('resolveFoldBandBudgets / resolveFoldConfigForBand (E10b target band)',
     expect(band.episodicBoundaryBudgetChars).toBe(2_000);
   });
 
-  test('band unset → the canonical ALWAYS_ON config object verbatim (same reference, zero behavior change)', () => {
-    expect(resolveFoldConfigForBand(undefined)).toBe(ALWAYS_ON_FOLD_CONFIG);
+  test('default band is 160K tokens and scales the assistant-text budget', () => {
+    expect(DEFAULT_FOLD_BAND_TOKENS).toBe(160_000);
+    const band = resolveFoldBandBudgets(DEFAULT_FOLD_BAND_TOKENS);
+    expect(band.bandChars).toBe(640_000);
+    expect(band.fullRetentionChars).toBe(80_000);
+    expect(band.essenceRetentionChars).toBe(160_000);
+
+    const resolved = resolveFoldConfigForBand(undefined);
+    expect(resolved).not.toBe(ALWAYS_ON_FOLD_CONFIG);
+    expect(resolved.assistantTextBudget?.fullRetentionChars).toBe(80_000);
+    expect(resolved.assistantTextBudget?.essenceRetentionChars).toBe(160_000);
   });
 
-  test('canonical band → deep-equals ALWAYS_ON config (scaled copy is indistinguishable at 100K)', () => {
+  test('explicit 100K base band → deep-equals ALWAYS_ON config', () => {
     const resolved = resolveFoldConfigForBand(100_000);
     expect(resolved).not.toBe(ALWAYS_ON_FOLD_CONFIG);
     expect(resolved).toEqual(ALWAYS_ON_FOLD_CONFIG);
@@ -2211,7 +2221,10 @@ describe('resolveFoldBandBudgets / resolveFoldConfigForBand (E10b target band)',
     expect(cfg.assistantTextBudget?.essenceRetentionChars).toBe(85_000);
   });
 
-  test('resolveFoldConfigForBand(undefined) ignores charsPerToken and returns the canonical reference', () => {
-    expect(resolveFoldConfigForBand(undefined, 3.4)).toBe(ALWAYS_ON_FOLD_CONFIG);
+  test('resolveFoldConfigForBand(undefined) uses the 160K default and threads charsPerToken', () => {
+    const cfg = resolveFoldConfigForBand(undefined, 3.4);
+    expect(cfg).not.toBe(ALWAYS_ON_FOLD_CONFIG);
+    expect(cfg.assistantTextBudget?.fullRetentionChars).toBe(68_000);
+    expect(cfg.assistantTextBudget?.essenceRetentionChars).toBe(136_000);
   });
 });

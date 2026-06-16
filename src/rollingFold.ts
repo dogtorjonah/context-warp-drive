@@ -195,46 +195,48 @@ export const ALWAYS_ON_FOLD_CONFIG: FoldConfig = {
 // ══════════════════════════════════════════════════════════════════════
 // Target-band budgeting (E10b)
 //
-// Today's fold budgets are absolute char constants that implicitly assume a
-// steady-state context band of ~100K tokens (400K chars at the fold's 4
-// chars/token estimate). The band resolver makes that assumption explicit and
-// tunable without tying steady state to model context window size: a 1M-token
-// model should keep roughly the same prompt band as a 200K-token model, using
-// the extra window as safety margin. Every ratio below is calibrated so the
-// canonical 100K-token band reproduces the existing constants EXACTLY
-// (default-equivalence, locked by tests). The remainder of the band (~56.5%) is
-// working-set + skeleton headroom.
+// Today's base fold budgets are absolute char constants calibrated against a
+// 100K-token band (400K chars at the fold's 4 chars/token estimate). The band
+// resolver keeps that base reproducible while making the public default band
+// explicit and tunable: 160K tokens by default, independent of model context
+// window size. Every ratio below is calibrated so an explicit 100K-token band
+// reproduces the existing constants EXACTLY (base-equivalence, locked by tests).
+// The remainder of the band (~56.5%) is working-set + skeleton headroom.
 // ══════════════════════════════════════════════════════════════════════
 
 /**
  * Default chars-per-token assumption for converting a token-denominated band
  * target into a char budget. Claude-calibrated (~4). Denser-tokenizing engines
- * (code/JSON/path-heavy transcripts) can pass a lower ratio so a 100K-token
- * band target yields a correspondingly smaller char budget — i.e. the band
- * stays pinned to real tokens, not chars. The default reproduces every existing
- * fold constant EXACTLY (default-equivalence, locked by tests).
+ * (code/JSON/path-heavy transcripts) can pass a lower ratio so the default
+ * 160K-token band target yields a correspondingly smaller char budget — i.e.
+ * the band stays pinned to real tokens, not chars. Passing 100K explicitly
+ * reproduces every existing fold constant EXACTLY (base-equivalence, locked by
+ * tests).
  */
 export const BAND_CHARS_PER_TOKEN = 4;
+
+/** Public steady-state fold-band default for omitted/undefined band targets. */
+export const DEFAULT_FOLD_BAND_TOKENS = 160_000;
 
 export interface FoldBandBudgets {
   bandTokens: number;
   /** bandTokens × charsPerToken (default 4). */
   bandChars: number;
-  /** 12.5% of band chars → assistantTextBudget.fullRetentionChars (50K at the canonical band). */
+  /** 12.5% of band chars → assistantTextBudget.fullRetentionChars (50K at the 100K base band). */
   fullRetentionChars: number;
-  /** 25% of band chars → assistantTextBudget.essenceRetentionChars (100K at the canonical band). */
+  /** 25% of band chars → assistantTextBudget.essenceRetentionChars (100K at the 100K base band). */
   essenceRetentionChars: number;
-  /** 5.5% of band chars → fold-block eviction threshold (22K at the canonical band; see E10). */
+  /** 5.5% of band chars → fold-block eviction threshold (22K at the 100K base band; see E10). */
   evictThresholdChars: number;
-  /** 0.5% of band chars → episodic boundary char budget (2K at the canonical band; see foldEpisodes.ts). */
+  /** 0.5% of band chars → episodic boundary char budget (2K at the 100K base band; see foldEpisodes.ts). */
   episodicBoundaryBudgetChars: number;
 }
 
 /**
  * Pure arithmetic — derive the dependent fold budgets from a target
  * steady-state band. `charsPerToken` converts the token target into chars;
- * the default (4) reproduces the canonical constants, while a lower per-engine
- * ratio keeps the band pinned to real tokens on denser tokenizers.
+ * the default (4) preserves ratio math, while a lower per-engine ratio keeps
+ * the band pinned to real tokens on denser tokenizers.
  */
 export function resolveFoldBandBudgets(
   bandTokens: number,
@@ -252,17 +254,17 @@ export function resolveFoldBandBudgets(
 }
 
 /**
- * Band-aware ALWAYS_ON fold config. `undefined` (env knob unset) returns the
- * canonical object VERBATIM — same reference, zero behavior change. A band
- * returns a copy with the assistant-text budget scaled by the documented
- * ratios; the canonical 100K band deep-equals the unscaled config.
+ * Band-aware ALWAYS_ON fold config. `undefined` (env knob unset) uses the
+ * public 160K default band. A band returns a copy with the assistant-text
+ * budget scaled by the documented ratios; explicit 100K deep-equals the
+ * unscaled base config.
  */
 export function resolveFoldConfigForBand(
-  bandTokens: number | undefined,
+  bandTokens: number | undefined = DEFAULT_FOLD_BAND_TOKENS,
   charsPerToken: number = BAND_CHARS_PER_TOKEN,
 ): FoldConfig {
-  if (bandTokens === undefined) return ALWAYS_ON_FOLD_CONFIG;
-  const band = resolveFoldBandBudgets(bandTokens, charsPerToken);
+  const resolvedBandTokens = bandTokens ?? DEFAULT_FOLD_BAND_TOKENS;
+  const band = resolveFoldBandBudgets(resolvedBandTokens, charsPerToken);
   return {
     ...ALWAYS_ON_FOLD_CONFIG,
     assistantTextBudget: {
