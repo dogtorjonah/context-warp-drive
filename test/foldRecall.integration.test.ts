@@ -1,7 +1,7 @@
 /**
  * Fold Recall ⇄ Fold Freeze integration — the full page-out/page-in cycle
  * against the REAL compaction pipeline (intra-turn + inter-turn fold) and the
- * REAL freeze gate, mirroring the reference session wiring:
+ * REAL freeze gate, mirroring fcBaseSession.applyCompaction's wiring:
  *
  *   epoch (pipeline + commit + index build)
  *     → tool re-touch of a folded path
@@ -40,7 +40,7 @@ import {
   type FoldMessage,
 } from '../src/rollingFold.js';
 
-// ── Session-shaped harness (mirrors the reference fold-on wiring) ──
+// ── Session-shaped harness (mirrors fcBaseSession.applyCompaction, fold 'on') ──
 
 const FREEZE_CONFIG: FoldFreezeConfig = { enabled: true, ttlMs: 5 * 60_000, maxTailChars: 150_000 };
 
@@ -79,8 +79,8 @@ function applyCompaction(
   return { view, action: 'recompute', reason: decision.reason };
 }
 
-const ABS = (rel: string) => `/home/jonah/my-app/${rel}`;
-const BIGFILE = 'project/src/bigfile.ts';
+const ABS = (rel: string) => `/home/jonah/my-monorepo/${rel}`;
+const BIGFILE = 'relay/src/bigfile.ts';
 const BIGFILE_BODY = 'BIGFILE UNIQUE PAYLOAD ' + 'x'.repeat(3_000);
 
 function userMsg(text: string): FoldMessage {
@@ -172,15 +172,15 @@ describe('fold recall ⇄ fold freeze lifecycle', () => {
     expect(freeze.epochs).toBe(1);
 
     // Tail-only activity on a path the frozen coverage never saw:
-    raw.push(toolUse('tu_tail', 'Read', { file_path: ABS('project/src/tailonly.ts') }));
+    raw.push(toolUse('tu_tail', 'Read', { file_path: ABS('relay/src/tailonly.ts') }));
     raw.push(toolResult('tu_tail', 'tail only content'));
 
     // (a) Claim on the tail-only path: freeze relevance gating reuses (no
     // epoch) and recall has no folded entry for it (tail is not folded).
-    const tailClaim = ctx([ABS('project/src/tailonly.ts')]);
+    const tailClaim = ctx([ABS('relay/src/tailonly.ts')]);
     const reuse = applyCompaction(freeze, recall, raw, tailClaim, t0 + 10_000);
     expect(reuse.action).toBe('reuse');
-    const tailSignals = extractRecallSignals(null, new Set([ABS('project/src/tailonly.ts')]));
+    const tailSignals = extractRecallSignals(null, new Set([ABS('relay/src/tailonly.ts')]));
     const noRecall = buildFoldRecallContext(recall, raw, tailSignals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(noRecall.text).toBeNull();
 
@@ -196,7 +196,7 @@ describe('fold recall ⇄ fold freeze lifecycle', () => {
     const claimSignals = extractRecallSignals(null, new Set([ABS(BIGFILE)]));
     const recalled = buildFoldRecallContext(recall, raw, claimSignals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(recalled.cards).toBe(1);
-    expect(recalled.text!).toContain('trigger: claim project/src/bigfile.ts');
+    expect(recalled.text!).toContain('trigger: claim relay/src/bigfile.ts');
     expect(recalled.text!).toContain('BIGFILE UNIQUE PAYLOAD');
   });
 
@@ -209,7 +209,7 @@ describe('fold recall ⇄ fold freeze lifecycle', () => {
     const disabled = buildFoldRecallContext(recall, raw, signals, 'healthy', { ...DEFAULT_FOLD_RECALL_CONFIG, enabled: false });
     expect(disabled.text).toBeNull();
 
-    // Cleared index (the session adapter clears it whenever the freeze-gated fold
+    // Cleared index (fcBaseSession clears it whenever the freeze-gated fold
     // path is not active) → no recall.
     recall.index = null;
     const cleared = buildFoldRecallContext(recall, raw, signals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);

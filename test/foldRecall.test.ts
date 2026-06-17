@@ -62,8 +62,8 @@ function openaiToolResult(callId: string, content: string): FoldMessage {
   return { role: 'tool', content, tool_call_id: callId };
 }
 
-const ABS = (rel: string) => `/home/jonah/my-app/${rel}`;
-const BIGFILE = 'project/src/bigfile.ts';
+const ABS = (rel: string) => `/home/jonah/my-monorepo/${rel}`;
+const BIGFILE = 'relay/src/bigfile.ts';
 const BIGFILE_CONTENT = 'BIGFILE CONTENT START ' + 'x'.repeat(3_000) + ' BIGFILE CONTENT END';
 
 /**
@@ -80,14 +80,14 @@ function buildAnthropicHistory(): FoldMessage[] {
   msgs.push(assistantMsg('Found the bug in bigfile.ts — the handler ignores null inputs because of a legacy guard.'));
   msgs.push(userMsg('Now check all the helpers'));
   for (let i = 0; i < 7; i++) {
-    msgs.push(anthropicToolUse(`tu_h${i}`, 'Read', { file_path: ABS(`project/src/helper${i}.ts`) }));
+    msgs.push(anthropicToolUse(`tu_h${i}`, 'Read', { file_path: ABS(`relay/src/helper${i}.ts`) }));
     msgs.push(anthropicToolResult(`tu_h${i}`, `HELPER${i} BODY ` + 'y'.repeat(2_500)));
   }
   msgs.push(assistantMsg('Helpers reviewed.'));
   return msgs;
 }
 
-/** The real compaction pipeline with fold mode enabled. */
+/** The real compaction pipeline as fcBaseSession runs it (fold mode 'on'). */
 function runPipeline(raw: FoldMessage[]): FoldMessage[] {
   const intra = intraTurnFold(raw, ALWAYS_ON_INTRA_FOLD_CONFIG);
   const trigger = checkFoldTrigger(intra.messages, ALWAYS_ON_FOLD_CONFIG);
@@ -127,7 +127,7 @@ describe('buildFoldIndex', () => {
     expect(toolEntries.map(e => e.toolId).sort()).toEqual(['tu_h0', 'tu_h1']);
     for (const e of toolEntries) {
       expect(e.tool).toBe('Read');
-      expect(e.path).toMatch(/^project\/src\/helper[01]\.ts$/);
+      expect(e.path).toMatch(/^relay\/src\/helper[01]\.ts$/);
       // Thousands separator round-trip: 2,5xx chars parsed back to a number.
       expect(e.chars).toBeGreaterThan(2_500);
     }
@@ -138,12 +138,12 @@ describe('buildFoldIndex', () => {
   test('parses OpenAI-shaped histories (tool_calls + role:tool, tool_call_id handles)', () => {
     const msgs: FoldMessage[] = [];
     msgs.push(userMsg('inspect the config'));
-    msgs.push(openaiToolCall('call_cfg', 'Read', { file_path: ABS('project/src/config.ts') }));
+    msgs.push(openaiToolCall('call_cfg', 'Read', { file_path: ABS('relay/src/config.ts') }));
     msgs.push(openaiToolResult('call_cfg', 'CONFIG ' + 'z'.repeat(3_000)));
     msgs.push(assistantMsg('Config reviewed in depth.'));
     msgs.push(userMsg('now the runtime'));
     for (let i = 0; i < 7; i++) {
-      msgs.push(openaiToolCall(`call_r${i}`, 'Read', { file_path: ABS(`project/src/rt${i}.ts`) }));
+      msgs.push(openaiToolCall(`call_r${i}`, 'Read', { file_path: ABS(`relay/src/rt${i}.ts`) }));
       msgs.push(openaiToolResult(`call_r${i}`, `RT${i} ` + 'w'.repeat(2_400)));
     }
     msgs.push(assistantMsg('Runtime reviewed.'));
@@ -151,7 +151,7 @@ describe('buildFoldIndex', () => {
     const index = indexFor(msgs);
     const toolEntries = index.entries.filter((e): e is IntraTurnIndexEntry => e.kind === 'tool');
     expect(toolEntries.map(e => e.toolId).sort()).toEqual(['call_r0', 'call_r1']);
-    expect(toolEntries[0].path).toMatch(/^project\/src\/rt[01]\.ts$/);
+    expect(toolEntries[0].path).toMatch(/^relay\/src\/rt[01]\.ts$/);
     const turnEntries = index.entries.filter(e => e.kind === 'turn');
     expect(turnEntries).toHaveLength(1);
   });
@@ -159,14 +159,14 @@ describe('buildFoldIndex', () => {
   test('a fold marker QUOTED inside live tool output does not index (anchored matching)', () => {
     const raw = buildAnthropicHistory();
     // A live (tail-buffer) result whose content merely QUOTES a fold marker.
-    raw.push(anthropicToolUse('tu_quote', 'Read', { file_path: ABS('project/src/transcript.txt') }));
+    raw.push(anthropicToolUse('tu_quote', 'Read', { file_path: ABS('relay/src/transcript.txt') }));
     raw.push(anthropicToolResult(
       'tu_quote',
-      'transcript says: [Folded: Read project/src/old.ts — 1,234 chars | recover from raw history] and more text',
+      'transcript says: [Folded: Read relay/src/old.ts — 1,234 chars | self-tap to recover] and more text',
     ));
     const index = indexFor(raw);
     expect(index.entries.some(e => e.kind === 'tool' && e.toolId === 'tu_quote')).toBe(false);
-    expect(index.entries.some(e => e.kind === 'tool' && e.path === 'project/src/old.ts')).toBe(false);
+    expect(index.entries.some(e => e.kind === 'tool' && e.path === 'relay/src/old.ts')).toBe(false);
   });
 
   test('no fold block in view → no inter-turn entries', () => {
@@ -182,7 +182,7 @@ describe('buildFoldIndex', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const raw: FoldMessage[] = [
       userMsg('look up the job id'),
-      anthropicToolUse('tu_lit', 'Read', { file_path: ABS('project/src/jobs.ts') }),
+      anthropicToolUse('tu_lit', 'Read', { file_path: ABS('relay/src/jobs.ts') }),
       anthropicToolResult('tu_lit', `job uuid ${uuid} registered`),
       assistantMsg('Found the job registration.'),
       userMsg('thanks, next task'),
@@ -198,7 +198,7 @@ describe('buildFoldIndex', () => {
     const index = buildFoldIndex(raw, view);
     const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
     expect(turnEntries).toHaveLength(1);
-    expect(turnEntries[0].paths).toEqual(['project/src/jobs.ts']);
+    expect(turnEntries[0].paths).toEqual(['relay/src/jobs.ts']);
   });
 
   test('precomputedTurns makes a single-user-turn marathon fold recall-addressable (omitting it is unchanged)', () => {
@@ -235,11 +235,11 @@ describe('buildFoldIndex', () => {
 describe('extractRecallSignals', () => {
   test('normalizes single and multi path args plus claims, sorted', () => {
     const signals = extractRecallSignals(
-      { file_path: ABS('project/src/zeta.ts'), paths: [ABS('project/src/alpha.ts'), 'project/src/beta.ts'] },
-      new Set([ABS('project/src/claimed.ts')]),
+      { file_path: ABS('relay/src/zeta.ts'), paths: [ABS('relay/src/alpha.ts'), 'relay/src/beta.ts'] },
+      new Set([ABS('relay/src/claimed.ts')]),
     );
-    expect(signals.touchedPaths).toEqual(['project/src/alpha.ts', 'project/src/beta.ts', 'project/src/zeta.ts']);
-    expect(signals.claimedPaths).toEqual(['project/src/claimed.ts']);
+    expect(signals.touchedPaths).toEqual(['relay/src/alpha.ts', 'relay/src/beta.ts', 'relay/src/zeta.ts']);
+    expect(signals.claimedPaths).toEqual(['relay/src/claimed.ts']);
   });
 
   test('no tool input and no claims → empty signals', () => {
@@ -306,7 +306,7 @@ describe('extractActiveWindowText (tier-2 active-window query source)', () => {
   test('excludes tool results and synthetic blocks from the query text', () => {
     const raw: FoldMessage[] = [
       userMsg('older folded turn'),
-      anthropicToolUse('tu_x', 'Read', { file_path: ABS('project/src/x.ts') }),
+      anthropicToolUse('tu_x', 'Read', { file_path: ABS('relay/src/x.ts') }),
       anthropicToolResult('tu_x', 'SECRET TOOL OUTPUT should never seed the query'),
       assistantMsg('the demand-paging reel narrates its own pivot'),
     ];
@@ -378,10 +378,10 @@ describe('deriveBoundaryRecallSignals (live fold-recall GET-path wiring seam)', 
 
   test('path-touch still proceeds with term recall OFF (tier-0 wiring unaffected by the seam)', () => {
     const { signals, proceed } = deriveBoundaryRecallSignals(
-      { file_path: ABS('project/src/x.ts') }, new Set(), wiringRaw(), 6, DEFAULT_FOLD_RECALL_CONFIG,
+      { file_path: ABS('relay/src/x.ts') }, new Set(), wiringRaw(), 6, DEFAULT_FOLD_RECALL_CONFIG,
     );
     expect(proceed).toBe(true);
-    expect(signals.touchedPaths).toEqual(['project/src/x.ts']);
+    expect(signals.touchedPaths).toEqual(['relay/src/x.ts']);
     expect(signals.terms).toBeUndefined();
   });
 });
@@ -391,31 +391,31 @@ describe('planRecall', () => {
 
   test('tier 0 (path-touch) outranks tier 1 (claim); recency desc within a tier; id asc ties', () => {
     const index = makeIndex([
-      toolEntry('a', 'project/src/touched.ts', 10),
-      toolEntry('b', 'project/src/claimed.ts', 99), // most recent but only claim-matched
-      toolEntry('c', 'project/src/touched.ts', 50),
+      toolEntry('a', 'relay/src/touched.ts', 10),
+      toolEntry('b', 'relay/src/claimed.ts', 99), // most recent but only claim-matched
+      toolEntry('c', 'relay/src/touched.ts', 50),
     ]);
     const plan = planRecall(
       index,
       new Map(),
       new Map(),
       1,
-      { touchedPaths: ['project/src/touched.ts'], claimedPaths: ['project/src/claimed.ts'] },
+      { touchedPaths: ['relay/src/touched.ts'], claimedPaths: ['relay/src/claimed.ts'] },
       'healthy',
       config,
     );
     expect(plan.items.map(i => i.entry.id)).toEqual(['tool:c', 'tool:a', 'tool:b']);
     expect(plan.items.map(i => i.tier)).toEqual([0, 0, 1]);
-    expect(plan.items[0].trigger).toBe('path-touch project/src/touched.ts');
-    expect(plan.items[2].trigger).toBe('claim project/src/claimed.ts');
+    expect(plan.items[0].trigger).toBe('path-touch relay/src/touched.ts');
+    expect(plan.items[2].trigger).toBe('claim relay/src/claimed.ts');
     // Card budget (2) then hints.
     expect(plan.items.map(i => i.render)).toEqual(['card', 'card', 'hint']);
   });
 
   test('resident card suppresses; resident hint escalates on a fresh hard trigger', () => {
     const index = makeIndex([
-      toolEntry('a', 'project/src/a.ts', 10),
-      toolEntry('b', 'project/src/b.ts', 20),
+      toolEntry('a', 'relay/src/a.ts', 10),
+      toolEntry('b', 'relay/src/b.ts', 20),
     ]);
     const resident = new Map([
       ['tool:a', { level: 'card' as const, expiresAtPass: 10 }],
@@ -426,7 +426,7 @@ describe('planRecall', () => {
       resident,
       new Map(),
       5,
-      { touchedPaths: ['project/src/a.ts', 'project/src/b.ts'], claimedPaths: [] },
+      { touchedPaths: ['relay/src/a.ts', 'relay/src/b.ts'], claimedPaths: [] },
       'healthy',
       config,
     );
@@ -438,19 +438,19 @@ describe('planRecall', () => {
   });
 
   test('expired residency is ignored', () => {
-    const index = makeIndex([toolEntry('a', 'project/src/a.ts', 10)]);
+    const index = makeIndex([toolEntry('a', 'relay/src/a.ts', 10)]);
     const resident = new Map([['tool:a', { level: 'card' as const, expiresAtPass: 5 }]]);
-    const plan = planRecall(index, resident, new Map(), 5, { touchedPaths: ['project/src/a.ts'], claimedPaths: [] }, 'healthy', config);
+    const plan = planRecall(index, resident, new Map(), 5, { touchedPaths: ['relay/src/a.ts'], claimedPaths: [] }, 'healthy', config);
     expect(plan.suppressed).toBe(0);
     expect(plan.items).toHaveLength(1);
   });
 
   test('pressure ladder: critical allows 1 card; auto_compact allows none', () => {
     const index = makeIndex([
-      toolEntry('a', 'project/src/a.ts', 10),
-      toolEntry('b', 'project/src/b.ts', 20),
+      toolEntry('a', 'relay/src/a.ts', 10),
+      toolEntry('b', 'relay/src/b.ts', 20),
     ]);
-    const signals = { touchedPaths: ['project/src/a.ts', 'project/src/b.ts'], claimedPaths: [] };
+    const signals = { touchedPaths: ['relay/src/a.ts', 'relay/src/b.ts'], claimedPaths: [] };
 
     const critical = planRecall(index, new Map(), new Map(), 1, signals, 'critical', config);
     expect(critical.items.map(i => i.render)).toEqual(['card', 'hint']);
@@ -460,9 +460,9 @@ describe('planRecall', () => {
   });
 
   test('pure: never mutates the residency map', () => {
-    const index = makeIndex([toolEntry('a', 'project/src/a.ts', 10)]);
+    const index = makeIndex([toolEntry('a', 'relay/src/a.ts', 10)]);
     const resident = new Map<string, { level: 'card' | 'hint'; expiresAtPass: number }>();
-    planRecall(index, resident, new Map(), 1, { touchedPaths: ['project/src/a.ts'], claimedPaths: [] }, 'healthy', config);
+    planRecall(index, resident, new Map(), 1, { touchedPaths: ['relay/src/a.ts'], claimedPaths: [] }, 'healthy', config);
     expect(resident.size).toBe(0);
   });
 
@@ -497,11 +497,11 @@ describe('planRecall', () => {
 
   test('path tiers still outrank term tier when both match', () => {
     const index = makeIndex([
-      turnEntry('path', 'ordinary touched file work', 10, ['project/src/hit.ts']),
+      turnEntry('path', 'ordinary touched file work', 10, ['relay/src/hit.ts']),
       turnEntry('term', 'pathless demand-paging reel without a member path', 99),
       turnEntry('other', 'context fold system filler', 90),
     ]);
-    const signals = extractRecallSignals({ file_path: 'project/src/hit.ts' }, new Set(), 'pathless demand-paging reel');
+    const signals = extractRecallSignals({ file_path: 'relay/src/hit.ts' }, new Set(), 'pathless demand-paging reel');
     const plan = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', { ...config, termRecallEnabled: true });
     expect(plan.items.map((i) => i.entry.id)).toEqual(['turn:path', 'turn:term']);
     expect(plan.items.map((i) => i.tier)).toEqual([0, 2]);
@@ -555,13 +555,13 @@ describe('planRecall — exact verbatim-token tier', () => {
 
   test('path-touch and claim tiers still outrank the verbatim-token tier', () => {
     const index = makeIndex([
-      tokenTurn('touch', 10, [], ['project/src/hit.ts']),
-      tokenTurn('claimed', 20, [], ['project/src/claimed.ts']),
+      tokenTurn('touch', 10, [], ['relay/src/hit.ts']),
+      tokenTurn('claimed', 20, [], ['relay/src/claimed.ts']),
       tokenTurn('tok', 99, [HASH]),
     ]);
     const signals = {
-      touchedPaths: ['project/src/hit.ts'],
-      claimedPaths: ['project/src/claimed.ts'],
+      touchedPaths: ['relay/src/hit.ts'],
+      claimedPaths: ['relay/src/claimed.ts'],
       verbatimTokens: [HASH],
     };
     const plan = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', {
@@ -600,7 +600,7 @@ describe('verbatim-token recall — buildFoldIndex + end-to-end (Tier-2 integrat
   function verbatimHistory(): FoldMessage[] {
     return [
       userMsg('investigate the changelog'),
-      anthropicToolUse('tu_cl', 'Read', { file_path: ABS('project/src/cl.ts') }),
+      anthropicToolUse('tu_cl', 'Read', { file_path: ABS('relay/src/cl.ts') }),
       anthropicToolResult('tu_cl', `changelog_id: ${HASH} found in ` + 'x'.repeat(4_000)),
       assistantMsg('Noted the changelog entry for later.'),
       userMsg('what was that id again'),
@@ -681,12 +681,12 @@ describe('buildFoldRecallContext', () => {
     expect(out.text).not.toBeNull();
     expect(out.cards).toBe(1);
     expect(out.text!).toContain(RECALL_CARD_PREFIX);
-    expect(out.text!).toContain('trigger: path-touch project/src/bigfile.ts');
+    expect(out.text!).toContain('trigger: path-touch relay/src/bigfile.ts');
     // Body sliced from in-memory raw history: the folded turn's tool result + assistant text.
     expect(out.text!).toContain('BIGFILE CONTENT START');
     expect(out.text!).toContain('Found the bug in bigfile.ts');
     expect(out.text!).toContain('[End fold recall]');
-    expect(out.triggers).toEqual(['path-touch project/src/bigfile.ts']);
+    expect(out.triggers).toEqual(['path-touch relay/src/bigfile.ts']);
     expect(state.cardsInjected).toBe(1);
     expect(state.recallChars).toBe(out.chars);
   });
@@ -697,7 +697,7 @@ describe('buildFoldRecallContext', () => {
     const signals = extractRecallSignals(null, new Set([ABS(BIGFILE)]));
     const out = buildFoldRecallContext(state, raw, signals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out.cards).toBe(1);
-    expect(out.text!).toContain('trigger: claim project/src/bigfile.ts');
+    expect(out.text!).toContain('trigger: claim relay/src/bigfile.ts');
   });
 
   test('tier-2 term overlap can render a card without any path signal when flag-enabled', () => {
@@ -740,7 +740,7 @@ describe('buildFoldRecallContext', () => {
     expect(second.suppressed).toBe(1);
 
     // Burn passes with non-matching (but non-empty) signals until the TTL lapses.
-    const unrelated = extractRecallSignals({ file_path: ABS('project/src/unrelated.ts') }, new Set());
+    const unrelated = extractRecallSignals({ file_path: ABS('relay/src/unrelated.ts') }, new Set());
     buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
     buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
 
@@ -772,7 +772,7 @@ describe('buildFoldRecallContext', () => {
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
     const signals = touchBigfile();
-    const unrelated = extractRecallSignals({ file_path: ABS('project/src/unrelated.ts') }, new Set());
+    const unrelated = extractRecallSignals({ file_path: ABS('relay/src/unrelated.ts') }, new Set());
 
     expect(buildFoldRecallContext(state, raw, signals, 'healthy', config).cards).toBe(1);
     for (let i = 0; i < config.ttlPasses + 1; i++) {
@@ -853,7 +853,7 @@ describe('buildFoldRecallContext', () => {
     const probeState = freshState(raw);
     const probe = buildFoldRecallContext(
       probeState, raw,
-      extractRecallSignals({ paths: [ABS('project/src/helper0.ts'), ABS('project/src/helper1.ts')] }, new Set()),
+      extractRecallSignals({ paths: [ABS('relay/src/helper0.ts'), ABS('relay/src/helper1.ts')] }, new Set()),
       'healthy',
       DEFAULT_FOLD_RECALL_CONFIG,
     );
@@ -864,7 +864,7 @@ describe('buildFoldRecallContext', () => {
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, maxTotalChars: oneCardChars + 300 };
     const out = buildFoldRecallContext(
       state, raw,
-      extractRecallSignals({ paths: [ABS('project/src/helper0.ts'), ABS('project/src/helper1.ts')] }, new Set()),
+      extractRecallSignals({ paths: [ABS('relay/src/helper0.ts'), ABS('relay/src/helper1.ts')] }, new Set()),
       'healthy',
       config,
     );
@@ -879,12 +879,12 @@ describe('buildFoldRecallContext', () => {
     const state = freshState(raw);
     const out = buildFoldRecallContext(
       state, raw,
-      extractRecallSignals({ file_path: ABS('project/src/helper0.ts') }, new Set()),
+      extractRecallSignals({ file_path: ABS('relay/src/helper0.ts') }, new Set()),
       'healthy',
       DEFAULT_FOLD_RECALL_CONFIG,
     );
     expect(out.cards).toBe(1);
-    expect(out.text!).toContain('Read project/src/helper0.ts');
+    expect(out.text!).toContain('Read relay/src/helper0.ts');
     expect(out.text!).toContain('HELPER0 BODY');
   });
 
@@ -925,7 +925,7 @@ describe('excerptForRecall', () => {
     const text = 'H'.repeat(5_000) + 'MIDDLE' + 'T'.repeat(5_000);
     const out = excerptForRecall(text, 1_000);
     expect(out.length).toBeLessThan(1_200);
-    expect(out).toContain('chars omitted — raw history has full content');
+    expect(out).toContain('chars omitted — self-tap for full content');
     expect(out.startsWith('H')).toBe(true);
     expect(out.endsWith('T')).toBe(true);
   });
@@ -999,11 +999,11 @@ describe('stripRecallBlocks', () => {
     const text = [
       'fresh read output',
       '',
-      `${RECALL_CARD_PREFIX} Read project/src/x.ts | trigger: path-touch project/src/x.ts | 5,000 chars folded]`,
+      `${RECALL_CARD_PREFIX} Read relay/src/x.ts | trigger: path-touch relay/src/x.ts | 5,000 chars folded]`,
       'stale recalled body',
       '[End fold recall]',
       'trailing real content',
-      `${RECALL_HINT_PREFIX} Read project/src/y.ts folded earlier (1,000 chars) | trigger: claim project/src/y.ts | recover from raw history]`,
+      `${RECALL_HINT_PREFIX} Read relay/src/y.ts folded earlier (1,000 chars) | trigger: claim relay/src/y.ts | self-tap to recover]`,
     ].join('\n');
     const out = stripRecallBlocks(text);
     expect(out).toContain('fresh read output');
@@ -1047,7 +1047,7 @@ describe('recall feedback-loop + rebuild-survival', () => {
 
     // After the TTL lapses, recall returns — and the re-recalled body must
     // contain the original payload but never a nested card.
-    const unrelated = extractRecallSignals({ file_path: ABS('project/src/other.ts') }, new Set());
+    const unrelated = extractRecallSignals({ file_path: ABS('relay/src/other.ts') }, new Set());
     for (let i = 0; i < config.ttlPasses; i++) {
       buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
     }
@@ -1064,18 +1064,18 @@ describe('recall feedback-loop + rebuild-survival', () => {
 // ══════════════════════════════════════════════════════════════════════
 
 describe('extractPathsFromBashCommand', () => {
-  test('absolute my-app path is normalized to repo-relative', () => {
+  test('absolute my-monorepo path is normalized to repo-relative', () => {
     expect(extractPathsFromBashCommand(`cat ${ABS(BIGFILE)}`)).toEqual([BIGFILE]);
   });
 
   test('repo-relative path (no home prefix) passes through unchanged', () => {
-    expect(extractPathsFromBashCommand('cat project/src/foldRecall.ts')).toEqual(['project/src/foldRecall.ts']);
+    expect(extractPathsFromBashCommand('cat relay/src/foldRecall.ts')).toEqual(['relay/src/foldRecall.ts']);
   });
 
   test('single-quoted path containing spaces is treated as one token', () => {
-    const abs = ABS('project/src/my file.ts');
+    const abs = ABS('relay/src/my file.ts');
     const result = extractPathsFromBashCommand(`cat '${abs}'`);
-    expect(result).toEqual(['project/src/my file.ts']);
+    expect(result).toEqual(['relay/src/my file.ts']);
   });
 
   test('flag tokens starting with - are ignored', () => {
@@ -1087,7 +1087,7 @@ describe('extractPathsFromBashCommand', () => {
   });
 
   test('redirect and /dev tokens are rejected while real paths survive', () => {
-    expect(extractPathsFromBashCommand('grep -n foo project/src/x.ts 2>/dev/null')).toEqual(['project/src/x.ts']);
+    expect(extractPathsFromBashCommand('grep -n foo relay/src/x.ts 2>/dev/null')).toEqual(['relay/src/x.ts']);
     expect(extractPathsFromBashCommand('cmd >/dev/null 2>&1')).toEqual([]);
     expect(extractPathsFromBashCommand('cat /dev/null')).toEqual([]);
     expect(extractPathsFromBashCommand('echo hi >> logs/out.txt')).toEqual(['logs/out.txt']);
@@ -1107,15 +1107,15 @@ describe('extractPathsFromBashCommand', () => {
   });
 
   test('cap at 4 paths per command; first four win', () => {
-    const paths = Array.from({ length: 5 }, (_, i) => ABS(`project/src/file${i}.ts`));
+    const paths = Array.from({ length: 5 }, (_, i) => ABS(`relay/src/file${i}.ts`));
     const result = extractPathsFromBashCommand(paths.join(' '));
     expect(result).toHaveLength(4);
-    expect(result[0]).toBe('project/src/file0.ts');
-    expect(result[3]).toBe('project/src/file3.ts');
+    expect(result[0]).toBe('relay/src/file0.ts');
+    expect(result[3]).toBe('relay/src/file3.ts');
   });
 
   test('multibyte command produces no lone surrogates in extracted paths', () => {
-    const cmd = `cat '${ABS('project/src/🦀emoji.ts')}'`;
+    const cmd = `cat '${ABS('relay/src/🦀emoji.ts')}'`;
     const result = extractPathsFromBashCommand(cmd);
     for (const p of result) {
       expect(LONE_SURROGATE_RE.test(p)).toBe(false);
@@ -1147,7 +1147,7 @@ function buildBashHistory(): FoldMessage[] {
   msgs.push(assistantMsg('Found the bug in bigfile.ts via bash read.'));
   msgs.push(userMsg('Now check the helpers'));
   for (let i = 0; i < 7; i++) {
-    msgs.push(anthropicToolUse(`tu_bh${i}`, 'Bash', { command: `cat ${ABS(`project/src/helper${i}.ts`)}` }));
+    msgs.push(anthropicToolUse(`tu_bh${i}`, 'Bash', { command: `cat ${ABS(`relay/src/helper${i}.ts`)}` }));
     msgs.push(anthropicToolResult(`tu_bh${i}`, `HELPER${i} BODY ` + 'y'.repeat(2_500)));
   }
   msgs.push(assistantMsg('All helpers checked via bash.'));
@@ -1163,7 +1163,7 @@ function buildOpenAIRunBashHistory(): FoldMessage[] {
   msgs.push(assistantMsg('Found the bug via run_bash.'));
   msgs.push(userMsg('Now check the helpers'));
   for (let i = 0; i < 7; i++) {
-    msgs.push(openaiToolCall(`call_bh${i}`, 'run_bash', { command: `cat ${ABS(`project/src/helper${i}.ts`)}` }));
+    msgs.push(openaiToolCall(`call_bh${i}`, 'run_bash', { command: `cat ${ABS(`relay/src/helper${i}.ts`)}` }));
     msgs.push(openaiToolResult(`call_bh${i}`, `HELPER${i} BODY ` + 'y'.repeat(2_500)));
   }
   msgs.push(assistantMsg('All helpers checked via run_bash.'));
@@ -1178,10 +1178,10 @@ describe('extractRecallSignals — bash arm', () => {
 
   test('bash command and file_path contribute additively to touchedPaths, sorted', () => {
     const signals = extractRecallSignals(
-      { file_path: ABS('project/src/zeta.ts'), command: `cat ${ABS('project/src/alpha.ts')}` },
+      { file_path: ABS('relay/src/zeta.ts'), command: `cat ${ABS('relay/src/alpha.ts')}` },
       new Set(),
     );
-    expect(signals.touchedPaths).toEqual(['project/src/alpha.ts', 'project/src/zeta.ts']);
+    expect(signals.touchedPaths).toEqual(['relay/src/alpha.ts', 'relay/src/zeta.ts']);
   });
 
   test('duplicate path from both file_path and command is deduped', () => {

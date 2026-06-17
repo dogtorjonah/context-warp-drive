@@ -163,11 +163,12 @@ const s4 = harvest(
 );
 expectExcluded('S4 blocked', s4, 'async bcrypt API or');
 
-// S5 — INTEGRATION: one finished investigation containing all four registers.
-// Only the 🏁 and ⚠️ survive into memory; the 🔍 and ❓ are dropped — even though
+// S5 — INTEGRATION: one finished investigation containing all five registers.
+// Only the 🏁 and ⚠️ survive into memory; 🔍, ▶, and ❓ are dropped — even though
 // they sit in the same burst, touch the same files, and read fluently.
 const s5 = harvest([
   ...fcTurn('🔍 I think the stale-profile bug is in the cache layer, still bisecting which commit introduced it.', 'src/cache/userCache.ts'),
+  ...fcTurn('▶ Applying the cache invalidation patch and running the focused test loop now.', 'src/cache/userCache.ts'),
   ...fcTurn('🏁 Verdict: the stale reads came from a cache that was never invalidated on write; invalidating on the write path fixed it.', 'src/cache/userCache.ts'),
   ...fcTurn('⚠️ Hazard: the user cache must be invalidated on every write or the API serves stale profile data after an update.', 'src/cache/userCache.ts'),
   ...fcTurn('❓ Blocked: do we invalidate the cache eagerly on write or lazily on next read. Need a perf decision first.', 'src/cache/userCache.ts'),
@@ -241,7 +242,7 @@ console.log('-----------------------------------------------------------------')
 console.log(`  ${passed}/${checks.length} checks passed`);
 console.log(
   allPass
-    ? '  ✅ Epistemic gate holds: 🏁/⚠️ become durable memory; 🔍/❓ never do.'
+    ? '  ✅ Epistemic gate holds: 🏁/⚠️ become durable memory; 🔍/▶/❓ never do.'
     : '  ❌ Epistemic gate BREACHED — a register leaked the wrong way (see above).',
 );
 console.log('-----------------------------------------------------------------\n');

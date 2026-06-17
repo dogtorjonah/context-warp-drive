@@ -1,16 +1,17 @@
 /// <reference path="../types/better-sqlite3.d.ts" />
 /**
- * Reference SQLite episode store for context-warp-drive.
+ * Reference SQLite episode store for context-warp.
  *
  * A one-call factory that opens a local SQLite database (via the OPTIONAL
  * `better-sqlite3` peer dependency) and creates the episodic spine schema —
  * `sessions`, `episodes`, `episode_members` — that `episodeStore.ts`'s
  * `recordEpisodes` / `recallEpisodeCards` operate on.
  *
- * This is a single-agent reference implementation. Production deployments may
- * layer on multi-agent lineage scoping, silo quarantine, workspace-root scoping,
- * chapter coalescing, and custom ranking. For a single agent, recency-ordered
- * path-keyed recall is enough.
+ * This is a single-agent reference implementation. The relay's production store
+ * (`relay/src/workerPool/handlers/foldEpisodes.ts`) additionally layers
+ * multi-agent lineage scoping, silo quarantine, workspace-root scoping, jaccard
+ * chapter coalescing, and chainScore ranking — documented as the production
+ * extension. For a single agent, recency-ordered path-keyed recall is enough.
  *
  * `better-sqlite3` is the only piece of the episodic layer that needs a native
  * module; the derivation + recall logic in `episodeStore.ts` is dependency-free,
@@ -70,7 +71,7 @@ export interface CreateEpisodeStoreOptions {
  * Open (or create) a SQLite-backed episode store and ensure the schema exists.
  * Returns a handle compatible with `recordEpisodes` / `recallEpisodeCards`.
  *
- * `better-sqlite3` is imported LAZILY here so that merely importing context-warp-drive
+ * `better-sqlite3` is imported LAZILY here so that merely importing context-warp
  * (even the root barrel) never requires the native module — only calling this
  * factory does. Async for the same reason.
  */

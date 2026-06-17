@@ -1,5 +1,6 @@
 export const REGISTER_GLYPHS = {
   in_progress: '🔍',
+  executing: '▶',
   verdict: '🏁',
   hazard: '⚠️',
   blocked: '❓',
@@ -8,6 +9,8 @@ export const REGISTER_GLYPHS = {
 export const ASCII_REGISTER_ALIASES = {
   '[progress]': 'in_progress',
   '[in_progress]': 'in_progress',
+  '[executing]': 'executing',
+  '[execute]': 'executing',
   '[verdict]': 'verdict',
   '[hazard]': 'hazard',
   '[blocked]': 'blocked',
@@ -64,13 +67,27 @@ interface PrefixMatch {
 }
 
 const WARNING_SIGN = '⚠';
+const PLAY_BUTTON = '▶';
 const VARIATION_SELECTOR_16 = '\ufe0f';
+const PLAY_BUTTON_TEXT_STYLE = `▶${VARIATION_SELECTOR_16}`;
 const KNOWN_GLYPH_PREFIXES: readonly PrefixMatch[] = [
   {
     register: 'hazard',
     glyph: REGISTER_GLYPHS.hazard,
     source: 'glyph',
     rawPrefix: REGISTER_GLYPHS.hazard,
+  },
+  {
+    register: 'executing',
+    glyph: REGISTER_GLYPHS.executing,
+    source: 'glyph',
+    rawPrefix: PLAY_BUTTON_TEXT_STYLE,
+  },
+  {
+    register: 'executing',
+    glyph: REGISTER_GLYPHS.executing,
+    source: 'glyph',
+    rawPrefix: PLAY_BUTTON,
   },
   {
     register: 'in_progress',
@@ -126,6 +143,7 @@ export function classifyAssistantRegister(
       return { register, trust: 'durable', durable: true, final: true };
     case 'blocked':
       return { register, trust: 'blocked', durable: false, final: true };
+    case 'executing':
     case 'in_progress':
       return { register, trust: 'transient', durable: false, final: false };
     default:

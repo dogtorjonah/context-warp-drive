@@ -12,6 +12,7 @@ import {
   createFoldFreezeState,
   evaluateFoldFreeze,
   commitFoldFreeze,
+  appendFoldFreezeTailEpoch,
   touchFoldFreeze,
   resolveFoldFreezeConfig,
   DEFAULT_FOLD_FREEZE_CONFIG,
@@ -219,6 +220,28 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     expect(state.frozenView).toHaveLength(view.length - 1);
   });
 
+  it('append tail epoch preserves the old frozen view as a byte-identical prefix', () => {
+    const { state, history, view } = frozenFixture();
+    const tailRaw = [
+      msg('user', 'new whale '.repeat(80)),
+      msg('assistant', 'folded whale summary'),
+    ];
+    const tailFolded = [msg('user', '[folded tail band]'), tailRaw[1]];
+    const grown = [...history, ...tailRaw];
+
+    const appended = appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
+
+    expect(appended).not.toBeNull();
+    expect(appended?.sealedPrefixMessageCount).toBe(view.length);
+    expect(appended?.view).toHaveLength(view.length + tailFolded.length);
+    for (let i = 0; i < view.length; i++) expect(appended?.view[i]).toBe(view[i]);
+    expect(appended?.view[view.length]).toBe(tailFolded[0]);
+    expect(state.frozenRawCount).toBe(grown.length);
+    expect(state.frozenView?.slice(0, view.length)).toEqual(view);
+    expect(state.lastAppendBoundaryViewCount).toBe(view.length);
+    expect(state.epochs).toBe(2);
+  });
+
   it('touch bumps hotReuses and slides lastCallAt; commit resets hotReuses and bumps epochs', () => {
     const { state, history } = frozenFixture();
     touchFoldFreeze(state, T0 + 1_000);
@@ -246,8 +269,8 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
 });
 
 describe('claims-relevance epoch gating', () => {
-  const ABS = '/home/jonah/my-app/project/src/sessionHooks.ts';
-  const REL = 'project/src/sessionHooks.ts';
+  const ABS = '/home/jonah/my-monorepo/relay/src/sessionHooks.ts';
+  const REL = 'relay/src/sessionHooks.ts';
 
   /** History containing one Anthropic-style tool_use on sessionHooks.ts. */
   const toolHistory = (): FoldMessage[] => [
@@ -273,7 +296,7 @@ describe('claims-relevance epoch gating', () => {
   it('reuses when a claim lands on a path the session never touched (cross-agent thrash fix)', () => {
     const { state, history } = freezeWith([]);
     const decision = evaluateFoldFreeze(
-      state, history, ctx('off', ['project/src/somebodyElsesFile.ts', '/home/jonah/other-app/x.md']), T0 + 1_000, CFG,
+      state, history, ctx('off', ['relay/src/somebodyElsesFile.ts', '/home/jonah/vet-soap/x.md']), T0 + 1_000, CFG,
     );
     expect(decision.action).toBe('reuse');
   });
@@ -308,11 +331,11 @@ describe('claims-relevance epoch gating', () => {
       ...history,
       {
         role: 'assistant',
-        content: [{ type: 'tool_use', id: 'tu_tail', name: 'edit_file', input: { file_path: 'project/src/tailOnly.ts' } }],
+        content: [{ type: 'tool_use', id: 'tu_tail', name: 'edit_file', input: { file_path: 'relay/src/tailOnly.ts' } }],
       },
       msg('user', 'tail tool result'),
     ];
-    const decision = evaluateFoldFreeze(state, grown, ctx('off', ['project/src/tailOnly.ts']), T0 + 1_000, CFG);
+    const decision = evaluateFoldFreeze(state, grown, ctx('off', ['relay/src/tailOnly.ts']), T0 + 1_000, CFG);
     expect(decision.action).toBe('reuse');
   });
 
@@ -324,23 +347,23 @@ describe('claims-relevance epoch gating', () => {
         role: 'assistant',
         content: null,
         tool_calls: [
-          { id: 'tc_1', function: { name: 'edit_file', arguments: JSON.stringify({ file_path: 'project/src/viaToolCalls.ts' }) } },
+          { id: 'tc_1', function: { name: 'edit_file', arguments: JSON.stringify({ file_path: 'relay/src/viaToolCalls.ts' }) } },
         ],
       },
       msg('assistant', 'edited'),
     ];
     commitFoldFreeze(state, history, history.slice(), ctx(), T0);
-    const decision = evaluateFoldFreeze(state, history, ctx('off', ['project/src/viaToolCalls.ts']), T0 + 1_000, CFG);
+    const decision = evaluateFoldFreeze(state, history, ctx('off', ['relay/src/viaToolCalls.ts']), T0 + 1_000, CFG);
     expect(decision).toMatchObject({ action: 'recompute', reason: 'context-changed' });
   });
 
   it('claims-before-freeze on never-touched paths stay irrelevant across the whole streak', () => {
     // Freeze WITH an irrelevant claim held; later calls with it still held,
     // released, or joined by more irrelevant claims must all reuse.
-    const { state, history } = freezeWith(['project/src/neverTouched.ts']);
-    expect(evaluateFoldFreeze(state, history, ctx('off', ['project/src/neverTouched.ts']), T0 + 1_000, CFG).action).toBe('reuse');
+    const { state, history } = freezeWith(['relay/src/neverTouched.ts']);
+    expect(evaluateFoldFreeze(state, history, ctx('off', ['relay/src/neverTouched.ts']), T0 + 1_000, CFG).action).toBe('reuse');
     expect(evaluateFoldFreeze(state, history, ctx('off', []), T0 + 2_000, CFG).action).toBe('reuse');
-    expect(evaluateFoldFreeze(state, history, ctx('off', ['project/src/another.ts', 'app/components/x.tsx']), T0 + 3_000, CFG).action).toBe('reuse');
+    expect(evaluateFoldFreeze(state, history, ctx('off', ['relay/src/another.ts', 'app/components/x.tsx']), T0 + 3_000, CFG).action).toBe('reuse');
   });
 });
 

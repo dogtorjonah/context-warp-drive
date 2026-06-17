@@ -36,17 +36,17 @@
  *     but that rule keys off tool-arg paths (`isClaimedPath(info.path)`), so
  *     a claim can only change the fold's output when its normalized path
  *     matches a tool path present in the covered raw history. Claims on paths
- *     this session never touched — the dominant multi-agent case under a
- *     shared claims set, where unrelated claims used to epoch every fold-on
- *     session — reuse safely. Releases of relevant claims also reuse: the
- *     affected content stays unfolded (correct, just briefly unoptimized) until
- *     the next natural epoch re-folds it.
+ *     this session never touched — the dominant cross-agent case under the
+ *     GLOBAL claims set, where every claim by any agent used to epoch every
+ *     fold-on session fleet-wide — reuse safely. Releases of relevant claims
+ *     also reuse: the affected content stays unfolded (correct, just briefly
+ *     unoptimized) until the next natural epoch re-folds it.
  *   - `history-rewound` / `boundary-mismatch`: the raw history no longer
- *     extends the frozen coverage (resume artifacts, truncation, in-place
+ *     extends the frozen coverage (rebirth artifacts, truncation, in-place
  *     rewrites). Self-healing: recompute from current raw truth.
  *
  * Net effect: the fold's quality machinery (graduated assistant-text budget,
- * sequence collapsing, and claimed-path unfolds) is
+ * sequence collapsing, claimed-path unfolds, atlas-metadata preservation) is
  * untouched — it simply fires in PULSES at epoch boundaries instead of on
  * every call. Between pulses the request stream is append-only and the
  * provider cache stays hot. A pleasant side effect: recent turns stay
@@ -54,10 +54,10 @@
  * softens the activeWindowTurns=1 "big result last turn" trade-off most of
  * the time.
  *
- * Engine-agnostic: lives at the "prepare the messages before the provider call"
- * seam, so any function-calling loop can reuse it. Pure CPU, zero I/O, no
- * timers — event-loop safe by construction. State lives on the session object
- * and resets naturally with a new session.
+ * Engine-agnostic: lives at the `applyCompaction` seam in FcBaseSession, so
+ * claude-api, OpenAI, Gemini, GLM, Grok, Mistral, and MiniMax all inherit it.
+ * Pure CPU, zero I/O, no timers — event-loop safe by construction. State
+ * lives on the session object and resets naturally on rebirth.
  *
  * Kill switch: WARP_FOLD_FREEZE=0 reverts to per-call recompute (the
  * pre-freeze always-on behavior). TTL and tail cap are env-tunable; callers may
@@ -77,8 +77,9 @@ export interface FoldFreezeConfig {
   /**
    * Provider prompt-cache TTL in ms. A gap between calls larger than this
    * means the cache entry has expired and recomputing the fold is free.
-   * Anthropic ephemeral: sliding 5m, or 1h when the caller explicitly uses
-   * extended-TTL cache controls. OpenAI automatic: ~5-10m idle eviction.
+   * Anthropic ephemeral: sliding 5m, or 1h with extended-TTL breakpoints
+   * (claude-api sessions inject the larger default via
+   * resolveFoldFreezeConfig defaults). OpenAI automatic: ~5-10m idle eviction.
    */
   ttlMs: number;
   /**
@@ -108,10 +109,10 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
  *   WARP_FOLD_FREEZE_MAX_TAIL_CHARS=<n>   → override raw overhang cap
  *
  * `defaults.ttlMs` lets a session inject its PROVIDER's actual cache TTL
- * (e.g. a caller using 1h Anthropic cache controls passes 3_600_000) so the
+ * (e.g. claude-api with 1h extended-TTL breakpoints passes 3_600_000) so the
  * cold-gap epoch doesn't refold against a still-warm cache: with a 1h
- * provider cache, a 20-minute gap is NOT free to refold — a 5m assumption
- * would bust the very cache entries the 1h TTL paid extra to keep.
+ * provider cache, a 20-minute gap is NOT free to refold — the old 5m
+ * assumption would bust the very cache entries the 1h TTL paid 2× to keep.
  * Precedence: explicit env override > session default > builtin.
  */
 export function resolveFoldFreezeConfig(
@@ -170,6 +171,8 @@ export interface FoldFreezeState {
   frozenView: FoldMessage[] | null;
   /** Char size of frozenView (telemetry). */
   frozenViewChars: number;
+  /** Message count at the last append-only sealed-boundary split, if this epoch appended a tail band. */
+  lastAppendBoundaryViewCount?: number;
   /** Number of raw history messages the frozen view was computed from. */
   frozenRawCount: number;
   /** Role of raw[frozenRawCount-1] at freeze time (integrity fingerprint). */
@@ -200,6 +203,7 @@ export function createFoldFreezeState(): FoldFreezeState {
   return {
     frozenView: null,
     frozenViewChars: 0,
+    lastAppendBoundaryViewCount: undefined,
     frozenRawCount: 0,
     boundaryRole: '',
     boundaryChars: 0,
@@ -339,6 +343,7 @@ export function commitFoldFreeze(
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
   state.frozenView = view.slice();
   state.frozenViewChars = countChars(view);
+  state.lastAppendBoundaryViewCount = undefined;
   state.frozenRawCount = history.length;
   state.boundaryRole = boundary?.role ?? '';
   state.boundaryChars = boundary ? countChars([boundary]) : 0;
@@ -359,3 +364,48 @@ export function commitFoldFreeze(
   state.hotReuses = 0;
   state.epochs += 1;
 }
+
+/**
+ * Append a freshly folded tail band without re-rendering the existing frozen
+ * view. This is the cache-preserving tail-epoch transition: the old frozen
+ * message objects remain the byte-identical prefix, and only the newly folded
+ * tail band is concatenated behind them.
+ */
+export function appendFoldFreezeTailEpoch(
+  state: FoldFreezeState,
+  history: FoldMessage[],
+  tailView: FoldMessage[],
+  context: FoldFreezeContext,
+  now: number,
+): { view: FoldMessage[]; sealedPrefixMessageCount: number } | null {
+  if (!state.frozenView) return null;
+  if (history.length < state.frozenRawCount) return null;
+
+  const sealedPrefixMessageCount = state.frozenView.length;
+  const view = state.frozenView.concat(tailView);
+  const boundary = history.length > 0 ? history[history.length - 1] : undefined;
+
+  state.frozenView = view.slice();
+  state.frozenViewChars = countChars(view);
+  state.lastAppendBoundaryViewCount = sealedPrefixMessageCount;
+  state.frozenRawCount = history.length;
+  state.boundaryRole = boundary?.role ?? '';
+  state.boundaryChars = boundary ? countChars([boundary]) : 0;
+  state.boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
+  state.thinningMode = context.thinningMode;
+
+  const toolPaths = extractToolPathSet(history);
+  const relevant = new Set<string>();
+  for (const claimed of context.claimedPaths) {
+    const normalized = normalizeToolPath(claimed);
+    if (toolPaths.has(normalized)) relevant.add(normalized);
+  }
+  state.frozenToolPaths = toolPaths;
+  state.frozenRelevantClaims = relevant;
+  state.lastCallAt = now;
+  state.hotReuses = 0;
+  state.epochs += 1;
+
+  return { view, sealedPrefixMessageCount };
+}
+

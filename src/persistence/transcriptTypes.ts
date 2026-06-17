@@ -1,9 +1,11 @@
 /**
- * Transcript types — minimal subset for context-warp-drive.
+ * Transcript types — vendored subset for context-warp.
  *
- * The fold engine's distinctive-term + sparse-vector primitives only need
- * `ChunkType`, `TranscriptChunk`, and `SparseVector`; broader transcript-index
- * schemas are intentionally out of scope here.
+ * Trimmed from the relay's `relay/src/persistence/transcriptTypes.ts` to ONLY
+ * the three types the fold engine's distinctive-term + sparse-vector primitives
+ * actually consume: `ChunkType`, `TranscriptChunk`, and `SparseVector`. The full
+ * relay file additionally defines BM25 / HNSW / hybrid-retrieval index types that
+ * the fold engine does not use; they are intentionally omitted here.
  *
  * Zero external dependencies.
  */
@@ -57,7 +59,7 @@ export interface TranscriptChunk {
   // ── Content ──
   /** The actual text content of the chunk. */
   text: string;
-  /** Optional caller-supplied token count. */
+  /** Approximate token count (chars / 4). */
   tokens: number;
 }
 

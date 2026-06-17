@@ -70,19 +70,19 @@ Every stage is **zero-LLM, zero-I/O, byte-identical for identical inputs** (the 
 Context Warp Drive was extracted from the production multi-agent system it was built
 for, where the fold/freeze/recall architecture runs live on long-horizon agent
 sessions. This repository is the portable public package derived from that engine,
-not a byte-for-byte copy of Voxxo Swarm's private integration layer.
+not a byte-for-byte copy of the private integration layer it was lifted from.
 
 The byte-identical invariant in this package is local: identical package inputs
 produce identical folded views, and a hot frozen prefix is reused byte-for-byte
 between epochs so provider prompt caches can hit. It is not a claim that every
-public source file renders the same output as the production monorepo for
-Voxxo-specific workloads.
+public source file renders the same output as the originating monorepo for
+its private integration workloads.
 
 The standalone dialect deliberately neutralizes private integration seams:
-`VOXXO_*` environment names become `WARP_*`, package examples avoid Voxxo paths,
-recovery text says "raw history" instead of "self-tap", and voice mining is keyed
-on generic glyph-grammar input shapes rather than named Voxxo tools. Known
-production-only non-parity areas include Atlas lookup metadata-preserving fold
-markers, Atlas/chatroom/tap_star/task_rail skeleton labels, rail episode fields,
-and walk-spine/rail recall cards. Treat those as integration features to port
-explicitly, not as hidden guarantees of the public package.
+environment names use the generic `WARP_*` prefix, package examples avoid private
+paths, recovery text says "raw history" instead of host-specific recovery verbs,
+and voice mining is keyed on generic glyph-grammar input shapes rather than named
+host tools. Known integration-only non-parity areas include lookup
+metadata-preserving fold markers, host coordination skeleton labels, rail episode
+fields, and walk-spine/rail recall cards. Treat those as integration features to
+port explicitly, not as hidden guarantees of the public package.

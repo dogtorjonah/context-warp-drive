@@ -4,7 +4,7 @@
   "description": "Infinite Context Warp Engine — deterministic, zero-LLM rolling-fold context compaction with Coordinate Closet, cache-hot freeze, ambient page-in recall, durable episodic memory, and register-glyph grammar. Keep long function-calling agent sessions under the context ceiling without summarization calls, while keeping provider prompt caches hot. Provider-agnostic: Anthropic content blocks, OpenAI tool_calls, and Gemini parts.",
   "license": "MIT",
   "type": "module",
-  "author": "Jonah (Voxxo Swarm)",
+  "author": "Jonah",
   "homepage": "https://github.com/dogtorjonah/context-warp-drive",
   "repository": {
     "type": "git",
@@ -45,6 +45,11 @@
       "types": "./dist/glyphs.d.ts",
       "import": "./dist/glyphs.js",
       "require": "./dist/glyphs.cjs"
+    },
+    "./overwatch": {
+      "types": "./dist/overwatch.d.ts",
+      "import": "./dist/overwatch.js",
+      "require": "./dist/overwatch.cjs"
     }
   },
   "main": "./dist/index.cjs",

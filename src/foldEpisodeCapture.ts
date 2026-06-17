@@ -5,11 +5,11 @@
  * blocks with tool_use/tool_result, and OpenAI tool_calls + role:'tool'
  * results) and derives sealed Episodes: zone members from real tool-input
  * touches, a structural-verbatim branch trace with outcomes, and VERBATIM
- * voice annotations mined from agent-authored tool inputs via the glyph
- * grammar — changelog entries, category-tagged notes, voice-tagged messages —
+ * voice annotations mined from the three agent-authored surfaces —
+ * atlas_commit changelog entries, tap_star notes, and typed chatroom lines —
  * plus tier-B narration mined at the burst seal from gap-resident assistant
  * prose (post-hoc by position; untagged prose is verdict-shaped by filter;
- * declared 🏁/⚠️ prose is trusted by the SOP message glyph; 🔍/❓ openers
+ * declared 🏁/⚠️ prose is trusted by the SOP message glyph; 🔍/▶/❓ openers
  * self-exclude).
  *
  * OPEN-BURST RULE: the final burst in the window is normally not recorded — it
@@ -76,6 +76,8 @@ export interface EpisodeCaptureIdentity {
   closedBy: Episode['closedBy'];
   /** Caller-supplied clock (keeps this module pure and testable). */
   nowIso: string;
+  railId?: string;
+  railStep?: string;
   /**
    * When TRUE, derived episodes inherit the siloed tag — recall gate keeps
    * them invisible to unsealed callers. Capture-but-quarantine, not
@@ -105,10 +107,10 @@ export interface EpisodeCaptureOptions {
    */
   timestamps?: readonly (string | undefined)[];
   /**
-   * Canonical path identity context. When provided, member
+   * Canonical path identity context (rail-da5b5e73). When provided, member
    * paths canonicalize to absolute repo-qualified form — relative paths
    * resolve against cwd (live) or unique disk existence (backfill only), and
-   * bridged cross-workspace calls re-root via their `workspace` argument. Absent →
+   * bridged atlas calls re-root via their `workspace` argument. Absent →
    * extraction is byte-identical to legacy behavior.
    */
   canon?: CanonContext;
@@ -243,8 +245,8 @@ function extractTouchPaths(input: Record<string, unknown>, canon?: CanonContext)
   }
   const sorted = Array.from(paths).sort();
   if (!canon) return sorted;
-  // Bridged cross-workspace calls carry a `workspace` argument — the highest-
-  // precision repo signal: relative paths re-root against that workspace's root.
+  // Bridged atlas calls carry a `workspace` argument — the highest-precision
+  // repo signal: relative paths re-root against that workspace's root.
   const workspaceArg = typeof input.workspace === 'string' ? input.workspace : undefined;
   try {
     return canonicalizeExtractedPaths(sorted, workspaceArg, canon).paths;
@@ -253,48 +255,44 @@ function extractTouchPaths(input: Record<string, unknown>, canon?: CanonContext)
   }
 }
 
-// Mine durable "voice" from a tool call's inputs — tool-agnostic, keyed on the
-// glyph grammar (epistemic categories + voice tags) and input shape, never on
-// tool identity. Any tool that emits one of these agent-authored surfaces gets
-// mined; tools that don't return null.
 function mineVoice(call: ToolCallView): EpisodeAnnotation | null {
-  const input = call.input;
-
-  // Changelog-style voice: a structured "what I changed and why" entry.
-  const entry = input.changelog_entry;
-  if (typeof entry === 'string' && entry.trim().length > 0) {
-    const filePath = input.file_path;
-    return {
-      ts: '',
-      kind: 'changelog',
-      text: truncateVerbatim(entry.split('\n')[0].trim(), VOICE_TEXT_CAP_CHARS),
-      ...(typeof filePath === 'string' ? { path: filePath } : {}),
-    };
-  }
-
-  // Pinned-waypoint voice: a note tagged with an epistemic category from the
-  // glyph grammar (decision/discovery/pivot/handoff/gotcha/result).
-  const note = input.note;
-  const category = input.category;
-  if (typeof note === 'string' && note.trim().length > 0
-    && typeof category === 'string' && STAR_CATEGORIES.has(category)) {
-    return {
-      ts: '',
-      kind: `star:${category}` as EpisodeAnnotationKind,
-      text: truncateVerbatim(note.trim(), VOICE_TEXT_CAP_CHARS),
-    };
-  }
-
-  // Typed-message voice: a message whose first line opens with a glyph-grammar
-  // voice tag (#decision/#blocker/#discovery).
-  const message = input.message;
-  if (typeof message === 'string') {
-    const firstLine = message.split('\n')[0].trim();
-    if (CHAT_VOICE_TAGS.some((tag) => firstLine.startsWith(tag))) {
-      return { ts: '', kind: 'chat', text: truncateVerbatim(firstLine, VOICE_TEXT_CAP_CHARS) };
+  const shortName = shortToolName(call.name).toLowerCase();
+  if (shortName === 'atlas_commit') {
+    const entry = call.input.changelog_entry;
+    if (typeof entry === 'string' && entry.trim().length > 0) {
+      const filePath = call.input.file_path;
+      return {
+        ts: '',
+        kind: 'changelog',
+        text: truncateVerbatim(entry.split('\n')[0].trim(), VOICE_TEXT_CAP_CHARS),
+        ...(typeof filePath === 'string' ? { path: filePath } : {}),
+      };
     }
+    return null;
   }
-
+  if (shortName === 'tap_star') {
+    const note = call.input.note;
+    const category = call.input.category;
+    if (typeof note === 'string' && note.trim().length > 0
+      && typeof category === 'string' && STAR_CATEGORIES.has(category)) {
+      return {
+        ts: '',
+        kind: `star:${category}` as EpisodeAnnotationKind,
+        text: truncateVerbatim(note.trim(), VOICE_TEXT_CAP_CHARS),
+      };
+    }
+    return null;
+  }
+  if (shortName === 'chatroom') {
+    const message = call.input.message;
+    if (call.input.action === 'send' && typeof message === 'string') {
+      const firstLine = message.split('\n')[0].trim();
+      if (CHAT_VOICE_TAGS.some((tag) => firstLine.startsWith(tag))) {
+        return { ts: '', kind: 'chat', text: truncateVerbatim(firstLine, VOICE_TEXT_CAP_CHARS) };
+      }
+    }
+    return null;
+  }
   return null;
 }
 
@@ -317,7 +315,7 @@ function assistantTextOf(message: FoldMessage): string {
  * burstFinalTouch is its LAST touch (INCLUSIVE) — see the call site.
  *
  * PASS 1 — DELIBERATE REGISTER (the all-in harvest). 🏁 verdict / ⚠️ hazard is
- * an explicit "resurface this" act by the agent: the GLYPH is the
+ * an explicit "resurface this" act by the agent (SOP P23): the GLYPH is the
  * trust signal, so POSITION is irrelevant. Capture EVERY eligible 🏁/⚠️ in
  * position across the WHOLE burst, not merely the closer — a hazard declared
  * mid-run is no longer dropped just because it was not the burst's last word.
@@ -325,7 +323,7 @@ function assistantTextOf(message: FoldMessage): string {
  * lost). There is deliberately NO count cap: selectVoiceInlays bounds what ever
  * reaches a rendered card by ANNOTATION_PRIORITY at READ time, so the STORE
  * stays complete and a hazard that ranks top in some later recall context is
- * never pre-discarded at write time. 🔍/❓ self-exclude (isNarrationEligibleGlyph)
+ * never pre-discarded at write time. 🔍/▶/❓ self-exclude (isNarrationEligibleGlyph)
  * so confidently-wrong mid-burst hypotheses never enter. Per-burst windows stay
  * disjoint (burst i scans [start(i), start(i+1)) — see call site), so a
  * boundary declaration lands on exactly one chapter. If pass 1 captured any
@@ -365,7 +363,7 @@ function mineNarrationForGap(
     const text = assistantTextOf(messages[i]);
     if (text.length === 0) continue;
     const glyph = classifyMessageGlyph(text);
-    if (!isNarrationEligibleGlyph(glyph)) continue; // 🔍/❓ self-exclude
+    if (!isNarrationEligibleGlyph(glyph)) continue; // 🔍/▶/❓ self-exclude
     const kind = narrationKindForGlyph(glyph);
     if (kind === 'narration') continue;             // untagged → pass 2 only
     if (isSyntheticContextText(text)) continue;
@@ -395,7 +393,7 @@ function mineNarrationForGap(
     const isBurstFinalTouch = i === burstFinalTouch;
     const glyph = classifyMessageGlyph(text);
     if (!isNarrationEligibleGlyph(glyph)) {
-      // Declared 🔍 in-progress / ❓ blocked: source-side self-exclusion.
+      // Declared 🔍 in-progress / ▶ executing / ❓ blocked: source-side self-exclusion.
       // Consumes the scan window (except at the burst-final touch) so exclusion
       // never extends reach deeper into next-task territory.
       if (!isBurstFinalTouch) {
@@ -429,9 +427,9 @@ function mineNarrationForGap(
 
 function structuralStep(call: ToolCallView, outcome: 'ok' | 'error' | undefined, touched: readonly string[]): TraceStep {
   const shortName = shortToolName(call.name);
-  const entry = call.input.changelog_entry;
-  if (typeof entry === 'string') {
-    const head = truncateVerbatim(entry.split('\n')[0].trim(), COMMIT_DETAIL_CAP_CHARS);
+  if (shortName.toLowerCase() === 'atlas_commit') {
+    const entry = call.input.changelog_entry;
+    const head = typeof entry === 'string' ? truncateVerbatim(entry.split('\n')[0].trim(), COMMIT_DETAIL_CAP_CHARS) : '';
     return { tool: 'commit', ...(head ? { detail: head } : {}) };
   }
   const targetSource = typeof call.input.file_path === 'string'
@@ -575,6 +573,8 @@ export function deriveEpisodesFromMessages(
       endedAt: burst.endedAt ?? identity.nowIso,
       closedBy: identity.closedBy,
       summary: deriveEpisodeSummary({ annotations, members: burst.members }),
+      ...(identity.railId !== undefined ? { railId: identity.railId } : {}),
+      ...(identity.railStep !== undefined ? { railStep: identity.railStep } : {}),
       members: burst.members,
       trace: buildBranchTrace(burstSteps),
       annotations,

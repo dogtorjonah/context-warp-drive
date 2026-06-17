@@ -2,13 +2,14 @@
 
 A one-character convention that turns ordinary assistant messages into a machine-readable trust signal — the substrate that lets episodic recall harvest **durable** memory from a stream of in-progress chatter without an LLM judging each line.
 
-## The four registers
+## The five registers
 
 Every assistant message opens with exactly one register glyph:
 
 | Glyph | Register | Meaning | Trust |
 |---|---|---|---|
 | 🔍 | `in_progress` | investigating, building, partial findings, hypotheses | transient (not final) |
+| ▶ | `executing` | tool, edit, test, or batch execution is actively underway | transient (not final) |
 | 🏁 | `verdict` | a verified outcome or settled conclusion | **durable**, final |
 | ⚠️ | `hazard` | a trap, gotcha, or invariant others must know | **durable**, final |
 | ❓ | `blocked` | needs a decision or input to proceed | final, not durable |
@@ -30,7 +31,7 @@ Strict, deterministic, first-character parse:
 
 Episodic capture mines an agent's burst-final prose into durable memory. Without a register signal, a confident-sounding **mid-investigation hypothesis** (which is often wrong) looks identical to a **verified conclusion** — and gets harvested as fact. The glyph is a coarse trust gate ahead of the shape filter:
 
-- 🔍 / ❓ messages **self-exclude** from harvest — an in-progress hypothesis can never masquerade as a verdict.
+- 🔍 / ▶ / ❓ messages **self-exclude** from harvest — in-progress, executing, and blocked work can never masquerade as a verdict.
 - 🏁 / ⚠️ messages are eligible, and their register sets the harvested line's **trust tier**: 🏁 → `narration:verdict`, ⚠️ → `narration:hazard`, both promoted into the high-priority ranking tier so a declared conclusion can outrank a routine log line.
 - Untagged prose stays a priority-last backstop — behavior is byte-identical at 0% glyph compliance and strictly less noisy above it.
 

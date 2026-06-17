@@ -26,6 +26,6 @@ export default defineConfig({
   plugins: [preferTypeScriptSourceSiblings()],
   test: {
     environment: 'node',
-    include: ['test/**/*.test.ts'],
+    include: ['test/**/*.test.ts', 'src/__tests__/**/*.test.ts'],
   },
 });

@@ -176,17 +176,17 @@ episodes are untouched until the operator-gated rebuild swap regenerates them
 (at which point narration applies retroactively for free).
 
 **Message glyph grammar (register tags):** the SOP mandates every agent
-message open with exactly one register glyph — 🔍 in progress · 🏁 verified
-verdict · ⚠️ hazard/gotcha · ❓ blocked (`classifyMessageGlyph`,
+message open with exactly one register glyph — 🔍 in progress · ▶ executing ·
+🏁 verified verdict · ⚠️ hazard/gotcha · ❓ blocked (`classifyMessageGlyph`,
 VS16-tolerant first-glyph parse; deploy the prompt/runtime convention wherever
 agents produce commentary). Narration consults it as a COARSE gate ahead of the shape
-filter: 🔍/❓ messages self-exclude — a declared hypothesis can no longer
+filter: 🔍/▶/❓ messages self-exclude — declared transient work can no longer
 masquerade as a verdict, the false-positive class shape filters cannot catch
 — while 🏁/⚠️ and untagged messages stay eligible with the shape gate still
 deciding (glyphs tighten the AND-gate, never bypass it). Excluded messages
 still consume the ≤3-message scan window. Untagged = legacy shape-only
 behavior: harvest is byte-identical at 0% compliance and strictly less noisy
-above it. Line-level mirrors: 🔍/❓-opened lines reject, 🏁/⚠️ openers strip
+above it. Line-level mirrors: 🔍/▶/❓-opened lines reject, 🏁/⚠️ openers strip
 as decoration. The declared register no longer only gates capture — it also
 sets the harvested line's TRUST TIER (`narrationKindForGlyph`): 🏁 verdict and
 ⚠️ hazard are promoted into the deliberate ranking tier and a declared hazard

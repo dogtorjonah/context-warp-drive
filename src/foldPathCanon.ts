@@ -3,22 +3,22 @@
  *
  * The episodic store's join key is "the file touched" — an immutable fact.
  * That fact is only unambiguous when the path is repo-qualified: a bare
- * `src/lib/x.ts` names different files in every repo a multi-workspace agent
- * drives. This module turns raw extracted tool paths into canonical
+ * `src/lib/x.ts` names different files in vet-soap, example-med-app, and
+ * knowledge-chat. This module turns raw extracted tool paths into canonical
  * ABSOLUTE paths — resolved against the toucher's cwd, a bridged workspace
  * root (the tool input's `workspace` argument), or (backfill only) disk
  * existence across known roots — plus the alias forms recall keeps matching
  * so legacy-format store rows stay reachable.
  *
  * Pure CPU, ZERO runtime imports (same residency rule as foldEpisodes.ts).
- * Filesystem access arrives only via the injected `fileExists`: live sessions
- * should omit it; offline backfills can pass a disk probe.
+ * Filesystem access arrives only via the injected `fileExists`: live relay
+ * sessions never pass it; the rebuild script passes fs.existsSync.
  */
 
 export interface WorkspaceRoot {
-  /** Workspace name (short workspace slug, e.g. "my-app"). */
+  /** Workspace name (atlas bridge slug, e.g. "vet-soap"). */
   name: string;
-  /** Absolute repo root, no trailing slash (e.g. "/home/user/my-app"). */
+  /** Absolute repo root, no trailing slash (e.g. "/home/jonah/vet-soap"). */
   root: string;
 }
 
@@ -26,7 +26,7 @@ export interface CanonContext {
   /** The toucher's working directory (absolute). Live-session resolution anchor. */
   cwd?: string;
   roots: readonly WorkspaceRoot[];
-  /** Backfill-only disk probe. NEVER provide this on live boundary paths. */
+  /** Backfill-only disk probe. NEVER provide this on relay boundary paths. */
   fileExists?: (absPath: string) => boolean;
 }
 
@@ -136,7 +136,7 @@ export function canonicalizeTouchPath(raw: string, ctx: CanonContext): CanonResu
 
 /**
  * Batch canonicalization for extracted tool paths. `workspaceArg` is the tool
- * input's `workspace` parameter (bridged cross-workspace calls): when
+ * input's `workspace` parameter (bridged atlas_query/atlas_graph calls): when
  * it names a known root, RELATIVE extracted paths re-root against that root
  * instead of cwd — the caller was explicitly addressing that repo, the
  * highest-precision repo signal available. Absolute paths are unaffected.

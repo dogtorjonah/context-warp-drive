@@ -10,24 +10,26 @@
  * WARNING / CRITICAL / AUTO_COMPACT as fractions of this number, so an
  * optimistic value pushes those tripwires ABOVE the provider's real wall —
  * the gauge reads "healthy" right until the API hard-rejects the request.
- * Precedent: MiniMax-M3 was once set to its advertised 1M and a long single-turn
- * run sailed past the provider's real ceiling into a 400 "context window exceeds
- * limit". It was corrected to the spec's guaranteed 512K floor. Exceptions set
- * above 200k are deliberate, not advertised-max traps: entries at 1M are set only
- * where a larger window is provider-documented (e.g. the modern Claude 4.x API
- * family — Opus 4-6/4-7/4-8 and Sonnet 4-6). Do NOT revert these to 200k as a
- * floor-style correction; the larger window is intended.
+ * Precedent: MiniMax-M3 was set to its advertised 1M and a long single-turn
+ * run sailed past MiniMax's real ceiling into a 400 "context window exceeds
+ * limit" (instance wEO2Ch8H, 2026-06-12). Corrected to the spec's guaranteed
+ * 512K floor. Exceptions set above 200k are deliberate, not advertised-max
+ * traps: claude-fable-5 at 1M is evidence-backed (≥351k live context was billed
+ * on it, disproving the 200k floor); the modern Claude 4.x API family at 1M
+ * (Opus 4-6/4-7/4-8 and Sonnet 4-6) is provider-documented and
+ * operator-confirmed, so the 200k rollout entries were the real bug. Do NOT
+ * revert these to 200k as a MiniMax-style correction; the 1M is intended.
  */
 
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // ── Claude models ──
-  'claude-fable-5': 1_000_000, // 1M — provider-reported window (above the legacy 200k default)
+  'claude-fable-5': 1_000_000, // Fable 5: 1M — ≥351k live context observed+billed on gHMKZbT6 (2026-06-10) disproved the 200k floor; matches provider-reported window
   'claude-opus-4-20250514': 200_000,
   'claude-opus-4': 200_000,
   'claude-sonnet-4-20250514': 200_000,
   'claude-sonnet-4': 200_000,
   'claude-sonnet-4-6': 1_000_000, // Sonnet 4.6 ships a 1M Claude API window; /200k gauges were stale rollout metadata
-  'claude-opus-4-8': 1_000_000, // Opus 4.x ships a 1M window (provider-documented; see invariant note above)
+  'claude-opus-4-8': 1_000_000, // Opus 4.x ships a 1M window — operator-directed (Jonah, 2026-06-13); mirrors the fable-5 exception (see invariant doc above)
   'claude-opus-4-7': 1_000_000, // same Opus 4.x family window
   'claude-opus-4-6': 1_000_000, // same Opus 4.x family window
   'claude-3-5-sonnet-20241022': 200_000,
@@ -43,9 +45,9 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // `engine: codex-api` gets a 1M budget and is handled by an engine+model
   // override before this generic model table. Do not collapse the two surfaces.
   // Anchoring the CLI path to the advertised/API 1M was the MiniMax-M3 trap (see
-  // invariant note above): a codex-5.5-instant ("fast" tier) session read
-  // "25% healthy" at ~264K input tokens and Codex hard-errored "ran out of
-  // room in the model's context window". 258K = guaranteed
+  // invariant doc above): instance UChw0eb_ (codex-5.5-instant, "fast" tier)
+  // read "25% healthy" at 264,175 input tokens and Codex hard-errored "ran out
+  // of room in the model's context window" (2026-06-14). 258K = guaranteed
   // effective input floor so CONTEXT_THRESHOLDS trip below the real wall
   // (AUTO_COMPACT 0.93 → ~240K). gpt-5.4/-pro share the catalog.
   'codex-5.5': 258_000,
@@ -246,8 +248,8 @@ export interface WindowAwareBurstCapInput {
 
 /**
  * Window-aware cumulative tool-result BURST cap (chars) for a CLI/MCP caller.
- * Tool proxies need to guard rapid bursts of tool results from summing past the
- * model window. A flat cap is window-blind and
+ * The relay's MCP tool-proxy (relayToolHost / relayMcpSidecar) guards a rapid burst
+ * of tool results from summing past the model window. A flat cap is window-blind and
  * guillotines large-window CLI engines (Gemini CLI's 1M window got ~3% of itself at
  * the legacy 120k). This sizes the batch budget to the caller's context window: a
  * single batch may occupy up to `fraction` of the model's char-capacity

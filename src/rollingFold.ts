@@ -154,12 +154,11 @@ export const DEFAULT_FOLD_CONFIG: FoldConfig = {
  * bypassed (continuous: true → checkFoldTrigger folds all foldable turns every
  * turn), but every signal-preservation rule that made threshold-gated folding
  * safe is unchanged:
- *   - activeWindowTurns (1, checkpoint-cadence sized — see the config below) is the
+ *   - activeWindowTurns (1, rebirth-cadence sized — see the config below) is the
  *     structural floor — the newest turn is NEVER folded and stays at full fidelity
  *     (live working memory is intact). This is the inter-turn analog of the
- *     intra-turn tail buffer. Sized to 1 because reset-heavy agents often
- *     checkpoint every few turns; a larger window meant inter-turn fold never
- *     engaged at all.
+ *     intra-turn tail buffer. Sized to 1 because swarm agents rebirth every ~2-3
+ *     turns; a larger window meant inter-turn fold never engaged at all.
  *   - assistantTextBudget (50K full / 100K essence, allocated newest-first)
  *     governs graduated per-turn detail: turns just past the active window keep
  *     their full assistant text, older turns keep an essence summary, only the
@@ -167,26 +166,25 @@ export const DEFAULT_FOLD_CONFIG: FoldConfig = {
  *     gradually, never cliff-edged — the exact machinery added (5/14) to fix the
  *     two layers of reasoning loss that category-gated folding caused.
  *   - the fold is recoverable, not destructive — foldContext returns a new array
- *     and never mutates the raw JSONL, so any folded turn is recoverable from
- *     raw history.
+ *     and never mutates the raw JSONL, so any folded turn is one self-tap away.
  *
  * Conversations with <= activeWindowTurns still no-op naturally (the active
  * window covers them) — at window=1 that means a brand-new single-turn session.
  * From the second turn onward, inter-turn folding bites every turn, which for a
- * checkpoint-heavy cadence is exactly when the prior turn has stopped earning
- * its full-fidelity cost.
+ * rebirth-heavy cadence is exactly when the prior turn has stopped earning its
+ * full-fidelity cost (the rebirth that follows will recompress it anyway).
  */
 export const ALWAYS_ON_FOLD_CONFIG: FoldConfig = {
   ...DEFAULT_FOLD_CONFIG,
   continuous: true,
-  // Checkpoint-cadence sizing (overrides DEFAULT's 20). Agents that checkpoint
-  // every few turns would never exceed a 20-turn active window
+  // Rebirth-cadence sizing (overrides DEFAULT's 20). Agents in this swarm rebirth
+  // every ~2-3 turns, so a 20-turn active window meant turnCount never exceeded it
   // → the continuous inter-turn fold NEVER engaged for this workflow (dead code).
   // Dropped to 1: only the CURRENT turn is the guaranteed-verbatim floor, and every
   // turn behind it folds on every call. Live working memory stays intact, the
   // assistantTextBudget (50K full / 100K essence, newest-first) carries recent
   // REASONING text past the floor, and raw tool results from prior turns skeletonize
-  // (recoverable from raw history). Inter-turn analog of intra-turn's tailBuffer.
+  // (recoverable via self-tap). Inter-turn analog of intra-turn's tailBuffer.
   // Reel-back: raise to 2 to also keep the immediately-previous turn verbatim
   // (restores the "read last turn, act this turn" pattern at full tool-result fidelity).
   activeWindowTurns: 1,
@@ -318,27 +316,20 @@ export const RECALL_CARD_PREFIX = '[Recalled from fold —';
 /** Prefix of one-line fold-recall hints injected at tool boundaries (see foldRecall.ts). */
 export const RECALL_HINT_PREFIX = '[Fold recall hint —';
 
-/** Prefix of the one-line fold-epoch stamp emitted at the first tool boundary after a freeze epoch. */
+/** Prefix of the one-line fold-epoch stamp emitted at the first tool boundary after a freeze epoch (see fcBaseSession.ts). */
 export const FOLD_EPOCH_STAMP_PREFIX = '[Fold epoch #';
 
 /**
  * Prefix of the episodic-recall block (durable blast-radius memory cards from
- * a caller-provided episode store) injected at tool boundaries. Synthetic like
- * recall cards: excluded from real-turn
+ * fold-episodes.sqlite) injected at tool boundaries (see fcBaseSession.ts /
+ * foldEpisodes.ts). Synthetic like recall cards: excluded from real-turn
  * detection and from mention-signal extraction (self-excitation guard — the
  * matcher must never read paths out of its own injected cards), and aged out
  * by later fold epochs like any other tool-boundary payload.
  */
 export const EPISODIC_RECALL_PREFIX = '[Episodic recall —';
 
-/**
- * Consumer-injected synthetic continuity note: a `[User Message Vault]` /
- * `[/User Message Vault]` block carrying bounded excerpts of earlier operator
- * messages, appended to a live user turn so a reborn or compacted session keeps
- * the operator's recent wording. The fold engine treats it as synthetic — never
- * a real turn boundary, and stripped before genuine user text is extracted — so
- * injected excerpts are never mistaken for fresh operator prose.
- */
+/** Synthetic relay note appended to live user turns with bounded operator-message excerpts. */
 export const USER_MESSAGE_VAULT_PREFIX = '[User Message Vault]';
 export const USER_MESSAGE_VAULT_END = '[/User Message Vault]';
 
@@ -367,10 +358,10 @@ export function formatFoldEpochStamp(epoch: number, detail: string): string {
  * the block's FIRST line stays the FOLD_MARKER header that foldRecall's
  * buildFoldIndex parses. Full mechanics: docs/context-folding.md.
  */
-export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves verbatim ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
+export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves closet items — ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
 
 /**
- * Synthetic injected context text — fold blocks, fold-recall
+ * Synthetic relay-injected context text — fold blocks, fold-recall
  * cards/hints, and fold-epoch stamps — is never a real user turn boundary.
  * Recall payloads therefore
  * attach to the turn they follow, so they skeletonize away at later fold
@@ -445,7 +436,7 @@ export function detectTurns(messages: FoldMessage[]): Turn[] {
 
 // ── Step-granular segmentation (marathon-turn fold) ──
 //
-// A "turn" only ends at real user TEXT (isUserTurnBoundary). A long agentic task
+// A "turn" only ends at real user TEXT (isUserTurnBoundary). A long agentic rail
 // runs as ONE turn — one kickoff prompt, hundreds of tool steps, no boundary — so
 // inter-turn fold (which only compresses turns BEHIND the 1-turn active window)
 // never engages on it (checkFoldTrigger: turnCount ≤ activeWindowTurns → no-fold),
@@ -707,9 +698,8 @@ function truncate(s: string, max: number): string {
 }
 
 /**
- * Normalize an absolute repo path to workspace-relative form by stripping a
- * leading `/home/<user>/<repo>/` prefix, so absolute tool-arg paths compare
- * equal to workspace-relative claim paths. This is the canonical normalization
+ * Normalize an absolute monorepo path to repo-relative form by stripping a
+ * leading `/home/<user>/<repo>/` prefix. This is the canonical normalization
  * used by claimed-path matching (`isClaimedPath`) and tool-arg path extraction
  * — exported so the fold freeze (foldFreeze.ts) can test claim relevance with
  * byte-identical semantics.
@@ -746,8 +736,8 @@ const USER_VERBATIM_LANE_RATIO = 0.25;
 
 const VERBATIM_UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const VERBATIM_HEX_RE = /\b[0-9a-f]{12,64}\b/gi;
-/** 8-11 hex requiring ≥1 letter AND ≥1 digit: admits common id
- *  shapes (ticket-1f6be5b4, short git SHAs like b602c1e8) while rejecting date-like
+/** 8-11 hex requiring ≥1 letter AND ≥1 digit: admits this codebase's dominant id
+ *  shapes (rail-1f6be5b4, short git SHAs like b602c1e8) while rejecting date-like
  *  digit runs (20260610) and hex-only English words (deadbeef). */
 const VERBATIM_HEX_SHORT_RE = /\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{8,11}\b/gi;
 const VERBATIM_ABS_PATH_RE = /(?:^|[\s"'`(=])(\/(?:[\w.@-]+\/)+[\w.@-]+)/g;
@@ -845,7 +835,7 @@ export const LABEL_MAX_CHARS = 24;
  * and when no meaningful preceding identifier exists. Heuristic: locate the
  * value's first boundary-aware occurrence and read the nearest preceding
  * identifier word (the JSON/KV key or prose subject), e.g. `"changelog_id":
- * "7fd5835b"`, `ticket 7fd5835b`, `commit b602c1e8`. A label that is itself
+ * "7fd5835b"`, `rail 7fd5835b`, `commit b602c1e8`. A label that is itself
  * pure-hex or letterless is rejected so one hash never labels another.
  * Pure: byte-identical for identical inputs.
  */
@@ -904,21 +894,28 @@ function beltVerbatim(text: string, max = 2): string {
 // Turn classifier
 // ══════════════════════════════════════════════════════════════════════
 
-// Turn classification by tool name. Tools are matched by SHORT name — any
-// `mcp__<server>__` prefix is stripped first (see classifyTurn) — so you can
-// extend these sets with your own MCP tools' short names and prefixed
-// invocations still classify. Only the universal coding-agent tools are
-// recognized out of the box.
 const RESEARCH_TOOLS = new Set([
   'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'ToolSearch',
+  'mcp__agent-bridge__atlas_query', 'mcp__brain-mcp__atlas_query',
+  'mcp__agent-bridge__atlas_graph', 'mcp__brain-mcp__atlas_graph',
+  'mcp__agent-bridge__atlas_audit', 'mcp__brain-mcp__atlas_audit',
+  'mcp__agent-bridge__search_docs', 'mcp__agent-bridge__devlog_query',
 ]);
 
 const ACTION_TOOLS = new Set([
   'Edit', 'Write', 'NotebookEdit',
+  'mcp__agent-bridge__atlas_commit', 'mcp__brain-mcp__atlas_commit',
+  'mcp__agent-bridge__apply_migration', 'mcp__agent-bridge__execute_sql',
+  'mcp__agent-bridge__deploy_edge_function',
 ]);
 
 const COORDINATION_TOOLS = new Set([
-  'Agent',
+  'mcp__agent-bridge__chatroom', 'mcp__agent-bridge__tap_instance_messages',
+  'mcp__agent-bridge__tap_star', 'mcp__agent-bridge__spawn_instance',
+  'mcp__agent-bridge__kill_instance',
+  'mcp__agent-bridge__psychic_pov', 'mcp__agent-bridge__task_rail',
+  'mcp__agent-bridge__signal_overseer', 'mcp__agent-bridge__self_rebirth',
+  'mcp__brain-mcp__brain_rebirth', 'mcp__brain-mcp__brain_handoff', 'Agent',
 ]);
 
 const MUTATING_BASH_RE = /\b(npm run build|npm install|git commit|git push|rm |mkdir |mv |cp |chmod|make |cargo build|pip install|docker )\b/;
@@ -941,21 +938,20 @@ export function classifyTurn(turnMessages: FoldMessage[]): TurnCategory {
   if (hasErrorBlock) return 'error';
 
   // Only count tool-result text errors from Bash (actual command failures).
-  // Research tools (Read, Grep, etc.) return source code that naturally
+  // Research tools (Read, Grep, Atlas) return source code that naturally
   // contains "Error:", "TypeError", etc. — those aren't real failures.
   const hasCommandError = toolCalls.some(tc =>
     tc.name === 'Bash' && (tc.resultText.includes('Error:') || tc.resultText.includes('FAILED')),
   );
   if (hasCommandError && toolCalls.every(tc => tc.name === 'Bash')) return 'error';
 
-  const shortNames = toolNames.map(n => n.replace(/^mcp__[^_]+__/, ''));
-  const actionCount = shortNames.filter(n => ACTION_TOOLS.has(n)).length;
+  const actionCount = toolNames.filter(n => ACTION_TOOLS.has(n)).length;
   const bashMutations = toolCalls.filter(tc => tc.name === 'Bash' && isMutatingBash(tc.input)).length;
   if (actionCount > 0 || bashMutations > 0) return 'action';
 
-  const researchCount = shortNames.filter(n => RESEARCH_TOOLS.has(n)).length;
+  const researchCount = toolNames.filter(n => RESEARCH_TOOLS.has(n)).length;
   const bashReads = toolCalls.filter(tc => tc.name === 'Bash' && !isMutatingBash(tc.input)).length;
-  const coordCount = shortNames.filter(n => COORDINATION_TOOLS.has(n)).length;
+  const coordCount = toolNames.filter(n => COORDINATION_TOOLS.has(n)).length;
 
   if (coordCount > 0 && researchCount === 0 && bashReads === 0) return 'coordination';
   if (researchCount > 0 || bashReads > 0) return 'research';
@@ -1016,6 +1012,28 @@ export function skeletonizeTool(call: ExtractedToolCall): string {
       return `🔎 ToolSearch: ${query}`;
     }
     default: {
+      if (shortName === 'atlas_query') {
+        const action = String(input.action ?? '');
+        const path = extractPath(input);
+        const query = input.query ? truncate(String(input.query), 30) : '';
+        if (action === 'lookup') return `🗺️ atlas lookup ${path}`;
+        if (action === 'search') return `🗺️ atlas search "${query}"`;
+        if (action === 'plan_context') return `🗺️ atlas plan "${query}"`;
+        return `🗺️ atlas ${action} ${path || query}`.trim();
+      }
+      if (shortName === 'atlas_commit') return `📌 atlas_commit ${extractPath(input)}`;
+      if (shortName === 'atlas_graph') return `🗺️ atlas_graph ${String(input.kind ?? '')} ${extractPath(input)}`.trim();
+      if (shortName === 'chatroom') {
+        const action = String(input.action ?? input.operation ?? 'send');
+        const room = String(input.room ?? input.room_name ?? '');
+        return `💬 chatroom ${action} ${room}`.trim();
+      }
+      if (shortName === 'tap_instance_messages') return `👂 tap ${String(input.target_instance ?? '')}`;
+      if (shortName === 'task_rail') return `📋 task_rail ${String(input.mode ?? '')} ${String(input.operation ?? '')}`.trim();
+      if (shortName === 'self_rebirth' || shortName === 'brain_rebirth') return `🔄 rebirth`;
+      if (shortName === 'spawn_instance') {
+        return `🌱 ${shortName} ${truncate(String(input.name ?? input.model ?? ''), 20)}`;
+      }
       const preview = truncate(resultText.split('\n')[0], 60);
       const belt = beltVerbatim(resultText);
       return belt ? `🔧 ${shortName} → ${preview} [${belt}]` : `🔧 ${shortName} → ${preview}`;
@@ -1231,7 +1249,7 @@ export function checkFoldTrigger(
 // it: at freeze EPOCH commits only (the prefix is recomputing anyway —
 // cache-safe by construction), when the block exceeds the char threshold, the
 // OLDEST folded spans collapse to one tombstone line each. Eligibility is the
-// session adapter's call: a turn is evictable
+// session's call (fcBaseSession.buildFoldEvictionInput): a turn is evictable
 // only when its content is durably covered by the episodic store (the capture
 // cursor advances past episode-bearing ranges only after the store CONFIRMS
 // the write) AND it has been folded for ≥2 epochs. Evicted content is not
@@ -1282,7 +1300,7 @@ export function mergeEvictionSpans(
 
 /**
  * Session-side eligibility ceiling for NEW eviction (pure; exported for the
- * session adapter and tests). A turn ordinal is evictable only when BOTH:
+ * fcBaseSession glue and tests). A turn ordinal is evictable only when BOTH:
  *   - durable coverage: the turn ends at or below `durableCursorIndex` (the
  *     episodic capture cursor — advances past episode-bearing ranges only
  *     after the store CONFIRMS the write, and past episode-free ranges
@@ -1706,7 +1724,7 @@ export function foldContext(
 // (most recent N results per turn) at full fidelity.
 //
 // Recovery: raw transcript lives in JSONL on disk. An agent can
-// recover from raw history without re-investigating.
+// self-tap to recover any folded result without re-investigating.
 // ══════════════════════════════════════════════════════════════════════
 
 export interface IntraTurnFoldConfig {
@@ -1716,6 +1734,8 @@ export interface IntraTurnFoldConfig {
   minTruncateSize: number;
   /** Only apply when total char count exceeds this. */
   charThreshold: number;
+  /** Higher threshold for atlas_query lookup results — they carry structured metadata worth preserving. */
+  atlasLookupThreshold: number;
   /** File paths currently claimed via partner_claim_file — these are never folded (auto-unfold on claim). */
   claimedPaths?: ReadonlySet<string>;
 }
@@ -1724,6 +1744,7 @@ export const DEFAULT_INTRA_FOLD_CONFIG: IntraTurnFoldConfig = {
   tailBuffer: 5,
   minTruncateSize: 500,
   charThreshold: 400_000,
+  atlasLookupThreshold: 8_000,
 };
 
 /**
@@ -1739,8 +1760,10 @@ export const DEFAULT_INTRA_FOLD_CONFIG: IntraTurnFoldConfig = {
  *   - minTruncateSize is raised to 2_000 so only genuinely expensive results
  *     fold — fold the whales, keep the minnows. Small/medium results that are
  *     already cheap stay verbatim rather than churning into ~80-char markers.
+ *   - atlas lookups < atlasLookupThreshold stay full; larger ones keep all
+ *     metadata (Purpose/Hazards/Patterns) and fold only the raw source block
  *   - claimed paths and error results are never folded
- *   - every folded result keeps a `recover from raw history` path (raw JSONL intact)
+ *   - every folded result keeps a `self-tap to recover` path (raw JSONL intact)
  *
  * Turns with <= tailBuffer substantial results still no-op naturally (the tail
  * buffer covers them), so short turns are unaffected — folding only bites once
@@ -1750,6 +1773,7 @@ export const ALWAYS_ON_INTRA_FOLD_CONFIG: IntraTurnFoldConfig = {
   tailBuffer: 5,
   minTruncateSize: 2_000,
   charThreshold: 0,
+  atlasLookupThreshold: 8_000,
 };
 
 export interface IntraTurnFoldResult {
@@ -1769,6 +1793,8 @@ interface ToolResultRef {
   toolId: string;
   charCount: number;
   isError: boolean;
+  /** Original content text — needed for atlas metadata preservation (feature #5). */
+  contentText: string;
 }
 
 function geminiFunctionResponseText(response: unknown): string {
@@ -1790,6 +1816,8 @@ function withFoldedGeminiFunctionResponse(response: unknown, foldedText: string)
 interface ToolInfo {
   name: string;
   path: string;
+  /** For atlas_query tools, the action parameter (lookup, search, etc.) */
+  atlasAction?: string;
 }
 
 function buildToolInfoMap(turnMessages: FoldMessage[]): Map<string, ToolInfo> {
@@ -1802,7 +1830,9 @@ function buildToolInfoMap(turnMessages: FoldMessage[]): Map<string, ToolInfo> {
         if (block?.type === 'tool_use' && block.id) {
           const name = block.name ?? 'unknown';
           const input = block.input ?? {};
-          map.set(block.id, { name, path: extractPath(input) });
+          const shortName = name.replace(/^mcp__[^_]+__/, '');
+          const atlasAction = shortName === 'atlas_query' ? String(input.action ?? '') : undefined;
+          map.set(block.id, { name, path: extractPath(input), atlasAction });
         }
       }
     }
@@ -1812,7 +1842,9 @@ function buildToolInfoMap(turnMessages: FoldMessage[]): Map<string, ToolInfo> {
           let args: Record<string, unknown> = {};
           try { args = JSON.parse(tc.function.arguments ?? '{}'); } catch { /* skip */ }
           const name = tc.function.name;
-          map.set(tc.id, { name, path: extractPath(args) });
+          const shortName = name.replace(/^mcp__[^_]+__/, '');
+          const atlasAction = shortName === 'atlas_query' ? String(args.action ?? '') : undefined;
+          map.set(tc.id, { name, path: extractPath(args), atlasAction });
         }
       }
     }
@@ -1823,7 +1855,9 @@ function buildToolInfoMap(turnMessages: FoldMessage[]): Map<string, ToolInfo> {
           if (fc.name) {
             const tcId = fc.id || '';
             const args = (fc.args ?? {}) as Record<string, unknown>;
-            map.set(tcId, { name: fc.name, path: extractPath(args) });
+            const shortName = fc.name.replace(/^mcp__[^_]+__/, '');
+            const atlasAction = shortName === 'atlas_query' ? String(args.action ?? '') : undefined;
+            map.set(tcId, { name: fc.name, path: extractPath(args), atlasAction });
           }
         }
       }
@@ -1831,6 +1865,12 @@ function buildToolInfoMap(turnMessages: FoldMessage[]): Map<string, ToolInfo> {
   }
 
   return map;
+}
+
+/** Check if a tool name (possibly with mcp prefix) is an atlas_query tool. */
+function isAtlasQueryTool(name: string): boolean {
+  const short = name.replace(/^mcp__[^_]+__/, '');
+  return short === 'atlas_query';
 }
 
 /** Check if a tool result path matches any claimed path (normalized comparison). */
@@ -1889,6 +1929,43 @@ export function extractToolPathSet(messages: readonly FoldMessage[]): Set<string
   return paths;
 }
 
+/**
+ * For atlas_query results, split content into metadata (everything before ## Source)
+ * and source code. Return metadata + fold marker for source, or null if not an atlas result.
+ */
+function foldAtlasPreservingMetadata(
+  content: string,
+  info: ToolInfo | undefined,
+  charCount: number,
+): string | null {
+  if (!info || !isAtlasQueryTool(info.name)) return null;
+
+  // Find the source section boundary
+  const sourceMarker = '\n## Source';
+  const sourceIdx = content.indexOf(sourceMarker);
+  if (sourceIdx === -1) {
+    // No source section — might be a search/cluster/brief result, not a lookup.
+    // Only apply metadata preservation for lookup results.
+    if (info.atlasAction === 'lookup') {
+      // Lookup without source section — keep the metadata intact, add fold note at end
+      return content + '\n\n[Folded source section — no source block found in this result]';
+    }
+    return null;
+  }
+
+  const metadata = content.slice(0, sourceIdx);
+  const metadataLen = metadata.length;
+  const sourceLen = charCount - metadataLen;
+
+  // If metadata alone is already huge (>20K), fold everything — the metadata is the bulk
+  if (metadataLen > 20_000) return null;
+
+  // Preserve metadata, fold the source
+  const toolName = info.name.replace(/^mcp__[^_]+__/, '');
+  const pathStr = info.path ? ` ${info.path}` : '';
+  return metadata.trimEnd() + `\n\n## Source [Folded: ${toolName}${pathStr} — ${sourceLen.toLocaleString()} chars of source code | self-tap to recover]`;
+}
+
 function findToolResults(turnMessages: FoldMessage[]): ToolResultRef[] {
   const refs: ToolResultRef[] = [];
 
@@ -1910,6 +1987,7 @@ function findToolResults(turnMessages: FoldMessage[]): ToolResultRef[] {
             toolId: block.tool_use_id,
             charCount: contentStr.length,
             isError: block.is_error === true,
+            contentText: contentStr,
           });
         }
       }
@@ -1922,6 +2000,7 @@ function findToolResults(turnMessages: FoldMessage[]): ToolResultRef[] {
         toolId: (msg as any).tool_call_id,
         charCount: content.length,
         isError: false,
+        contentText: content,
       });
     }
 
@@ -1937,6 +2016,7 @@ function findToolResults(turnMessages: FoldMessage[]): ToolResultRef[] {
             toolId: fr.id,
             charCount: contentStr.length,
             isError: false,
+            contentText: contentStr,
           });
         }
       }
@@ -1946,10 +2026,17 @@ function findToolResults(turnMessages: FoldMessage[]): ToolResultRef[] {
   return refs;
 }
 
-function foldSummaryText(info: ToolInfo | undefined, charCount: number): string {
+function foldSummaryText(info: ToolInfo | undefined, charCount: number, originalContent?: string): string {
   const toolName = info?.name?.replace(/^mcp__[^_]+__/, '') ?? 'tool';
   const pathStr = info?.path ? ` ${info.path}` : '';
-  return `[Folded: ${toolName}${pathStr} — ${charCount.toLocaleString()} chars | recover from raw history]`;
+
+  // Feature #5: For atlas_query results, try preserving metadata
+  if (originalContent && info && isAtlasQueryTool(info.name)) {
+    const preserved = foldAtlasPreservingMetadata(originalContent, info, charCount);
+    if (preserved !== null) return preserved;
+  }
+
+  return `[Folded: ${toolName}${pathStr} — ${charCount.toLocaleString()} chars | self-tap to recover]`;
 }
 
 interface TurnFoldStats { folded: number; kept: number }
@@ -1987,6 +2074,14 @@ function foldTurnToolResults(
       keepSet.add(i);
       continue;
     }
+
+    // Feature #2: Higher threshold for atlas_query lookup results
+    if (info && isAtlasQueryTool(info.name) && info.atlasAction === 'lookup') {
+      if (ref.charCount < config.atlasLookupThreshold) {
+        keepSet.add(i);
+      }
+      // atlas lookups above threshold proceed to fold (with feature #5 metadata preservation)
+    }
   }
 
   const foldTargets = new Map<string, ToolResultRef>();
@@ -2017,7 +2112,7 @@ function foldTurnToolResults(
     if (msg.role === 'tool' && foldTargets.has(`${i}`)) {
       const ref = foldTargets.get(`${i}`)!;
       const info = toolInfoMap.get(ref.toolId);
-      foldedMessages.push({ ...msg, content: foldSummaryText(info, ref.charCount) });
+      foldedMessages.push({ ...msg, content: foldSummaryText(info, ref.charCount, ref.contentText) });
       continue;
     }
 
@@ -2033,7 +2128,7 @@ function foldTurnToolResults(
         if (block?.type === 'tool_result' && foldTargets.has(key)) {
           const ref = foldTargets.get(key)!;
           const info = toolInfoMap.get(ref.toolId);
-          newContent.push({ ...block, content: foldSummaryText(info, ref.charCount) });
+          newContent.push({ ...block, content: foldSummaryText(info, ref.charCount, ref.contentText) });
           changed = true;
         } else {
           newContent.push(block);
@@ -2061,7 +2156,7 @@ function foldTurnToolResults(
             ...part,
             functionResponse: {
               ...fr,
-              response: withFoldedGeminiFunctionResponse(fr.response, foldSummaryText(info, ref.charCount)),
+              response: withFoldedGeminiFunctionResponse(fr.response, foldSummaryText(info, ref.charCount, ref.contentText)),
             },
           });
           changed = true;
@@ -2088,7 +2183,7 @@ function foldTurnToolResults(
  * mutates input — returns a new array.
  *
  * Recovery path: raw transcript persists in JSONL on disk; agents can
- * recover from raw history.
+ * self-tap to recover any folded result.
  */
 export function intraTurnFold(
   messages: FoldMessage[],

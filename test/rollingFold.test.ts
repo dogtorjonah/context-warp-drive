@@ -1,3 +1,22 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Authoritative test-runner note (rail-ed4a7878 step-9)
+//
+// In the my-monorepo monorepo this file is NOT executed by the relay's vitest:
+// that runner's `include` is scoped to relay/src/__tests__, and context-warp is
+// not a monorepo npm workspace, so its devDeps (vitest ^2.1.0) are not installed
+// in-tree and `vitest/config` does not resolve from here.
+//
+// The canonical fold engine IS covered in-tree by relay/src/__tests__/rollingFold.test.ts
+// (currently 169 tests, green): relay/src/rollingFold.ts is a zero-logic
+// `export *` re-export shim of THIS package's src/rollingFold.ts (enforced by the
+// context-warp-parity check, drift=0), so every relay assertion executes this
+// package's own source. There is no shim-only coverage illusion — the canonical
+// copy, not just the shim, is what runs.
+//
+// To run THIS standalone copy directly (e.g. published-package CI), provision the
+// package's own devDeps first:
+//   cd packages/context-warp && npm install && npm test
+// ─────────────────────────────────────────────────────────────────────────────
 import { describe, expect, test } from 'vitest';
 
 import {
@@ -5,6 +24,7 @@ import {
   skeletonizeTool,
   extractAssistantEssence,
   extractAssistantText,
+  extractUserText,
   extractToolPathSet,
   collapseSequences,
   checkFoldTrigger,
@@ -20,9 +40,8 @@ import {
   LABEL_MAX_CHARS,
   isSyntheticContextText,
   stripUserMessageVaultBlocks,
-  USER_MESSAGE_VAULT_PREFIX,
   USER_MESSAGE_VAULT_END,
-  extractUserText,
+  USER_MESSAGE_VAULT_PREFIX,
   formatFoldEpochStamp,
   formatFoldTombstoneLine,
   mergeEvictionSpans,
@@ -113,12 +132,12 @@ function buildDecisionTurn(): FoldMessage[] {
 }
 
 function buildCoordinationTurn(): FoldMessage[] {
-  const id1 = 'toolu_agent1';
+  const id1 = 'toolu_chat1';
   return [
-    userMsg('Delegate the auth refactor'),
-    anthropicToolUse('Agent', { description: 'auth refactor', prompt: 'Refactor the auth module' }, id1),
-    anthropicToolResult(id1, 'Sub-agent completed the auth refactor'),
-    assistantMsg('Delegated the auth refactor to a sub-agent.'),
+    userMsg('Check in with the team'),
+    anthropicToolUse('mcp__agent-bridge__chatroom', { action: 'send', room: 'dev-auth', message: 'Auth refactor complete' }, id1),
+    anthropicToolResult(id1, 'Message sent to #dev-auth'),
+    assistantMsg('Posted the update to the dev-auth chatroom.'),
   ];
 }
 
@@ -193,9 +212,9 @@ describe('classifyTurn', () => {
 
 describe('skeletonizeTool', () => {
   test('Read tool', () => {
-    const skeleton = skeletonizeTool({ name: 'Read', input: { file_path: '/home/user/my-app/project/src/auth.ts' }, resultText: 'source', toolId: 't1' });
+    const skeleton = skeletonizeTool({ name: 'Read', input: { file_path: '/home/user/my-monorepo/relay/src/auth.ts' }, resultText: 'source', toolId: 't1' });
     expect(skeleton).toContain('📖');
-    expect(skeleton).toContain('project/src/auth.ts');
+    expect(skeleton).toContain('relay/src/auth.ts');
   });
 
   test('Grep tool', () => {
@@ -220,20 +239,42 @@ describe('skeletonizeTool', () => {
   test('Edit tool preserves diff summary', () => {
     const skeleton = skeletonizeTool({
       name: 'Edit',
-      input: { file_path: '/home/user/my-app/project/src/auth.ts', old_string: 'return false;', new_string: 'return true;' },
+      input: { file_path: '/home/user/my-monorepo/relay/src/auth.ts', old_string: 'return false;', new_string: 'return true;' },
       resultText: 'edited',
       toolId: 't5',
     });
     expect(skeleton).toContain('✏️');
-    expect(skeleton).toContain('project/src/auth.ts');
+    expect(skeleton).toContain('relay/src/auth.ts');
     expect(skeleton).toContain('return false;');
     expect(skeleton).toContain('return true;');
+  });
+
+  test('atlas_query tool', () => {
+    const skeleton = skeletonizeTool({
+      name: 'mcp__agent-bridge__atlas_query',
+      input: { action: 'search', query: 'context thinning' },
+      resultText: 'results',
+      toolId: 't6',
+    });
+    expect(skeleton).toContain('🗺️');
+    expect(skeleton).toContain('atlas search');
+  });
+
+  test('chatroom tool', () => {
+    const skeleton = skeletonizeTool({
+      name: 'mcp__agent-bridge__chatroom',
+      input: { action: 'send', room: 'dev-auth' },
+      resultText: 'sent',
+      toolId: 't7',
+    });
+    expect(skeleton).toContain('💬');
+    expect(skeleton).toContain('chatroom');
   });
 
   test('Write tool', () => {
     const skeleton = skeletonizeTool({
       name: 'Write',
-      input: { file_path: '/home/user/my-app/project/src/newFile.ts', content: 'x'.repeat(500) },
+      input: { file_path: '/home/user/my-monorepo/relay/src/newFile.ts', content: 'x'.repeat(500) },
       resultText: 'written',
       toolId: 't8',
     });
@@ -507,7 +548,7 @@ describe('foldContext end-to-end', () => {
     );
     expect(foldBlock).toBeDefined();
     const content = foldBlock!.content as string;
-    expect(content).toContain('Delegated the auth refactor');
+    expect(content).toContain('Posted the update');
   });
 
   test('budget-based retention: skeleton when over budget', () => {
@@ -599,7 +640,7 @@ describe('planActiveTurnStepFold — marathon step-fold (single oversized turn)'
   // ONE detected turn that inter-turn fold can never compress (the MiniMax-M3 400
   // failure mode). Step-fold segments it so foldContext can skeletonize old steps.
   function buildMarathon(steps: number, resultChars: number): FoldMessage[] {
-    const msgs: FoldMessage[] = [userMsg('KICKOFF: sweep every file and review each one')];
+    const msgs: FoldMessage[] = [userMsg('KICKOFF: sweep every file and atlas-commit each one')];
     for (let i = 0; i < steps; i++) {
       const id = `toolu_step_${i}`;
       msgs.push({
@@ -742,14 +783,14 @@ describe('planActiveTurnStepFold — marathon step-fold (single oversized turn)'
       {
         role: 'model',
         parts: [
-          { text: 'Gemini reasoning about project/src/rollingFold.ts' },
-          { functionCall: { name: 'read_file', args: { path: 'project/src/rollingFold.ts' }, id: 'call_1' } },
+          { text: 'Gemini reasoning about relay/src/rollingFold.ts' },
+          { functionCall: { name: 'read_file', args: { path: 'relay/src/rollingFold.ts' }, id: 'call_1' } },
         ],
       },
     ] as FoldMessage[];
 
     expect(extractAssistantText(msgs)).toContain('Gemini reasoning');
-    expect(extractToolPathSet(msgs)).toEqual(new Set(['project/src/rollingFold.ts']));
+    expect(extractToolPathSet(msgs)).toEqual(new Set(['relay/src/rollingFold.ts']));
   });
 
   test('produces valid user/assistant alternation at the fold seam (ack dropped, no consecutive assistants)', () => {
@@ -782,7 +823,7 @@ describe('planActiveTurnStepFold — marathon step-fold (single oversized turn)'
       userMsg('KICKOFF'),
       {
         role: 'model',
-        parts: [{ functionCall: { name: 'read_file', args: { path: 'project/src/a.ts' }, id: 'call_1' }, thoughtSignature: 'SIG_1' }],
+        parts: [{ functionCall: { name: 'read_file', args: { path: 'relay/src/a.ts' }, id: 'call_1' }, thoughtSignature: 'SIG_1' }],
       },
       {
         role: 'user',
@@ -794,13 +835,14 @@ describe('planActiveTurnStepFold — marathon step-fold (single oversized turn)'
       tailBuffer: 0,
       minTruncateSize: 100,
       charThreshold: 0,
+      atlasLookupThreshold: 100,
     });
 
     expect(result.toolResultsFolded).toBe(1);
     const foldedResponse = (result.messages[2] as any).parts[0].functionResponse;
     expect(foldedResponse.id).toBe('call_1');
     expect(foldedResponse.name).toBe('read_file');
-    expect(foldedResponse.response.result).toContain('[Folded: read_file project/src/a.ts');
+    expect(foldedResponse.response.result).toContain('[Folded: read_file relay/src/a.ts');
   });
 
   test('intra-turn fold keeps Gemini functionResponse parts for claimed paths', () => {
@@ -808,7 +850,7 @@ describe('planActiveTurnStepFold — marathon step-fold (single oversized turn)'
       userMsg('KICKOFF'),
       {
         role: 'model',
-        parts: [{ functionCall: { name: 'read_file', args: { path: 'project/src/a.ts' }, id: 'call_1' } }],
+        parts: [{ functionCall: { name: 'read_file', args: { path: 'relay/src/a.ts' }, id: 'call_1' } }],
       },
       {
         role: 'user',
@@ -820,7 +862,8 @@ describe('planActiveTurnStepFold — marathon step-fold (single oversized turn)'
       tailBuffer: 0,
       minTruncateSize: 100,
       charThreshold: 0,
-      claimedPaths: new Set(['project/src/a.ts']),
+      atlasLookupThreshold: 100,
+      claimedPaths: new Set(['relay/src/a.ts']),
     });
 
     expect(result.toolResultsFolded).toBe(0);
@@ -865,7 +908,7 @@ describe('OpenAI format support', () => {
     const callId = 'call_abc123';
     const messages = [
       userMsg('first turn'),
-      openaiToolCall('Read', { file_path: '/home/user/my-app/project/src/auth.ts' }, callId),
+      openaiToolCall('Read', { file_path: '/home/user/my-monorepo/relay/src/auth.ts' }, callId),
       openaiToolResult(callId, 'x'.repeat(5000)),
       assistantMsg('Read the file.'),
       userMsg('second turn'),
@@ -890,6 +933,7 @@ describe('intraTurnFold', () => {
     tailBuffer: 3,
     minTruncateSize: 100,
     charThreshold: 100,  // trigger on tiny conversations for testing
+    atlasLookupThreshold: 8_000,
   };
 
   function buildHeavyTurn(toolCount: number, resultSize = 2000): FoldMessage[] {
@@ -897,7 +941,7 @@ describe('intraTurnFold', () => {
     for (let i = 0; i < toolCount; i++) {
       const id = `toolu_heavy_${i}`;
       msgs.push(
-        anthropicToolUse('Read', { file_path: `/home/user/my-app/project/src/file${i}.ts` }, id),
+        anthropicToolUse('Read', { file_path: `/home/user/my-monorepo/relay/src/file${i}.ts` }, id),
         anthropicToolResult(id, `// source code for file${i}\n` + 'x'.repeat(resultSize)),
       );
     }
@@ -942,7 +986,7 @@ describe('intraTurnFold', () => {
     const foldedBlock = (foldedMsg!.content as any[]).find(
       (b: any) => b?.type === 'tool_result' && typeof b.content === 'string' && b.content.includes('[Folded:'),
     );
-    expect(foldedBlock.content).toContain('recover from raw history');
+    expect(foldedBlock.content).toContain('self-tap to recover');
     expect(foldedBlock.content).toContain('Read');
     expect(foldedBlock.content).toMatch(/file\d\.ts/);
   });
@@ -1010,7 +1054,7 @@ describe('intraTurnFold', () => {
     for (let i = 0; i < 8; i++) {
       const id = `call_oai_${i}`;
       msgs.push(
-        openaiToolCall('Read', { file_path: `/home/user/my-app/src/f${i}.ts` }, id),
+        openaiToolCall('Read', { file_path: `/home/user/my-monorepo/src/f${i}.ts` }, id),
         openaiToolResult(id, 'content '.repeat(300)),
       );
     }
@@ -1078,6 +1122,187 @@ describe('intraTurnFold', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════
+// Feature #2: Atlas lookup threshold
+// ══════════════════════════════════════════════════════════════════════
+
+describe('intraTurnFold — atlas lookup threshold (#2)', () => {
+  const config: IntraTurnFoldConfig = {
+    tailBuffer: 1,
+    minTruncateSize: 100,
+    charThreshold: 100,
+    atlasLookupThreshold: 5_000,
+  };
+
+  function buildAtlasLookupTurn(lookupSize: number, extraTools = 0): FoldMessage[] {
+    const msgs: FoldMessage[] = [userMsg('Investigate the codebase')];
+    const atlasId = 'toolu_atlas1';
+    const atlasContent = [
+      '# relay/src/foo.ts',
+      '## Purpose',
+      'Does important things.',
+      '## Patterns',
+      'factory, singleton',
+      '## Hazards',
+      '- Must not be called after shutdown',
+      '## Source',
+      '```',
+      'x'.repeat(lookupSize),
+      '```',
+    ].join('\n');
+    msgs.push(
+      anthropicToolUse('mcp__agent-bridge__atlas_query', { action: 'lookup', file_path: 'relay/src/foo.ts' }, atlasId),
+      anthropicToolResult(atlasId, atlasContent),
+    );
+    // Add extra tools to exceed tail buffer
+    for (let i = 0; i < extraTools; i++) {
+      const id = `toolu_extra_${i}`;
+      msgs.push(
+        anthropicToolUse('Read', { file_path: `/home/user/my-monorepo/relay/src/file${i}.ts` }, id),
+        anthropicToolResult(id, 'x'.repeat(2000)),
+      );
+    }
+    msgs.push(assistantMsg('Investigation complete.'));
+    return msgs;
+  }
+
+  test('keeps small atlas lookup results under threshold', () => {
+    // 1000 chars < atlasLookupThreshold of 5000
+    const turn = buildAtlasLookupTurn(500, 3);
+    const result = intraTurnFold(turn, config);
+    // The atlas result should be kept (not folded) even though it's outside the tail buffer
+    const atlasResult = result.messages.find(m => {
+      if (m.role !== 'user' || !Array.isArray(m.content)) return false;
+      const blocks = m.content as any[];
+      return blocks.some(b => b?.content?.includes('Does important things'));
+    });
+    expect(atlasResult).toBeDefined();
+  });
+
+  test('folds large atlas lookup results above threshold', () => {
+    // 6000 chars > atlasLookupThreshold of 5000
+    const turn = buildAtlasLookupTurn(5800, 3);
+    const result = intraTurnFold(turn, config);
+    // The atlas result should be folded
+    const foldedContent = JSON.stringify(result.messages);
+    expect(foldedContent).toContain('[Folded:');
+  });
+
+  test('other tool types are unaffected by atlas threshold', () => {
+    // Regular Read tool with 1000 chars — should fold normally (above minTruncateSize of 100)
+    const msgs: FoldMessage[] = [userMsg('Read stuff')];
+    const id = 'toolu_read1';
+    msgs.push(
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/foo.ts' }, id),
+      anthropicToolResult(id, 'x'.repeat(1000)),
+    );
+    // Add a tail buffer entry so the Read is foldable
+    const tailId = 'toolu_tail';
+    msgs.push(
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/bar.ts' }, tailId),
+      anthropicToolResult(tailId, 'tail content'),
+    );
+    msgs.push(assistantMsg('Done.'));
+    const result = intraTurnFold(msgs, config);
+    // The first Read should be folded (not protected by atlas threshold — it's a Read, not atlas)
+    const foldedContent = JSON.stringify(result.messages);
+    expect(foldedContent).toContain('[Folded:');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// Feature #5: Preserve atlas metadata when folding
+// ══════════════════════════════════════════════════════════════════════
+
+describe('intraTurnFold — preserve atlas metadata (#5)', () => {
+  const config: IntraTurnFoldConfig = {
+    tailBuffer: 1,
+    minTruncateSize: 100,
+    charThreshold: 100,
+    atlasLookupThreshold: 100, // low so we trigger folding
+  };
+
+  test('preserves metadata section and folds source section', () => {
+    const atlasId = 'toolu_atlas1';
+    const metadata = [
+      '# relay/src/foo.ts',
+      '## Purpose',
+      'Core authentication module handling JWT validation.',
+      '## Patterns',
+      'factory, singleton, middleware-chain',
+      '## Hazards',
+      '- Must not be called after shutdown',
+      '- Token refresh race condition possible',
+      '## Public API',
+      '- authenticate(token: string): Promise<User>',
+      '- validateRefresh(refreshToken: string): Promise<boolean>',
+    ].join('\n');
+    const sourceCode = [
+      '',
+      '## Source (234 lines)',
+      '```',
+      'export function authenticate(token: string) {',
+      '  // lots of code here',
+      '  return verify(token);',
+      '}',
+      '```',
+    ].join('\n');
+    const fullContent = metadata + sourceCode;
+
+    const msgs: FoldMessage[] = [
+      userMsg('Look at auth'),
+      anthropicToolUse('mcp__agent-bridge__atlas_query', { action: 'lookup', file_path: 'relay/src/foo.ts' }, atlasId),
+      anthropicToolResult(atlasId, fullContent),
+      // tail buffer
+      anthropicToolUse('Grep', { pattern: 'auth' }, 'toolu_tail'),
+      anthropicToolResult('toolu_tail', 'tail'),
+      assistantMsg('Done.'),
+    ];
+
+    const result = intraTurnFold(msgs, config);
+
+    // Find the folded atlas result
+    const foldedMsg = result.messages.find(m => {
+      if (m.role !== 'user' || !Array.isArray(m.content)) return false;
+      const blocks = m.content as any[];
+      return blocks.some(b => b?.content?.includes('Core authentication module'));
+    });
+
+    expect(foldedMsg).toBeDefined();
+    const foldedContent = JSON.stringify(foldedMsg);
+
+    // Metadata sections preserved
+    expect(foldedContent).toContain('## Purpose');
+    expect(foldedContent).toContain('Core authentication module');
+    expect(foldedContent).toContain('## Patterns');
+    expect(foldedContent).toContain('## Hazards');
+    expect(foldedContent).toContain('## Public API');
+
+    // Source code should be folded (replaced with marker)
+    expect(foldedContent).toContain('[Folded:');
+    expect(foldedContent).toContain('self-tap to recover');
+  });
+
+  test('non-atlas results still fold normally (full replacement)', () => {
+    const id = 'toolu_read1';
+    const content = '## Purpose\nSomething\n## Source\n```\n' + 'x'.repeat(300) + '\n```';
+    const msgs: FoldMessage[] = [
+      userMsg('Read stuff'),
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/foo.ts' }, id),
+      anthropicToolResult(id, content),
+      // tail buffer
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/bar.ts' }, 'toolu_tail'),
+      anthropicToolResult('toolu_tail', 'tail'),
+      assistantMsg('Done.'),
+    ];
+    const result = intraTurnFold(msgs, config);
+    const foldedContent = JSON.stringify(result.messages);
+    // Regular Read should fold entirely — no metadata preservation
+    expect(foldedContent).toContain('[Folded: Read');
+    expect(foldedContent).not.toContain('[Folded: atlas_query');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
 // Feature #1: Auto-unfold on file claim
 // ══════════════════════════════════════════════════════════════════════
 
@@ -1086,19 +1311,20 @@ describe('intraTurnFold — auto-unfold on claim (#1)', () => {
     tailBuffer: 1,
     minTruncateSize: 100,
     charThreshold: 100,
+    atlasLookupThreshold: 100,
   };
 
   test('keeps results for claimed files even outside tail buffer', () => {
-    const claimedPath = 'project/src/foo.ts';
+    const claimedPath = 'relay/src/foo.ts';
     const claimedPaths = new Set([claimedPath]);
 
     const id = 'toolu_read1';
     const msgs: FoldMessage[] = [
       userMsg('Edit the file'),
-      anthropicToolUse('Read', { file_path: `/home/user/my-app/${claimedPath}` }, id),
+      anthropicToolUse('Read', { file_path: `/home/user/my-monorepo/${claimedPath}` }, id),
       anthropicToolResult(id, 'x'.repeat(2000)),
       // tail buffer — different file
-      anthropicToolUse('Read', { file_path: '/home/user/my-app/project/src/bar.ts' }, 'toolu_tail'),
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/bar.ts' }, 'toolu_tail'),
       anthropicToolResult('toolu_tail', 'tail'),
       assistantMsg('Done.'),
     ];
@@ -1116,15 +1342,15 @@ describe('intraTurnFold — auto-unfold on claim (#1)', () => {
   });
 
   test('folds unclaimed files normally', () => {
-    const claimedPaths = new Set(['project/src/other.ts']);
+    const claimedPaths = new Set(['relay/src/other.ts']);
 
     const id = 'toolu_read1';
     const msgs: FoldMessage[] = [
       userMsg('Edit the file'),
-      anthropicToolUse('Read', { file_path: '/home/user/my-app/project/src/foo.ts' }, id),
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/foo.ts' }, id),
       anthropicToolResult(id, 'x'.repeat(2000)),
       // tail buffer
-      anthropicToolUse('Read', { file_path: '/home/user/my-app/project/src/bar.ts' }, 'toolu_tail'),
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/bar.ts' }, 'toolu_tail'),
       anthropicToolResult('toolu_tail', 'tail'),
       assistantMsg('Done.'),
     ];
@@ -1142,10 +1368,10 @@ describe('intraTurnFold — auto-unfold on claim (#1)', () => {
     const id = 'toolu_read1';
     const msgs: FoldMessage[] = [
       userMsg('Edit'),
-      anthropicToolUse('Read', { file_path: '/home/user/my-app/project/src/foo.ts' }, id),
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/foo.ts' }, id),
       anthropicToolResult(id, 'x'.repeat(2000)),
       // tail buffer
-      anthropicToolUse('Read', { file_path: '/home/user/my-app/project/src/bar.ts' }, 'toolu_tail'),
+      anthropicToolUse('Read', { file_path: '/home/user/my-monorepo/relay/src/bar.ts' }, 'toolu_tail'),
       anthropicToolResult('toolu_tail', 'tail'),
       assistantMsg('Done.'),
     ];
@@ -1173,8 +1399,8 @@ describe('nominateVerbatim — pattern coverage (P1/s5)', () => {
   });
 
   test('matches absolute path', () => {
-    const lits = nominateVerbatim('reading /home/jonah/my-app/project/src/foo.ts done');
-    expect(lits.some(l => l.includes('/project/src/foo.ts'))).toBe(true);
+    const lits = nominateVerbatim('reading /home/jonah/my-monorepo/relay/src/foo.ts done');
+    expect(lits.some(l => l.includes('/relay/src/foo.ts'))).toBe(true);
   });
 
   test('matches port=3002 key=value pair', () => {
@@ -1188,7 +1414,7 @@ describe('nominateVerbatim — pattern coverage (P1/s5)', () => {
   });
 
   test('matches issue ref #1234', () => {
-    const lits = nominateVerbatim('fixes #1234 in project');
+    const lits = nominateVerbatim('fixes #1234 in relay');
     expect(lits.some(l => l === '#1234')).toBe(true);
   });
 
@@ -1212,8 +1438,8 @@ describe('nominateVerbatim — pattern coverage (P1/s5)', () => {
     }
   });
 
-  test('short mixed hex (8-11, letters+digits) nominated — ticket ids, short git SHAs', () => {
-    const lits = nominateVerbatim('see ticket-1f6be5b4 at commit b602c1e8');
+  test('short mixed hex (8-11, letters+digits) nominated — rail ids, short git SHAs', () => {
+    const lits = nominateVerbatim('see rail-1f6be5b4 at commit b602c1e8');
     expect(lits).toContain('1f6be5b4');
     expect(lits).toContain('b602c1e8');
   });
@@ -1302,7 +1528,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const msgs: FoldMessage[] = [
       userMsg('first'),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_u1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_u1'),
       anthropicToolResult('toolu_u1', `content with ${uuid} inside`),
       assistantMsg('processed first'),
       userMsg('active'),
@@ -1340,11 +1566,11 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const msgs: FoldMessage[] = [
       userMsg('first'),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_s1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_s1'),
       anthropicToolResult('toolu_s1', `found ${uuid} in config`),
       assistantMsg('noted'),
       userMsg('second'),
-      anthropicToolUse('Read', { file_path: 'project/src/b.ts' }, 'toolu_s2'),
+      anthropicToolUse('Read', { file_path: 'relay/src/b.ts' }, 'toolu_s2'),
       anthropicToolResult('toolu_s2', `same value id: ${uuid} again`),
       assistantMsg('confirmed'),
       userMsg('active'),
@@ -1366,7 +1592,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const msgs: FoldMessage[] = [
       userMsg('first'),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_d1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_d1'),
       anthropicToolResult('toolu_d1', `value ${uuid} here`),
       assistantMsg('seen'),
       userMsg('active'),
@@ -1425,11 +1651,11 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     // second addition needs 3+36=39 extra → 36+39=75 > 36, so uuid2 is skipped.
     const msgs: FoldMessage[] = [
       userMsg('first'),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_r1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_r1'),
       anthropicToolResult('toolu_r1', 'content with ' + uuid1 + ' inside'),
       assistantMsg('processed first'),
       userMsg('second'),
-      anthropicToolUse('Read', { file_path: 'project/src/b.ts' }, 'toolu_r2'),
+      anthropicToolUse('Read', { file_path: 'relay/src/b.ts' }, 'toolu_r2'),
       anthropicToolResult('toolu_r2', 'content with ' + uuid2 + ' inside'),
       assistantMsg('processed second'),
       userMsg('active'),
@@ -1457,7 +1683,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const msgs: FoldMessage[] = [
       userMsg(`please investigate job ${uuid} for me`),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_up1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_up1'),
       anthropicToolResult('toolu_up1', 'file contents with no identifiers'),
       assistantMsg('looked, nothing relevant there'),
       userMsg('active'),
@@ -1482,7 +1708,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     );
     const msgs: FoldMessage[] = [
       userMsg('here is a giant log dump: ' + userUuids.join(' ')),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_sq1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_sq1'),
       anthropicToolResult('toolu_sq1', `agent working id ${agentUuid}`),
       assistantMsg('done'),
       userMsg('active'),
@@ -1508,7 +1734,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const msgs: FoldMessage[] = [
       userMsg(`debug ${uuid} please`),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_dd1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_dd1'),
       anthropicToolResult('toolu_dd1', `found ${uuid} in the file`),
       assistantMsg('confirmed'),
       userMsg('active'),
@@ -1527,7 +1753,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const msgs: FoldMessage[] = [
       userMsg(`pasted id ${uuid} here`),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_z1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_z1'),
       anthropicToolResult('toolu_z1', 'no identifiers in result'),
       assistantMsg('ok'),
       userMsg('active'),
@@ -1538,7 +1764,7 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     const content = (result.messages.find(m =>
       typeof m.content === 'string' && m.content.includes('[Conversation Context'),
     )!.content) as string;
-    expect(content).not.toContain('Coordinate Closet (conserved');
+    expect(content).not.toContain('⌖⌖⌖ COORDINATE CLOSET');
   });
 });
 
@@ -1572,7 +1798,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
   test('default MCP arm appends [literal] when result contains a hex id', () => {
     const hexId = 'deadbeefcafe'; // 12-char hex
     const skeleton = skeletonizeTool({
-      name: 'mcp__example__some_tool',
+      name: 'mcp__agent-bridge__some_tool',
       input: {},
       resultText: `id: ${hexId}`,
       toolId: 'tu3',
@@ -1583,7 +1809,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
 
   test('default arm has no bracket when result has no closet items', () => {
     const skeleton = skeletonizeTool({
-      name: 'mcp__example__some_tool',
+      name: 'mcp__agent-bridge__some_tool',
       input: {},
       resultText: 'plain text output nothing here',
       toolId: 'tu4',
@@ -1626,44 +1852,9 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
 // Fold-recall synthetic text exclusion (see foldRecall.ts)
 // ══════════════════════════════════════════════════════════════════════
 
-// ══════════════════════════════════════════════════════════════════════
-// User Message Vault — synthetic continuity note inside user turns
-// ══════════════════════════════════════════════════════════════════════
-
-describe('User Message Vault synthetic filtering', () => {
-  const vault = `${USER_MESSAGE_VAULT_PREFIX}\nold operator copy\n${USER_MESSAGE_VAULT_END}`;
-
-  test('standalone vault text is synthetic and never a turn boundary', () => {
-    expect(isSyntheticContextText(vault)).toBe(true);
-
-    const msgs: FoldMessage[] = [
-      userMsg(vault),
-      assistantMsg('continuing'),
-      userMsg('real request'),
-      assistantMsg('ok'),
-    ];
-
-    expect(detectTurns(msgs)).toHaveLength(1);
-  });
-
-  test('vault blocks are stripped before extracting genuine user text', () => {
-    const mixed = `real request\n\n${vault}`;
-
-    expect(stripUserMessageVaultBlocks(mixed)).toBe('real request');
-    expect(extractUserText([userMsg(mixed)])).toBe('real request');
-  });
-
-  test('incomplete vault marker mentions stay user-authored text', () => {
-    const text = `literal marker mention ${USER_MESSAGE_VAULT_PREFIX}`;
-
-    expect(stripUserMessageVaultBlocks(text)).toBe(text);
-    expect(extractUserText([userMsg(text)])).toBe(text);
-  });
-});
-
 describe('recall-card turn boundary exclusion', () => {
-  const CARD = '[Recalled from fold — Read project/src/foo.ts | trigger: path-touch project/src/foo.ts | 5,000 chars folded]\nrecalled body text here\n[End fold recall]';
-  const HINT = '[Fold recall hint — Read project/src/foo.ts folded earlier (5,000 chars) | trigger: claim project/src/foo.ts | recover from raw history]';
+  const CARD = '[Recalled from fold — Read relay/src/foo.ts | trigger: path-touch relay/src/foo.ts | 5,000 chars folded]\nrecalled body text here\n[End fold recall]';
+  const HINT = '[Fold recall hint — Read relay/src/foo.ts folded earlier (5,000 chars) | trigger: claim relay/src/foo.ts | self-tap to recover]';
 
   test('recall cards and hints never start a new turn (all three content arms)', () => {
     const msgs: FoldMessage[] = [
@@ -1725,8 +1916,8 @@ describe('recall-card turn boundary exclusion', () => {
 
 describe('formatFoldEpochStamp', () => {
   test('formats epoch number and detail as one bracketed line', () => {
-    const stamp = formatFoldEpochStamp(3, 'context-changed: claim project/src/foo.ts, gap 46s');
-    expect(stamp).toBe('[Fold epoch #3 — context-changed: claim project/src/foo.ts, gap 46s]');
+    const stamp = formatFoldEpochStamp(3, 'context-changed: claim relay/src/foo.ts, gap 46s');
+    expect(stamp).toBe('[Fold epoch #3 — context-changed: claim relay/src/foo.ts, gap 46s]');
     expect(stamp.startsWith('[Fold epoch #')).toBe(true);
     expect(stamp.endsWith(']')).toBe(true);
   });
@@ -1755,6 +1946,41 @@ describe('formatFoldEpochStamp', () => {
       assistantMsg('ok'),
     ];
     expect(detectTurns(msgs)).toHaveLength(2);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// User Message Vault — synthetic relay note inside user turns
+// ══════════════════════════════════════════════════════════════════════
+
+describe('User Message Vault synthetic filtering', () => {
+  const vault = `${USER_MESSAGE_VAULT_PREFIX}\nold operator copy\n${USER_MESSAGE_VAULT_END}`;
+
+  test('standalone vault text is synthetic and never a turn boundary', () => {
+    expect(isSyntheticContextText(vault)).toBe(true);
+
+    const msgs: FoldMessage[] = [
+      userMsg(vault),
+      assistantMsg('continuing'),
+      userMsg('real request'),
+      assistantMsg('ok'),
+    ];
+
+    expect(detectTurns(msgs)).toHaveLength(1);
+  });
+
+  test('vault blocks are stripped before extracting genuine user text', () => {
+    const mixed = `real request\n\n${vault}`;
+
+    expect(stripUserMessageVaultBlocks(mixed)).toBe('real request');
+    expect(extractUserText([userMsg(mixed)])).toBe('real request');
+  });
+
+  test('incomplete vault marker mentions stay user-authored text', () => {
+    const text = `literal marker mention ${USER_MESSAGE_VAULT_PREFIX}`;
+
+    expect(stripUserMessageVaultBlocks(text)).toBe(text);
+    expect(extractUserText([userMsg(text)])).toBe(text);
   });
 });
 
@@ -1811,7 +2037,7 @@ interface EvictionSimResult {
 }
 
 /**
- * Drive N freeze epochs the way the session adapter does: per epoch, append turns,
+ * Drive N freeze epochs the way fcBaseSession does: per epoch, append turns,
  * compute the eligibility ceiling (durable cursor ∧ ≥2-epoch age over the
  * recorded fold frontiers), fold with the carried span state, then adopt the
  * updated spans and record the frontier. `cursorCapTurns` simulates a store
@@ -2023,7 +2249,7 @@ describe('foldContext — episodic eviction (E10 sawtooth)', () => {
     expect(lastBlock).not.toContain(evictionBodyToken(0));
   });
 
-  test('evicted ordinals do not nominate into the coordinate closet', () => {
+  test('evicted ordinals do not nominate into the closet', () => {
     const messages: FoldMessage[] = [];
     for (let i = 0; i < 5; i++) messages.push(...evictionTurn(i));
     const result = foldContext(messages, 4, ALWAYS_ON_FOLD_CONFIG, {
@@ -2048,8 +2274,8 @@ describe('extractVerbatimContextLabel — Tier-1 annotated keep (page-out)', () 
   test('KV colon form → key name', () => {
     expect(extractVerbatimContextLabel('changelog_id: 7fd5835b00ab done', '7fd5835b00ab')).toBe('changelog_id');
   });
-  test('ticket-prefixed short hex → prose subject', () => {
-    expect(extractVerbatimContextLabel('see ticket-1f6be5b4 now', '1f6be5b4')).toBe('ticket');
+  test('rail-prefixed short hex → prose subject', () => {
+    expect(extractVerbatimContextLabel('see rail-1f6be5b4 now', '1f6be5b4')).toBe('rail');
   });
   test('UUID with preceding subject → subject', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
@@ -2097,7 +2323,7 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
   test('opaque hash from a keyed tool result renders value ⟦label⟧', () => {
     const msgs: FoldMessage[] = [
       userMsg('first'),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_l1'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_l1'),
       anthropicToolResult('toolu_l1', `changelog_id: ${hash} landed`),
       assistantMsg('processed'),
       userMsg('active'),
@@ -2112,7 +2338,7 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
   test('labelled closet line is byte-identical across runs (determinism)', () => {
     const msgs: FoldMessage[] = [
       userMsg('first'),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_l2'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_l2'),
       anthropicToolResult('toolu_l2', `changelog_id: ${hash} landed`),
       assistantMsg('processed'),
       userMsg('active'),
@@ -2125,7 +2351,7 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
   test('under tight budget the value is preferred over its label (labelled→bare→skip)', () => {
     const msgs: FoldMessage[] = [
       userMsg('first'),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_l3'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_l3'),
       anthropicToolResult('toolu_l3', `changelog_id: ${hash} landed`),
       assistantMsg('processed'),
       userMsg('active'),
@@ -2142,7 +2368,7 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
   test('P1b user-lane value also carries a label', () => {
     const msgs: FoldMessage[] = [
       userMsg(`changelog_id: ${hash} from operator`),
-      anthropicToolUse('Read', { file_path: 'project/src/a.ts' }, 'toolu_l4'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_l4'),
       anthropicToolResult('toolu_l4', 'plain content with no ids'),
       assistantMsg('ok'),
       userMsg('active'),

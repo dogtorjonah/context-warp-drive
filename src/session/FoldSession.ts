@@ -44,6 +44,14 @@ import {
   type FoldFreezeConfig,
   type FoldFreezeContext,
 } from '../foldFreeze.ts';
+import {
+  renderUserMessageVault,
+  recordUserMessageVaultEntry,
+  recordAssistantGlyphVaultEntry,
+  appendUserMessageVaultToView,
+  type UserMessageVaultEntry,
+  type AssistantGlyphVaultEntry,
+} from '../userMessageVault.ts';
 
 const EMPTY_CLAIMED: ReadonlySet<string> = new Set<string>();
 export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = 240_000;
@@ -85,8 +93,30 @@ export interface FoldSessionOptions {
    * tune. The host must pass measuredInputTokens to prepare() for it to fire.
    */
   readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
+  /**
+   * Glyph Grammar Vault companion. Off by default. When enabled, FoldSession
+   * keeps a bounded buffer of recent operator messages and the agent's own
+   * recent glyph-tagged turns (fed via {@link FoldSession.recordOperatorMessage}
+   * / {@link FoldSession.recordAssistantMessage}) and appends a rendered vault
+   * block to the OUTGOING send view each turn — never the raw history. The block
+   * lands on the newest text-bearing user turn (structurally in the cache-miss
+   * raw tail), so a hot frozen prefix stays byte-identical. It self-gates:
+   * messages still visible verbatim in the view dedupe out, so pre-fold the
+   * vault renders empty.
+   */
+  readonly vault?: boolean | FoldVaultConfig;
   /** Clock injection for deterministic tests. Defaults to Date.now. */
   readonly now?: () => number;
+}
+
+export interface FoldVaultConfig {
+  /**
+   * Bound the vault append to the newest `tailWindow` messages of the send view
+   * for extra cache-tail safety. Optional — the newest user turn is already
+   * structurally in the raw tail, so the default (unbounded scan from newest)
+   * is cache-safe on append-only history.
+   */
+  readonly tailWindow?: number;
 }
 
 export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
@@ -136,6 +166,12 @@ export interface FoldOutcome {
   /** The full fold result, present only on an epoch (fresh fold). */
   readonly result?: FoldResult;
   readonly stats: FoldStats;
+  /**
+   * The rendered Glyph Grammar Vault block appended to `messages` this turn, when
+   * the vault companion is enabled and produced a non-empty block. Omitted when
+   * the vault is off or self-gated to empty.
+   */
+  readonly vault?: string;
 }
 
 /**
@@ -151,6 +187,10 @@ export class FoldSession {
   private readonly evictionThresholdChars: number;
   private readonly pressureCeilingTokens: number | null;
   private readonly clock: () => number;
+  private readonly vaultEnabled: boolean;
+  private readonly vaultTailWindow: number | undefined;
+  private readonly userMessageVaultEntries: UserMessageVaultEntry[] = [];
+  private readonly assistantGlyphVaultEntries: AssistantGlyphVaultEntry[] = [];
   private foldEpochs = 0;
   private foldEvictedSpans: FoldEvictionSpan[] = [];
   private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
@@ -185,8 +225,57 @@ export class FoldSession {
         : options.pressureCeiling?.tokens ?? DEFAULT_FOLD_PRESSURE_CEILING_TOKENS;
       this.pressureCeilingTokens = Number.isFinite(configured) && configured > 0 ? configured : null;
     }
+    if (options.vault === true) {
+      this.vaultEnabled = true;
+      this.vaultTailWindow = undefined;
+    } else if (options.vault && typeof options.vault === 'object') {
+      this.vaultEnabled = true;
+      this.vaultTailWindow = typeof options.vault.tailWindow === 'number' && Number.isFinite(options.vault.tailWindow)
+        ? options.vault.tailWindow
+        : undefined;
+    } else {
+      this.vaultEnabled = false;
+      this.vaultTailWindow = undefined;
+    }
     this.freezeState = createFoldFreezeState();
     this.clock = options.now ?? Date.now;
+  }
+
+  /**
+   * Record a genuine operator/user message into the vault buffer. No-op unless
+   * the vault companion is enabled. Bounded + deduped at render.
+   */
+  recordOperatorMessage(text: string, createdAt?: string): void {
+    if (!this.vaultEnabled) return;
+    recordUserMessageVaultEntry(this.userMessageVaultEntries, text, createdAt);
+  }
+
+  /**
+   * Record a completed assistant message into the glyph vault buffer (its
+   * opening register is classified for scarce-slot priority). No-op unless the
+   * vault companion is enabled.
+   */
+  recordAssistantMessage(text: string, createdAt?: string): void {
+    if (!this.vaultEnabled) return;
+    recordAssistantGlyphVaultEntry(this.assistantGlyphVaultEntries, text, createdAt);
+  }
+
+  /**
+   * Append the rendered Glyph Grammar Vault to the outgoing send view (never the
+   * raw history). Passing the view as visibleUserMessages self-gates the vault:
+   * any operator/assistant text still present verbatim in the view dedupes out,
+   * so pre-fold (everything still visible) the vault renders empty.
+   */
+  private applyVault(outcome: FoldOutcome): FoldOutcome {
+    if (!this.vaultEnabled) return outcome;
+    const vault = renderUserMessageVault(this.userMessageVaultEntries, {
+      visibleUserMessages: outcome.messages,
+      assistantEntries: this.assistantGlyphVaultEntries,
+    });
+    if (!vault) return outcome;
+    const messages = appendUserMessageVaultToView(outcome.messages, vault, this.vaultTailWindow);
+    if (messages === outcome.messages) return { ...outcome, vault };
+    return { ...outcome, messages, vault };
   }
 
   /** Count conversational turns in a provider-shaped message array. */
@@ -303,7 +392,7 @@ export class FoldSession {
         this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
       );
       this.commitEvictionEpoch(result, upcomingEpoch);
-      return {
+      return this.applyVault({
         messages: result.messages,
         cacheHot: false,
         result,
@@ -311,7 +400,7 @@ export class FoldSession {
           ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
           ...(pressureCeilingTriggered ? { epochReason: 'pressure-ceiling' } : {}),
         },
-      };
+      });
     }
 
     const ctx: FoldFreezeContext = {
@@ -322,7 +411,7 @@ export class FoldSession {
 
     if (decision.action === 'reuse' && !pressureCeilingTriggered) {
       touchFoldFreeze(this.freezeState, now);
-      return {
+      return this.applyVault({
         messages: decision.view,
         cacheHot: true,
         stats: {
@@ -332,7 +421,7 @@ export class FoldSession {
           epochs: this.freezeState.epochs,
           ...this.pressureStats(false),
         },
-      };
+      });
     }
 
     const recomputeReason = decision.action === 'recompute' ? decision.reason : undefined;
@@ -351,7 +440,7 @@ export class FoldSession {
     const epochReason = pressureCeilingTriggered
       ? recomputeReason ? `pressure-ceiling+${recomputeReason}` : 'pressure-ceiling'
       : recomputeReason;
-    return {
+    return this.applyVault({
       messages: result.messages,
       cacheHot: false,
       result,
@@ -359,7 +448,7 @@ export class FoldSession {
         ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
         ...(epochReason ? { epochReason } : {}),
       },
-    };
+    });
   }
 
   /** Freeze-layer telemetry: hot reuses since last epoch, lifetime epochs, frozen size. */

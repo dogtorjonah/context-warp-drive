@@ -8,12 +8,12 @@
 
 Deterministic. Zero-LLM. Pure CPU, zero I/O, byte-identical output for identical inputs. Provider-agnostic: **Anthropic** content blocks, **OpenAI** `tool_calls`, and **Gemini** `parts`.
 
-Extracted from a production multi-agent system (the Voxxo Swarm), where it folds context continuously across every model and long-running agent workloads.
+Extracted from a production multi-agent system, where it folds context continuously across every model and long-running agent workloads.
 
 - The core engine passes **277 deterministic tests** across rolling fold, recall, freeze, and integration.
 - Every number below is **measured, not estimated** — production cache rates from the Claude provider usage ledger, reproducible live against Claude (`ANTHROPIC_API_KEY=… npx tsx examples/benchmark-live.ts`, real model + real summarizer) and offline with exact `o200k_base` BPE token counts (`npx tsx examples/benchmark.ts`, deterministic, no key).
 
-**Provenance note:** this public package is production-derived, not a byte-for-byte mirror of Voxxo Swarm's private integration layer. The standalone repo intentionally uses generic `WARP_*` environment names, package-neutral examples, raw-history recovery wording, and tool-agnostic voice mining. Voxxo-only integration surfaces are not part of the public parity contract unless they are explicitly documented here: Atlas lookup metadata-preserving fold markers, Atlas/chatroom/tap_star/task_rail skeleton labels, rail episode fields, and walk-spine/rail recall cards are known non-parity areas.
+**Provenance note:** this public package is production-derived. It is the portable distribution of an engine that runs live inside a private multi-agent system, so it deliberately uses generic `WARP_*` environment names, package-neutral examples, raw-history recovery wording, and tool-agnostic voice mining. The byte-identical invariant is local to this package — identical inputs produce identical folded views — and is not a claim of bit-for-bit parity with any private integration layer.
 
 ---
 
@@ -145,7 +145,10 @@ A page table (`buildFoldIndex`) tracks everything the fold paged out. When activ
 Beyond the in-session fold, sealed work **episodes** (the files touched + the agent's verbatim conclusions) persist to a local store and are recalled by path the next time any session touches a member file. Turnkey portable store included (`createEpisodeStore`, SQLite); the advanced chain-card/narration engine ships namespaced as `richEpisodes`.
 
 ### 6. Glyph grammar (register tags) — `context-warp-drive/glyphs`
-Every agent message opens with one register glyph — 🔍 in-progress · 🏁 verdict · ⚠️ hazard · ❓ blocked. `parseRegisterGlyph` classifies it; episodic recall uses it as a trust signal so only **settled** conclusions (🏁/⚠️) get harvested into durable memory and in-progress hypotheses (🔍) self-exclude. See [`docs/glyph-grammar.md`](./docs/glyph-grammar.md).
+Every agent message opens with one register glyph — 🔍 in-progress · ▶ executing · 🏁 verdict · ⚠️ hazard · ❓ blocked. `parseRegisterGlyph` classifies it; episodic recall uses it as a trust signal so only **settled** conclusions (🏁/⚠️) get harvested into durable memory while transient work (🔍/▶/❓) self-excludes. See [`docs/glyph-grammar.md`](./docs/glyph-grammar.md).
+
+### 7. Overwatch (trace-driven governor) — `context-warp-drive/overwatch`
+Overwatch is the pure, standalone context-geometry governor. Feed it a recent trace of register-glyph messages and tool ticks plus measured pressure/cache telemetry, and it returns auditable recommendations for retained band size, recall aperture, episodic capture, and cache-safe fold timing. It is deliberately adapter-free: your runtime maps its own message/tool history into `TraceToken[]`.
 
 ---
 
@@ -186,6 +189,9 @@ import {
 
 // Glyph grammar — also at "context-warp-drive/glyphs"
 import { parseRegisterGlyph, REGISTER_GLYPHS, classifyAssistantRegister } from 'context-warp-drive';
+
+// Overwatch governor — also at "context-warp-drive/overwatch"
+import { governByTrace, classifyToolClass, glyphFromMessage } from 'context-warp-drive';
 ```
 
 ---
@@ -210,4 +216,4 @@ npm test   # runs the 277-test deterministic suite (rolling fold, freeze, recall
 
 ## License
 
-MIT © Jonah (Voxxo Swarm)
+MIT © Jonah

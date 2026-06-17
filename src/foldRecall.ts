@@ -3,7 +3,7 @@
  *
  * The rolling fold pages content OUT of context (inter-turn turn skeletons,
  * intra-turn folded tool results); this module pages it back IN when current
- * activity proves it relevant again. Ambient page-in discipline applied
+ * activity proves it relevant again. Ambient-Atlas-style discipline applied
  * to the fold: tiered relevance triggers, TTL'd residency dedupe, a
  * context-pressure budget ladder, and deterministic rendering.
  *
@@ -13,7 +13,7 @@
  *   replaying the deterministic turn detection over raw history and reading
  *   the folded-view fold block's exact "N turns folded" count; intra-turn
  *   entries by scanning the folded view for the fold's own
- *   "[Folded: tool path — n,nnn chars | recover from raw history]" markers, keyed
+ *   "[Folded: tool path — n,nnn chars | self-tap to recover]" markers, keyed
  *   by provider tool ids (tool_use_id / tool_call_id) as recovery handles.
  * - TRIGGERS (tool-boundary only): tier 0 = a tool call re-touches a folded
  *   path; tier 1 = a file claim lands on a folded path. Tier 2 distinctive-term
@@ -83,6 +83,21 @@ export interface FoldRecallConfig {
    * claim tiers still outrank.
    */
   verbatimRecallEnabled: boolean;
+  /**
+   * Curated Code Radar — source-highlight guideposts (WARP_FOLD_RECALL_HIGHLIGHTS).
+   * Prepends Atlas-curated `⌖ label (a–b)` lines to a recall card so the agent
+   * sees the file's key regions the moment it pages back in. Default ON
+   * (operator-blessed, Jonah 2026-06-17). Renders only when enrichment is
+   * resident in FoldRecallState; absence is byte-identical to legacy recall.
+   */
+  highlightsEnabled: boolean;
+  /**
+   * Curated Code Radar — hazard guideposts (WARP_FOLD_RECALL_HAZARDS).
+   * Prepends Atlas-curated `⚠️ text (L85)` lines (hazard-first, above highlights)
+   * so a hazard the agent is about to trip surfaces on re-touch. Default ON
+   * (operator-blessed, Jonah 2026-06-17). Same residency/byte-identity contract.
+   */
+  hazardsEnabled: boolean;
 }
 
 export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
@@ -93,6 +108,8 @@ export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
   ttlPasses: 8,
   termRecallEnabled: false,
   verbatimRecallEnabled: true,
+  highlightsEnabled: true,
+  hazardsEnabled: true,
 };
 
 /** Hints injected per pass never exceed this, regardless of pressure. */
@@ -119,6 +136,8 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
  *   WARP_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 8)
  *   WARP_FOLD_RECALL_TERMS=1|true|on|yes  → enable tier-2 term matching (default off)
  *   WARP_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
+ *   WARP_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
+ *   WARP_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
  */
 export function resolveFoldRecallConfig(
   env: Record<string, string | undefined> = process.env,
@@ -127,6 +146,8 @@ export function resolveFoldRecallConfig(
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
   const termRaw = (env.WARP_FOLD_RECALL_TERMS ?? '').trim().toLowerCase();
   const verbatimRaw = (env.WARP_FOLD_RECALL_VERBATIM ?? '').trim().toLowerCase();
+  const highlightsRaw = (env.WARP_FOLD_RECALL_HIGHLIGHTS ?? '').trim().toLowerCase();
+  const hazardsRaw = (env.WARP_FOLD_RECALL_HAZARDS ?? '').trim().toLowerCase();
   return {
     enabled,
     maxCards: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARDS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
@@ -137,6 +158,12 @@ export function resolveFoldRecallConfig(
     // Default ON (operator-blessed); only explicit disable values turn it off.
     verbatimRecallEnabled:
       verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
+    // Curated Code Radar (operator-blessed, Jonah 2026-06-17): both default ON;
+    // only explicit 0/false/off/no disable. Same idiom as verbatimRecallEnabled.
+    highlightsEnabled:
+      highlightsRaw === '' || (highlightsRaw !== '0' && highlightsRaw !== 'false' && highlightsRaw !== 'off' && highlightsRaw !== 'no'),
+    hazardsEnabled:
+      hazardsRaw === '' || (hazardsRaw !== '0' && hazardsRaw !== 'false' && hazardsRaw !== 'off' && hazardsRaw !== 'no'),
   };
 }
 
@@ -348,7 +375,9 @@ export interface FoldRecallIndex {
 /** Matches the folded view's fold-block header: "[Conversation Context — N turns folded, …". */
 const FOLD_BLOCK_COUNT_RE = /^\[Conversation Context — (\d+) turns folded,/;
 /** Whole-content intra-fold marker (generic replacement by foldSummaryText). */
-const INTRA_GENERIC_MARKER_RE = /^\[Folded: (\S+)(?: (.+?))? — ([\d,]+) chars \| recover from raw history\]$/;
+const INTRA_GENERIC_MARKER_RE = /^\[Folded: (\S+)(?: (.+?))? — ([\d,]+) chars \| self-tap to recover\]$/;
+/** Suffix intra-fold marker (atlas metadata-preserving variant). */
+const INTRA_ATLAS_MARKER_RE = /\n## Source \[Folded: (\S+)(?: (.+?))? — ([\d,]+) chars of source code \| self-tap to recover\]$/;
 
 function parseMarkerChars(raw: string): number {
   const n = Number.parseInt(raw.replace(/,/g, ''), 10);
@@ -372,13 +401,17 @@ interface ParsedIntraMarker {
 
 /**
  * Parse an intra-fold marker out of a folded tool result's content. Anchored
- * whole-content matching so a marker merely QUOTED inside live tool output
- * never indexes.
+ * matching (whole-content for the generic marker, suffix for the atlas
+ * variant) so markers merely QUOTED inside live tool output never index.
  */
 function parseIntraMarker(content: string): ParsedIntraMarker | null {
   const generic = INTRA_GENERIC_MARKER_RE.exec(content);
   if (generic) {
     return { tool: generic[1], path: normalizeToolPath(generic[2] ?? ''), chars: parseMarkerChars(generic[3]) };
+  }
+  const atlas = INTRA_ATLAS_MARKER_RE.exec(content);
+  if (atlas) {
+    return { tool: atlas[1], path: normalizeToolPath(atlas[2] ?? ''), chars: parseMarkerChars(atlas[3]) };
   }
   return null;
 }
@@ -619,6 +652,30 @@ export function buildFoldIndex(
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Curated Code Radar — Atlas enrichment carried on recall state (Atlas-free)
+// ══════════════════════════════════════════════════════════════════════
+//
+// Atlas source_highlights + ranged hazards, fetched OFF-THREAD by the relay
+// (worker-pool atlas:recallEnrichment) and merged into FoldRecallState keyed by
+// normalized path. This package stays pure: it only HOLDS and RENDERS these — it
+// never reads Atlas. Absent/empty ⇒ recall renders exactly as before (byte-
+// identical), so the radar is a strict superset enhancement.
+
+/** A curated source-highlight guidepost for a file (mirrors Atlas source_highlights). */
+export interface RecallSourceHighlight {
+  label: string;
+  startLine: number;
+  endLine: number;
+}
+
+/** A curated hazard for a file. Null start/endLine = file-level (whole-file) hazard. */
+export interface RecallHazard {
+  text: string;
+  startLine: number | null;
+  endLine: number | null;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // State (per-session; lives beside foldFreezeState)
 // ══════════════════════════════════════════════════════════════════════
 
@@ -640,6 +697,15 @@ export interface FoldRecallState {
    * shown content quiet regardless of which entry would carry it.
    */
   residentPaths: Map<string, ResidencyRecord>;
+  /**
+   * Curated Code Radar carriers, keyed by normalized workspace-relative path
+   * (== Atlas file_path == index entry path). Populated OFF-THREAD by the relay
+   * after each epoch's buildFoldIndex; read at render time with zero I/O. Empty
+   * until enrichment resolves (and whenever both flags are off) — recall degrades
+   * silently to its pre-radar (byte-identical) output.
+   */
+  pathHighlights: Map<string, RecallSourceHighlight[]>;
+  pathHazards: Map<string, RecallHazard[]>;
   /** Recall pass counter — one pass per tool boundary that carried signals. */
   passSeq: number;
   // ── Lifetime telemetry counters ──
@@ -654,6 +720,8 @@ export function createFoldRecallState(): FoldRecallState {
     index: null,
     resident: new Map(),
     residentPaths: new Map(),
+    pathHighlights: new Map(),
+    pathHazards: new Map(),
     passSeq: 0,
     cardsInjected: 0,
     hintsInjected: 0,
@@ -675,6 +743,50 @@ export interface RecallSignals {
   terms?: string[];
   /** Exact verbatim identifiers seen in the active window, sorted. Drives the verbatim-token tier; omitted unless supplied. */
   verbatimTokens?: string[];
+  /**
+   * Paths whose Curated Code Radar is suppressed because the current boundary's
+   * tool is an Atlas read (lookup/brief/snippet) of them — the agent is seeing
+   * that file's full source_highlights+hazards live, so the compressed radar
+   * would just parrot the tool output. Omitted unless the relay supplies it; the
+   * folded card BODY still pages in, and tier matching is unaffected.
+  */
+  atlasReadPaths?: string[];
+}
+
+/**
+ * Leaf-normalize a dispatched tool name for Atlas-read matching. Mirrors the
+ * relay's normalizeAmbientAtlasToolName (kept local so this carve-out package
+ * stays relay-dependency-free): strips MCP server namespaces
+ * (mcp__server__atlas_query), provider prefixes (functions.atlas_query), and
+ * mcp_/mcp_to_ leaders, then lowercases the leaf.
+ */
+function normalizeAtlasReadToolLeaf(toolName: string | null | undefined): string {
+  const raw = (toolName ?? '').trim();
+  if (!raw) return '';
+  const doubleUnderscoreLeaf = raw.split('__').at(-1) ?? raw;
+  const dottedLeaf = doubleUnderscoreLeaf.split('.').at(-1) ?? doubleUnderscoreLeaf;
+  return dottedLeaf.replace(/^mcp_to_/, '').replace(/^mcp_/, '').trim().toLowerCase();
+}
+
+/**
+ * True when the just-dispatched tool is itself a highlight/hazard-rendering
+ * Atlas read of the touched path — atlas_lookup/atlas_brief/atlas_snippet, or
+ * atlas_query with action in {lookup,brief,snippet}. The agent is then already
+ * seeing that file's full source_highlights+hazards live, so the (compressed)
+ * Curated Code Radar would just parrot the tool output and is suppressed for
+ * those paths (the folded card BODY still pages in). The tool name is
+ * leaf-normalized so namespaced MCP forms (mcp__agent-bridge__atlas_query)
+ * and provider-prefixed forms match — not only bare names. search/history/graph/
+ * diff do NOT match: they do not render the curated per-file record.
+ */
+export function radarDuplicatesActiveAtlasRead(
+  toolName: string | null | undefined,
+  action: unknown,
+): boolean {
+  const leaf = normalizeAtlasReadToolLeaf(toolName);
+  if (leaf === 'atlas_lookup' || leaf === 'atlas_brief' || leaf === 'atlas_snippet') return true;
+  if (leaf === 'atlas_query') return action === 'lookup' || action === 'brief' || action === 'snippet';
+  return false;
 }
 
 /**
@@ -1018,7 +1130,7 @@ export function excerptForRecall(text: string, maxChars: number): string {
   const omitted = text.length - headLen - tailLen;
   const head = charSafeSlice(text, 0, headLen);
   const tail = tailLen > 0 ? charSafeSlice(text, text.length - tailLen, text.length) : '';
-  return `${head}\n…[${formatChars(omitted)} chars omitted — raw history has full content]…\n${tail}`;
+  return `${head}\n…[${formatChars(omitted)} chars omitted — self-tap for full content]…\n${tail}`;
 }
 
 /**
@@ -1119,7 +1231,7 @@ function describeEntry(entry: FoldIndexEntry): string {
 }
 
 function renderHint(item: RecallPlanItem): string {
-  return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} folded earlier (${formatChars(item.entry.chars)} chars) | trigger: ${item.trigger} | recover from raw history]`;
+  return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} folded earlier (${formatChars(item.entry.chars)} chars) | trigger: ${item.trigger} | self-tap to recover]`;
 }
 
 /** Body text for a recall card, sliced from in-memory raw history only. */
@@ -1144,10 +1256,133 @@ function renderEntryBody(entry: FoldIndexEntry, matchedPath: string, rawHistory:
   return body.trim() ? body : null;
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number): string {
-  const excerpt = excerptForRecall(body, bodyBudget);
+// ── Curated Code Radar formatters (deterministic, bounded, char-safe) ──
+
+const RECALL_RADAR_MAX_LINES = 3;
+
+/** Deterministic line-range token: "L85" for a point, "L85–95" for a span. */
+function formatRadarLineRange(startLine: number, endLine: number): string {
+  return startLine === endLine ? `L${startLine}` : `L${startLine}–${endLine}`;
+}
+
+/**
+ * Compact source-highlight radar — Atlas-curated guideposts to a touched file's
+ * key regions, rendered as `⌖ label (a–b)` lines. Deterministic (startLine asc),
+ * bounded by RECALL_RADAR_MAX_LINES and charBudget. Returns '' when nothing fits.
+ */
+export function formatHighlightsRadar(highlights: readonly RecallSourceHighlight[], charBudget: number): string {
+  if (highlights.length === 0 || charBudget <= 0) return '';
+  const sorted = [...highlights].sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+  const lines: string[] = [];
+  let used = 0;
+  for (const h of sorted) {
+    if (lines.length >= RECALL_RADAR_MAX_LINES) break;
+    const line = `⌖ ${h.label} (${formatRadarLineRange(h.startLine, h.endLine)})`;
+    if (used + line.length + 1 > charBudget) break;
+    lines.push(line);
+    used += line.length + 1;
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Compact hazard radar — `⚠️ text (L85)` / `⚠️ text (L85–95)` for ranged hazards,
+ * `⚠️ text` for file-level (null range). Ranged hazards sort by startLine asc;
+ * file-level hazards sort last. Deterministic, bounded. '' when nothing fits.
+ */
+export function formatHazardRadar(hazards: readonly RecallHazard[], charBudget: number): string {
+  if (hazards.length === 0 || charBudget <= 0) return '';
+  const sorted = [...hazards].sort((a, b) => {
+    const aFile = a.startLine === null;
+    const bFile = b.startLine === null;
+    if (aFile !== bFile) return aFile ? 1 : -1; // file-level hazards sort last
+    if (aFile && bFile) return 0;
+    return (a.startLine as number) - (b.startLine as number);
+  });
+  const lines: string[] = [];
+  let used = 0;
+  for (const hz of sorted) {
+    if (lines.length >= RECALL_RADAR_MAX_LINES) break;
+    const range = hz.startLine === null ? '' : ` (${formatRadarLineRange(hz.startLine, hz.endLine ?? hz.startLine)})`;
+    const line = `⚠️ ${hz.text}${range}`;
+    if (used + line.length + 1 > charBudget) break;
+    lines.push(line);
+    used += line.length + 1;
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Resolve the curated enrichment for a plan item from FoldRecallState. Tier 0/1
+ * matched a real file path; tier 2 (verbatim/term) keys are synthetic, so fall
+ * back to the entry's own paths. Deduped across paths.
+ */
+function resolveItemEnrichment(
+  item: RecallPlanItem,
+  state: FoldRecallState,
+  suppressPaths: ReadonlySet<string>,
+): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
+  const synthetic = item.matchedPath.startsWith('verbatim:') || item.matchedPath.startsWith('term:');
+  const keys = synthetic ? entryPaths(item.entry) : [item.matchedPath];
+  const highlights: RecallSourceHighlight[] = [];
+  const hazards: RecallHazard[] = [];
+  const seenH = new Set<string>();
+  const seenZ = new Set<string>();
+  for (const key of keys) {
+    // Dedup vs an active Atlas read: the agent is seeing this file's full record
+    // live this turn, so its radar would duplicate the tool output — skip it.
+    if (suppressPaths.has(key)) continue;
+    for (const h of state.pathHighlights.get(key) ?? []) {
+      const sig = `${h.startLine}:${h.endLine}:${h.label}`;
+      if (seenH.has(sig)) continue;
+      seenH.add(sig);
+      highlights.push(h);
+    }
+    for (const hz of state.pathHazards.get(key) ?? []) {
+      const sig = `${hz.startLine}:${hz.endLine}:${hz.text}`;
+      if (seenZ.has(sig)) continue;
+      seenZ.add(sig);
+      hazards.push(hz);
+    }
+  }
+  return { highlights, hazards };
+}
+
+/**
+ * Build the Curated Code Radar block for a card: hazard radar first (higher
+ * urgency), then highlight radar — each flag-gated, the two sharing charBudget.
+ * Returns '' when both flags are off, nothing is resident, or nothing fits.
+ */
+function buildRadar(
+  item: RecallPlanItem,
+  state: FoldRecallState,
+  config: FoldRecallConfig,
+  charBudget: number,
+  suppressPaths: ReadonlySet<string>,
+): string {
+  if (charBudget <= 0 || (!config.highlightsEnabled && !config.hazardsEnabled)) return '';
+  const { highlights, hazards } = resolveItemEnrichment(item, state, suppressPaths);
+  const parts: string[] = [];
+  let used = 0;
+  if (config.hazardsEnabled && hazards.length > 0) {
+    const block = formatHazardRadar(hazards, charBudget - used);
+    if (block) { parts.push(block); used += block.length + 1; }
+  }
+  if (config.highlightsEnabled && highlights.length > 0) {
+    const block = formatHighlightsRadar(highlights, charBudget - used);
+    if (block) { parts.push(block); used += block.length + 1; }
+  }
+  return parts.join('\n');
+}
+
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string): string {
+  // Radar (hazard + highlight guideposts) prepends the body excerpt and shares
+  // the card budget — subtract its footprint so the total card stays bounded.
+  // radar === '' ⇒ output is byte-identical to legacy recall.
+  const radarBlock = radar ? `${radar}\n` : '';
+  const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - radarBlock.length));
   const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
-  return `${header}\n${excerpt}\n[End fold recall]`;
+  return `${header}\n${radarBlock}${excerpt}\n[End fold recall]`;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1236,6 +1471,9 @@ export function buildFoldRecallContext(
   let charsUsed = 0;
   let cards = 0;
   let hints = 0;
+  // Radar dedup: paths the current Atlas-read tool already rendered live, whose
+  // radar would duplicate the tool output (empty set ⇒ byte-identical).
+  const radarSuppressPaths = new Set(signals.atlasReadPaths ?? []);
 
   for (const item of plan.items) {
     const remaining = budget.charBudget - charsUsed;
@@ -1251,7 +1489,10 @@ export function buildFoldRecallContext(
       } else {
         const body = renderEntryBody(item.entry, item.matchedPath, rawHistory);
         if (body === null) continue; // raw no longer recoverable — skip silently
-        rendered = renderCard(item, body, bodyBudget);
+        // Curated Code Radar may take up to half the card body budget; the
+        // excerpt keeps the rest. '' (empty carriers / flags off) ⇒ byte-identical.
+        const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 2), radarSuppressPaths);
+        rendered = renderCard(item, body, bodyBudget, radar);
         if (rendered.length > remaining) {
           level = 'hint';
           rendered = null;

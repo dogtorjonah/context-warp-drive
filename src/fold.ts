@@ -1,5 +1,5 @@
 /**
- * context-warp-drive/fold — the dependency-free rolling-fold engine.
+ * context-warp/fold — the dependency-free rolling-fold engine.
  *
  * Rolling fold + Coordinate Closet, cache-hot fold freeze, ambient page-in recall,
  * provider context-window sizing, and distinctive-term primitives, plus the
@@ -11,12 +11,14 @@ export * from './foldFreeze.ts';
 export * from './foldRecall.ts';
 export * from './foldTerms.ts';
 export * from './contextWindow.ts';
+export * from './userMessageVault.ts';
 
 export { DEFAULT_FOLD_PRESSURE_CEILING_TOKENS, FoldSession } from './session/FoldSession.ts';
 export type {
   FoldPrepareContext,
   FoldPressureCeilingConfig,
   FoldSessionOptions,
+  FoldVaultConfig,
   FoldOutcome,
   FoldStats,
 } from './session/FoldSession.ts';

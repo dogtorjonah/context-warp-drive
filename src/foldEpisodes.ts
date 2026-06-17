@@ -351,23 +351,25 @@ const NARRATION_DECORATION_RE = /^[\s#>*\-•·–—\d.)✓✗✅❌🎯⚠️�
 // card's voice/pointer/delta line), never fresh narration — reject outright.
 const NARRATION_QUOTED_VOICE_RE = /^[✎⭐💬🗣⌖Δ↞↠]/u;
 
-// Line-level register tags: a line the agent itself opened with 🔍/❓ is
-// declared in-progress/blocked — never voice, even inside an eligible message.
+// Line-level register tags: a line the agent itself opened with 🔍/▶/❓ is
+// declared in-progress/executing/blocked — never voice, even inside an eligible message.
 // 🏁/⚠️ line openers strip as decoration and are handled by the caller's declared
 // vs untagged extraction mode.
-const NARRATION_NONVERDICT_LINE_RE = /^[🔍❓❔]/u;
+const NARRATION_NONVERDICT_LINE_RE = /^[🔍▶❓❔]/u;
 
 // ── Message glyph grammar (register tags) ────────────────────────────────
 
 /** Register an agent declares by opening a message with one SOP glyph. */
-export type MessageGlyphMode = 'working' | 'verdict' | 'hazard' | 'blocked';
+export type MessageGlyphMode = 'working' | 'executing' | 'verdict' | 'hazard' | 'blocked';
 
-// SOP taxonomy (sop/master.md P23): 🔍 in-progress · 🏁 verified verdict ·
-// ⚠️ hazard/gotcha · ❓ blocked. Bare ⚠/❔ forms cover engines that emit
-// emoji without the VS16 presentation selector. Card-grammar glyphs
+// SOP taxonomy (sop/master.md P23): 🔍 in-progress · ▶ executing ·
+// 🏁 verified verdict · ⚠️ hazard/gotcha · ❓ blocked. Bare ▶/⚠/❔
+// forms cover engines that emit emoji without the VS16 presentation selector. Card-grammar glyphs
 // (✎⭐💬🗣⌖Δ↞↠) are deliberately NOT modes — they mark quoted memory.
 const MESSAGE_GLYPHS: readonly (readonly [string, MessageGlyphMode])[] = [
   ['🔍', 'working'],
+  ['▶️', 'executing'],
+  ['▶', 'executing'],
   ['🏁', 'verdict'],
   ['⚠️', 'hazard'],
   ['⚠', 'hazard'],
@@ -395,14 +397,14 @@ export function classifyMessageGlyph(text: string | undefined): MessageGlyphMode
 
 /**
  * Harvest eligibility under the glyph gate: declared non-verdict registers
- * (🔍 working / ❓ blocked) self-exclude — the false-positive class no shape
+ * (🔍 working / ▶ executing / ❓ blocked) self-exclude — the false-positive class no shape
  * filter can catch ("Found the likely culprit…" inside a 🔍 message is a
  * hypothesis wearing verdict clothes). 🏁/⚠️ and untagged stay eligible:
  * untagged still needs the lexical verdict gate, while declared 🏁/⚠️ uses the
  * glyph as the deliberate trust signal.
  */
 export function isNarrationEligibleGlyph(mode: MessageGlyphMode | undefined): boolean {
-  return mode !== 'working' && mode !== 'blocked';
+  return mode !== 'working' && mode !== 'executing' && mode !== 'blocked';
 }
 
 /**
@@ -410,7 +412,7 @@ export function isNarrationEligibleGlyph(mode: MessageGlyphMode | undefined): bo
  * promotion key. A 🏁-declared verdict and ⚠️-declared hazard become the
  * promoted kinds (they rank in the deliberate tier, and a declared hazard feeds
  * the chain-surfacing boost); everything else stays the priority-last backstop.
- * 'working'/'blocked' never reach harvest (isNarrationEligibleGlyph excludes
+ * 'working'/'executing'/'blocked' never reach harvest (isNarrationEligibleGlyph excludes
  * them upstream), so in practice this only ever sees 'verdict'/'hazard'/
  * undefined — but it stays total so the kind taxonomy has one authority.
  */
@@ -1222,7 +1224,7 @@ export interface EpisodicInjectionState {
    * Active-path pin cards re-emitted as working memory while a zone stays live.
    * Deliberately separate from chainCardsInjected/episodicChars: pins re-page an
    * already-served hot card, so folding them into the served-set counters would
-   * double-count. Bounded only by VOXXO_FOLD_EPISODES_PIN_BUDGET_CHARS.
+   * double-count. Bounded only by WARP_FOLD_EPISODES_PIN_BUDGET_CHARS.
    */
   episodicPinsInjected: number;
   /** Chars emitted via active-path pin blocks (NOT included in episodicChars). */
@@ -1545,7 +1547,7 @@ export function renderActiveEpisodicPathBlock(
  * the reminder fires and drives the tagging that upgrades future 🗣 to trusted.
  */
 export const EPISODIC_NARRATION_REMINDER =
-  '[🗣 above is recovered agent voice — it survived into memory because an agent tagged its messages by register. Open yours with one of 🔍 working · 🏁 verdict · ⚠️ hazard · ❓ blocked and future agents inherit your conclusions the same way.]';
+  '[🗣 above is recovered agent voice — it survived into memory because an agent tagged its messages by register. Open yours with one of 🔍 working · ▶ executing · 🏁 verdict · ⚠️ hazard · ❓ blocked and future agents inherit your conclusions the same way.]';
 
 /**
  * Render the per-boundary episodic block. The header line MUST start with the
