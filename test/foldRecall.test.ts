@@ -691,6 +691,39 @@ describe('buildFoldRecallContext', () => {
     expect(state.recallChars).toBe(out.chars);
   });
 
+  test('live source delta renders when recalled body is stale vs current box source', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    // Simulate the worker supplying a live source snapshot that differs from
+    // the historical folded body ('BIGFILE CONTENT START ...').
+    state.pathSourceDeltas.set(BIGFILE, {
+      path: BIGFILE,
+      liveHash: 'abcd1234',
+      liveSource: 'COMPLETELY NEW CONTENT ON DISK NOW',
+    });
+    const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.cards).toBe(1);
+    expect(out.text!).toContain('Live Source Delta');
+    expect(out.text!).toContain('current box source differs');
+    expect(out.text!).toContain('COMPLETELY NEW CONTENT ON DISK NOW');
+  });
+
+  test('live source delta suppressed when recalled body still matches current source', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    // Worker supplies a live snapshot that IS a substring of the historical body.
+    state.pathSourceDeltas.set(BIGFILE, {
+      path: BIGFILE,
+      liveHash: 'abcd1234',
+      liveSource: 'BIGFILE CONTENT START',
+    });
+    const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.cards).toBe(1);
+    expect(out.text!).not.toContain('Live Source Delta');
+  });
+
   test('tier-1 claim on a folded path pages content in', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);

@@ -17,6 +17,7 @@ import {
   USER_MESSAGE_VAULT_PREFIX,
   USER_MESSAGE_VAULT_END,
   stripUserMessageVaultBlocks,
+  nominateVerbatim,
 } from './rollingFold.ts';
 
 export interface UserMessageVaultEntry {
@@ -173,10 +174,51 @@ function surfaceLimit(surface: VaultSurface): number {
 }
 
 /**
+ * Extract verbatim recall tokens from the omitted middle region of an oversized
+ * vault excerpt. These tokens (file paths, hex hashes, changelog IDs, symbol
+ * names) are the same shapes the fold recall engine's verbatim-token tier
+ * matches against active window text. Injecting them into the [chars omitted]
+ * marker makes the vault self-activating: when the agent writes any of these
+ * tokens in its normal reasoning, verbatim recall fires and pages back the
+ * full turn automatically. Cap: 8 tokens, 4–60 chars each.
+ */
+function extractVaultRecallTokens(omittedText: string): string[] {
+  const MAX_TOKENS = 8;
+  const MAX_TOKEN_LEN = 60;
+  const tokens = nominateVerbatim(omittedText, MAX_TOKENS * 4);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const tok of tokens) {
+    if (tok.length > MAX_TOKEN_LEN || tok.length < 4) continue;
+    if (seen.has(tok)) continue;
+    seen.add(tok);
+    result.push(tok);
+    if (result.length >= MAX_TOKENS) break;
+  }
+  return result;
+}
+
+/**
+ * Build the [chars omitted] marker enriched with recall tokens from the omitted
+ * region, or a plain marker when no distinctive tokens are found.
+ */
+function buildOmittedMarker(omittedChars: number, omittedText: string): string {
+  const tokens = extractVaultRecallTokens(omittedText);
+  if (tokens.length === 0) {
+    return `… [${omittedChars} chars omitted] …`;
+  }
+  return `… [${omittedChars} chars omitted — write any token to recall full text: ${tokens.join(', ')}] …`;
+}
+
+/**
  * Bound a vault row's text to its surface cap with a deterministic head/tail
  * excerpt (keeps the request opening AND its tail, where the operative ask
  * usually sits) instead of a front-only truncation. Under the cap, the text is
  * returned trimmed and unchanged.
+ *
+ * The [chars omitted] marker is enriched with verbatim recall tokens extracted
+ * from the omitted region so the fold recall engine can self-activate recovery
+ * of the full message when the agent touches those tokens in subsequent turns.
  */
 function excerptForSurface(text: string, surface: VaultSurface): string {
   const trimmed = text.trim();
@@ -186,11 +228,13 @@ function excerptForSurface(text: string, surface: VaultSurface): string {
   const tailLen = Math.max(0, max - headLen);
   const head = trimmed.slice(0, headLen).trimEnd();
   const tail = tailLen > 0 ? trimmed.slice(trimmed.length - tailLen).trimStart() : '';
-  const omitted = trimmed.length - head.length - tail.length;
-  if (omitted <= 0) return trimmed;
+  const omittedChars = trimmed.length - head.length - tail.length;
+  if (omittedChars <= 0) return trimmed;
+  const omittedText = trimmed.slice(head.length, trimmed.length - tail.length);
+  const marker = buildOmittedMarker(omittedChars, omittedText);
   return tail
-    ? `${head}\n… [${omitted} chars omitted] …\n${tail}`
-    : `${head}\n… [${omitted} chars omitted]`;
+    ? `${head}\n${marker}\n${tail}`
+    : `${head}\n${marker}`;
 }
 
 const HEADER = [

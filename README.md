@@ -127,6 +127,70 @@ See [`examples/anthropic-loop.ts`](./examples/anthropic-loop.ts) and [`examples/
 
 ---
 
+## Model-aware budgets — `context-warp-drive/budget`
+
+Use the budget resolver when you want Warp Drive tuned to the real model window instead of a one-size-fits-all fold line. It knows common provider/model families (Claude, OpenAI/Codex API, Codex CLI, Gemini, GLM, Grok, Mistral, MiniMax, DeepSeek, Kimi, Qwen) and lets new/unknown models opt in with an explicit measured/configured window.
+
+```ts
+import { resolveContextBudget } from 'context-warp-drive/budget';
+
+const sonnet = resolveContextBudget({ engine: 'claude', model: 'claude-sonnet-4' });
+// 200k survival profile: tighter pressure ceiling, full-recompute-only eviction.
+
+const codexCli = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5' });
+// Codex CLI/OAuth path uses its effective 258k input cap, not the Codex API 1M window.
+
+const arbitraryModel = resolveContextBudget({
+  engine: 'my-provider',
+  model: 'new-million-context-model',
+  contextWindowTokens: 1_000_000,
+  targetBandTokens: 150_000,
+});
+```
+
+Budget outputs are mechanical ceilings and knobs: `contextWindowTokens`, `messageCeilingTokens`, `pressureCeilingTokens`, `prefixSaturationTokens`, `bandTokens`, `tailEpochCapTokens`, compression profile, and eviction policy. Token pressure uses supplied/measured token telemetry or explicit model windows — it does **not** infer live token pressure from character counts.
+
+---
+
+## Portable Task Rail — `context-warp-drive/task-rail`
+
+Long-horizon agents need more than memory compression: they need an execution spine that survives folding, rebirth, process restarts, or a custom UI. The Task Rail export is a pure state machine for plan steps, sprint/shoot execution, ACKs, progress, and JSON serialization.
+
+It is deliberately **not** a tool server. No MCP wrapper, no relay persistence, no squad permissions, no chat/Atlas coupling. You own the wrapper: CLI, MCP, browser UI, local JSON, SQLite, or your own agent runtime.
+
+```ts
+import {
+  startTaskRail,
+  sprint,
+  ackStep,
+  shoot,
+  serializeTaskRail,
+  restoreTaskRail,
+} from 'context-warp-drive/task-rail';
+
+const rail = startTaskRail({
+  title: 'Ship the feature',
+  objective: 'Keep execution state outside the prompt.',
+  locked: true,
+  steps: [
+    { instruction: 'Inspect the failing path.' },
+    { instruction: 'Patch the smallest correct surface.' },
+    { instruction: 'Validate and write the handoff.' },
+  ],
+});
+
+const batch = sprint(rail, { sprintCount: 2 });
+ackStep(rail, batch.steps![0].id, 'done', { evidence: 'source read' });
+const next = shoot(rail);
+
+const saved = JSON.stringify(serializeTaskRail(rail));
+const restored = restoreTaskRail(JSON.parse(saved));
+```
+
+Pair it with FoldSession like this: raw transcript stays in your storage, folded prompt view stays lean, and task rail tracks what the agent is supposed to do next.
+
+---
+
 ## How it works
 
 ### 1. Rolling fold (page-out) — `foldContext`
@@ -149,6 +213,12 @@ Every agent message opens with one register glyph — 🔍 in-progress · ▶ ex
 
 ### 7. Overwatch (trace-driven governor) — `context-warp-drive/overwatch`
 Overwatch is the pure, standalone context-geometry governor. Feed it a recent trace of register-glyph messages and tool ticks plus measured pressure/cache telemetry, and it returns auditable recommendations for retained band size, recall aperture, episodic capture, and cache-safe fold timing. It is deliberately adapter-free: your runtime maps its own message/tool history into `TraceToken[]`.
+
+### 8. Context budget (model-aware mechanical limits) — `context-warp-drive/budget`
+The budget resolver turns model/engine/window choices into deterministic fold knobs: active band, message ceiling, pressure ceiling, prefix saturation, tail epoch cap, and compression/eviction profile. Known model tables cover common providers, while explicit `contextWindowTokens` lets any new model opt in without waiting for a package release.
+
+### 9. Task Rail (portable execution state) — `context-warp-drive/task-rail`
+Task Rail is the dependency-free long-horizon execution state machine. It tracks steps, sprint/shoot reservations, ACK status, progress, and JSON serialization so your own tool/UI/storage can preserve “what next?” outside the provider prompt.
 
 ---
 
@@ -192,6 +262,12 @@ import { parseRegisterGlyph, REGISTER_GLYPHS, classifyAssistantRegister } from '
 
 // Overwatch governor — also at "context-warp-drive/overwatch"
 import { governByTrace, classifyToolClass, glyphFromMessage } from 'context-warp-drive';
+
+// Model-aware fold/pressure knobs — also at "context-warp-drive/budget"
+import { resolveContextBudget } from 'context-warp-drive';
+
+// Portable execution state — also at "context-warp-drive/task-rail"
+import { startTaskRail, sprint, shoot, ackStep, serializeTaskRail } from 'context-warp-drive';
 ```
 
 ---

@@ -114,6 +114,20 @@ export interface OverwatchPressure {
   readonly windowTokens: number;
   /** Optional measured cache-hit evidence for the breakeven gate. */
   readonly cache?: OverwatchCacheTelemetry;
+  /** Provider/request message ceiling from the host budget resolver, if tighter than the window. */
+  readonly messageCeilingTokens?: number | null;
+  /** Pressure ceiling from contextBudget/relay telemetry, if configured. */
+  readonly pressureCeilingTokens?: number | null;
+  /** Prefix-saturation backstop, measured/configured by the host; never derived from chars. */
+  readonly prefixSaturationTokens?: number | null;
+  /** Measured rolling next-call burst reserve, or a configured host fallback. */
+  readonly burstReserveTokens?: number | null;
+  /** Host-configured safety runway below the burst reserve. */
+  readonly safetyMarginTokens?: number | null;
+  /** Optional measured frozen-prefix tokens; unknown stays null/undefined. */
+  readonly frozenPrefixTokens?: number | null;
+  /** Optional measured raw-tail tokens; unknown stays null/undefined. */
+  readonly rawTailTokens?: number | null;
 }
 
 export type OverwatchPressureLevel =
@@ -122,6 +136,24 @@ export type OverwatchPressureLevel =
   | 'warning'
   | 'critical'
   | 'auto_compact';
+
+export type OverwatchPressureAction =
+  | 'hold'
+  | 'normal_append'
+  | 'pressure_tail_append'
+  | 'suffix_compact'
+  | 'full_recompute_evict';
+
+export interface OverwatchPressureActionRec {
+  readonly action: OverwatchPressureAction;
+  readonly reason: string;
+  readonly noProviderCallWithoutRelief: boolean;
+  readonly ceilingTokens: number | null;
+  readonly warnAtTokens: number | null;
+  readonly hardAtTokens: number | null;
+  readonly burstReserveTokens: number | null;
+  readonly safetyMarginTokens: number | null;
+}
 
 /**
  * Work flavor — what KIND of work the window shows. This is the histogram-derived
@@ -173,7 +205,11 @@ export interface OverwatchDecision {
     readonly utilization: number | null;
     readonly measuredTokens: number | null;
     readonly windowTokens: number | null;
+    readonly ceilingTokens: number | null;
+    readonly warnAtTokens: number | null;
+    readonly hardAtTokens: number | null;
   };
+  readonly pressureAction: OverwatchPressureActionRec;
   /** Recommended retained-history band. null = no change (hold prior). */
   readonly bandTokens: number | null;
   readonly recall: OverwatchRecallRec;
@@ -326,12 +362,35 @@ const FLAVOR_RELEVANT: ReadonlySet<OverwatchToolClass> = new Set<OverwatchToolCl
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
-function pressureLevel(p: OverwatchPressure): {
-  level: OverwatchPressureLevel;
-  utilization: number | null;
-  measured: number | null;
-  window: number | null;
-} {
+function finitePositive(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function defaultBurstReserveTokens(windowTokens: number): number {
+  if (windowTokens <= 213_000) return 37_000;
+  if (windowTokens >= 900_000) return 50_000;
+  return 45_000;
+}
+
+function defaultSafetyMarginTokens(windowTokens: number): number {
+  if (windowTokens <= 213_000) return 10_000;
+  if (windowTokens >= 900_000) return 50_000;
+  return 25_000;
+}
+
+interface PressureMath {
+  readonly level: OverwatchPressureLevel;
+  readonly utilization: number | null;
+  readonly measured: number | null;
+  readonly window: number | null;
+  readonly ceiling: number | null;
+  readonly warnAt: number | null;
+  readonly hardAt: number | null;
+  readonly burstReserve: number | null;
+  readonly safetyMargin: number | null;
+}
+
+function pressureLevel(p: OverwatchPressure): PressureMath {
   const { measuredTokens, windowTokens } = p;
   if (
     !Number.isFinite(measuredTokens) ||
@@ -339,13 +398,92 @@ function pressureLevel(p: OverwatchPressure): {
     !Number.isFinite(windowTokens) ||
     windowTokens <= 0
   ) {
-    return { level: 'unknown', utilization: null, measured: null, window: null };
+    return {
+      level: 'unknown',
+      utilization: null,
+      measured: null,
+      window: null,
+      ceiling: null,
+      warnAt: null,
+      hardAt: null,
+      burstReserve: null,
+      safetyMargin: null,
+    };
   }
+
+  const configuredCeiling = finitePositive(p.pressureCeilingTokens)
+    ?? finitePositive(p.messageCeilingTokens)
+    ?? windowTokens;
+  const ceiling = Math.min(windowTokens, configuredCeiling);
+  const burstReserve = finitePositive(p.burstReserveTokens) ?? defaultBurstReserveTokens(windowTokens);
+  const safetyMargin = finitePositive(p.safetyMarginTokens) ?? defaultSafetyMarginTokens(windowTokens);
+  const hardAt = Math.max(1, ceiling - burstReserve);
+  const warnAt = Math.max(1, hardAt - safetyMargin);
   const u = measuredTokens / windowTokens;
-  if (u >= 0.93) return { level: 'auto_compact', utilization: u, measured: measuredTokens, window: windowTokens };
-  if (u >= 0.8) return { level: 'critical', utilization: u, measured: measuredTokens, window: windowTokens };
-  if (u >= 0.65) return { level: 'warning', utilization: u, measured: measuredTokens, window: windowTokens };
-  return { level: 'healthy', utilization: u, measured: measuredTokens, window: windowTokens };
+
+  if (measuredTokens >= ceiling) {
+    return { level: 'auto_compact', utilization: u, measured: measuredTokens, window: windowTokens, ceiling, warnAt, hardAt, burstReserve, safetyMargin };
+  }
+  if (measuredTokens >= hardAt) {
+    return { level: 'critical', utilization: u, measured: measuredTokens, window: windowTokens, ceiling, warnAt, hardAt, burstReserve, safetyMargin };
+  }
+  if (measuredTokens >= warnAt) {
+    return { level: 'warning', utilization: u, measured: measuredTokens, window: windowTokens, ceiling, warnAt, hardAt, burstReserve, safetyMargin };
+  }
+  return { level: 'healthy', utilization: u, measured: measuredTokens, window: windowTokens, ceiling, warnAt, hardAt, burstReserve, safetyMargin };
+}
+
+function pressureAction(pressure: OverwatchPressure, press: PressureMath): OverwatchPressureActionRec {
+  const base = {
+    ceilingTokens: press.ceiling,
+    warnAtTokens: press.warnAt,
+    hardAtTokens: press.hardAt,
+    burstReserveTokens: press.burstReserve,
+    safetyMarginTokens: press.safetyMargin,
+  };
+  if (press.measured === null || press.warnAt === null || press.hardAt === null) {
+    return { action: 'hold', reason: 'measured pressure unavailable', noProviderCallWithoutRelief: false, ...base };
+  }
+
+  const noProviderCallWithoutRelief = press.measured >= press.hardAt;
+  const prefixSaturation = finitePositive(pressure.prefixSaturationTokens);
+  const frozenPrefix = finitePositive(pressure.frozenPrefixTokens);
+  if (prefixSaturation !== null && frozenPrefix !== null && frozenPrefix >= prefixSaturation) {
+    return {
+      action: 'full_recompute_evict',
+      reason: `frozen prefix ${frozenPrefix} >= saturation ${prefixSaturation}`,
+      noProviderCallWithoutRelief,
+      ...base,
+    };
+  }
+
+  if (press.measured < press.warnAt) {
+    return {
+      action: 'normal_append',
+      reason: `measured ${press.measured} < warnAt ${press.warnAt}`,
+      noProviderCallWithoutRelief: false,
+      ...base,
+    };
+  }
+
+  const rawTail = finitePositive(pressure.rawTailTokens);
+  if (rawTail === null || rawTail > 0) {
+    return {
+      action: 'pressure_tail_append',
+      reason: rawTail === null
+        ? `measured ${press.measured} >= warnAt ${press.warnAt}; tail token split unknown, host must verify append boundary`
+        : `measured ${press.measured} >= warnAt ${press.warnAt}; raw tail ${rawTail} can be relieved first`,
+      noProviderCallWithoutRelief,
+      ...base,
+    };
+  }
+
+  return {
+    action: 'suffix_compact',
+    reason: `measured ${press.measured} >= warnAt ${press.warnAt}; raw tail measured empty, compact suffix before provider call`,
+    noProviderCallWithoutRelief,
+    ...base,
+  };
 }
 
 /** Tool tokens, in order. */
@@ -671,6 +809,13 @@ export function governByTrace(
   if (thrash > 0) derivation.push(`thrash=${thrash} (re-read folded paths)`);
   if (pathChurn > 0) derivation.push(`path-churn=${pathChurn}`);
 
+  const pressureAct = pressureAction(pressure, press);
+  derivation.push(
+    `pressure-action: ${pressureAct.action} (${pressureAct.reason}; ` +
+      `warnAt=${pressureAct.warnAtTokens ?? 'null'} hardAt=${pressureAct.hardAtTokens ?? 'null'} ` +
+      `no-call=${pressureAct.noProviderCallWithoutRelief})`,
+  );
+
   // ── Band ──────────────────────────────────────────────────────────────────
   // GENEROUS DEFAULT: hold the prior band. Only positive, corroborated signals
   // move it — the asymmetry fix (wrongly tightening a reviewer is expensive;
@@ -767,7 +912,11 @@ export function governByTrace(
       utilization: press.utilization,
       measuredTokens: press.measured,
       windowTokens: press.window,
+      ceilingTokens: press.ceiling,
+      warnAtTokens: press.warnAt,
+      hardAtTokens: press.hardAt,
     },
+    pressureAction: pressureAct,
     bandTokens,
     recall,
     episodic,

@@ -675,6 +675,18 @@ export interface RecallHazard {
   endLine: number | null;
 }
 
+/** Worker-provided live file snapshot for historical-vs-current recall deltas. */
+export interface RecallSourceDelta {
+  /** Normalized workspace-relative path. */
+  path: string;
+  /** Stable hash of the live source snapshot, supplied by the relay worker. */
+  liveHash: string;
+  /** Current file text, bounded by the worker before crossing back to the main thread. */
+  liveSource: string;
+  /** True when liveSource is a prefix because the file exceeded the worker cap. */
+  truncated?: boolean;
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // State (per-session; lives beside foldFreezeState)
 // ══════════════════════════════════════════════════════════════════════
@@ -706,6 +718,8 @@ export interface FoldRecallState {
    */
   pathHighlights: Map<string, RecallSourceHighlight[]>;
   pathHazards: Map<string, RecallHazard[]>;
+  /** Live source snapshots, keyed by normalized path, supplied off-thread by the relay worker. */
+  pathSourceDeltas: Map<string, RecallSourceDelta>;
   /** Recall pass counter — one pass per tool boundary that carried signals. */
   passSeq: number;
   // ── Lifetime telemetry counters ──
@@ -722,6 +736,7 @@ export function createFoldRecallState(): FoldRecallState {
     residentPaths: new Map(),
     pathHighlights: new Map(),
     pathHazards: new Map(),
+    pathSourceDeltas: new Map(),
     passSeq: 0,
     cardsInjected: 0,
     hintsInjected: 0,
@@ -1375,14 +1390,44 @@ function buildRadar(
   return parts.join('\n');
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string): string {
-  // Radar (hazard + highlight guideposts) prepends the body excerpt and shares
-  // the card budget — subtract its footprint so the total card stays bounded.
-  // radar === '' ⇒ output is byte-identical to legacy recall.
+function normalizeSourceForComparison(text: string): string {
+  return text.replace(/\r\n/g, '\n').trim();
+}
+
+function resolveItemSourceDelta(item: RecallPlanItem, state: FoldRecallState): RecallSourceDelta | null {
+  const synthetic = item.matchedPath.startsWith('verbatim:') || item.matchedPath.startsWith('term:');
+  const keys = synthetic ? entryPaths(item.entry) : [item.matchedPath];
+  for (const key of keys) {
+    const delta = state.pathSourceDeltas.get(key);
+    if (delta) return delta;
+  }
+  return null;
+}
+
+function formatSourceDelta(delta: RecallSourceDelta, historicalBody: string, charBudget: number): string {
+  if (charBudget < 160) return '';
+  const live = normalizeSourceForComparison(delta.liveSource);
+  if (!live) return '';
+  const historical = normalizeSourceForComparison(historicalBody);
+  if (historical.includes(live)) return '';
+  const heading = `⚠ Live Source Delta (${delta.path}): current box source differs from this historical fold-recall body; liveHash=${delta.liveHash}${delta.truncated ? '; live snapshot truncated' : ''}`;
+  const bodyBudget = charBudget - heading.length - '\nCurrent source excerpt:\n'.length;
+  if (bodyBudget < 80) return '';
+  return `${heading}\nCurrent source excerpt:\n${excerptForRecall(live, bodyBudget)}`;
+}
+
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, sourceDelta: RecallSourceDelta | null): string {
+  // Radar (hazard + highlight guideposts) and live-source delta both prepend the
+  // body excerpt and share the card budget — subtract their footprint so the
+  // total card stays bounded. Empty carriers ⇒ output is byte-identical to
+  // legacy recall.
   const radarBlock = radar ? `${radar}\n` : '';
-  const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - radarBlock.length));
+  const deltaBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length) / 2);
+  const deltaBlock = sourceDelta ? formatSourceDelta(sourceDelta, body, deltaBudget) : '';
+  const prefixBlock = deltaBlock ? `${radarBlock}${deltaBlock}\n` : radarBlock;
+  const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - prefixBlock.length));
   const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
-  return `${header}\n${radarBlock}${excerpt}\n[End fold recall]`;
+  return `${header}\n${prefixBlock}${excerpt}\n[End fold recall]`;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1491,8 +1536,9 @@ export function buildFoldRecallContext(
         if (body === null) continue; // raw no longer recoverable — skip silently
         // Curated Code Radar may take up to half the card body budget; the
         // excerpt keeps the rest. '' (empty carriers / flags off) ⇒ byte-identical.
-        const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 2), radarSuppressPaths);
-        rendered = renderCard(item, body, bodyBudget, radar);
+        const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
+        const sourceDelta = resolveItemSourceDelta(item, state);
+        rendered = renderCard(item, body, bodyBudget, radar, sourceDelta);
         if (rendered.length > remaining) {
           level = 'hint';
           rendered = null;

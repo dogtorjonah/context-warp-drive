@@ -36,6 +36,11 @@
       "import": "./dist/fold.js",
       "require": "./dist/fold.cjs"
     },
+    "./budget": {
+      "types": "./dist/budget.d.ts",
+      "import": "./dist/budget.js",
+      "require": "./dist/budget.cjs"
+    },
     "./episodes": {
       "types": "./dist/episodes.d.ts",
       "import": "./dist/episodes.js",
@@ -50,6 +55,11 @@
       "types": "./dist/overwatch.d.ts",
       "import": "./dist/overwatch.js",
       "require": "./dist/overwatch.cjs"
+    },
+    "./task-rail": {
+      "types": "./dist/task-rail.d.ts",
+      "import": "./dist/task-rail.js",
+      "require": "./dist/task-rail.cjs"
     }
   },
   "main": "./dist/index.cjs",

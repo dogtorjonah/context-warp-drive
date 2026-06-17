@@ -116,6 +116,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'grok-4.20-multi-agent-0309': 2_000_000,
 
   // ── GLM (Z.ai) models ──
+  'glm-5.2': 1_000_000,
   'glm-5.1': 200_000,
   'glm-5-turbo': 200_000,
   'glm-5': 80_000,

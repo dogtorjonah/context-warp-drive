@@ -288,3 +288,68 @@ describe('governByTrace — derivation is always populated', () => {
     expect(d.derivation.some((line) => line.startsWith('flavor='))).toBe(true);
   });
 });
+
+describe('governByTrace — pressure action dynamic thresholds', () => {
+  it('uses burst reserve + safety runway so a 200k Sonnet Atlas burst triggers relief before 80%', () => {
+    const pressure = {
+      measuredTokens: 153_500,
+      windowTokens: 200_000,
+      burstReserveTokens: 37_000,
+      safetyMarginTokens: 10_000,
+      rawTailTokens: 8_000,
+    };
+    const d = governByTrace([msg('executing'), tool('search')], pressure, 170_000);
+
+    expect(d.pressure.level).toBe('warning');
+    expect(d.pressure.warnAtTokens).toBe(153_000);
+    expect(d.pressure.hardAtTokens).toBe(163_000);
+    expect(d.pressureAction.action).toBe('pressure_tail_append');
+    expect(d.pressureAction.noProviderCallWithoutRelief).toBe(false);
+  });
+
+  it('marks 200k hard runway as no-provider-call-without-relief', () => {
+    const d = governByTrace([msg('working'), tool('search')], {
+      measuredTokens: 164_000,
+      windowTokens: 200_000,
+      burstReserveTokens: 37_000,
+      safetyMarginTokens: 10_000,
+      rawTailTokens: 12_000,
+    }, 170_000);
+
+    expect(d.pressure.level).toBe('critical');
+    expect(d.pressureAction.action).toBe('pressure_tail_append');
+    expect(d.pressureAction.noProviderCallWithoutRelief).toBe(true);
+  });
+
+  it('does not classify a 1M window as critical at the same absolute burst runway', () => {
+    const d = governByTrace([msg('working'), tool('search')], {
+      measuredTokens: 850_000,
+      windowTokens: 1_000_000,
+      burstReserveTokens: 37_000,
+      safetyMarginTokens: 50_000,
+      rawTailTokens: 10_000,
+    }, 170_000);
+
+    expect(d.pressure.level).toBe('healthy');
+    expect(d.pressure.warnAtTokens).toBe(913_000);
+    expect(d.pressureAction.action).toBe('normal_append');
+    expect(d.pressureAction.noProviderCallWithoutRelief).toBe(false);
+  });
+
+  it('uses prefix saturation as the conservative full-recompute backstop', () => {
+    const d = governByTrace([msg('working'), tool('search')], {
+      measuredTokens: 925_000,
+      windowTokens: 1_000_000,
+      burstReserveTokens: 37_000,
+      safetyMarginTokens: 50_000,
+      frozenPrefixTokens: 900_000,
+      prefixSaturationTokens: 900_000,
+      rawTailTokens: 10_000,
+    }, 170_000);
+
+    expect(d.pressure.level).toBe('warning');
+    expect(d.pressureAction.action).toBe('full_recompute_evict');
+    expect(d.pressureAction.noProviderCallWithoutRelief).toBe(false);
+  });
+});
+
