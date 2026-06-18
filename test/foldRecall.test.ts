@@ -3,7 +3,9 @@ import { describe, expect, test } from 'vitest';
 import {
   buildFoldRecallContext,
   buildFoldIndex,
+  blendScores,
   createFoldRecallState,
+  distanceToBooster,
   deriveBoundaryRecallSignals,
   DEFAULT_FOLD_RECALL_CONFIG,
   excerptForRecall,
@@ -1601,5 +1603,49 @@ describe('buildFoldRecallContext — bash-path participation', () => {
     const b = buildFoldRecallContext(makeState(), raw, sig, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(a.text).toBe(b.text);
     expect(a.chars).toBe(b.chars);
+  });
+});
+
+describe('tier-1b (BENCHED): import-graph distance booster pure helpers', () => {
+  // These helpers are benched — nothing in the live pipeline calls them. The tests
+  // guard the retained ranking math so it stays correct if tier-1b is ever revived.
+  test('distanceToBooster: distance 0 → 1.0, ∞ → 0, linear between', () => {
+    expect(distanceToBooster(0)).toBe(1.0);
+    expect(distanceToBooster(Number.POSITIVE_INFINITY)).toBe(0);
+    expect(distanceToBooster(6)).toBe(0);
+    expect(distanceToBooster(3)).toBeCloseTo(0.5, 5);
+    expect(distanceToBooster(1)).toBeCloseTo(1 - 1 / 6, 5);
+  });
+
+  test('distanceToBooster: cross-cluster (∞) is zero boost, NOT negative', () => {
+    expect(distanceToBooster(Number.POSITIVE_INFINITY)).toBeGreaterThanOrEqual(0);
+  });
+
+  test('blendScores: booster-only invariant — never below behavioral baseline', () => {
+    expect(blendScores(0.8, 0)).toBeGreaterThanOrEqual(0.8);
+    expect(blendScores(0.9, 0.1)).toBeGreaterThanOrEqual(0.9);
+    expect(blendScores(0.5, 1.0)).toBeCloseTo(0.65, 5);
+  });
+
+  test('blendScores: cold-start (behavioral=0) uses import booster as fallback', () => {
+    const score = blendScores(0, 1.0);
+    expect(score).toBeCloseTo(0.3, 5);
+    expect(score).toBeGreaterThan(0);
+  });
+
+  test('blendScores: all scores clamped to [0, 1]', () => {
+    expect(blendScores(1, 1)).toBeLessThanOrEqual(1);
+    expect(blendScores(1, 1)).toBeGreaterThanOrEqual(0);
+    expect(blendScores(0, 0)).toBeGreaterThanOrEqual(0);
+  });
+
+  test('blendScores: cross-cluster paths (∞ distance) get zero boost but no penalty', () => {
+    expect(blendScores(0.6, 0)).toBeCloseTo(0.6, 5);
+  });
+
+  test('booster raises score above behavioral-only baseline', () => {
+    const noBoost = blendScores(0.5, 0);
+    const withBoost = blendScores(0.5, 1.0);
+    expect(withBoost).toBeGreaterThan(noBoost);
   });
 });

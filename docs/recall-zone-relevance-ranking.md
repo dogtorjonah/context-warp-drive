@@ -79,8 +79,10 @@ the agent's real touches. The worker's `burstGroups` come from fold index
   and normalizes to 0-1.
 
 - **Tier 1b** (⏸️ **BENCHED**): the import-graph distance booster
-  (`distanceToBooster` / `blendScores`) is retained as pure, unit-tested helpers,
-  but it is **not applied** by the live worker — affinity is behavioral-only.
+  (`distanceToBooster` / `blendScores`) is retained as pure, unit-tested helpers
+  **in the package** (`src/foldRecall.ts`, both repos; the relay worker imports
+  them via the shim — single source of truth), but it is **not applied** by the
+  live worker — affinity is behavioral-only.
 
 ### Why Tier-1b Is Benched
 
@@ -124,7 +126,8 @@ if it could). Until then the retained helpers + their tests document the math.
 |-----------|------|------|
 | Tier-0 ordering + cap | `src/foldRecall.ts` | both |
 | Tier-1 carrier + relevance (proximity fallback/tie-break) | `src/foldRecall.ts` | both |
-| Affinity worker (tier-1 behavioral; tier-1b benched) | `relay/src/workerPool/handlers/foldRecallAffinity.ts` | voxxo-swarm |
+| Tier-1b booster math (benched, pure: `distanceToBooster`/`blendScores`) | `src/foldRecall.ts` | both |
+| Affinity worker (tier-1 behavioral; imports benched helpers via shim) | `relay/src/workerPool/handlers/foldRecallAffinity.ts` | voxxo-swarm |
 | Task types (`cwd` reserved/unused) | `relay/src/workerPool/types.ts` | voxxo-swarm |
 | Handler registration | `relay/src/workerPool/worker.ts` | voxxo-swarm |
 | Wiring (no cwd; carrier rebuilt per epoch) | `relay/src/fcBaseSession.ts` (`enrichFoldRecallIndex`) | voxxo-swarm |
@@ -142,9 +145,9 @@ if it could). Until then the retained helpers + their tests document the math.
 
 ### Test Coverage
 
-- Standalone `foldRecall.test.ts`: 82 tests (tier-0 proximity + residency + tier-1 affinity + F7 cold-zone fallback)
-- Canonical `foldRecall.test.ts`: 79 tests
-- Relay `foldRecallAffinity.test.ts`: 16 tests (9 tier-1 behavioral + 7 benched tier-1b pure-helper invariants)
+- Standalone `foldRecall.test.ts`: 89 tests (tier-0 proximity + residency + tier-1 affinity + F7 cold-zone fallback + 7 benched tier-1b helper invariants)
+- Canonical `foldRecall.test.ts`: 86 tests
+- Relay `foldRecallAffinity.test.ts`: 16 tests (9 tier-1 behavioral handler tests + 7 benched tier-1b helper invariants; helpers imported from the package)
 
 ## Measurement Plan for Future Tuning
 

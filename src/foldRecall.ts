@@ -1012,6 +1012,43 @@ function orderZoneByRelevance(
     .map((z) => z.p);
 }
 
+// ── Tier-1b booster math (BENCHED) ──────────────────────────────────────────
+// Pure import-graph-distance ranking helpers. BENCHED: nothing in the live
+// pipeline calls these. The host-side affinity worker computes behavioral-only
+// affinity — the import booster was demoted by its own thesis to a minority-case
+// tie-breaker, could not resolve the workspace root inside a worker thread
+// (process.chdir throws there), and had no relevance telemetry to justify it.
+// They live HERE, in the fold-engine package, because they are pure recall-ranking
+// math (the natural sibling of orderZoneByRelevance) so standalone and any host
+// share one source of truth. Revive only after measuring tier-1 lift AND threading
+// the impact-graph root explicitly (never via process.chdir). Kept unit-tested.
+const BEHAVIORAL_WEIGHT = 0.7;
+const IMPORT_BOOSTER_WEIGHT = 0.3;
+
+/**
+ * BENCHED (tier-1b). Convert import-graph distance to a 0-1 booster signal:
+ * distance 0 (same file / direct dependency) → 1.0; distance ∞ (cross-cluster) →
+ * 0 (no boost, NO penalty). Formula: max(0, 1 - distance / 6) — the 6-hop bound
+ * matches the host impact graph's max traversal depth.
+ */
+export function distanceToBooster(distance: number): number {
+  if (!Number.isFinite(distance)) return 0; // cross-cluster → zero boost, no penalty
+  return Math.max(0, 1 - distance / 6);
+}
+
+/**
+ * BENCHED (tier-1b). Blend behavioral affinity with the import-graph booster.
+ * Booster-only invariant: the result is never below the behavioral baseline (import
+ * distance only RAISES a score, never penalizes). Cold-start (behavioral 0) falls
+ * back to the booster.
+ * finalScore = max(behavioral, behavioral*BEHAVIORAL_WEIGHT + importBooster*IMPORT_BOOSTER_WEIGHT)
+ */
+export function blendScores(behavioral: number, importBooster: number): number {
+  const blended = behavioral * BEHAVIORAL_WEIGHT + importBooster * IMPORT_BOOSTER_WEIGHT;
+  // Booster-only invariant: never below behavioral baseline; clamp to [0,1].
+  return Math.max(behavioral, Math.max(0, Math.min(1, blended)));
+}
+
 /**
  * Paths that share the same recall body/enrichment zone. A folded inter-turn
  * entry is one temporal read burst, so touching any member path should recover
