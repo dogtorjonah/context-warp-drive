@@ -931,6 +931,22 @@ function entryPaths(entry: FoldIndexEntry): readonly string[] {
   return entry.kind === 'turn' ? entry.paths : entry.path ? [entry.path] : [];
 }
 
+function isSyntheticRecallKey(matchedPath: string): boolean {
+  return matchedPath.startsWith('verbatim:') || matchedPath.startsWith('term:');
+}
+
+/**
+ * Paths that share the same recall body/enrichment zone. A folded inter-turn
+ * entry is one temporal read burst, so touching any member path should recover
+ * the whole co-folded source context. Intra-tool entries stay exact-path.
+ */
+function recallZonePaths(item: RecallPlanItem): readonly string[] {
+  if (item.entry.kind === 'turn' || isSyntheticRecallKey(item.matchedPath)) {
+    return entryPaths(item.entry);
+  }
+  return [item.matchedPath];
+}
+
 /** Smallest path present in both sorted lists, or null. Both inputs sorted. */
 function firstIntersection(sortedA: readonly string[], sortedB: readonly string[]): string | null {
   let i = 0;
@@ -1192,20 +1208,29 @@ export function findToolResultText(rawHistory: readonly FoldMessage[], toolId: s
   return null;
 }
 
-/** Collect tool result texts within a turn slice whose tool-arg path matches. */
-function collectToolResultTextsForPath(slice: readonly FoldMessage[], path: string): string[] {
+/** Collect tool result texts within a turn slice whose tool-arg path matches any recall-zone path. */
+function collectToolResultTextsForPaths(slice: readonly FoldMessage[], paths: readonly string[]): string[] {
+  if (paths.length === 0) return [];
+  const wanted = new Set(paths);
   const ids: string[] = [];
+  const seenIds = new Set<string>();
+  const pushId = (id: string): void => {
+    if (seenIds.has(id)) return;
+    seenIds.add(id);
+    ids.push(id);
+  };
   for (const msg of slice) {
     if (msg.role !== 'assistant') continue;
     if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
         if (block?.type === 'tool_use' && typeof block.id === 'string') {
-          if (extractPath(block.input ?? {}) === path) {
-            ids.push(block.id);
+          const path = extractPath(block.input ?? {});
+          if (path && wanted.has(path)) {
+            pushId(block.id);
           } else if (typeof block.name === 'string' && BASH_TOOL_NAME_RE.test(block.name)) {
             const cmd = (block.input as any)?.command;
-            if (typeof cmd === 'string' && extractPathsFromBashCommand(cmd).includes(path)) {
-              ids.push(block.id);
+            if (typeof cmd === 'string' && extractPathsFromBashCommand(cmd).some(p => wanted.has(p))) {
+              pushId(block.id);
             }
           }
         }
@@ -1216,12 +1241,13 @@ function collectToolResultTextsForPath(slice: readonly FoldMessage[], path: stri
         if (tc?.id && tc?.function?.name) {
           let args: Record<string, unknown> = {};
           try { args = JSON.parse(tc.function.arguments ?? '{}'); } catch { /* skip */ }
-          if (extractPath(args) === path) {
-            ids.push(tc.id);
+          const path = extractPath(args);
+          if (path && wanted.has(path)) {
+            pushId(tc.id);
           } else if (BASH_TOOL_NAME_RE.test(tc.function.name)) {
             const cmd = args.command;
-            if (typeof cmd === 'string' && extractPathsFromBashCommand(cmd).includes(path)) {
-              ids.push(tc.id);
+            if (typeof cmd === 'string' && extractPathsFromBashCommand(cmd).some(p => wanted.has(p))) {
+              pushId(tc.id);
             }
           }
         }
@@ -1250,7 +1276,7 @@ function renderHint(item: RecallPlanItem): string {
 }
 
 /** Body text for a recall card, sliced from in-memory raw history only. */
-function renderEntryBody(entry: FoldIndexEntry, matchedPath: string, rawHistory: readonly FoldMessage[]): string | null {
+function renderEntryBody(entry: FoldIndexEntry, recallPaths: readonly string[], rawHistory: readonly FoldMessage[]): string | null {
   if (entry.kind === 'tool') {
     const text = findToolResultText(rawHistory, entry.toolId);
     return text === null ? null : stripRecallBlocks(text);
@@ -1262,8 +1288,8 @@ function renderEntryBody(entry: FoldIndexEntry, matchedPath: string, rawHistory:
   if (user) parts.push(`User asked: ${user.length > 300 ? charSafeSlice(user, 0, 299) + '…' : user}`);
   const assistant = extractAssistantText(slice as FoldMessage[]);
   if (assistant) parts.push(assistant);
-  if (matchedPath && !matchedPath.startsWith('term:')) {
-    for (const text of collectToolResultTextsForPath(slice, matchedPath)) {
+  if (recallPaths.length > 0) {
+    for (const text of collectToolResultTextsForPaths(slice, recallPaths)) {
       parts.push(stripRecallBlocks(text));
     }
   }
@@ -1337,8 +1363,7 @@ function resolveItemEnrichment(
   state: FoldRecallState,
   suppressPaths: ReadonlySet<string>,
 ): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
-  const synthetic = item.matchedPath.startsWith('verbatim:') || item.matchedPath.startsWith('term:');
-  const keys = synthetic ? entryPaths(item.entry) : [item.matchedPath];
+  const keys = recallZonePaths(item);
   const highlights: RecallSourceHighlight[] = [];
   const hazards: RecallHazard[] = [];
   const seenH = new Set<string>();
@@ -1394,14 +1419,17 @@ function normalizeSourceForComparison(text: string): string {
   return text.replace(/\r\n/g, '\n').trim();
 }
 
-function resolveItemSourceDelta(item: RecallPlanItem, state: FoldRecallState): RecallSourceDelta | null {
-  const synthetic = item.matchedPath.startsWith('verbatim:') || item.matchedPath.startsWith('term:');
-  const keys = synthetic ? entryPaths(item.entry) : [item.matchedPath];
+function resolveItemSourceDeltas(item: RecallPlanItem, state: FoldRecallState): RecallSourceDelta[] {
+  const keys = recallZonePaths(item);
+  const deltas: RecallSourceDelta[] = [];
+  const seen = new Set<string>();
   for (const key of keys) {
     const delta = state.pathSourceDeltas.get(key);
-    if (delta) return delta;
+    if (!delta || seen.has(delta.path)) continue;
+    seen.add(delta.path);
+    deltas.push(delta);
   }
-  return null;
+  return deltas;
 }
 
 function formatSourceDelta(delta: RecallSourceDelta, historicalBody: string, charBudget: number): string {
@@ -1418,14 +1446,18 @@ function formatSourceDelta(delta: RecallSourceDelta, historicalBody: string, cha
   return `${heading}\nCurrent source excerpt:\n${excerptForRecall(live, bodyBudget)}`;
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, sourceDelta: RecallSourceDelta | null): string {
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, sourceDeltas: readonly RecallSourceDelta[]): string {
   // Radar (hazard + highlight guideposts) and live-source delta both prepend the
   // body excerpt and share the card budget — subtract their footprint so the
   // total card stays bounded. Empty carriers ⇒ output is byte-identical to
   // legacy recall.
   const radarBlock = radar ? `${radar}\n` : '';
   const deltaBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length) / 2);
-  const deltaBlock = sourceDelta ? formatSourceDelta(sourceDelta, body, deltaBudget) : '';
+  const perDeltaBudget = sourceDeltas.length > 0 ? Math.floor(deltaBudget / sourceDeltas.length) : 0;
+  const deltaBlock = sourceDeltas
+    .map(delta => formatSourceDelta(delta, body, perDeltaBudget))
+    .filter(Boolean)
+    .join('\n');
   const prefixBlock = deltaBlock ? `${radarBlock}${deltaBlock}\n` : radarBlock;
   const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - prefixBlock.length));
   const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
@@ -1534,13 +1566,14 @@ export function buildFoldRecallContext(
       if (bodyBudget < MIN_USEFUL_CARD_CHARS) {
         level = 'hint'; // measured budget overflow → card degrades to hint
       } else {
-        const body = renderEntryBody(item.entry, item.matchedPath, rawHistory);
+        const recallPaths = recallZonePaths(item);
+        const body = renderEntryBody(item.entry, recallPaths, rawHistory);
         if (body === null) continue; // raw no longer recoverable — skip silently
         // Curated Code Radar may take up to half the card body budget; the
         // excerpt keeps the rest. '' (empty carriers / flags off) ⇒ byte-identical.
         const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
-        const sourceDelta = resolveItemSourceDelta(item, state);
-        rendered = renderCard(item, body, bodyBudget, radar, sourceDelta);
+        const sourceDeltas = resolveItemSourceDeltas(item, state);
+        rendered = renderCard(item, body, bodyBudget, radar, sourceDeltas);
         if (rendered.length > remaining) {
           level = 'hint';
           rendered = null;

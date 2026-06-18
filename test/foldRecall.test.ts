@@ -743,6 +743,44 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).toContain('live snapshot truncated');
   });
 
+  test('touching one folded read-burst member carries sibling source deltas', () => {
+    const alpha = 'relay/src/alpha.ts';
+    const beta = 'relay/src/beta.ts';
+    const raw: FoldMessage[] = [
+      userMsg('Read alpha and beta together'),
+      anthropicToolUse('tu_alpha', 'Read', { file_path: ABS(alpha) }),
+      anthropicToolResult('tu_alpha', 'ALPHA OLD CONTENT'),
+      anthropicToolUse('tu_beta', 'Read', { file_path: ABS(beta) }),
+      anthropicToolResult('tu_beta', 'BETA OLD CONTENT'),
+      assistantMsg('Alpha and beta were reviewed in one temporal burst.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([
+      turnEntry('burst', 'alpha beta reviewed together', 30, [alpha, beta], 0, raw.length),
+    ], raw.length);
+    state.pathSourceDeltas.set(beta, {
+      path: beta,
+      liveHash: 'beta-new',
+      liveSource: 'BETA NEW CONTENT',
+    });
+
+    const out = buildFoldRecallContext(
+      state,
+      raw,
+      extractRecallSignals({ file_path: ABS(alpha) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+
+    expect(out.cards).toBe(1);
+    expect(out.text!).toContain('trigger: path-touch relay/src/alpha.ts');
+    expect(out.text!).toContain('ALPHA OLD CONTENT');
+    expect(out.text!).toContain('BETA OLD CONTENT');
+    expect(out.text!).toContain('Live Source Delta (relay/src/beta.ts)');
+    expect(out.text!).toContain('BETA NEW CONTENT');
+    expect(out.text!).not.toContain('Live Source Delta (relay/src/alpha.ts)');
+  });
+
   test('tier-1 claim on a folded path pages content in', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
