@@ -881,6 +881,106 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).not.toContain('PKG-INCIDENTAL');
   });
 
+  test('tier-1: affinity carrier overrides proximity ordering for enrichment', () => {
+    const core = 'relay/src/core.ts';
+    const helper = 'relay/src/helper.ts';       // same-dir sibling (proximity=2)
+    const shared = 'shared/types.ts';           // cross-cluster (proximity=0)
+    const raw: FoldMessage[] = [
+      userMsg('Read core, helper, and shared types together'),
+      anthropicToolUse('tu_core', 'Read', { file_path: ABS(core) }),
+      anthropicToolResult('tu_core', 'CORE OLD CONTENT'),
+      anthropicToolUse('tu_helper', 'Read', { file_path: ABS(helper) }),
+      anthropicToolResult('tu_helper', 'HELPER OLD CONTENT'),
+      anthropicToolUse('tu_shared', 'Read', { file_path: ABS(shared) }),
+      anthropicToolResult('tu_shared', 'SHARED OLD CONTENT'),
+      assistantMsg('Core, helper, and shared types reviewed together.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([
+      turnEntry('burst', 'core helper shared reviewed', 30, [core, helper, shared], 0, raw.length),
+    ], raw.length);
+    // Highlights for all 3 paths.
+    state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(shared, [{ label: 'SHARED-TYPE', startLine: 10, endLine: 20 }]);
+    // Affinity carrier: shared has HIGH affinity to core (0.9), helper LOW (0.1).
+    // Proximity alone would rank helper above shared, but affinity overrides.
+    state.pathAffinity.set(`${core}\x00${shared}`, 0.9);
+    state.pathAffinity.set(`${core}\x00${helper}`, 0.1);
+
+    const out = buildFoldRecallContext(
+      state,
+      raw,
+      extractRecallSignals({ file_path: ABS(core) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+
+    expect(out.cards).toBe(1);
+    // All bodies present (uncapped).
+    expect(out.text!).toContain('CORE OLD CONTENT');
+    expect(out.text!).toContain('HELPER OLD CONTENT');
+    expect(out.text!).toContain('SHARED OLD CONTENT');
+    // Enrichment is affinity-ordered: anchor (core) + shared (0.9) make top-2,
+    // helper (0.1) is third. With K=3 all three fit, but the key assertion is
+    // that SHARED-TYPE radar appears (it would be excluded under tier-0 proximity
+    // if K<3, since shared is cross-cluster). More importantly, the ranking is
+    // by affinity not proximity: shared ranks above helper.
+    expect(out.text!).toContain('CORE-ANCHOR');
+    expect(out.text!).toContain('SHARED-TYPE');
+    expect(out.text!).toContain('HELPER-SIBLING');
+    // Verify affinity ordering: SHARED-TYPE should appear before HELPER-SIBLING
+    // in the radar output (higher affinity ranks first).
+    const sharedIdx = out.text!.indexOf('SHARED-TYPE');
+    const helperIdx = out.text!.indexOf('HELPER-SIBLING');
+    expect(sharedIdx).toBeGreaterThan(-1);
+    expect(helperIdx).toBeGreaterThan(-1);
+    expect(sharedIdx).toBeLessThan(helperIdx);
+  });
+
+  test('tier-1: empty affinity carrier falls back to proximity ordering', () => {
+    const core = 'relay/src/core.ts';
+    const helper = 'relay/src/helper.ts';
+    const extra = 'relay/src/utils/extra.ts';
+    const pkg = 'package.json';
+    const raw: FoldMessage[] = [
+      userMsg('Read core, helper, extra, and package.json together'),
+      anthropicToolUse('tu_core', 'Read', { file_path: ABS(core) }),
+      anthropicToolResult('tu_core', 'CORE OLD CONTENT'),
+      anthropicToolUse('tu_helper', 'Read', { file_path: ABS(helper) }),
+      anthropicToolResult('tu_helper', 'HELPER OLD CONTENT'),
+      anthropicToolUse('tu_extra', 'Read', { file_path: ABS(extra) }),
+      anthropicToolResult('tu_extra', 'EXTRA OLD CONTENT'),
+      anthropicToolUse('tu_pkg', 'Read', { file_path: ABS(pkg) }),
+      anthropicToolResult('tu_pkg', 'PACKAGE CONFIG'),
+      assistantMsg('Core, helper, extra, and package config reviewed together.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([
+      turnEntry('burst', 'core helper extra pkg reviewed', 30, [core, helper, extra, pkg], 0, raw.length),
+    ], raw.length);
+    // pathAffinity is empty (default) → tier-0 proximity fallback.
+    state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(extra, [{ label: 'EXTRA-NESTED', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(pkg, [{ label: 'PKG-INCIDENTAL', startLine: 10, endLine: 20 }]);
+
+    const out = buildFoldRecallContext(
+      state,
+      raw,
+      extractRecallSignals({ file_path: ABS(core) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+
+    expect(out.cards).toBe(1);
+    // Proximity fallback: same-dir siblings in top-K=3, cross-cluster excluded.
+    expect(out.text!).toContain('CORE-ANCHOR');
+    expect(out.text!).toContain('HELPER-SIBLING');
+    expect(out.text!).toContain('EXTRA-NESTED');
+    expect(out.text!).not.toContain('PKG-INCIDENTAL');
+  });
+
   test('tier-1 claim on a folded path pages content in', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);

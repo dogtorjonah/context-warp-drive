@@ -720,6 +720,15 @@ export interface FoldRecallState {
   pathHazards: Map<string, RecallHazard[]>;
   /** Live source snapshots, keyed by normalized path, supplied off-thread by the relay worker. */
   pathSourceDeltas: Map<string, RecallSourceDelta>;
+  /**
+   * Tier-1 behavioral co-activation affinity carrier. Keyed by a composite
+   * "anchor\x00zonePath" string (see affinityKey), value = normalized 0-1
+   * relevance score (1.0 = strongest co-activation). Populated OFF-THREAD by the
+   * relay worker from real touch/edit history (NOT recall output — closing the
+   * loop on recall output creates a self-reinforcing echo chamber). Empty in
+   * standalone/no-host mode → orderZoneByRelevance falls back to tier-0 proximity.
+   */
+  pathAffinity: Map<string, number>;
   /** Recall pass counter — one pass per tool boundary that carried signals. */
   passSeq: number;
   // ── Lifetime telemetry counters ──
@@ -737,6 +746,7 @@ export function createFoldRecallState(): FoldRecallState {
     pathHighlights: new Map(),
     pathHazards: new Map(),
     pathSourceDeltas: new Map(),
+    pathAffinity: new Map(),
     passSeq: 0,
     cardsInjected: 0,
     hintsInjected: 0,
@@ -963,19 +973,53 @@ function orderZoneByProximity(anchor: string, paths: readonly string[]): string[
 }
 
 /**
+ * Composite key for the pairwise pathAffinity carrier. Null-byte separator
+ * avoids path collision (paths never contain \x00).
+ */
+function affinityKey(anchor: string, zonePath: string): string {
+  return `${anchor}\x00${zonePath}`;
+}
+
+/**
+ * Order zone paths by behavioral co-activation affinity from the host-supplied
+ * pathAffinity carrier (tier-1): anchor first (affinity=1.0 by convention), then
+ * by descending affinity score, cross-cluster/unseen paths last. When the
+ * carrier is empty (standalone/no-host mode), falls back to tier-0 directory
+ * proximity — preserving byte-identical standalone behavior.
+ */
+function orderZoneByRelevance(
+  anchor: string,
+  paths: readonly string[],
+  affinity: ReadonlyMap<string, number>,
+): string[] {
+  if (affinity.size === 0) return orderZoneByProximity(anchor, paths);
+  return paths
+    .map((p, i) => ({
+      p,
+      i,
+      score: p === anchor ? Infinity : (affinity.get(affinityKey(anchor, p)) ?? -1),
+    }))
+    .sort((x, y) => y.score - x.score || x.i - y.i)
+    .map(z => z.p);
+}
+
+/**
  * Paths that share the same recall body/enrichment zone. A folded inter-turn
  * entry is one temporal read burst, so touching any member path should recover
  * the whole co-folded source context. Intra-tool entries stay exact-path.
  *
- * For real anchors (tier-0/1 path touches) the zone is proximity-ordered so
- * enrichment (radar, source deltas) prioritizes the anchor and its closest
- * siblings. Synthetic keys (verbatim:/term:) have no real anchor, so they keep
- * entry order.
+ * For real anchors (tier-0/1 path touches) the zone is relevance-ordered:
+ * tier-1 behavioral affinity when the carrier is populated, tier-0 directory
+ * proximity as fallback. Synthetic keys (verbatim:/term:) have no real anchor,
+ * so they keep entry order.
  */
-function recallZonePaths(item: RecallPlanItem): readonly string[] {
+function recallZonePaths(item: RecallPlanItem, state?: FoldRecallState): readonly string[] {
   if (item.entry.kind === 'turn' || isSyntheticRecallKey(item.matchedPath)) {
     if (isSyntheticRecallKey(item.matchedPath)) return entryPaths(item.entry);
-    return orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
+    const affinity = state?.pathAffinity;
+    return affinity
+      ? orderZoneByRelevance(item.matchedPath, entryPaths(item.entry), affinity)
+      : orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
   }
   return [item.matchedPath];
 }
@@ -1396,7 +1440,7 @@ function resolveItemEnrichment(
   state: FoldRecallState,
   suppressPaths: ReadonlySet<string>,
 ): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
-  const keys = recallZonePaths(item).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
+  const keys = recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
   const highlights: RecallSourceHighlight[] = [];
   const hazards: RecallHazard[] = [];
   const seenH = new Set<string>();
@@ -1453,7 +1497,7 @@ function normalizeSourceForComparison(text: string): string {
 }
 
 function resolveItemSourceDeltas(item: RecallPlanItem, state: FoldRecallState): RecallSourceDelta[] {
-  const keys = recallZonePaths(item).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
+  const keys = recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
   const deltas: RecallSourceDelta[] = [];
   const seen = new Set<string>();
   for (const key of keys) {
@@ -1599,7 +1643,7 @@ export function buildFoldRecallContext(
       if (bodyBudget < MIN_USEFUL_CARD_CHARS) {
         level = 'hint'; // measured budget overflow → card degrades to hint
       } else {
-        const recallPaths = recallZonePaths(item);
+        const recallPaths = recallZonePaths(item, state);
         const body = renderEntryBody(item.entry, recallPaths, rawHistory);
         if (body === null) continue; // raw no longer recoverable — skip silently
         // Curated Code Radar may take up to half the card body budget; the
