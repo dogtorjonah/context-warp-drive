@@ -135,7 +135,7 @@ function buildCoordinationTurn(): FoldMessage[] {
   const id1 = 'toolu_chat1';
   return [
     userMsg('Check in with the team'),
-    anthropicToolUse('mcp__agent-bridge__chatroom', { action: 'send', room: 'dev-auth', message: 'Auth refactor complete' }, id1),
+    anthropicToolUse('mcp__voxxo-swarm-bridge__chatroom', { action: 'send', room: 'dev-auth', message: 'Auth refactor complete' }, id1),
     anthropicToolResult(id1, 'Message sent to #dev-auth'),
     assistantMsg('Posted the update to the dev-auth chatroom.'),
   ];
@@ -251,7 +251,7 @@ describe('skeletonizeTool', () => {
 
   test('atlas_query tool', () => {
     const skeleton = skeletonizeTool({
-      name: 'mcp__agent-bridge__atlas_query',
+      name: 'mcp__voxxo-swarm-bridge__atlas_query',
       input: { action: 'search', query: 'context thinning' },
       resultText: 'results',
       toolId: 't6',
@@ -262,7 +262,7 @@ describe('skeletonizeTool', () => {
 
   test('chatroom tool', () => {
     const skeleton = skeletonizeTool({
-      name: 'mcp__agent-bridge__chatroom',
+      name: 'mcp__voxxo-swarm-bridge__chatroom',
       input: { action: 'send', room: 'dev-auth' },
       resultText: 'sent',
       toolId: 't7',
@@ -1150,7 +1150,7 @@ describe('intraTurnFold — atlas lookup threshold (#2)', () => {
       '```',
     ].join('\n');
     msgs.push(
-      anthropicToolUse('mcp__agent-bridge__atlas_query', { action: 'lookup', file_path: 'relay/src/foo.ts' }, atlasId),
+      anthropicToolUse('mcp__voxxo-swarm-bridge__atlas_query', { action: 'lookup', file_path: 'relay/src/foo.ts' }, atlasId),
       anthropicToolResult(atlasId, atlasContent),
     );
     // Add extra tools to exceed tail buffer
@@ -1250,7 +1250,7 @@ describe('intraTurnFold — preserve atlas metadata (#5)', () => {
 
     const msgs: FoldMessage[] = [
       userMsg('Look at auth'),
-      anthropicToolUse('mcp__agent-bridge__atlas_query', { action: 'lookup', file_path: 'relay/src/foo.ts' }, atlasId),
+      anthropicToolUse('mcp__voxxo-swarm-bridge__atlas_query', { action: 'lookup', file_path: 'relay/src/foo.ts' }, atlasId),
       anthropicToolResult(atlasId, fullContent),
       // tail buffer
       anthropicToolUse('Grep', { pattern: 'auth' }, 'toolu_tail'),
@@ -1798,7 +1798,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
   test('default MCP arm appends [literal] when result contains a hex id', () => {
     const hexId = 'deadbeefcafe'; // 12-char hex
     const skeleton = skeletonizeTool({
-      name: 'mcp__agent-bridge__some_tool',
+      name: 'mcp__voxxo-swarm-bridge__some_tool',
       input: {},
       resultText: `id: ${hexId}`,
       toolId: 'tu3',
@@ -1809,7 +1809,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
 
   test('default arm has no bracket when result has no closet items', () => {
     const skeleton = skeletonizeTool({
-      name: 'mcp__agent-bridge__some_tool',
+      name: 'mcp__voxxo-swarm-bridge__some_tool',
       input: {},
       resultText: 'plain text output nothing here',
       toolId: 'tu4',
@@ -2393,17 +2393,17 @@ describe('resolveFoldBandBudgets / resolveFoldConfigForBand (E10b target band)',
     expect(band.episodicBoundaryBudgetChars).toBe(2_000);
   });
 
-  test('default band is 160K tokens and scales the assistant-text budget', () => {
-    expect(DEFAULT_FOLD_BAND_TOKENS).toBe(160_000);
+  test('default band is 100K tokens and scales the assistant-text budget', () => {
+    expect(DEFAULT_FOLD_BAND_TOKENS).toBe(100_000);
     const band = resolveFoldBandBudgets(DEFAULT_FOLD_BAND_TOKENS);
-    expect(band.bandChars).toBe(640_000);
-    expect(band.fullRetentionChars).toBe(80_000);
-    expect(band.essenceRetentionChars).toBe(160_000);
+    expect(band.bandChars).toBe(400_000);
+    expect(band.fullRetentionChars).toBe(50_000);
+    expect(band.essenceRetentionChars).toBe(100_000);
 
     const resolved = resolveFoldConfigForBand(undefined);
     expect(resolved).not.toBe(ALWAYS_ON_FOLD_CONFIG);
-    expect(resolved.assistantTextBudget?.fullRetentionChars).toBe(80_000);
-    expect(resolved.assistantTextBudget?.essenceRetentionChars).toBe(160_000);
+    expect(resolved.assistantTextBudget?.fullRetentionChars).toBe(50_000);
+    expect(resolved.assistantTextBudget?.essenceRetentionChars).toBe(100_000);
   });
 
   test('explicit 100K base band → deep-equals ALWAYS_ON config', () => {
@@ -2447,10 +2447,10 @@ describe('resolveFoldBandBudgets / resolveFoldConfigForBand (E10b target band)',
     expect(cfg.assistantTextBudget?.essenceRetentionChars).toBe(85_000);
   });
 
-  test('resolveFoldConfigForBand(undefined) uses the 160K default and threads charsPerToken', () => {
+  test('resolveFoldConfigForBand(undefined) uses the 100K default and threads charsPerToken', () => {
     const cfg = resolveFoldConfigForBand(undefined, 3.4);
     expect(cfg).not.toBe(ALWAYS_ON_FOLD_CONFIG);
-    expect(cfg.assistantTextBudget?.fullRetentionChars).toBe(68_000);
-    expect(cfg.assistantTextBudget?.essenceRetentionChars).toBe(136_000);
+    expect(cfg.assistantTextBudget?.fullRetentionChars).toBe(42_500);
+    expect(cfg.assistantTextBudget?.essenceRetentionChars).toBe(85_000);
   });
 });

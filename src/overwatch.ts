@@ -190,6 +190,28 @@ export interface OverwatchFreezeRec {
   readonly reason: string;
 }
 
+/**
+ * Fidelity ratios — what percentage of the fold band stays at each retention
+ * tier. These are the quality-driven levers (as opposed to the cost-driven
+ * band-size lever). The governor adjusts them based on glyph grammar
+ * transitions: when the agent is thriving (rapid verdicts), it can afford
+ * less verbatim history; when struggling (blocked, thrash), it needs more.
+ *
+ * null = no recommendation (hold prior). Same pattern as {@link OverwatchDecision.bandTokens}.
+ */
+export interface FidelityRatios {
+  /** Fraction of bandChars for full-fidelity assistant text. Default 0.125 (12.5%). */
+  readonly fullRetentionFraction: number;
+  /** Fraction of bandChars for essence-extracted text. Default 0.25 (25%). */
+  readonly essenceRetentionFraction: number;
+}
+
+/** Default fidelity ratios matching the hardcoded fold-budget constants. */
+export const DEFAULT_FIDELITY_RATIOS: FidelityRatios = {
+  fullRetentionFraction: 0.125,
+  essenceRetentionFraction: 0.25,
+};
+
 /** Breakdown of the decaying impulses at the current tick — the trust artifact. */
 export interface OverwatchImpulses {
   readonly tighten: number;
@@ -212,6 +234,8 @@ export interface OverwatchDecision {
   readonly pressureAction: OverwatchPressureActionRec;
   /** Recommended retained-history band. null = no change (hold prior). */
   readonly bandTokens: number | null;
+  /** Recommended fidelity ratios (quality-driven). null = no change (hold prior). */
+  readonly fidelity: FidelityRatios | null;
   readonly recall: OverwatchRecallRec;
   readonly episodic: OverwatchEpisodicRec;
   readonly freeze: OverwatchFreezeRec;
@@ -248,6 +272,17 @@ export interface OverwatchConfig {
   readonly thrashGapTicks: number;
   /** Max fractional band shrink a single full-amplitude verdict can propose. */
   readonly maxTightenFraction: number;
+  /** Fidelity ratio bounds — the governor clamps recommendations to these. */
+  readonly fidelity: {
+    /** Min full-retention fraction when tightening (agent thriving). */
+    readonly minFullRetention: number;
+    /** Max full-retention fraction when widening (agent struggling). */
+    readonly maxFullRetention: number;
+    /** Min essence-retention fraction when tightening. */
+    readonly minEssenceRetention: number;
+    /** Max essence-retention fraction when widening. */
+    readonly maxEssenceRetention: number;
+  };
   /** Cache economics — base-input-price multiples. */
   readonly cache: {
     /** Cache read/hit multiplier (Anthropic: 0.1×). */
@@ -276,6 +311,12 @@ export const DEFAULT_OVERWATCH_CONFIG: OverwatchConfig = {
   marathonTicks: 12,
   thrashGapTicks: 3,
   maxTightenFraction: 0.5,
+  fidelity: {
+    minFullRetention: 0.10,
+    maxFullRetention: 0.20,
+    minEssenceRetention: 0.20,
+    maxEssenceRetention: 0.35,
+  },
   cache: { readMultiplier: 0.1, writeMultiplier: 1.25 },
   defaults: {
     recallCards: 2,
@@ -361,6 +402,10 @@ const FLAVOR_RELEVANT: ReadonlySet<OverwatchToolClass> = new Set<OverwatchToolCl
 ]);
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * Math.max(0, Math.min(1, t));
+}
 
 function finitePositive(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
@@ -852,6 +897,53 @@ export function governByTrace(
     derivation.push(`band: hold prior (${priorBand ?? 'null'}) — no corroborated tighten signal`);
   }
 
+  // ── Fidelity ratios (quality-driven) ───────────────────────────────────────
+  // Unlike the band (cost-driven, shrink-only), fidelity ratios are bidirectional:
+  // they WIDEN when the agent is struggling (blocked, thrash) and TIGHTEN when
+  // thriving (verdicts clearing breakeven). Default = null (hold prior).
+  let fidelity: FidelityRatios | null = null;
+  const fcfg = cfg.fidelity;
+  if (press.level === 'auto_compact' || press.level === 'critical') {
+    // Under hard pressure, tighten fidelity aggressively — skeletonize more to
+    // survive the pressure event. The agent will get recall cards instead.
+    fidelity = {
+      fullRetentionFraction: fcfg.minFullRetention,
+      essenceRetentionFraction: fcfg.minEssenceRetention,
+    };
+    derivation.push(
+      `fidelity: hard pressure → tighten to ${fcfg.minFullRetention}/${fcfg.minEssenceRetention}`,
+    );
+  } else if (impulses.widenRecall > 0 || thrash > 0) {
+    // Blocked glyph or thrash → agent lost context, WIDEN fidelity so more
+    // turns survive at full/essence retention.
+    const widenStrength = Math.min(1, impulses.widenRecall + thrash * 0.3);
+    fidelity = {
+      fullRetentionFraction: lerp(DEFAULT_FIDELITY_RATIOS.fullRetentionFraction, fcfg.maxFullRetention, widenStrength),
+      essenceRetentionFraction: lerp(DEFAULT_FIDELITY_RATIOS.essenceRetentionFraction, fcfg.maxEssenceRetention, widenStrength),
+    };
+    derivation.push(
+      `fidelity: WIDEN → ${fidelity.fullRetentionFraction.toFixed(3)}/${fidelity.essenceRetentionFraction.toFixed(3)} ` +
+        `(${impulses.widenRecall > 0 ? 'blocked' : ''}${impulses.widenRecall > 0 && thrash > 0 ? '+' : ''}${thrash > 0 ? 'thrash' : ''}, strength=${widenStrength.toFixed(2)})`,
+    );
+  } else if (executionHold >= EXECUTION_HOLD_MIN_IMPULSE) {
+    // Mid-execution: hold — don't change ratios while the agent is actively working.
+    derivation.push('fidelity: executing hold → hold prior');
+  } else if (impulses.tighten > 0 && impulses.hold <= impulses.tighten && bandTokens !== null && priorBand !== null && bandTokens < priorBand) {
+    // Verdict armed a band tighten that cleared breakeven — also tighten fidelity.
+    // The agent is coping well, so it can afford less verbatim history.
+    const tightenStrength = Math.min(1, impulses.tighten);
+    fidelity = {
+      fullRetentionFraction: lerp(DEFAULT_FIDELITY_RATIOS.fullRetentionFraction, fcfg.minFullRetention, tightenStrength),
+      essenceRetentionFraction: lerp(DEFAULT_FIDELITY_RATIOS.essenceRetentionFraction, fcfg.minEssenceRetention, tightenStrength),
+    };
+    derivation.push(
+      `fidelity: tighten → ${fidelity.fullRetentionFraction.toFixed(3)}/${fidelity.essenceRetentionFraction.toFixed(3)} ` +
+        `(verdict, strength=${tightenStrength.toFixed(2)})`,
+    );
+  } else {
+    derivation.push('fidelity: hold prior — no corroborated signal');
+  }
+
   // ── Recall ──────────────────────────────────────────────────────────────────
   let recall: OverwatchRecallRec;
   if (press.level === 'auto_compact' || press.level === 'critical') {
@@ -918,6 +1010,7 @@ export function governByTrace(
     },
     pressureAction: pressureAct,
     bandTokens,
+    fidelity,
     recall,
     episodic,
     freeze,

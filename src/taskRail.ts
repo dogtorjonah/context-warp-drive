@@ -964,7 +964,7 @@ export class EmptyRailError extends Error {
 /** Error thrown when the rail is still in draft state (not locked). */
 export class DraftRailError extends Error {
   constructor() {
-    super('Task rail is still draft. In the relay task_rail tool, sprint/shoot execution is implicit approval and may lock non-empty draft rails; pure callers should lock only after approval.');
+    super('Task rail is still draft. Callers should lock the rail (set locked: true or call with explicit approval) before shoot/sprint execution — execution is implicit approval and may lock non-empty draft rails.');
     this.name = 'DraftRailError';
   }
 }

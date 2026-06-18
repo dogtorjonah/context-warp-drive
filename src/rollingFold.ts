@@ -214,7 +214,7 @@ export const ALWAYS_ON_FOLD_CONFIG: FoldConfig = {
 export const BAND_CHARS_PER_TOKEN = 4;
 
 /** Public steady-state fold-band default for omitted/undefined band targets. */
-export const DEFAULT_FOLD_BAND_TOKENS = 160_000;
+export const DEFAULT_FOLD_BAND_TOKENS = 100_000;
 
 export interface FoldBandBudgets {
   bandTokens: number;
@@ -231,21 +231,38 @@ export interface FoldBandBudgets {
 }
 
 /**
+ * Optional fidelity overrides — when provided by the governor, these replace
+ * the default 0.125/0.25 multipliers. Allows quality-driven ratio adjustment
+ * without changing band size.
+ */
+export interface FidelityOverrides {
+  /** Fraction of bandChars for full retention. Overrides default 0.125. */
+  fullRetentionFraction?: number;
+  /** Fraction of bandChars for essence retention. Overrides default 0.25. */
+  essenceRetentionFraction?: number;
+}
+
+/**
  * Pure arithmetic — derive the dependent fold budgets from a target
  * steady-state band. `charsPerToken` converts the token target into chars;
  * the default (4) preserves ratio math, while a lower per-engine ratio keeps
  * the band pinned to real tokens on denser tokenizers.
+ *
+ * When `fidelity` is provided, the retention fractions are overridden — this
+ * is the quality-driven lever (band controls total size, fidelity controls
+ * what proportion stays at each tier).
  */
 export function resolveFoldBandBudgets(
   bandTokens: number,
   charsPerToken: number = BAND_CHARS_PER_TOKEN,
+  fidelity?: FidelityOverrides,
 ): FoldBandBudgets {
   const bandChars = bandTokens * charsPerToken;
   return {
     bandTokens,
     bandChars,
-    fullRetentionChars: Math.round(bandChars * 0.125),
-    essenceRetentionChars: Math.round(bandChars * 0.25),
+    fullRetentionChars: Math.round(bandChars * (fidelity?.fullRetentionFraction ?? 0.125)),
+    essenceRetentionChars: Math.round(bandChars * (fidelity?.essenceRetentionFraction ?? 0.25)),
     evictThresholdChars: Math.round(bandChars * 0.055),
     episodicBoundaryBudgetChars: Math.round(bandChars * 0.005),
   };
@@ -256,13 +273,17 @@ export function resolveFoldBandBudgets(
  * public 160K default band. A band returns a copy with the assistant-text
  * budget scaled by the documented ratios; explicit 100K deep-equals the
  * unscaled base config.
+ *
+ * When `fidelity` is provided, the retention fractions are overridden —
+ * enabling quality-driven ratio adjustment.
  */
 export function resolveFoldConfigForBand(
   bandTokens: number | undefined = DEFAULT_FOLD_BAND_TOKENS,
   charsPerToken: number = BAND_CHARS_PER_TOKEN,
+  fidelity?: FidelityOverrides,
 ): FoldConfig {
   const resolvedBandTokens = bandTokens ?? DEFAULT_FOLD_BAND_TOKENS;
-  const band = resolveFoldBandBudgets(resolvedBandTokens, charsPerToken);
+  const band = resolveFoldBandBudgets(resolvedBandTokens, charsPerToken, fidelity);
   return {
     ...ALWAYS_ON_FOLD_CONFIG,
     assistantTextBudget: {
@@ -698,13 +719,16 @@ function truncate(s: string, max: number): string {
 }
 
 /**
- * Normalize an absolute voxxo-swarm path to repo-relative form. This is the
+ * Normalize an absolute `/home/<user>/<repo>/…` path to repo-relative form. The
  * canonical normalization used by claimed-path matching (`isClaimedPath`) and
  * tool-arg path extraction — exported so the fold freeze (foldFreeze.ts) can
  * test claim relevance with byte-identical semantics.
+ *
+ * Strips the leading `/home/<user>/<repo>/` segment (heuristic: repo one level
+ * under home). foldPathCanon.ts handles arbitrary roots via injected context.
  */
 export function normalizeToolPath(p: string): string {
-  return p.replace(/^\/home\/[^/]+\/voxxo-swarm\//, '');
+  return p.replace(/^\/home\/[^/]+\/[^/]+\//, '');
 }
 
 /**

@@ -184,6 +184,72 @@ describe('governByTrace — (d) blocked glyph widens recall', () => {
   });
 });
 
+describe('governByTrace — fidelity ratios (quality-driven, bidirectional)', () => {
+  const DEFAULT_FULL = 0.125;
+  const DEFAULT_ESSENCE = 0.25;
+
+  it('holds fidelity (null) when no corroborated signal moves it', () => {
+    const window: TraceToken[] = [msg('working'), tool('read', { paths: ['src/a.ts'] }), tool('search')];
+    const d = governByTrace(window, HEALTHY, 100_000);
+    expect(d.fidelity).toBeNull();
+  });
+
+  it('WIDENS fidelity above the default when the agent declares it is blocked (struggling)', () => {
+    const window: TraceToken[] = [tool('read', { paths: ['src/x.ts'] }), msg('blocked')];
+    const d = governByTrace(window, HEALTHY, 100_000);
+    expect(d.fidelity).not.toBeNull();
+    expect(d.fidelity!.fullRetentionFraction).toBeGreaterThan(DEFAULT_FULL);
+    expect(d.fidelity!.essenceRetentionFraction).toBeGreaterThan(DEFAULT_ESSENCE);
+    // Quality lever moved; cost lever (band) untouched.
+    expect(d.bandTokens).toBe(100_000);
+    expect(d.derivation.some((l) => l.startsWith('fidelity: WIDEN'))).toBe(true);
+  });
+
+  it('WIDENS fidelity on observed thrash (re-reading a folded path) without a glyph', () => {
+    const window: TraceToken[] = [
+      tool('read', { paths: ['src/lost.ts'] }),
+      tool('search'),
+      tool('search'),
+      tool('search'),
+      tool('read', { paths: ['src/lost.ts'] }),
+    ];
+    const d = governByTrace(window, HEALTHY, 100_000);
+    expect(d.signals.thrash).toBeGreaterThan(0);
+    expect(d.fidelity).not.toBeNull();
+    expect(d.fidelity!.fullRetentionFraction).toBeGreaterThan(DEFAULT_FULL);
+  });
+
+  it('TIGHTENS fidelity below the default when a verdict clears the band-shrink breakeven (thriving)', () => {
+    const window: TraceToken[] = [
+      ...repeat(tool('edit', { paths: ['src/impl.ts'] }), 90),
+      msg('verdict'),
+      tool('edit', { paths: ['src/impl.ts'] }),
+    ];
+    const d = governByTrace(window, HEALTHY, 170_000);
+    expect(d.bandTokens!).toBeLessThan(170_000); // breakeven cleared → band shrank
+    expect(d.fidelity).not.toBeNull();
+    expect(d.fidelity!.fullRetentionFraction).toBeLessThan(DEFAULT_FULL);
+    expect(d.fidelity!.essenceRetentionFraction).toBeLessThan(DEFAULT_ESSENCE);
+    expect(d.derivation.some((l) => l.startsWith('fidelity: tighten'))).toBe(true);
+  });
+
+  it('does NOT tighten fidelity when the band shrink is vetoed (coupled to the band lever)', () => {
+    // Fresh verdict but a short tail → breakeven vetoes the shrink, so fidelity holds too.
+    const window: TraceToken[] = [tool('edit', { paths: ['src/impl.ts'] }), msg('verdict')];
+    const d = governByTrace(window, HEALTHY, 170_000);
+    expect(d.bandTokens).toBe(170_000); // band held (veto)
+    expect(d.fidelity).toBeNull(); // fidelity tighten requires an actual band shrink
+  });
+
+  it('clamps fidelity to the configured min under hard pressure (skeletonize to survive)', () => {
+    const window: TraceToken[] = [msg('working'), tool('read', { paths: ['src/a.ts'] })];
+    const d = governByTrace(window, CRITICAL, 170_000);
+    expect(d.fidelity).not.toBeNull();
+    expect(d.fidelity!.fullRetentionFraction).toBe(DEFAULT_OVERWATCH_CONFIG.fidelity.minFullRetention);
+    expect(d.fidelity!.essenceRetentionFraction).toBe(DEFAULT_OVERWATCH_CONFIG.fidelity.minEssenceRetention);
+  });
+});
+
 describe('governByTrace — executing glyph holds the burst runway', () => {
   it('treats executing as implementation runway: hold band and modestly widen recall', () => {
     const window: TraceToken[] = [

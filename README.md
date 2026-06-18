@@ -10,7 +10,7 @@ Deterministic. Zero-LLM. Pure CPU, zero I/O, byte-identical output for identical
 
 Extracted from a production multi-agent system, where it folds context continuously across every model and long-running agent workloads.
 
-- The core engine passes **277 deterministic tests** across rolling fold, recall, freeze, and integration.
+- The core engine passes **380+ deterministic tests** across rolling fold, recall, freeze, and integration.
 - Every number below is **measured, not estimated** — production cache rates from the Claude provider usage ledger, reproducible live against Claude (`ANTHROPIC_API_KEY=… npx tsx examples/benchmark-live.ts`, real model + real summarizer) and offline with exact `o200k_base` BPE token counts (`npx tsx examples/benchmark.ts`, deterministic, no key).
 
 **Provenance note:** this public package is production-derived. It is the portable distribution of an engine that runs live inside a private multi-agent system, so it deliberately uses generic `WARP_*` environment names, package-neutral examples, raw-history recovery wording, and tool-agnostic voice mining. The byte-identical invariant is local to this package — identical inputs produce identical folded views — and is not a claim of bit-for-bit parity with any private integration layer.
@@ -72,6 +72,21 @@ npm install better-sqlite3
 ```
 
 The core (`context-warp-drive/fold`) has **zero runtime dependencies**. `better-sqlite3` is an optional peer needed only by the reference episodic store.
+
+<details>
+<summary>Building from source (git clone)</summary>
+
+`dist/` is gitignored — it ships only in the npm tarball. After cloning:
+
+```bash
+git clone https://github.com/dogtorjonah/context-warp-drive.git
+cd context-warp-drive
+npm install        # runs `prepare` → builds dist/ automatically
+# or if prepare was skipped (e.g. --ignore-scripts):
+npm run build      # explicit fallback
+```
+
+</details>
 
 ---
 
@@ -189,6 +204,10 @@ const restored = restoreTaskRail(JSON.parse(saved));
 
 Pair it with FoldSession like this: raw transcript stays in your storage, folded prompt view stays lean, and task rail tracks what the agent is supposed to do next.
 
+> **Draft operations** (`TASK_RAIL_DRAFT_OPERATIONS`, `TaskRailDraft`, conflict/merge types) are exported for parity with the full-featured relay wrapper. The draft *types* are here; the merge *engine* lives in the relay-side wrapper. If you need collaborative draft merging, build it on the exported types — the pure state machine only handles locked-rail execution.
+
+See [`examples/task-rail.ts`](./examples/task-rail.ts) for a full runnable walkthrough (start → sprint → ack → shoot → serialize → restore, zero dependencies).
+
 ---
 
 ## How it works
@@ -287,7 +306,7 @@ All optional; sensible defaults. `WARP_FOLD_FREEZE` (freeze on/off) · `WARP_FOL
 ## Tests
 
 ```bash
-npm test   # runs the 277-test deterministic suite (rolling fold, freeze, recall)
+npm test   # runs the 380+ test deterministic suite (rolling fold, freeze, recall, task rail)
 ```
 
 ## License

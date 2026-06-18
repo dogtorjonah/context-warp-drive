@@ -59,7 +59,7 @@
  * Pure CPU, zero I/O, no timers — event-loop safe by construction. State
  * lives on the session object and resets naturally on rebirth.
  *
- * Kill switch: VOXXO_FOLD_FREEZE=0 reverts to per-call recompute (the
+ * Kill switch: WARP_FOLD_FREEZE=0 reverts to per-call recompute (the
  * pre-freeze always-on behavior). TTL and tail cap are env-tunable; callers may
  * also provide model-aware defaults so the hot-tail sawtooth tracks the fold
  * target band unless explicitly overridden.
@@ -104,9 +104,9 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
 
 /**
  * Resolve config from environment. Default ON.
- *   VOXXO_FOLD_FREEZE=0|false|off|no      → disable (legacy per-call recompute)
- *   VOXXO_FOLD_FREEZE_TTL_MS=<ms>          → override cache TTL
- *   VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS=<n>   → override raw overhang cap
+ *   WARP_FOLD_FREEZE=0|false|off|no      → disable (legacy per-call recompute)
+ *   WARP_FOLD_FREEZE_TTL_MS=<ms>          → override cache TTL
+ *   WARP_FOLD_FREEZE_MAX_TAIL_CHARS=<n>   → override raw overhang cap
  *
  * `defaults.ttlMs` lets a session inject its PROVIDER's actual cache TTL
  * (e.g. claude-api with 1h extended-TTL breakpoints passes 3_600_000) so the
@@ -119,13 +119,13 @@ export function resolveFoldFreezeConfig(
   env: Record<string, string | undefined> = process.env,
   defaults?: { ttlMs?: number; maxTailChars?: number },
 ): FoldFreezeConfig {
-  const raw = (env.VOXXO_FOLD_FREEZE ?? '').trim().toLowerCase();
+  const raw = (env.WARP_FOLD_FREEZE ?? '').trim().toLowerCase();
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
   return {
     enabled,
-    ttlMs: parsePositiveInt(env.VOXXO_FOLD_FREEZE_TTL_MS) ?? defaults?.ttlMs ?? DEFAULT_FOLD_FREEZE_CONFIG.ttlMs,
+    ttlMs: parsePositiveInt(env.WARP_FOLD_FREEZE_TTL_MS) ?? defaults?.ttlMs ?? DEFAULT_FOLD_FREEZE_CONFIG.ttlMs,
     maxTailChars:
-      parsePositiveInt(env.VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS)
+      parsePositiveInt(env.WARP_FOLD_FREEZE_MAX_TAIL_CHARS)
       ?? defaults?.maxTailChars
       ?? DEFAULT_FOLD_FREEZE_CONFIG.maxTailChars,
   };
@@ -250,6 +250,15 @@ export interface FoldFreezeState {
   lastTransitionReason?: FoldFreezeTransitionReason;
   /** Last full-recompute cause; append-only tail epochs do not overwrite it. */
   lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
+  /**
+   * One-shot bypass set by rebirth fold-state restoration: when true, the
+   * next evaluateFoldFreeze call skips boundary/hash validation and trusts the
+   * restored frozen view as-is (accepting the tail from current raw history).
+   * Cleared after that single evaluation regardless of outcome — normal
+   * boundary checking resumes immediately. This lets the reborn session reuse
+   * the predecessor's cached prefix bytes without a cold-start epoch.
+   */
+  forceAcceptRestoredView?: boolean;
 }
 
 export function createFoldFreezeState(): FoldFreezeState {
@@ -290,6 +299,7 @@ export interface SerializedFoldFreezeState {
   epochs: number;
   lastTransitionReason?: FoldFreezeTransitionReason;
   lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
+  forceAcceptRestoredView?: boolean;
 }
 
 export interface FoldFreezeBoundaryMetadata {
@@ -336,6 +346,7 @@ export function serializeFoldFreezeState(state: FoldFreezeState): SerializedFold
     epochs: state.epochs,
     lastTransitionReason: state.lastTransitionReason,
     lastFullRecomputeReason: state.lastFullRecomputeReason,
+    forceAcceptRestoredView: state.forceAcceptRestoredView,
   };
 }
 
@@ -357,6 +368,7 @@ export function restoreFoldFreezeState(snapshot: SerializedFoldFreezeState): Fol
     epochs: snapshot.epochs,
     lastTransitionReason: snapshot.lastTransitionReason,
     lastFullRecomputeReason: snapshot.lastFullRecomputeReason,
+    forceAcceptRestoredView: snapshot.forceAcceptRestoredView,
   };
 }
 
@@ -423,6 +435,36 @@ export function evaluateFoldFreeze(
   if (!state.frozenView) {
     return { action: 'recompute', reason: 'first-call', gapMs };
   }
+
+  // ── Rebirth fold-state restoration bypass ────────────────────────────
+  // When a session rebirths with a restored fold-freeze state (same engine +
+  // model, fold on), the seed messages that birth-fold hydration pours in have
+  // different byte-level formatting than the predecessor's live raw history.
+  // The boundary checks below would reject them (boundary-mismatch), forcing a
+  // cold-start first-call epoch and burning the provider cache. Instead, trust
+  // the restored frozen view for exactly one evaluation: accept the tail from
+  // current raw history and reuse the predecessor's frozen prefix bytes. This
+  // is the mechanism that lets the cache survive the rebirth boundary.
+  //
+  // Safety: one-shot — the flag is cleared regardless of outcome. If raw
+  // history doesn't even cover the frozen range, fall through to the normal
+  // first-call path (the session must build a fresh epoch).
+  if (state.forceAcceptRestoredView) {
+    state.forceAcceptRestoredView = false;
+    if (state.frozenView && history.length >= state.frozenRawCount) {
+      const tail = history.slice(state.frozenRawCount);
+      const tailChars = tail.length > 0 ? countChars(tail) : 0;
+      return {
+        action: 'reuse',
+        view: state.frozenView.concat(tail),
+        tailChars,
+        tailCount: tail.length,
+      };
+    }
+    // Conditions not met — fall through to normal evaluation (will be
+    // first-call since the boundary won't match the seed messages).
+  }
+
   // Cache already expired → mutation is free. Strict >: a gap of exactly the
   // TTL is treated as hot (sliding TTLs persist "at least" their window).
   if (gapMs > config.ttlMs) {

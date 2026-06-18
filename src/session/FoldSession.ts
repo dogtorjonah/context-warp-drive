@@ -28,11 +28,13 @@ import {
   computeEvictableThroughOrdinal,
   DEFAULT_FOLD_CONFIG,
   DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
+  DEFAULT_ASSISTANT_TEXT_BUDGET,
   type FoldMessage,
   type FoldConfig,
   type FoldResult,
   type FoldEvictionInput,
   type FoldEvictionSpan,
+  type FidelityOverrides,
 } from '../rollingFold.ts';
 import {
   createFoldFreezeState,
@@ -56,6 +58,15 @@ import {
 const EMPTY_CLAIMED: ReadonlySet<string> = new Set<string>();
 export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = 240_000;
 
+/**
+ * Default retention fractions of the fold band (mirrors rollingFold's
+ * resolveFoldBandBudgets defaults). A governor fidelity override is expressed
+ * relative to these, so FoldSession can scale a fully-resolved base config
+ * without knowing the original band size.
+ */
+const DEFAULT_FULL_RETENTION_FRACTION = 0.125;
+const DEFAULT_ESSENCE_RETENTION_FRACTION = 0.25;
+
 export interface FoldPressureCeilingConfig {
   /**
    * Absolute measured input-token ceiling. FoldSession never estimates tokens:
@@ -72,6 +83,14 @@ export interface FoldSessionOptions {
    * ALWAYS_ON_FOLD_CONFIG and tune `activeWindowTurns` up if you do not rebirth).
    */
   readonly foldConfig?: FoldConfig;
+  /**
+   * Quality-driven fidelity override (session default). Sets what fraction of
+   * the band stays at full / essence retention, independent of band size. The
+   * governor (governByTrace) can also supply this per-turn via
+   * {@link FoldPrepareContext.fidelity}; a per-turn value takes precedence.
+   * Applied only at epoch boundaries (cache-safe).
+   */
+  readonly fidelity?: FidelityOverrides | null;
   /**
    * Provider-cache freeze layer. `true` (default) uses DEFAULT_FOLD_FREEZE_CONFIG
    * (5m TTL, 150K raw-tail cap). Pass a FoldFreezeConfig to tune TTL to your
@@ -132,6 +151,15 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    * ceiling, FoldSession forces a fresh fold epoch instead of hot-reusing.
    */
   readonly measuredInputTokens?: number;
+  /**
+   * Quality-driven fidelity override for THIS turn — typically the governor's
+   * `decision.fidelity` from {@link governByTrace}. Scales the full/essence
+   * retention budget without changing band size. Applied only when this turn
+   * triggers a fold epoch (never mid hot-reuse), mirroring the relay's
+   * epoch-gated band/fidelity application. `undefined` keeps the last value;
+   * `null` clears any override back to the base config.
+   */
+  readonly fidelity?: FidelityOverrides | null;
 }
 
 export interface FoldStats {
@@ -176,6 +204,14 @@ export interface FoldOutcome {
    */
   readonly sealedBoundary?: number | null;
   /**
+   * The fidelity ratios actually baked into the CURRENT view (the override in
+   * effect since the last fold epoch). Echoes the governor's applied
+   * recommendation for observability; `null` when no override is active (base
+   * config). Updated only at epoch boundaries — on a hot reuse it reflects the
+   * value from the last fold.
+   */
+  readonly appliedFidelity?: FidelityOverrides | null;
+  /**
    * The rendered Glyph Grammar Vault block appended to `messages` this turn, when
    * the vault companion is enabled and produced a non-empty block. Omitted when
    * the vault is off or self-gated to empty.
@@ -204,9 +240,11 @@ export class FoldSession {
   private foldEvictedSpans: FoldEvictionSpan[] = [];
   private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
   private lastPreparedRawCount = 0;
+  private activeFidelity: FidelityOverrides | null = null;
 
   constructor(options: FoldSessionOptions = {}) {
     this.foldConfig = options.foldConfig ?? DEFAULT_FOLD_CONFIG;
+    this.activeFidelity = options.fidelity ?? null;
     if (options.freeze === false) {
       this.freezeEnabled = false;
       this.freezeConfig = DEFAULT_FOLD_FREEZE_CONFIG;
@@ -297,6 +335,38 @@ export class FoldSession {
     return typeof explicit === 'number'
       ? Math.max(0, Math.min(explicit, total))
       : Math.max(0, total - this.foldConfig.activeWindowTurns);
+  }
+
+  /**
+   * Apply a governor fidelity override to the base fold config. The override is
+   * expressed as a FRACTION of the band; FoldSession owns a fully-resolved config
+   * (not a band), so it scales the base assistant-text budget by the override
+   * fraction relative to the default fraction. When the base config was built via
+   * resolveFoldConfigForBand (the standard path), this reproduces bandChars ×
+   * fraction exactly; for any other base it scales proportionally. A null/empty
+   * override returns the base config unchanged.
+   *
+   * Cache-safe: only ever called on an epoch (fresh fold), never on a hot reuse,
+   * so the frozen prefix never changes mid-cache — mirroring the relay's
+   * epoch-gated band/fidelity application in fcBaseSession.
+   */
+  private effectiveFoldConfig(fidelity: FidelityOverrides | null): FoldConfig {
+    if (
+      !fidelity ||
+      (fidelity.fullRetentionFraction === undefined && fidelity.essenceRetentionFraction === undefined)
+    ) {
+      return this.foldConfig;
+    }
+    const base = this.foldConfig.assistantTextBudget ?? DEFAULT_ASSISTANT_TEXT_BUDGET;
+    const fullRetentionChars =
+      fidelity.fullRetentionFraction !== undefined
+        ? Math.round(base.fullRetentionChars * (fidelity.fullRetentionFraction / DEFAULT_FULL_RETENTION_FRACTION))
+        : base.fullRetentionChars;
+    const essenceRetentionChars =
+      fidelity.essenceRetentionFraction !== undefined
+        ? Math.round(base.essenceRetentionChars * (fidelity.essenceRetentionFraction / DEFAULT_ESSENCE_RETENTION_FRACTION))
+        : base.essenceRetentionChars;
+    return { ...this.foldConfig, assistantTextBudget: { fullRetentionChars, essenceRetentionChars } };
   }
 
   /**
@@ -392,12 +462,20 @@ export class FoldSession {
     }
     this.lastPreparedRawCount = messages.length;
 
+    // Quality-driven fidelity override. Resolved once per turn but APPLIED only
+    // at an epoch (fresh fold) — a hot reuse keeps the frozen prefix byte-identical
+    // (cache-safe), so a mid-reuse fidelity change waits for the next epoch.
+    // undefined = keep last applied; null/value = set. Mirrors the relay's
+    // epoch-gated band/fidelity application.
+    const desiredFidelity = context.fidelity === undefined ? this.activeFidelity : context.fidelity;
+
     if (!this.freezeEnabled) {
+      this.activeFidelity = desiredFidelity;
       const upcomingEpoch = this.foldEpochs + 1;
       const result = foldContext(
         messages,
         this.resolveTurnsToFold(messages),
-        this.foldConfig,
+        this.effectiveFoldConfig(desiredFidelity),
         this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
       );
       this.commitEvictionEpoch(result, upcomingEpoch);
@@ -405,6 +483,7 @@ export class FoldSession {
         messages: result.messages,
         cacheHot: false,
         result,
+        appliedFidelity: this.activeFidelity,
         stats: {
           ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
           ...(pressureCeilingTriggered ? { epochReason: 'pressure-ceiling' } : {}),
@@ -424,6 +503,7 @@ export class FoldSession {
         messages: decision.view,
         cacheHot: true,
         sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
+        appliedFidelity: this.activeFidelity,
         stats: {
           totalTurns,
           cacheHot: true,
@@ -438,11 +518,12 @@ export class FoldSession {
     if (recomputeReason === 'history-rewound' || recomputeReason === 'boundary-mismatch') {
       this.resetEvictionState();
     }
+    this.activeFidelity = desiredFidelity;
     const upcomingEpoch = this.foldEpochs + 1;
     const result = foldContext(
       messages,
       this.resolveTurnsToFold(messages),
-      this.foldConfig,
+      this.effectiveFoldConfig(desiredFidelity),
       this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
     );
     commitFoldFreeze(this.freezeState, messages, result.messages, ctx, now);
@@ -455,6 +536,7 @@ export class FoldSession {
       cacheHot: false,
       sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
       result,
+      appliedFidelity: this.activeFidelity,
       stats: {
         ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
         ...(epochReason ? { epochReason } : {}),

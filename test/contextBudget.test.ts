@@ -3,16 +3,16 @@ import { describe, expect, it } from 'vitest';
 import { resolveContextBudget } from '../src/contextBudget.ts';
 
 describe('resolveContextBudget', () => {
-  it('keeps 1M-class providers on the absolute 160k band with cache-economic headroom', () => {
+  it('keeps 1M-class providers on the absolute 100k band with cache-economic headroom', () => {
     const budget = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' });
 
     expect(budget.contextWindowTokens).toBe(1_000_000);
     expect(budget.budgetTier).toBe('large-1m');
     expect(budget.compressionProfile).toBe('cache-economic');
-    expect(budget.bandTokens).toBe(160_000);
+    expect(budget.bandTokens).toBe(100_000);
     expect(budget.pressureCeilingTokens).toBe(240_000);
     expect(budget.prefixSaturationTokens).toBe(900_000);
-    expect(budget.tailEpochCapTokens).toBe(40_000);
+    expect(budget.tailEpochCapTokens).toBe(25_000);
     expect(budget.evictionPolicy).toBe('recompute-on-prefix-saturation');
   });
 
@@ -22,11 +22,11 @@ describe('resolveContextBudget', () => {
     expect(budget.contextWindowTokens).toBe(200_000);
     expect(budget.budgetTier).toBe('small-200k');
     expect(budget.compressionProfile).toBe('survival');
-    expect(budget.bandTokens).toBe(120_000);
+    expect(budget.bandTokens).toBe(100_000);
     expect(budget.pressureCeilingTokens).toBe(160_000);
     expect(budget.messageCeilingTokens).toBe(176_000);
     expect(budget.prefixSaturationTokens).toBe(176_000);
-    expect(budget.tailEpochCapTokens).toBe(30_000);
+    expect(budget.tailEpochCapTokens).toBe(25_000);
     expect(budget.evictionPolicy).toBe('full-recompute-only');
   });
 
@@ -84,10 +84,10 @@ describe('resolveContextBudget', () => {
 
     expect(cli.contextWindowTokens).toBe(258_000);
     expect(cli.compressionProfile).toBe('survival');
-    expect(cli.bandTokens).toBe(Math.round(258_000 * 0.6));
+    expect(cli.bandTokens).toBe(100_000);
     expect(api.contextWindowTokens).toBe(1_048_576);
     expect(api.compressionProfile).toBe('cache-economic');
-    expect(api.bandTokens).toBe(160_000);
+    expect(api.bandTokens).toBe(100_000);
   });
 
   it('treats GLM 5.2 as a 1M flagship window instead of the older GLM fallback', () => {
@@ -96,7 +96,7 @@ describe('resolveContextBudget', () => {
     expect(budget.contextWindowTokens).toBe(1_000_000);
     expect(budget.budgetTier).toBe('large-1m');
     expect(budget.compressionProfile).toBe('cache-economic');
-    expect(budget.bandTokens).toBe(160_000);
+    expect(budget.bandTokens).toBe(100_000);
     expect(budget.pressureCeilingTokens).toBe(240_000);
   });
 
@@ -162,8 +162,8 @@ describe('resolveContextBudget', () => {
       },
     });
 
-    expect(budget.requestedBandTokens).toBe(160_000);
-    expect(budget.bandTokens).toBe(120_000);
+    expect(budget.requestedBandTokens).toBe(100_000);
+    expect(budget.bandTokens).toBe(100_000);
     expect(budget.pressureCeilingTokens).toBe(160_000);
     expect(budget.outputReserveTokens).toBe(16_000);
     expect(budget.systemToolsReserveTokens).toBe(16_000);
@@ -216,7 +216,7 @@ describe('resolveContextBudget', () => {
 
     expect(budget.contextWindowTokens).toBe(1_000_000);
     expect(budget.pressureCeilingTokens).toBeNull();
-    expect(budget.bandTokens).toBe(160_000);
+    expect(budget.bandTokens).toBe(100_000);
   });
 
   it('marks unknown providers as conservative 200k-style fallback instead of guessing upward', () => {
