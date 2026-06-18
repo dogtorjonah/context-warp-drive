@@ -590,3 +590,91 @@ export function deriveEpisodesFromMessages(
     : trailingSettled ? messages.length : null;
   return { episodes, openBurstStartIndex: resumeIndex };
 }
+
+/** Result of {@link computeOpenBurst} — the still-open read-burst the fold guard holds. */
+export interface OpenBurstResult {
+  /**
+   * FoldMessage index where the open read-burst begins. The read-burst guard keeps
+   * every turn from here onward unfolded (the active window's floor). `null` when
+   * nothing is held: no touches at all, or the trailing burst has SETTLED (work
+   * moved >gapEvents events / >gapMs past its last touch — it will not grow).
+   */
+  openBurstStartIndex: number | null;
+  /** Member paths of the open burst (the resident co-activation set); empty when none. */
+  heldPaths: readonly string[];
+  /** Total bursts detected (sealed + open) — diagnostics only. */
+  burstCount: number;
+}
+
+/**
+ * Open-burst boundary for the read-burst fold guard (consumed by FoldSession).
+ *
+ * Lean sibling of {@link deriveEpisodesFromMessages}: it runs the SAME touch loop
+ * (`iterToolCalls` + `extractTouchPaths` + `isEditTool`) and the SAME
+ * `groupTouchesIntoEpisodes` + trailing-settled seal, but skips voice mining,
+ * narration, and Episode assembly. It answers one question — *which trailing
+ * message window is the still-open read-burst that the fold should hold resident?*
+ *
+ * Empirical basis (rail-f1b6c230, ~90 transcripts / ~900 real bursts): agent
+ * read-bursts are inherently multi-directory (79-84%) and multi-cluster (67-74%),
+ * so NO topic-shift seal is applied — a directory seal over-fragments 13x
+ * (median burst 21-24 touches -> 2) and a cluster seal ~9x. The open burst is the
+ * episode co-activation zone, unchanged; the guard simply keeps it unfolded until
+ * a following burst forms (retrospective release), it settles, the
+ * maxBurstEvents/maxBurstMs backstop caps it, or — in FoldSession — the measured
+ * pressure ceiling forces a fold anyway.
+ *
+ * Pure: zero I/O, deterministic. Safe to call per tool-step on the fold hot path.
+ *
+ * PARITY CONTRACT: when an open burst exists, `openBurstStartIndex` MUST equal the
+ * burst `deriveEpisodesFromMessages` defers (`openBurst.startEventIndex`) for the
+ * same inputs. The trailing-settled block below is duplicated from that function
+ * deliberately (rather than refactoring load-bearing, byte-parity-mirrored capture
+ * code) — keep the two in lockstep. Pinned by test/foldEpisodeCapture.openBurst.test.ts.
+ *
+ * Called WITHOUT timestamps/nowIso (the FoldSession default), the seal is pure
+ * event-count (`trailingEventGap > gapEvents`) — the work-time basis, not wall-clock.
+ * Pivots are not mined here (that needs voice mining); pass them only for exact
+ * parity testing. A missing pivot merely holds the burst slightly longer (until the
+ * next burst forms), which is harmless for fold-holding.
+ */
+export function computeOpenBurst(
+  messages: readonly FoldMessage[],
+  options: {
+    canon?: CanonContext;
+    timestamps?: readonly (string | undefined)[];
+    pivots?: readonly EpisodePivotMarker[];
+    nowIso?: string;
+  } = {},
+): OpenBurstResult {
+  const touches: EpisodeTouch[] = [];
+  for (const call of iterToolCalls(messages, 0)) {
+    const touched = extractTouchPaths(call.input, options.canon);
+    const kind = isEditTool(call.name) ? 'edit' as const : 'read' as const;
+    const ts = options.timestamps?.[call.eventIndex];
+    for (const p of touched) {
+      touches.push({ eventIndex: call.eventIndex, path: p, kind, ...(ts !== undefined ? { ts } : {}) });
+    }
+  }
+
+  const bursts = groupTouchesIntoEpisodes(touches, { pivots: options.pivots ?? [] });
+  if (bursts.length === 0) return { openBurstStartIndex: null, heldPaths: [], burstCount: 0 };
+
+  // ── trailing-settled seal — MUST mirror deriveEpisodesFromMessages (the
+  //    `trailingSettled` block above). The guard never force-seals the trailing
+  //    burst (no sealTrailing), so this is purely: has work moved on past it?
+  const lastBurst = bursts[bursts.length - 1];
+  const trailingEventGap = messages.length - lastBurst.endEventIndex;
+  const trailingMsGap = (options.nowIso !== undefined && lastBurst.endedAt !== undefined)
+    ? Date.parse(options.nowIso) - Date.parse(lastBurst.endedAt)
+    : Number.NaN;
+  const trailingSettled = trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
+    || (Number.isFinite(trailingMsGap) && trailingMsGap > DEFAULT_EPISODE_GROUPING.gapMs);
+  if (trailingSettled) return { openBurstStartIndex: null, heldPaths: [], burstCount: bursts.length };
+
+  return {
+    openBurstStartIndex: lastBurst.startEventIndex,
+    heldPaths: lastBurst.members.map((m) => m.path),
+    burstCount: bursts.length,
+  };
+}

@@ -36,6 +36,7 @@ import {
   type FoldEvictionSpan,
   type FidelityOverrides,
 } from '../rollingFold.ts';
+import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
   createFoldFreezeState,
   evaluateFoldFreeze,
@@ -112,6 +113,19 @@ export interface FoldSessionOptions {
    * tune. The host must pass measuredInputTokens to prepare() for it to fire.
    */
   readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
+
+  /**
+   * Read-burst fold guard (rail-f1b6c230). When `true`, an epoch-time fold keeps
+   * the still-open read-burst — the trailing window of co-activated file touches
+   * the episode segmenter would defer — inside the active (unfolded) window, so a
+   * multi-file read is not skeletonized mid-burst (the moment that costs the most
+   * cross-reference fidelity). Reuses {@link computeOpenBurst} UNCHANGED: no
+   * topic-shift seal, because empirically agent bursts are inherently multi-dir
+   * (79-84%) and a directory/cluster seal over-fragments them 9-13x. Growth is
+   * bounded by the segmenter's maxBurst caps and the guard is always vetoed by the
+   * measured pressure ceiling — a deferral, not an absolute pin. Default `false`.
+   */
+  readonly readBurstGuard?: boolean;
   /**
    * Glyph Grammar Vault companion. Off by default. When enabled, FoldSession
    * keeps a bounded buffer of recent operator messages and the agent's own
@@ -231,6 +245,7 @@ export class FoldSession {
   private readonly evictionEnabled: boolean;
   private readonly evictionThresholdChars: number;
   private readonly pressureCeilingTokens: number | null;
+  private readonly readBurstGuardEnabled: boolean;
   private readonly clock: () => number;
   private readonly vaultEnabled: boolean;
   private readonly vaultTailWindow: number | undefined;
@@ -245,6 +260,7 @@ export class FoldSession {
   constructor(options: FoldSessionOptions = {}) {
     this.foldConfig = options.foldConfig ?? DEFAULT_FOLD_CONFIG;
     this.activeFidelity = options.fidelity ?? null;
+    this.readBurstGuardEnabled = options.readBurstGuard === true;
     if (options.freeze === false) {
       this.freezeEnabled = false;
       this.freezeConfig = DEFAULT_FOLD_FREEZE_CONFIG;
@@ -335,6 +351,34 @@ export class FoldSession {
     return typeof explicit === 'number'
       ? Math.max(0, Math.min(explicit, total))
       : Math.max(0, total - this.foldConfig.activeWindowTurns);
+  }
+
+  /**
+   * Read-burst guard: cap turnsToFold so the still-open read-burst stays in the
+   * active (unfolded) window. Called only at the two epoch sites (never on the hot
+   * reuse path), so computeOpenBurst runs only when a fold actually happens.
+   *
+   * No-op unless readBurstGuard is enabled, when the pressure ceiling is triggered
+   * (GOD-RULE-7: measured tokens only — the ceiling overrides the guard so a runaway
+   * burst can never breach the token wall), or when there is nothing to fold. The
+   * open burst is the episode co-activation zone, UNCHANGED (no topic-shift seal).
+   * Release is emergent and free: when a following burst forms the open burst
+   * advances and turnsToFold climbs back (one clean epoch); a settled/abandoned
+   * burst yields via computeOpenBurst returning null; growth is bounded by the
+   * segmenter's maxBurst caps. floor <= base always, so this can only DEFER a fold.
+   */
+  private guardedTurnsToFold(messages: FoldMessage[], pressureCeilingTriggered: boolean): number {
+    const base = this.resolveTurnsToFold(messages);
+    if (!this.readBurstGuardEnabled || pressureCeilingTriggered || base <= 0) return base;
+    const { openBurstStartIndex } = computeOpenBurst(messages);
+    if (openBurstStartIndex === null) return base;
+    const turns = detectTurns(messages);
+    let floor = 0;
+    for (const turn of turns) {
+      if (turn.endIndex <= openBurstStartIndex) floor += 1;
+      else break;
+    }
+    return Math.min(base, floor);
   }
 
   /**
@@ -474,7 +518,7 @@ export class FoldSession {
       const upcomingEpoch = this.foldEpochs + 1;
       const result = foldContext(
         messages,
-        this.resolveTurnsToFold(messages),
+        this.guardedTurnsToFold(messages, pressureCeilingTriggered),
         this.effectiveFoldConfig(desiredFidelity),
         this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
       );
@@ -522,7 +566,7 @@ export class FoldSession {
     const upcomingEpoch = this.foldEpochs + 1;
     const result = foldContext(
       messages,
-      this.resolveTurnsToFold(messages),
+      this.guardedTurnsToFold(messages, pressureCeilingTriggered),
       this.effectiveFoldConfig(desiredFidelity),
       this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
     );
