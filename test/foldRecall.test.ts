@@ -981,6 +981,55 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).not.toContain('PKG-INCIDENTAL');
   });
 
+  test('tier-1: behaviorally-cold zone keeps tier-0 proximity even when carrier is non-empty (F7 regression)', () => {
+    const core = 'relay/src/core.ts';
+    const helper = 'relay/src/helper.ts';
+    const extra = 'relay/src/utils/extra.ts';
+    const pkg = 'package.json';
+    const raw: FoldMessage[] = [
+      userMsg('Read core, package.json, helper, and extra together'),
+      anthropicToolUse('tu_core', 'Read', { file_path: ABS(core) }),
+      anthropicToolResult('tu_core', 'CORE OLD CONTENT'),
+      anthropicToolUse('tu_pkg', 'Read', { file_path: ABS(pkg) }),
+      anthropicToolResult('tu_pkg', 'PACKAGE CONFIG'),
+      anthropicToolUse('tu_helper', 'Read', { file_path: ABS(helper) }),
+      anthropicToolResult('tu_helper', 'HELPER OLD CONTENT'),
+      anthropicToolUse('tu_extra', 'Read', { file_path: ABS(extra) }),
+      anthropicToolResult('tu_extra', 'EXTRA OLD CONTENT'),
+      assistantMsg('Core, package, helper, and extra reviewed together.'),
+    ];
+    const state = createFoldRecallState();
+    // Insertion order deliberately puts cross-cluster pkg SECOND, so the old
+    // insertion-order tie-break would rank pkg into top-K and drop extra.
+    state.index = makeIndex([
+      turnEntry('burst', 'core pkg helper extra reviewed', 30, [core, pkg, helper, extra], 0, raw.length),
+    ], raw.length);
+    state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(extra, [{ label: 'EXTRA-NESTED', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(pkg, [{ label: 'PKG-INCIDENTAL', startLine: 10, endLine: 20 }]);
+    // Carrier is NON-EMPTY, but only for an UNRELATED anchor — core's zone has no
+    // affinity entries. Pre-F7 this forced insertion-order ranking (losing tier-0
+    // proximity); post-F7 it falls back to proximity per-anchor.
+    state.pathAffinity.set('unrelated/anchor.ts\x00unrelated/zone.ts', 0.9);
+
+    const out = buildFoldRecallContext(
+      state,
+      raw,
+      extractRecallSignals({ file_path: ABS(core) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+
+    expect(out.cards).toBe(1);
+    // Proximity preserved: anchor + same-dir siblings make top-K=3; cross-cluster
+    // pkg is excluded, NOT crowded in by insertion order.
+    expect(out.text!).toContain('CORE-ANCHOR');
+    expect(out.text!).toContain('HELPER-SIBLING');
+    expect(out.text!).toContain('EXTRA-NESTED');
+    expect(out.text!).not.toContain('PKG-INCIDENTAL');
+  });
+
   test('tier-1 claim on a folded path pages content in', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);

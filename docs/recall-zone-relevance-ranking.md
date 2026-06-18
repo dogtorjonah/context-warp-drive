@@ -1,4 +1,4 @@
-# Recall Zone Relevance Ranking — Tier 0 → 1b
+# Recall Zone Relevance Ranking — Tier 0 → 1 (Tier-1b benched)
 
 ## The Problem
 
@@ -24,7 +24,10 @@ primary ranker for a multi-cluster-dominant phenomenon. Using it as primary woul
 systematically discard exactly the co-reads that bursts are made of, fighting the
 empirics the burst guard was built on.
 
-**The right signal is behavioral co-activation**, not structural imports.
+**The right signal is behavioral co-activation**, not structural imports. This
+finding is also why **tier-1b (the import booster) is benched** — see below: the
+document's own thesis demotes the import graph to a minority-case tie-breaker, so
+it should not be the part that carries the most complexity and risk.
 
 ## The Closed Loop
 
@@ -35,7 +38,8 @@ relay worker computes behavioral co-activation affinity (ground truth = real tou
     ↓
 supplied as pathAffinity carrier (composite key: anchor\x00zonePath → 0-1 score)
     ↓
-pure package ranks recall zones by affinity, falls back to proximity when empty
+pure package ranks recall zones by affinity, with directory proximity as the
+    per-anchor fallback + tie-breaker
     ↓
 recall cards ordered by relevance, budget allocated to most-relevant-first
 ```
@@ -53,9 +57,9 @@ the agent's real touches. The worker's `burstGroups` come from fold index
 
 | Tier | Signal | Where | When | Status |
 |------|--------|-------|------|--------|
-| **0** | Directory proximity + top-K cap | in-package, pure | Always (fallback when no host data) | ✅ Shipped |
+| **0** | Directory proximity + top-K cap | in-package, pure | Always (fallback + tie-breaker) | ✅ Shipped |
 | **1** | Behavioral co-activation affinity | worker → carrier | Primary relevance signal; matches multi-cluster reality | ✅ Shipped |
-| **1b** | Import-graph distance booster | worker → carrier | Booster/tie-breaker only, never primary | ✅ Shipped |
+| **1b** | Import-graph distance booster | worker → carrier | Booster/tie-breaker only, never primary | ⏸️ **Benched** (see below) |
 | **2** | Atlas embeddings / changelog co-change | worker → carrier | Cold-start fallback when behavioral history is sparse | Future |
 
 ### How the Tiers Compose
@@ -67,39 +71,63 @@ the agent's real touches. The worker's `burstGroups` come from fold index
 
 - **Tier 1** (worker → carrier): `pathAffinity: Map<string, number>` with
   composite `affinityKey(anchor, zonePath)`. `orderZoneByRelevance` ranks by
-  affinity when the carrier is populated, falls back to proximity when empty.
-  The relay worker builds a co-occurrence graph from burst groups (real touch
-  history) and normalizes to 0-1.
+  affinity, with **directory proximity as the per-anchor fallback AND tie-breaker**:
+  a zone whose anchor has no affinity entries collapses to pure tier-0 proximity
+  even when the carrier is non-empty for some *other* anchor (an empty carrier
+  short-circuits straight to proximity — byte-identical standalone behavior). The
+  relay worker builds a co-occurrence graph from burst groups (real touch history)
+  and normalizes to 0-1.
 
-- **Tier 1b** (worker → carrier, blended into tier 1): import-graph distance from
-  `computeFileSetDistance` is converted to a 0-1 booster signal. Blending:
-  `finalScore = max(behavioral, behavioral*0.7 + importBooster*0.3)`. The `max`
-  enforces the **booster-only invariant**: import distance can only RAISE a score
-  above its behavioral baseline, never lower it. Cross-cluster paths (∞ distance)
-  get zero boost without penalty. Cold-start (no behavioral data) gets an
-  import-booster signal so paths sharing imports rank above unrelated ones.
+- **Tier 1b** (⏸️ **BENCHED**): the import-graph distance booster
+  (`distanceToBooster` / `blendScores`) is retained as pure, unit-tested helpers,
+  but it is **not applied** by the live worker — affinity is behavioral-only.
 
-### Booster-Only Invariant
+### Why Tier-1b Is Benched
 
-The import booster is mathematically prevented from penalizing:
+Three independent reasons, in order of severity:
+
+1. **It was dead in production.** The booster needs the impact graph rooted at the
+   *session* workspace. `computeFileSetDistance` → `resolveWorkspaceRoot()` reads
+   `process.cwd()`, and the worker tried to set it with `process.chdir(cwd)`. But
+   the affinity handler runs in a `worker_threads.Worker`, where `process.chdir()`
+   throws `ERR_WORKER_UNSUPPORTED_OPERATION` (confirmed, Node v22.22.3). The throw
+   was silently caught, so the graph resolved against the relay's fixed startup cwd
+   and returned ∞ for every non-relay workspace → booster 0 everywhere. No test
+   exercised a real `cwd`, so it passed CI while contributing nothing.
+
+2. **The thesis demotes it.** This very document argues the import graph is the
+   *wrong* graph for a multi-cluster-dominant phenomenon — import distance is
+   high-precision/low-recall and can only matter for the minority of in-cluster
+   co-reads. The booster is, by design, the lowest-value signal; it should not be
+   the part that carries the most complexity and risk.
+
+3. **No relevance telemetry.** Nothing measured whether ranking by affinity ever
+   beats proximity, so there was never evidence the booster's marginal nudge helped.
+
+The booster's math is still correct and worth keeping for reference:
 
 ```
 distanceToBooster(∞) = 0          // cross-cluster → zero boost
-blendScores(b, 0) = max(b, b*0.7) = b   // behavioral preserved
+blendScores(b, 0) = max(b, b*0.7) = b   // behavioral preserved (booster-only)
 ```
 
-This is the invariant that makes tier-1b safe for multi-cluster bursts.
+**Revival preconditions:** (a) instrument tier-1 and show it changes enrichment
+ranking vs tier-0 proximity often enough to matter (Measurement Plan #4);
+(b) thread the impact-graph root **explicitly** through `computeFileSetDistance`
+(add a `root` param defaulting to `process.cwd()`), **never** via `process.chdir`
+(which cannot work in a worker thread, and would race the shared worker pool even
+if it could). Until then the retained helpers + their tests document the math.
 
 ## Implementation
 
 | Component | File | Repo |
 |-----------|------|------|
 | Tier-0 ordering + cap | `src/foldRecall.ts` | both |
-| Tier-1 carrier + relevance | `src/foldRecall.ts` | both |
-| Affinity worker | `relay/src/workerPool/handlers/foldRecallAffinity.ts` | voxxo-swarm |
-| Task types | `relay/src/workerPool/types.ts` | voxxo-swarm |
+| Tier-1 carrier + relevance (proximity fallback/tie-break) | `src/foldRecall.ts` | both |
+| Affinity worker (tier-1 behavioral; tier-1b benched) | `relay/src/workerPool/handlers/foldRecallAffinity.ts` | voxxo-swarm |
+| Task types (`cwd` reserved/unused) | `relay/src/workerPool/types.ts` | voxxo-swarm |
 | Handler registration | `relay/src/workerPool/worker.ts` | voxxo-swarm |
-| Wiring | `relay/src/fcBaseSession.ts` (`enrichFoldRecallIndex`) | voxxo-swarm |
+| Wiring (no cwd; carrier rebuilt per epoch) | `relay/src/fcBaseSession.ts` (`enrichFoldRecallIndex`) | voxxo-swarm |
 | Tests | `test/foldRecall.test.ts` + `relay/src/__tests__/foldRecallAffinity.test.ts` | both |
 
 ### Key Commits
@@ -109,21 +137,22 @@ This is the invariant that makes tier-1b safe for multi-cluster bursts.
 - Standalone tier-1: `97abd2f`
 - Canonical tier-1: `12d1499b`
 - Relay tier-1: `4afb483a` + `9285c0c4`
-- Relay tier-1b: `5f4a85cf`
+- Relay tier-1b (now benched): `5f4a85cf`
+- Review fixes (F7 + bench + F6): rail-307ad5cf
 
 ### Test Coverage
 
-- Standalone `foldRecall.test.ts`: 81 tests (tier-0 proximity + residency + tier-1 affinity)
-- Canonical `foldRecall.test.ts`: 78 tests
-- Relay `foldRecallAffinity.test.ts`: 16 tests (9 tier-1 + 7 tier-1b booster invariants)
+- Standalone `foldRecall.test.ts`: 82 tests (tier-0 proximity + residency + tier-1 affinity + F7 cold-zone fallback)
+- Canonical `foldRecall.test.ts`: 79 tests
+- Relay `foldRecallAffinity.test.ts`: 16 tests (9 tier-1 behavioral + 7 benched tier-1b pure-helper invariants)
 
 ## Measurement Plan for Future Tuning
 
-1. **Blend weights**: `BEHAVIORAL_WEIGHT=0.7`, `IMPORT_BOOSTER_WEIGHT=0.3` are
-   starting values. Instrument: log the distribution of behavioral vs import
-   contributions across real sessions. If behavioral dominates >90% of the final
-   score, consider lowering behavioral weight. If import booster rarely fires,
-   the workspace graph may be too sparse.
+1. **Blend weights (tier-1b revival only)**: `BEHAVIORAL_WEIGHT=0.7`,
+   `IMPORT_BOOSTER_WEIGHT=0.3` are starting values for the benched booster. Before
+   reviving, instrument the distribution of behavioral vs import contributions on
+   real sessions. If behavioral dominates >90% of the final score, the booster is
+   not worth its complexity; if it rarely fires, the workspace graph is too sparse.
 
 2. **Top-K cap**: `ZONE_ENRICHMENT_MAX_PATHS=3` is conservative. If wide bursts
    (5+ paths) show agents re-touching the 4th-ranked sibling frequently, consider
@@ -135,11 +164,27 @@ This is the invariant that makes tier-1b safe for multi-cluster bursts.
    If cold-start is too long, tier-2 (Atlas embeddings) can provide a cold-start
    signal from changelog co-change patterns.
 
-4. **Proximity sufficiency**: directory proximity alone may be sufficient for
-   most sessions. Measure the delta: how often does tier-1 affinity change the
-   enrichment ranking vs tier-0 proximity? If <5%, tier-0 alone may be the right
-   default and tier-1 can stay opt-in.
+4. **Proximity sufficiency (tier-1b revival gate)**: directory proximity alone may
+   be sufficient for most sessions. Measure the delta: how often does tier-1
+   affinity change the enrichment ranking vs tier-0 proximity? If <5%, tier-0 alone
+   is the right default, tier-1 stays opt-in, and tier-1b should NOT be revived.
+   This is the precondition gate for un-benching tier-1b.
 
 ---
 
-*Built rail-8d3a390d, June 2026.*
+## Review Fixes (rail-307ad5cf, June 2026)
+
+A predecessor review (opus-4.8) found and fixed:
+
+- **F7 — proximity fallback regression:** `orderZoneByRelevance` used insertion
+  index as its tie-breaker, so once the carrier held *any* entry, a behaviorally
+  cold zone lost tier-0 proximity and reverted to arbitrary (alphabetical entry)
+  order. Fixed: directory proximity is now the universal tie-breaker + per-anchor
+  fallback. Regression test added in both repos.
+- **Tier-1b benched** (see "Why Tier-1b Is Benched"): worker stripped to
+  behavioral-only; `cwd` no longer passed; booster helpers retained as benched.
+- **F6 — carrier growth/staleness:** the affinity `.then` now rebuilds (clears
+  before repopulating) the `pathAffinity` carrier each epoch instead of merging,
+  bounding it to the current epoch and dropping stale composite keys.
+
+*Built rail-8d3a390d, June 2026; reviewed + corrected rail-307ad5cf.*

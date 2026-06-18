@@ -982,10 +982,13 @@ function affinityKey(anchor: string, zonePath: string): string {
 
 /**
  * Order zone paths by behavioral co-activation affinity from the host-supplied
- * pathAffinity carrier (tier-1): anchor first (affinity=1.0 by convention), then
- * by descending affinity score, cross-cluster/unseen paths last. When the
- * carrier is empty (standalone/no-host mode), falls back to tier-0 directory
- * proximity — preserving byte-identical standalone behavior.
+ * pathAffinity carrier (tier-1): anchor first, then by descending affinity score.
+ * Directory proximity (tier-0) is the deterministic tie-breaker AND the per-anchor
+ * fallback: paths with equal or absent affinity keep proximity order, so a
+ * behaviorally-cold zone (this anchor has no affinity entries → every score -1)
+ * collapses to pure tier-0 proximity instead of arbitrary entry/insertion order —
+ * even when the carrier is non-empty for some OTHER anchor. An empty carrier
+ * short-circuits straight to proximity (byte-identical standalone behavior).
  */
 function orderZoneByRelevance(
   anchor: string,
@@ -993,14 +996,20 @@ function orderZoneByRelevance(
   affinity: ReadonlyMap<string, number>,
 ): string[] {
   if (affinity.size === 0) return orderZoneByProximity(anchor, paths);
+  // Proximity rank is the fallback ordering: it tie-breaks equal affinity scores
+  // and fully orders a zone whose anchor has no affinity keys (all score -1),
+  // preserving tier-0 proximity rather than collapsing to insertion order.
+  const proximityRank = new Map(
+    orderZoneByProximity(anchor, paths).map((p, rank) => [p, rank] as const),
+  );
   return paths
-    .map((p, i) => ({
+    .map((p) => ({
       p,
-      i,
+      rank: proximityRank.get(p) ?? Number.MAX_SAFE_INTEGER,
       score: p === anchor ? Infinity : (affinity.get(affinityKey(anchor, p)) ?? -1),
     }))
-    .sort((x, y) => y.score - x.score || x.i - y.i)
-    .map(z => z.p);
+    .sort((x, y) => y.score - x.score || x.rank - y.rank)
+    .map((z) => z.p);
 }
 
 /**
