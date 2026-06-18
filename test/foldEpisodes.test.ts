@@ -212,6 +212,19 @@ describe('operator intent (Episode.intent)', () => {
     ({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: file } }] });
   const toolResult = (id: string): FoldMessage =>
     ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] });
+  const relayResumeWrapper = `[Temporal Context] Session age: 4h 3m
+
+[System Note: Context pressure limits were reached during your execution.
+Your context has been successfully folded for efficiency.
+Please seamlessly continue your previous turn from where you were interrupted.
+Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
+
+[User Message Vault]
+Synthetic relay continuity note.
+
+[operator message @ 2026-06-18 20:00]
+Ok do that for both standalone repo and Voxxo swarm relay please
+[/User Message Vault]`;
 
   it('mines the nearest genuine operator ask onto the burst it drove', () => {
     const ask = 'Fix the recall ranker so cold zones keep directory proximity';
@@ -243,6 +256,29 @@ describe('operator intent (Episode.intent)', () => {
   it('leaves intent undefined for an agent-initiated burst with no preceding operator message', () => {
     const messages: FoldMessage[] = [
       editCall('t1', 'src/x.ts'),
+      toolResult('t1'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].intent).toBeUndefined();
+  });
+
+  it('strips relay resume wrappers before choosing the operator intent', () => {
+    const ask = 'Patch the intent miner so wrappers do not become the ask';
+    const messages: FoldMessage[] = [
+      userAsk(`${relayResumeWrapper}\n\n${ask}`),
+      editCall('t1', 'src/foldEpisodeCapture.ts'),
+      toolResult('t1'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].intent).toBe(ask);
+  });
+
+  it('leaves intent undefined when only relay resume wrappers precede a burst', () => {
+    const messages: FoldMessage[] = [
+      userAsk(relayResumeWrapper),
+      editCall('t1', 'src/foldEpisodeCapture.ts'),
       toolResult('t1'),
     ];
     const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });

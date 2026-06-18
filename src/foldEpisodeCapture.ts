@@ -449,11 +449,11 @@ function structuralStep(call: ToolCallView, outcome: 'ok' | 'error' | undefined,
  * The verbatim operator ask that drove a burst: scan the raw window BACKWARD from
  * the burst's first touch for the nearest genuine user message. Reuses the
  * canonical operator-text gate — extractUserText drops tool_result / Gemini
- * functionResponse blocks and strips vault blocks, isSyntheticContextText drops
- * fold / recall-card / epoch-stamp / vault synthetic context — so recalled cards
- * and tool output can never launder into intent. Scans the FULL messages array
- * (not just [startIndex, …]) so an ask issued in a PRIOR epoch still anchors the
- * burst it motivated. Pure CPU, no I/O.
+ * functionResponse blocks and strips relay synthetic user-context wrappers,
+ * while isSyntheticContextText drops fold / recall-card / epoch-stamp context —
+ * so recalled cards and tool output can never launder into intent. Scans the
+ * FULL messages array (not just [startIndex, …]) so an ask issued in a PRIOR
+ * epoch still anchors the burst it motivated. Pure CPU, no I/O.
  */
 function mineIntentForBurst(messages: readonly FoldMessage[], burstStartIndex: number): string | undefined {
   for (let i = Math.min(burstStartIndex, messages.length - 1); i >= 0; i--) {

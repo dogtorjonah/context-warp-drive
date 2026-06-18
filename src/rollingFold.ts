@@ -353,6 +353,10 @@ export const EPISODIC_RECALL_PREFIX = '[Episodic recall —';
 /** Synthetic relay note appended to live user turns with bounded operator-message excerpts. */
 export const USER_MESSAGE_VAULT_PREFIX = '[User Message Vault]';
 export const USER_MESSAGE_VAULT_END = '[/User Message Vault]';
+/** Synthetic relay time hint prepended to resumed/fold-pressure user turns. */
+export const TEMPORAL_CONTEXT_PREFIX = '[Temporal Context]';
+/** Synthetic relay continuation note prepended after context-pressure folds. */
+export const SYSTEM_NOTE_PREFIX = '[System Note:';
 
 /**
  * Prefix of tombstone lines inside the fold block marking spans whose detail
@@ -414,23 +418,63 @@ export function stripUserMessageVaultBlocks(text: string): string {
   return result;
 }
 
+function stripOneLeadingSyntheticUserContextBlock(text: string): string | null {
+  const leadingMatch = /^[ \t]*(?:\r?\n)*/.exec(text);
+  const leading = leadingMatch?.[0] ?? '';
+  const body = text.slice(leading.length);
+
+  if (body.startsWith(TEMPORAL_CONTEXT_PREFIX)) {
+    const lineEnd = body.indexOf('\n');
+    const after = lineEnd < 0 ? '' : body.slice(lineEnd + 1).replace(/^(?:[ \t]*\r?\n)+/, '');
+    return `${leading}${after}`;
+  }
+
+  if (body.startsWith(SYSTEM_NOTE_PREFIX)) {
+    const note = /^\[System Note:[\s\S]*?\](?:[ \t]*(?:\r?\n|$))?/.exec(body);
+    if (!note) return null;
+    const after = body.slice(note[0].length).replace(/^(?:[ \t]*\r?\n)+/, '');
+    return `${leading}${after}`;
+  }
+
+  return null;
+}
+
+export function stripSyntheticUserContextBlocks(text: string): string {
+  let result = stripUserMessageVaultBlocks(text);
+  for (let guard = 0; guard < 20; guard += 1) {
+    const next = stripOneLeadingSyntheticUserContextBlock(result);
+    if (next === null || next === result) break;
+    result = next;
+  }
+  return result;
+}
+
 function isUserTurnBoundary(msg: FoldMessage): boolean {
   if (msg.role !== 'user') return false;
   const content = msg.content;
   if (typeof content === 'string') {
-    return content.length > 0 && !isSyntheticContextText(content);
+    const cleaned = stripSyntheticUserContextBlocks(content).trim();
+    return cleaned.length > 0 && !isSyntheticContextText(cleaned);
   }
   if (Array.isArray(content)) {
-    return content.some((block: any) =>
-      (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0 && !isSyntheticContextText(block.text))
-      || (typeof block === 'string' && block.length > 0 && !isSyntheticContextText(block)),
-    );
+    return content.some((block: any) => {
+      const text = block?.type === 'text' && typeof block.text === 'string'
+        ? block.text
+        : typeof block === 'string'
+          ? block
+          : '';
+      const cleaned = stripSyntheticUserContextBlocks(text).trim();
+      return cleaned.length > 0 && !isSyntheticContextText(cleaned);
+    });
   }
   const parts = (msg as any).parts;
   if (Array.isArray(parts)) {
-    return parts.some((part: any) =>
-      typeof part?.text === 'string' && part.text.length > 0 && !isSyntheticContextText(part.text)
-    );
+    return parts.some((part: any) => {
+      const cleaned = typeof part?.text === 'string'
+        ? stripSyntheticUserContextBlocks(part.text).trim()
+        : '';
+      return cleaned.length > 0 && !isSyntheticContextText(cleaned);
+    });
   }
   return false;
 }
@@ -691,13 +735,13 @@ export function extractUserText(turnMessages: FoldMessage[]): string {
   for (const msg of turnMessages) {
     if (msg.role !== 'user') continue;
     if (typeof msg.content === 'string' && msg.content.trim()) {
-      const cleaned = stripUserMessageVaultBlocks(msg.content).trim();
+      const cleaned = stripSyntheticUserContextBlocks(msg.content).trim();
       if (cleaned) texts.push(cleaned);
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
         // Only genuine text blocks — tool_result blocks are tool output.
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-          const cleaned = stripUserMessageVaultBlocks(block.text).trim();
+          const cleaned = stripSyntheticUserContextBlocks(block.text).trim();
           if (cleaned) texts.push(cleaned);
         }
       }
@@ -705,7 +749,7 @@ export function extractUserText(turnMessages: FoldMessage[]): string {
       for (const part of (msg as any).parts as any[]) {
         if (part?.functionResponse) continue; // tool output, not user text
         if (typeof part?.text === 'string' && part.text.trim()) {
-          const cleaned = stripUserMessageVaultBlocks(part.text).trim();
+          const cleaned = stripSyntheticUserContextBlocks(part.text).trim();
           if (cleaned) texts.push(cleaned);
         }
       }

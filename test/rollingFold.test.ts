@@ -39,6 +39,7 @@ import {
   extractVerbatimContextLabel,
   LABEL_MAX_CHARS,
   isSyntheticContextText,
+  stripSyntheticUserContextBlocks,
   stripUserMessageVaultBlocks,
   USER_MESSAGE_VAULT_END,
   USER_MESSAGE_VAULT_PREFIX,
@@ -1955,6 +1956,14 @@ describe('formatFoldEpochStamp', () => {
 
 describe('User Message Vault synthetic filtering', () => {
   const vault = `${USER_MESSAGE_VAULT_PREFIX}\nold operator copy\n${USER_MESSAGE_VAULT_END}`;
+  const relayResumeWrapper = `[Temporal Context] Session age: 4h 3m
+
+[System Note: Context pressure limits were reached during your execution.
+Your context has been successfully folded for efficiency.
+Please seamlessly continue your previous turn from where you were interrupted.
+Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
+
+${vault}`;
 
   test('standalone vault text is synthetic and never a turn boundary', () => {
     expect(isSyntheticContextText(vault)).toBe(true);
@@ -1974,6 +1983,19 @@ describe('User Message Vault synthetic filtering', () => {
 
     expect(stripUserMessageVaultBlocks(mixed)).toBe('real request');
     expect(extractUserText([userMsg(mixed)])).toBe('real request');
+  });
+
+  test('relay resume wrappers are stripped before extracting genuine user text', () => {
+    const mixed = `${relayResumeWrapper}\n\nreal request`;
+
+    expect(stripSyntheticUserContextBlocks(mixed)).toBe('real request');
+    expect(extractUserText([userMsg(mixed)])).toBe('real request');
+  });
+
+  test('wrapper-only resume notes do not become user text or turn boundaries', () => {
+    expect(stripSyntheticUserContextBlocks(relayResumeWrapper)).toBe('');
+    expect(extractUserText([userMsg(relayResumeWrapper)])).toBe('');
+    expect(detectTurns([userMsg(relayResumeWrapper), assistantMsg('continuing')])).toHaveLength(0);
   });
 
   test('incomplete vault marker mentions stay user-authored text', () => {
