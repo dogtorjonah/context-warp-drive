@@ -22,7 +22,9 @@
  * Sub-path entry points are also published:
  *   `context-warp-drive/fold`, `context-warp-drive/budget`,
  *   `context-warp-drive/episodes`, `context-warp-drive/glyphs`,
- *   `context-warp-drive/overwatch`, `context-warp-drive/task-rail`.
+ *   `context-warp-drive/overwatch`, `context-warp-drive/task-rail`,
+ *   `context-warp-drive/providers/anthropic`,
+ *   `context-warp-drive/providers/gemini-cli`.
  *
  * Pure CPU, zero I/O, zero LLM calls (the episodic SQLite store is the only
  * optional native dependency). Byte-identical output for identical inputs is the
@@ -39,3 +41,4 @@ export * from './taskRail.ts';
 // who want turnkey cache-breakpoint injection (Anthropic, etc).
 //
 //   import { applyCacheBreakpoints } from 'context-warp-drive/providers/anthropic';
+//   import { buildGeminiCliFoldView } from 'context-warp-drive/providers/gemini-cli';

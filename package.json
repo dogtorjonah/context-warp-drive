@@ -65,6 +65,11 @@
       "types": "./dist/providers/anthropic.d.ts",
       "import": "./dist/providers/anthropic.js",
       "require": "./dist/providers/anthropic.cjs"
+    },
+    "./providers/gemini-cli": {
+      "types": "./dist/providers/geminiCli.d.ts",
+      "import": "./dist/providers/geminiCli.js",
+      "require": "./dist/providers/geminiCli.cjs"
     }
   },
   "main": "./dist/index.cjs",

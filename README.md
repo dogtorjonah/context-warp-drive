@@ -103,6 +103,7 @@ Then add the provider cache knob:
 | Claude / Anthropic | Add top-level `cache_control: { type: 'ephemeral' }` to the request. Use `ttl: '1h'` only when you actually want Anthropic's paid 1-hour cache. Log `usage.cache_read_input_tokens` and `usage.cache_creation_input_tokens`. |
 | OpenAI | No cache marker is required. Keep static tools/system/context first, pass the prepared `messages`, optionally reuse a stable `prompt_cache_key`, and log `usage.prompt_tokens_details.cached_tokens`. |
 | Gemini | Implicit caching is automatic on Gemini 2.5+ when prefixes match. For a large static document/corpus, create an explicit Gemini cache separately and pass it as `cachedContent`; keep the folded conversation after that stable prefix. Log `usage_metadata`. |
+| Gemini CLI | Use `context-warp-drive/providers/gemini-cli` to fold the CLI-owned JSONL view, preserving the metadata header and rewriting with `$set.messages` + `$set.lastUpdated`. |
 
 Context Warp Drive keeps the prefix byte-identical. The provider SDK call still owns provider-specific cache settings.
 
@@ -253,6 +254,11 @@ The engine reads three message shapes natively — pass your history through unc
 
 > **FC (function-calling) APIs only.** Context Warp Drive folds the *conversational message array* you control. CLI/agent runtimes that own their own context (and don't expose the message array) can't be folded this way.
 
+Gemini CLI is the special case: `context-warp-drive/providers/gemini-cli` mirrors
+the Voxxo relay's JSONL fold seam for CLI-owned history, including the 250k
+measured-token trigger, 100k band fold config, recent token high-water scan, and
+dry-run/atomic rewrite helpers.
+
 ---
 
 ## API surface
@@ -287,6 +293,13 @@ import { resolveContextBudget } from 'context-warp-drive';
 
 // Portable execution state — also at "context-warp-drive/task-rail"
 import { startTaskRail, sprint, shoot, ackStep, serializeTaskRail } from 'context-warp-drive';
+
+// Gemini CLI JSONL folding adapter
+import {
+  buildGeminiCliFoldView,
+  readLatestGeminiCliMeasuredTokens,
+  writeFoldedGeminiCliJsonl,
+} from 'context-warp-drive/providers/gemini-cli';
 ```
 
 ---
