@@ -56,7 +56,7 @@ async function callAnthropic(
 }
 
 async function runAgent(task: string): Promise<void> {
-  // One FoldSession per conversation. Use 1h TTL to match the cache breakpoints.
+  // One FoldSession per conversation.
   const session = new FoldSession({
     foldConfig: ALWAYS_ON_FOLD_CONFIG,
     freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 },
@@ -84,14 +84,13 @@ async function runAgent(task: string): Promise<void> {
     //   - rolling breakpoint on the last message caches the append-only tail
     const cachedMessages = applyCacheBreakpoints(messages as Message[], {
       sealedBoundary,
-      ttl: '1h',
     });
 
     // Also cache the system prompt and tool definitions (stable per session).
-    const cachedSystem = buildCachedSystem(SYSTEM_PROMPT, '1h');
-    const cachedTools = applyToolsCacheBreakpoint(TOOLS, '1h');
+    const cachedSystem = buildCachedSystem(SYSTEM_PROMPT);
+    const cachedTools = applyToolsCacheBreakpoint(TOOLS);
 
-    // Step 3: Send to Anthropic. The beta header is needed for 1h TTL.
+    // Step 3: Send to Anthropic. No beta header needed for default 5m TTL.
     const response = await callAnthropic(cachedMessages, cachedSystem, cachedTools);
 
     // Step 4: Append to raw history (append-only — never mutate past messages).

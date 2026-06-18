@@ -38,10 +38,11 @@
  *
  * ## TTL
  *
- * All breakpoints carry the same TTL. `'1h'` (default) uses the extended cache
- * TTL (2× input write, but survives human-paced turn gaps of 9-36 min —
- * ledger data shows these are the norm). `'5m'` is the legacy sliding window
- * (1.25× input write). Pass `ttl: '5m'` to opt back into the legacy behavior.
+ * All breakpoints carry the same TTL. `'5m'` (default) uses the legacy
+ * sliding window (1.25× input write). Since agent loops hit every few
+ * seconds the cache never expires during continuous work — reads refresh
+ * the TTL. `'1h'` uses the extended cache TTL (2× input write, but survives
+ * >5-minute turn gaps). Pass `ttl: '1h'` to opt into the extended behavior.
  * The `'1h'` TTL requires the `anthropic-beta: extended-cache-ttl-2025-04-11`
  * header on the request — see {@link EXTENDED_CACHE_TTL_BETA}.
  *
@@ -82,7 +83,7 @@ export type CacheTtl = '5m' | '1h';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
-function ephemeralCacheControl(ttl: CacheTtl = '1h'): CacheControl {
+function ephemeralCacheControl(ttl: CacheTtl = '5m'): CacheControl {
   return ttl === '1h' ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' };
 }
 
@@ -107,7 +108,7 @@ export function applyCacheBreakpoints(
   },
 ): Message[] {
   if (messages.length === 0) return messages;
-  const ttl = options?.ttl ?? '1h';
+  const ttl = options?.ttl ?? '5m';
   let out: Message[] | null = null;
 
   const markLastBlock = (messageIndex: number): void => {
@@ -143,7 +144,7 @@ export function applyCacheBreakpoints(
  */
 export function buildCachedSystem(
   systemPrompt: string,
-  ttl: CacheTtl = '1h',
+  ttl: CacheTtl = '5m',
 ): string | SystemBlock[] {
   if (!systemPrompt) return systemPrompt;
   return [{ type: 'text', text: systemPrompt, cache_control: ephemeralCacheControl(ttl) }];
@@ -156,7 +157,7 @@ export function buildCachedSystem(
  */
 export function applyToolsCacheBreakpoint<T extends ToolSpec>(
   tools: T[],
-  ttl: CacheTtl = '1h',
+  ttl: CacheTtl = '5m',
 ): T[] {
   if (tools.length === 0) return tools;
   const out = tools.slice();
