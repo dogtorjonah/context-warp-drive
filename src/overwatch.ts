@@ -1026,3 +1026,48 @@ export function governByTrace(
     derivation,
   };
 }
+
+// ─── Prefix trace caching ──────────────────────────────────────────────────
+//
+// On hot-reuse calls the frozen prefix is byte-identical, yet
+// buildOverwatchTrace scans the last N messages on every call. For sessions
+// with long frozen prefixes, most of those N messages are frozen content
+// being re-scanned redundantly. This utility lets callers cache the prefix
+// portion's trace at epoch boundaries and only scan the raw tail on
+// subsequent calls.
+
+/**
+ * Cached prefix-trace window. Populated at epoch boundaries (when the frozen
+ * view changes) and reused on hot-reuse calls where the prefix is byte-stable.
+ */
+export interface CachedTraceWindow {
+  /** Trace tokens for the frozen prefix, in chronological order. */
+  readonly tokens: TraceToken[];
+  /** Raw message count covered by the cached prefix (exclusive upper bound). */
+  readonly rawCount: number;
+}
+
+/**
+ * Build a trace window with prefix caching. If `cache` covers `rawCount`
+ * messages and the current history is longer, only the tail beyond the cached
+ * prefix is scanned. Otherwise a full scan is performed.
+ *
+ * The `scanFn` parameter is the message→trace function (typically
+ * `buildOverwatchTrace` bound to a maxMessages cap). It is called with only
+ * the uncached tail slice.
+ *
+ * Pure function, no side effects, safe on any thread.
+ */
+export function buildTraceWithCache(
+  messages: readonly unknown[],
+  cache: CachedTraceWindow | null,
+  scanFn: (msgs: readonly unknown[]) => TraceToken[],
+): TraceToken[] {
+  if (!cache || cache.rawCount <= 0 || messages.length <= cache.rawCount) {
+    return scanFn(messages);
+  }
+  // Scan only the tail beyond the cached prefix.
+  const tail = messages.slice(cache.rawCount);
+  const tailTokens = scanFn(tail);
+  return [...cache.tokens, ...tailTokens];
+}
