@@ -781,6 +781,106 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).not.toContain('Live Source Delta (relay/src/alpha.ts)');
   });
 
+  test('zone fan-out residency stays exact-path: later sibling touch is not suppressed', () => {
+    const alpha = 'relay/src/alpha.ts';
+    const beta = 'relay/src/beta.ts';
+    const raw: FoldMessage[] = [
+      userMsg('Read alpha and beta together'),
+      anthropicToolUse('tu_alpha', 'Read', { file_path: ABS(alpha) }),
+      anthropicToolResult('tu_alpha', 'ALPHA OLD CONTENT'),
+      anthropicToolUse('tu_beta', 'Read', { file_path: ABS(beta) }),
+      anthropicToolResult('tu_beta', 'BETA OLD CONTENT'),
+      assistantMsg('Alpha and beta were reviewed in one temporal burst.'),
+      userMsg('Later, check beta again'),
+      anthropicToolUse('tu_beta2', 'Read', { file_path: ABS(beta) }),
+      anthropicToolResult('tu_beta2', 'BETA LATER CONTENT'),
+      assistantMsg('Beta revisited in a separate turn.'),
+    ];
+    const state = createFoldRecallState();
+    // Two separate entries: a shared burst (alpha+beta) and a later beta-only turn.
+    state.index = makeIndex([
+      turnEntry('burst', 'alpha beta reviewed together', 30, [alpha, beta], 0, 6),
+      turnEntry('later-beta', 'beta revisited separately', 20, [beta], 6, raw.length),
+    ], raw.length);
+
+    // Pass 1: touch alpha → matches the burst entry. Card injected; residency
+    // keys on matchedPath (alpha), NOT the zone.
+    const out1 = buildFoldRecallContext(
+      state,
+      raw,
+      extractRecallSignals({ file_path: ABS(alpha) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+    expect(out1.cards).toBe(1);
+    expect(out1.text!).toContain('trigger: path-touch relay/src/alpha.ts');
+
+    // Pass 2: touch beta → the burst entry is entry-resident (suppressed), but
+    // the later-beta entry is a different entry and must still produce a card.
+    // If residency incorrectly used the zone, beta would be path-resident from
+    // pass 1 and the later-beta entry would be suppressed too.
+    const out2 = buildFoldRecallContext(
+      state,
+      raw,
+      extractRecallSignals({ file_path: ABS(beta) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+    expect(out2.cards).toBe(1);
+    expect(out2.text!).toContain('trigger: path-touch relay/src/beta.ts');
+  });
+
+  test('wide burst: enrichment is proximity-ordered and top-K capped, body is not', () => {
+    const core = 'relay/src/core.ts';
+    const helper = 'relay/src/helper.ts';
+    const extra = 'relay/src/utils/extra.ts';
+    const pkg = 'package.json';
+    const raw: FoldMessage[] = [
+      userMsg('Read core, helper, utils, and package.json together'),
+      anthropicToolUse('tu_core', 'Read', { file_path: ABS(core) }),
+      anthropicToolResult('tu_core', 'CORE OLD CONTENT'),
+      anthropicToolUse('tu_helper', 'Read', { file_path: ABS(helper) }),
+      anthropicToolResult('tu_helper', 'HELPER OLD CONTENT'),
+      anthropicToolUse('tu_extra', 'Read', { file_path: ABS(extra) }),
+      anthropicToolResult('tu_extra', 'EXTRA OLD CONTENT'),
+      anthropicToolUse('tu_pkg', 'Read', { file_path: ABS(pkg) }),
+      anthropicToolResult('tu_pkg', 'PACKAGE CONFIG'),
+      assistantMsg('Core, helper, extra, and package config reviewed together.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([
+      turnEntry('burst', 'core helper extra pkg reviewed', 30, [core, helper, extra, pkg], 0, raw.length),
+    ], raw.length);
+    // Highlights for all 4 paths so enrichment (radar) is observable.
+    state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(extra, [{ label: 'EXTRA-NESTED', startLine: 10, endLine: 20 }]);
+    state.pathHighlights.set(pkg, [{ label: 'PKG-INCIDENTAL', startLine: 10, endLine: 20 }]);
+
+    const out = buildFoldRecallContext(
+      state,
+      raw,
+      extractRecallSignals({ file_path: ABS(core) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+
+    expect(out.cards).toBe(1);
+    // Body is uncapped: all 4 tool-result bodies are present.
+    expect(out.text!).toContain('CORE OLD CONTENT');
+    expect(out.text!).toContain('HELPER OLD CONTENT');
+    expect(out.text!).toContain('EXTRA OLD CONTENT');
+    expect(out.text!).toContain('PACKAGE CONFIG');
+    // Enrichment is proximity-ordered + top-K capped (K=3).
+    // Anchor (core) and same-dir siblings (helper, extra) rank in top-3.
+    expect(out.text!).toContain('CORE-ANCHOR');
+    expect(out.text!).toContain('HELPER-SIBLING');
+    expect(out.text!).toContain('EXTRA-NESTED');
+    // Cross-cluster incidental (package.json, sharedPrefix=0) is sorted last
+    // and excluded from the top-K enrichment cap.
+    expect(out.text!).not.toContain('PKG-INCIDENTAL');
+  });
+
   test('tier-1 claim on a folded path pages content in', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);

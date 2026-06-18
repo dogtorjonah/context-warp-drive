@@ -935,14 +935,47 @@ function isSyntheticRecallKey(matchedPath: string): boolean {
   return matchedPath.startsWith('verbatim:') || matchedPath.startsWith('term:');
 }
 
+/** Maximum number of zone paths that participate in enrichment (radar + source deltas). */
+const ZONE_ENRICHMENT_MAX_PATHS = 3;
+
+function dirSegments(p: string): string[] {
+  const i = p.lastIndexOf('/');
+  return (i < 0 ? '' : p.slice(0, i)).split('/').filter(Boolean);
+}
+
+function sharedPrefix(a: readonly string[], b: readonly string[]): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[n] === b[n]) n++;
+  return n;
+}
+
+/**
+ * Order zone paths by directory proximity to the anchor: anchor first, then
+ * closest sibling dirs, cross-cluster paths last. Stable within ties.
+ * Pure string work — zero I/O. Used for enrichment ranking, not body collection.
+ */
+function orderZoneByProximity(anchor: string, paths: readonly string[]): string[] {
+  const aSegs = dirSegments(anchor);
+  return paths
+    .map((p, i) => ({ p, i, score: p === anchor ? Infinity : sharedPrefix(dirSegments(p), aSegs) }))
+    .sort((x, y) => y.score - x.score || x.i - y.i)
+    .map(z => z.p);
+}
+
 /**
  * Paths that share the same recall body/enrichment zone. A folded inter-turn
  * entry is one temporal read burst, so touching any member path should recover
  * the whole co-folded source context. Intra-tool entries stay exact-path.
+ *
+ * For real anchors (tier-0/1 path touches) the zone is proximity-ordered so
+ * enrichment (radar, source deltas) prioritizes the anchor and its closest
+ * siblings. Synthetic keys (verbatim:/term:) have no real anchor, so they keep
+ * entry order.
  */
 function recallZonePaths(item: RecallPlanItem): readonly string[] {
   if (item.entry.kind === 'turn' || isSyntheticRecallKey(item.matchedPath)) {
-    return entryPaths(item.entry);
+    if (isSyntheticRecallKey(item.matchedPath)) return entryPaths(item.entry);
+    return orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
   }
   return [item.matchedPath];
 }
@@ -1363,7 +1396,7 @@ function resolveItemEnrichment(
   state: FoldRecallState,
   suppressPaths: ReadonlySet<string>,
 ): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
-  const keys = recallZonePaths(item);
+  const keys = recallZonePaths(item).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
   const highlights: RecallSourceHighlight[] = [];
   const hazards: RecallHazard[] = [];
   const seenH = new Set<string>();
@@ -1420,7 +1453,7 @@ function normalizeSourceForComparison(text: string): string {
 }
 
 function resolveItemSourceDeltas(item: RecallPlanItem, state: FoldRecallState): RecallSourceDelta[] {
-  const keys = recallZonePaths(item);
+  const keys = recallZonePaths(item).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
   const deltas: RecallSourceDelta[] = [];
   const seen = new Set<string>();
   for (const key of keys) {
