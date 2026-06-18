@@ -101,6 +101,17 @@ export interface Episode {
   closedBy: EpisodeClosedBy;
   /** One-line header; see deriveEpisodeSummary fallback chain. */
   summary: string;
+  /**
+   * Verbatim operator ask that drove this burst — the nearest genuine user
+   * message at/before the burst start, mined from the RAW capture window (not the
+   * recency-capped transient send-view vault) and denormalized here at write time
+   * so the "why" outlives its source transcript. Absent when the burst was
+   * agent-initiated (no preceding operator message) or on legacy rows. This is
+   * operator-authored verbatim text: the one voice on the spine that is NOT the
+   * agent's own — it stays inside the no-narrator rule (real, contemporaneous,
+   * never paraphrased).
+   */
+  intent?: string;
   gitHead?: string;
   railId?: string;
   railStep?: string;
@@ -237,6 +248,12 @@ export const SUMMARY_CAP_CHARS = 120;
 export const HEADER_SUMMARY_CAP_CHARS = 60;
 export const VOICE_TEXT_CAP_CHARS = 200;
 export const TRACE_VOICE_TEXT_CAP_CHARS = 60;
+/**
+ * Verbatim cap for the operator-ask intent anchor (Episode.intent). The driving
+ * user message can run long; bound it like voice and keep it to a single anchor
+ * line on the card.
+ */
+export const INTENT_TEXT_CAP_CHARS = 200;
 export const CHAIN_CARD_DEFAULT_BUDGET_CHARS = 1_600;
 
 const TOUCH_KIND_RANK: Record<EpisodeTouchKind, number> = { edit: 2, read: 1, mention: 0 };
@@ -885,6 +902,11 @@ function renderChapterBody(
   voiceLabel: string,
 ): string[] {
   const lines: string[] = [];
+  // Operator-ask anchor first: the "why" the burst happened, above the structural
+  // members/trace. Hot + full-previous chapters render full bodies so both surface
+  // it; warm/cold collapse to one-liners and never reach here. Guarded so episodes
+  // with no mined ask (agent-initiated / legacy) stay byte-identical to before.
+  if (episode.intent) lines.push(`  ↳ ask:"${truncateVerbatim(episode.intent, INTENT_TEXT_CAP_CHARS)}"`);
   lines.push(renderMembersLine(episode));
   if (episode.trace.length > 0) lines.push(`  trace: ${episode.trace}`);
   for (const inlay of selectVoiceInlays(episode.annotations, maxVoiceInlays)) {

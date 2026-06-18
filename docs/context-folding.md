@@ -123,7 +123,10 @@ request object tells the provider how to cache those bytes.
 Beyond the in-session fold, `foldEpisodes.ts` + `foldEpisodeCapture.ts` keep a
 durable store (the `EpisodeDatabase` handle; a `better-sqlite3` reference
 implementation ships in `src/episodes/`) of sealed work episodes: zone members
-(files touched), a structural branch trace, and verbatim voice annotations —
+(files touched), a structural branch trace, the operator intent (the verbatim
+ask that drove the burst, mined from the raw capture window — not the recency-capped
+transient user-message vault — and denormalized at write; rendered as the card's
+`↳ ask` anchor), and verbatim voice annotations —
 tier-A: glyph-grammar-tagged tool inputs (changelogs, stars, typed lines);
 tier-B: narration (below). Capture runs at freeze
 epochs behind a durable-coverage cursor; recall fires at tool boundaries —

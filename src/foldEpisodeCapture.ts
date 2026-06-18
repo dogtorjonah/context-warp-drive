@@ -42,6 +42,7 @@ import {
   NARRATION_MAX_LINES,
   NARRATION_MAX_LINES_TAGGED,
   VOICE_TEXT_CAP_CHARS,
+  INTENT_TEXT_CAP_CHARS,
   type Episode,
   type EpisodeAnnotation,
   type EpisodeAnnotationKind,
@@ -51,7 +52,7 @@ import {
 } from './foldEpisodes.ts';
 import { canonicalizeExtractedPaths, type CanonContext } from './foldPathCanon.ts';
 import { extractPathsFromBashCommand, extractRecallSignals } from './foldRecall.ts';
-import { isSyntheticContextText, type FoldMessage } from './rollingFold.ts';
+import { extractUserText, isSyntheticContextText, type FoldMessage } from './rollingFold.ts';
 
 const EDIT_TOOL_HINTS = ['edit', 'write', 'apply_patch', 'notebookedit', 'str_replace', 'create_file'];
 const CHECK_TOOL_RE = /test|typecheck|tsc|vitest|build|lint/i;
@@ -445,6 +446,28 @@ function structuralStep(call: ToolCallView, outcome: 'ok' | 'error' | undefined,
 }
 
 /**
+ * The verbatim operator ask that drove a burst: scan the raw window BACKWARD from
+ * the burst's first touch for the nearest genuine user message. Reuses the
+ * canonical operator-text gate — extractUserText drops tool_result / Gemini
+ * functionResponse blocks and strips vault blocks, isSyntheticContextText drops
+ * fold / recall-card / epoch-stamp / vault synthetic context — so recalled cards
+ * and tool output can never launder into intent. Scans the FULL messages array
+ * (not just [startIndex, …]) so an ask issued in a PRIOR epoch still anchors the
+ * burst it motivated. Pure CPU, no I/O.
+ */
+function mineIntentForBurst(messages: readonly FoldMessage[], burstStartIndex: number): string | undefined {
+  for (let i = Math.min(burstStartIndex, messages.length - 1); i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== 'user') continue;
+    const text = extractUserText([message]).trim();
+    if (text.length === 0) continue;            // tool_result-only / empty user turn
+    if (isSyntheticContextText(text)) continue; // fold / recall / vault / epoch synthetic
+    return truncateVerbatim(text, INTENT_TEXT_CAP_CHARS);
+  }
+  return undefined;
+}
+
+/**
  * Derive sealed episodes from the raw message window starting at startIndex.
  * Touch kinds come from tool names (edit-ish vs read); pivot stars seal
  * bursts; voice annotations attach to their burst (gap annotations attach to
@@ -564,6 +587,7 @@ export function deriveEpisodesFromMessages(
         : s.eventIndex >= burst.startEventIndex && s.eventIndex <= burst.endEventIndex)
       .map((s) => s.step);
     const annotations = annotationsPerBurst[index];
+    const intent = mineIntentForBurst(messages, burst.startEventIndex);
     return {
       workspace: identity.workspace,
       instanceId: identity.instanceId,
@@ -573,6 +597,7 @@ export function deriveEpisodesFromMessages(
       endedAt: burst.endedAt ?? identity.nowIso,
       closedBy: identity.closedBy,
       summary: deriveEpisodeSummary({ annotations, members: burst.members }),
+      ...(intent !== undefined ? { intent } : {}),
       ...(identity.railId !== undefined ? { railId: identity.railId } : {}),
       ...(identity.railStep !== undefined ? { railStep: identity.railStep } : {}),
       members: burst.members,
