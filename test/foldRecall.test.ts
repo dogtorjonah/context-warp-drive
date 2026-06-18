@@ -724,6 +724,25 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).not.toContain('Live Source Delta');
   });
 
+  test('source delta: truncated live source renders delta even when prefix matches historical', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    // Simulate a TRUNCATED live source whose prefix matches the historical body.
+    // The file may have changed beyond the truncation point — delta MUST render.
+    state.pathSourceDeltas.set(BIGFILE, {
+      path: BIGFILE,
+      liveHash: 'ghi789',
+      liveSource: BIGFILE_CONTENT.slice(0, 500),
+      truncated: true,
+    });
+    const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+    expect(out.cards).toBe(1);
+    // The delta should render because truncated=true — we can't know if the
+    // rest of the file changed beyond the truncation point.
+    expect(out.text!).toContain('Live Source Delta');
+    expect(out.text!).toContain('live snapshot truncated');
+  });
+
   test('tier-1 claim on a folded path pages content in', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);

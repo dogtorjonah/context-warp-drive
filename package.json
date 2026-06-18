@@ -60,6 +60,11 @@
       "types": "./dist/task-rail.d.ts",
       "import": "./dist/task-rail.js",
       "require": "./dist/task-rail.cjs"
+    },
+    "./providers/anthropic": {
+      "types": "./dist/providers/anthropic.d.ts",
+      "import": "./dist/providers/anthropic.js",
+      "require": "./dist/providers/anthropic.cjs"
     }
   },
   "main": "./dist/index.cjs",

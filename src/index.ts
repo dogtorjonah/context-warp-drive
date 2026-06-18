@@ -34,3 +34,8 @@ export * from './episodes.ts';
 export * from './glyphs.ts';
 export * from './overwatch.ts';
 export * from './taskRail.ts';
+
+// Provider adapters — re-exported under `providers/` sub-path for consumers
+// who want turnkey cache-breakpoint injection (Anthropic, etc).
+//
+//   import { applyCacheBreakpoints } from 'context-warp-drive/providers/anthropic';

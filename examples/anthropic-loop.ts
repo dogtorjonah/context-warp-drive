@@ -1,86 +1,111 @@
 /**
  * Example — wiring context-warp-drive into an Anthropic function-calling loop.
  *
- * The only context-warp-drive surface you need for the headline feature is
- * `FoldSession.prepare(history)`: hand it your full provider-shaped history every
- * turn, send the returned (compacted) messages, and the frozen fold prefix is
- * reused byte-identical while Anthropic's prompt cache is warm. Anthropic still
- * needs the request-level `cache_control` knob at the SDK call site.
+ * This is the FULL plug-and-play loop: FoldSession compacts history + freezes
+ * the prefix, and the Anthropic provider adapter injects `cache_control`
+ * breakpoints so the frozen prefix stays cached on Anthropic's side.
  *
- * This file is self-contained so it typechecks without the SDK installed.
- * In your project: `import { FoldSession } from 'context-warp-drive'` and replace
- * `callAnthropic` with a real `@anthropic-ai/sdk` Messages.create call.
+ * Two function calls per turn — that's the whole integration:
+ *
+ *   1. session.prepare(history) → compacted messages + sealedBoundary
+ *   2. applyCacheBreakpoints(messages, { sealedBoundary }) → cached messages
+ *
+ * In your project:
+ *   import { FoldSession } from 'context-warp-drive';
+ *   import { applyCacheBreakpoints } from 'context-warp-drive/providers/anthropic';
  */
 import { FoldSession, ALWAYS_ON_FOLD_CONFIG, type FoldMessage } from '../src/index.ts';
+import {
+  applyCacheBreakpoints,
+  buildCachedSystem,
+  applyToolsCacheBreakpoint,
+  EXTENDED_CACHE_TTL_BETA,
+  type Message,
+  type ToolSpec,
+} from '../src/providers/anthropic.ts';
 
-// --- Your provider call (stub). Anthropic returns content blocks. ---
-interface AnthropicAssistantTurn {
-  role: 'assistant';
+// --- Your provider call (stub). Replace with real @anthropic-ai/sdk. ---
+interface AnthropicResponse {
   content: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
-}
-
-interface AnthropicCacheControl {
-  type: 'ephemeral';
-  ttl?: '1h';
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
 }
 
 async function callAnthropic(
-  messages: FoldMessage[],
-  cacheControl: AnthropicCacheControl = { type: 'ephemeral' },
-): Promise<AnthropicAssistantTurn> {
+  messages: Message[],
+  system: string | object,
+  tools: ToolSpec[],
+): Promise<AnthropicResponse> {
   // const client = new Anthropic();
   // const res = await client.messages.create({
-  //   model: 'claude-...',
-  //   max_tokens: 4096,
-  //   cache_control: cacheControl,
+  //   model: 'claude-sonnet-4-20250514',
+  //   max_tokens: 8192,
   //   system,
   //   tools,
-  //   messages: messages as Anthropic.MessageParam[],
+  //   messages,
+  //   betas: { headers: { 'anthropic-beta': EXTENDED_CACHE_TTL_BETA } },
   // });
-  // console.log(res.usage.cache_read_input_tokens, res.usage.cache_creation_input_tokens);
-  // return { role: 'assistant', content: res.content };
-  void messages;
-  void cacheControl;
-  return { role: 'assistant', content: [{ type: 'text', text: '(stub assistant reply)' }] };
+  // console.log('cache stats:', res.usage.cache_read_input_tokens, res.usage.cache_creation_input_tokens);
+  // return res;
+  void messages; void system; void tools;
+  return { content: [{ type: 'text', text: '(stub)' }] };
 }
 
 async function runAgent(task: string): Promise<void> {
-  // One FoldSession per conversation. ALWAYS_ON_FOLD_CONFIG folds continuously
-  // past the active window; omit it for the conservative threshold-gated default.
+  // One FoldSession per conversation. Use 1h TTL to match the cache breakpoints.
   const session = new FoldSession({
     foldConfig: ALWAYS_ON_FOLD_CONFIG,
-    freeze: { enabled: true, ttlMs: 5 * 60_000, maxTailChars: 150_000 },
+    freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 },
   });
+
+  const SYSTEM_PROMPT = 'You are a helpful assistant with file-editing tools.';
+  const TOOLS: ToolSpec[] = [
+    { name: 'edit_file', description: 'Edit a file', input_schema: { type: 'object', properties: {} } },
+  ];
 
   const history: FoldMessage[] = [{ role: 'user', content: task }];
 
-  for (let turn = 0; turn < 12; turn++) {
-    // Compact the history. `messages` is what you send to the provider; the
-    // frozen prefix is byte-identical to last turn whenever cacheHot is true.
-    const { messages, cacheHot, stats } = session.prepare(history);
+  for (let turn = 0; turn < 100; turn++) {
+    // Step 1: Compact history. The frozen prefix is byte-identical when cacheHot.
+    const { messages, cacheHot, sealedBoundary, stats } = session.prepare(history);
+
     console.log(
       `turn ${turn}: send=${messages.length} msgs cacheHot=${cacheHot} ` +
-        `savings=${stats.savingsPercent ?? 0}% hotReuses=${stats.hotReuses} epochs=${stats.epochs}`,
+        `savings=${stats.savingsPercent ?? 0}% epochs=${stats.epochs} ` +
+        `sealedBoundary=${sealedBoundary ?? 'none'}`,
     );
 
-    const assistant = await callAnthropic(messages);
-    history.push(assistant as unknown as FoldMessage);
+    // Step 2: Inject cache breakpoints. This is the only provider-specific call.
+    //   - sealedBoundary breakpoint caches the frozen prefix band
+    //   - rolling breakpoint on the last message caches the append-only tail
+    const cachedMessages = applyCacheBreakpoints(messages as Message[], {
+      sealedBoundary,
+      ttl: '1h',
+    });
 
-    const toolUses = assistant.content.filter((b) => b.type === 'tool_use');
-    if (toolUses.length === 0) break; // model is done
+    // Also cache the system prompt and tool definitions (stable per session).
+    const cachedSystem = buildCachedSystem(SYSTEM_PROMPT, '1h');
+    const cachedTools = applyToolsCacheBreakpoint(TOOLS, '1h');
 
-    // Execute tools and append a single user turn carrying the tool_result blocks.
+    // Step 3: Send to Anthropic. The beta header is needed for 1h TTL.
+    const response = await callAnthropic(cachedMessages, cachedSystem, cachedTools);
+
+    // Step 4: Append to raw history (append-only — never mutate past messages).
+    history.push({ role: 'assistant', content: response.content } as unknown as FoldMessage);
+
+    const toolUses = response.content.filter((b) => b.type === 'tool_use');
+    if (toolUses.length === 0) break;
+
     const toolResults = toolUses.map((b) => ({
       type: 'tool_result',
       tool_use_id: b.id,
       content: `result of ${b.name ?? 'tool'}`,
     }));
     history.push({ role: 'user', content: toolResults });
-
-    // OPTIONAL page-in: on a tool boundary, build the fold index, extract recall
-    // signals from the tool input (touched paths), and append recall cards.
-    // See ../src/foldRecall.ts (buildFoldIndex / extractRecallSignals /
-    // buildFoldRecallContext) and the README "Fold recall" section.
   }
 }
 

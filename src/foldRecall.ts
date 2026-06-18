@@ -17,7 +17,7 @@
  *   by provider tool ids (tool_use_id / tool_call_id) as recovery handles.
  * - TRIGGERS (tool-boundary only): tier 0 = a tool call re-touches a folded
  *   path; tier 1 = a file claim lands on a folded path. Tier 2 distinctive-term
- *   overlap is available behind WARP_FOLD_RECALL_TERMS (default OFF).
+ *   overlap is available behind VOXXO_FOLD_RECALL_TERMS (default OFF).
  * - INJECTION: the session appends rendered cards/hints to the tool result's
  *   post-dispatch context (the same channel as tool-boundary mesh digest
  *   deltas; payloads are body-only strings). Cards land durably in raw
@@ -34,7 +34,7 @@
  * Set/Map iteration order is observable in any rendered string (entries are
  * explicitly ordered: tier asc, recency desc, id asc).
  *
- * Kill switch: WARP_FOLD_RECALL=0. Recall only ever runs when fold mode is
+ * Kill switch: VOXXO_FOLD_RECALL=0. Recall only ever runs when fold mode is
  * 'on' and the fold freeze is active — no fold, no index, no recall.
  */
 
@@ -62,7 +62,7 @@ import { extractDistinctiveTerms, idfFromDocumentFrequency, scoreTermOverlap } f
 // ══════════════════════════════════════════════════════════════════════
 
 export interface FoldRecallConfig {
-  /** Master switch (WARP_FOLD_RECALL). Default ON when fold mode is 'on'. */
+  /** Master switch (VOXXO_FOLD_RECALL). Default ON when fold mode is 'on'. */
   enabled: boolean;
   /** Max full-content cards injected per pass (healthy pressure). */
   maxCards: number;
@@ -75,16 +75,16 @@ export interface FoldRecallConfig {
   /** Tier-2 distinctive-term matching. Default OFF; path tiers stay unchanged. */
   termRecallEnabled: boolean;
   /**
-   * Exact verbatim-token page-in (WARP_FOLD_RECALL_VERBATIM). When a kept
+   * Exact verbatim-token page-in (VOXXO_FOLD_RECALL_VERBATIM). When a kept
    * identifier (a hash/UUID conserved by the Coordinate Closet) re-surfaces in the
    * active window, its source turn pages back in. A single EXACT match suffices
    * (vs the ≥2 fuzzy-term gate). Default ON (operator-blessed, Jonah 2026-06-14);
-   * set WARP_FOLD_RECALL_VERBATIM=0 for byte-identical legacy behavior. Path/
+   * set VOXXO_FOLD_RECALL_VERBATIM=0 for byte-identical legacy behavior. Path/
    * claim tiers still outrank.
    */
   verbatimRecallEnabled: boolean;
   /**
-   * Curated Code Radar — source-highlight guideposts (WARP_FOLD_RECALL_HIGHLIGHTS).
+   * Curated Code Radar — source-highlight guideposts (VOXXO_FOLD_RECALL_HIGHLIGHTS).
    * Prepends Atlas-curated `⌖ label (a–b)` lines to a recall card so the agent
    * sees the file's key regions the moment it pages back in. Default ON
    * (operator-blessed, Jonah 2026-06-17). Renders only when enrichment is
@@ -92,7 +92,7 @@ export interface FoldRecallConfig {
    */
   highlightsEnabled: boolean;
   /**
-   * Curated Code Radar — hazard guideposts (WARP_FOLD_RECALL_HAZARDS).
+   * Curated Code Radar — hazard guideposts (VOXXO_FOLD_RECALL_HAZARDS).
    * Prepends Atlas-curated `⚠️ text (L85)` lines (hazard-first, above highlights)
    * so a hazard the agent is about to trip surfaces on re-touch. Default ON
    * (operator-blessed, Jonah 2026-06-17). Same residency/byte-identity contract.
@@ -129,31 +129,31 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
 /**
  * Resolve config from environment. Default ON (recall is already gated on
  * fold mode 'on' + an active fold-freeze index upstream).
- *   WARP_FOLD_RECALL=0|false|off|no       → disable
- *   WARP_FOLD_RECALL_MAX_CARDS=<n>        → cards per pass (default 2)
- *   WARP_FOLD_RECALL_MAX_TOTAL_CHARS=<n>  → total chars per pass (default 12000)
- *   WARP_FOLD_RECALL_MAX_CARD_CHARS=<n>   → chars per card body (default 6000)
- *   WARP_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 8)
- *   WARP_FOLD_RECALL_TERMS=1|true|on|yes  → enable tier-2 term matching (default off)
- *   WARP_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
- *   WARP_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
- *   WARP_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
+ *   VOXXO_FOLD_RECALL=0|false|off|no       → disable
+ *   VOXXO_FOLD_RECALL_MAX_CARDS=<n>        → cards per pass (default 2)
+ *   VOXXO_FOLD_RECALL_MAX_TOTAL_CHARS=<n>  → total chars per pass (default 12000)
+ *   VOXXO_FOLD_RECALL_MAX_CARD_CHARS=<n>   → chars per card body (default 6000)
+ *   VOXXO_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 8)
+ *   VOXXO_FOLD_RECALL_TERMS=1|true|on|yes  → enable tier-2 term matching (default off)
+ *   VOXXO_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
+ *   VOXXO_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
+ *   VOXXO_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
  */
 export function resolveFoldRecallConfig(
   env: Record<string, string | undefined> = process.env,
 ): FoldRecallConfig {
-  const raw = (env.WARP_FOLD_RECALL ?? '').trim().toLowerCase();
+  const raw = (env.VOXXO_FOLD_RECALL ?? '').trim().toLowerCase();
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
-  const termRaw = (env.WARP_FOLD_RECALL_TERMS ?? '').trim().toLowerCase();
-  const verbatimRaw = (env.WARP_FOLD_RECALL_VERBATIM ?? '').trim().toLowerCase();
-  const highlightsRaw = (env.WARP_FOLD_RECALL_HIGHLIGHTS ?? '').trim().toLowerCase();
-  const hazardsRaw = (env.WARP_FOLD_RECALL_HAZARDS ?? '').trim().toLowerCase();
+  const termRaw = (env.VOXXO_FOLD_RECALL_TERMS ?? '').trim().toLowerCase();
+  const verbatimRaw = (env.VOXXO_FOLD_RECALL_VERBATIM ?? '').trim().toLowerCase();
+  const highlightsRaw = (env.VOXXO_FOLD_RECALL_HIGHLIGHTS ?? '').trim().toLowerCase();
+  const hazardsRaw = (env.VOXXO_FOLD_RECALL_HAZARDS ?? '').trim().toLowerCase();
   return {
     enabled,
-    maxCards: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARDS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
-    maxTotalChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_TOTAL_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
-    maxCardChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARD_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCardChars,
-    ttlPasses: parsePositiveInt(env.WARP_FOLD_RECALL_TTL_PASSES) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
+    maxCards: parsePositiveInt(env.VOXXO_FOLD_RECALL_MAX_CARDS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
+    maxTotalChars: parsePositiveInt(env.VOXXO_FOLD_RECALL_MAX_TOTAL_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
+    maxCardChars: parsePositiveInt(env.VOXXO_FOLD_RECALL_MAX_CARD_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCardChars,
+    ttlPasses: parsePositiveInt(env.VOXXO_FOLD_RECALL_TTL_PASSES) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
     termRecallEnabled: termRaw === '1' || termRaw === 'true' || termRaw === 'on' || termRaw === 'yes',
     // Default ON (operator-blessed); only explicit disable values turn it off.
     verbatimRecallEnabled:
@@ -340,7 +340,7 @@ export interface InterTurnIndexEntry {
   /**
    * Sorted verbatim identifiers (UUIDs/hex/paths/KV — nominateVerbatim, cap 40)
    * this turn paged out, the same family the Coordinate Closet conserves. Drives the
-   * exact-token page-in tier (WARP_FOLD_RECALL_VERBATIM). Bounded to the turn's
+   * exact-token page-in tier (VOXXO_FOLD_RECALL_VERBATIM). Bounded to the turn's
    * own nomination — no dense search/embeddings.
    */
   verbatimTokens?: string[];
@@ -790,7 +790,7 @@ function normalizeAtlasReadToolLeaf(toolName: string | null | undefined): string
  * seeing that file's full source_highlights+hazards live, so the (compressed)
  * Curated Code Radar would just parrot the tool output and is suppressed for
  * those paths (the folded card BODY still pages in). The tool name is
- * leaf-normalized so namespaced MCP forms (mcp__agent-bridge__atlas_query)
+ * leaf-normalized so namespaced MCP forms (mcp__voxxo-swarm-bridge__atlas_query)
  * and provider-prefixed forms match — not only bare names. search/history/graph/
  * diff do NOT match: they do not render the curated per-file record.
  */
@@ -1409,7 +1409,9 @@ function formatSourceDelta(delta: RecallSourceDelta, historicalBody: string, cha
   const live = normalizeSourceForComparison(delta.liveSource);
   if (!live) return '';
   const historical = normalizeSourceForComparison(historicalBody);
-  if (historical.includes(live)) return '';
+  // Truncated live sources are only a prefix — the file may have changed
+  // beyond the truncation point. Skip suppression so the delta always renders.
+  if (!delta.truncated && historical.includes(live)) return '';
   const heading = `⚠ Live Source Delta (${delta.path}): current box source differs from this historical fold-recall body; liveHash=${delta.liveHash}${delta.truncated ? '; live snapshot truncated' : ''}`;
   const bodyBudget = charBudget - heading.length - '\nCurrent source excerpt:\n'.length;
   if (bodyBudget < 80) return '';
@@ -1554,7 +1556,7 @@ export function buildFoldRecallContext(
         continue;
       }
       if (hints >= MAX_HINTS_PER_PASS) continue;
-      rendered = renderHint(item);
+      rendered ??= renderHint(item);
       if (rendered.length > remaining) continue;
     }
 

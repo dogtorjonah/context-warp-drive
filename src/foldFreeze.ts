@@ -59,7 +59,7 @@
  * Pure CPU, zero I/O, no timers — event-loop safe by construction. State
  * lives on the session object and resets naturally on rebirth.
  *
- * Kill switch: WARP_FOLD_FREEZE=0 reverts to per-call recompute (the
+ * Kill switch: VOXXO_FOLD_FREEZE=0 reverts to per-call recompute (the
  * pre-freeze always-on behavior). TTL and tail cap are env-tunable; callers may
  * also provide model-aware defaults so the hot-tail sawtooth tracks the fold
  * target band unless explicitly overridden.
@@ -104,9 +104,9 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
 
 /**
  * Resolve config from environment. Default ON.
- *   WARP_FOLD_FREEZE=0|false|off|no      → disable (legacy per-call recompute)
- *   WARP_FOLD_FREEZE_TTL_MS=<ms>          → override cache TTL
- *   WARP_FOLD_FREEZE_MAX_TAIL_CHARS=<n>   → override raw overhang cap
+ *   VOXXO_FOLD_FREEZE=0|false|off|no      → disable (legacy per-call recompute)
+ *   VOXXO_FOLD_FREEZE_TTL_MS=<ms>          → override cache TTL
+ *   VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS=<n>   → override raw overhang cap
  *
  * `defaults.ttlMs` lets a session inject its PROVIDER's actual cache TTL
  * (e.g. claude-api with 1h extended-TTL breakpoints passes 3_600_000) so the
@@ -119,13 +119,13 @@ export function resolveFoldFreezeConfig(
   env: Record<string, string | undefined> = process.env,
   defaults?: { ttlMs?: number; maxTailChars?: number },
 ): FoldFreezeConfig {
-  const raw = (env.WARP_FOLD_FREEZE ?? '').trim().toLowerCase();
+  const raw = (env.VOXXO_FOLD_FREEZE ?? '').trim().toLowerCase();
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
   return {
     enabled,
-    ttlMs: parsePositiveInt(env.WARP_FOLD_FREEZE_TTL_MS) ?? defaults?.ttlMs ?? DEFAULT_FOLD_FREEZE_CONFIG.ttlMs,
+    ttlMs: parsePositiveInt(env.VOXXO_FOLD_FREEZE_TTL_MS) ?? defaults?.ttlMs ?? DEFAULT_FOLD_FREEZE_CONFIG.ttlMs,
     maxTailChars:
-      parsePositiveInt(env.WARP_FOLD_FREEZE_MAX_TAIL_CHARS)
+      parsePositiveInt(env.VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS)
       ?? defaults?.maxTailChars
       ?? DEFAULT_FOLD_FREEZE_CONFIG.maxTailChars,
   };
@@ -166,6 +166,53 @@ function boundaryFingerprintInput(msg: FoldMessage): string {
 // State
 // ══════════════════════════════════════════════════════════════════════
 
+export type FoldFreezeFullRecomputeCause =
+  | 'first-call'
+  | 'cold-gap'
+  | 'context-changed'
+  | 'history-rewound'
+  | 'boundary-mismatch'
+  | 'tail-epoch'
+  | 'prefix-saturation';
+
+export type FoldFreezeTransitionReason =
+  | FoldFreezeFullRecomputeCause
+  | 'hot-reuse'
+  | 'append-tail-epoch';
+
+export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecomputeCause[] = [
+  'first-call',
+  'cold-gap',
+  'context-changed',
+  'history-rewound',
+  'boundary-mismatch',
+  'tail-epoch',
+  'prefix-saturation',
+];
+
+export interface FoldFreezeSealedBandMetadata {
+  /** View index where the stable prefix ends and this folded tail band begins. */
+  sealedPrefixMessageCount: number;
+  /** Char count of the stable prefix before the tail band was appended. */
+  sealedPrefixChars: number;
+  /** Inclusive start / exclusive end indices in the current frozen view. */
+  bandStartViewIndex: number;
+  bandEndViewIndex: number;
+  /** Folded message count and char size for the appended band. */
+  bandViewCount: number;
+  bandViewChars: number;
+  /** Inclusive start / exclusive end raw-history indices covered by the band. */
+  rawStartIndex: number;
+  rawEndIndex: number;
+  rawCount: number;
+  /** Boundary identity after the append transition. */
+  boundaryRole: string;
+  boundaryChars: number;
+  boundaryHash?: string;
+  /** Caller-supplied epoch ms for diagnostics only; identity comes from bytes. */
+  createdAt: number;
+}
+
 export interface FoldFreezeState {
   /** Frozen pipeline output covering raw history [0..frozenRawCount). Null until first epoch. */
   frozenView: FoldMessage[] | null;
@@ -173,6 +220,8 @@ export interface FoldFreezeState {
   frozenViewChars: number;
   /** Message count at the last append-only sealed-boundary split, if this epoch appended a tail band. */
   lastAppendBoundaryViewCount?: number;
+  /** Deterministic metadata for append-only sealed bands in this freeze epoch. */
+  sealedBands: readonly FoldFreezeSealedBandMetadata[];
   /** Number of raw history messages the frozen view was computed from. */
   frozenRawCount: number;
   /** Role of raw[frozenRawCount-1] at freeze time (integrity fingerprint). */
@@ -197,6 +246,10 @@ export interface FoldFreezeState {
   hotReuses: number;
   /** Lifetime epoch (recompute) count (telemetry). */
   epochs: number;
+  /** Last state transition reason, including hot reuse and append-only growth. */
+  lastTransitionReason?: FoldFreezeTransitionReason;
+  /** Last full-recompute cause; append-only tail epochs do not overwrite it. */
+  lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
 }
 
 export function createFoldFreezeState(): FoldFreezeState {
@@ -204,6 +257,7 @@ export function createFoldFreezeState(): FoldFreezeState {
     frozenView: null,
     frozenViewChars: 0,
     lastAppendBoundaryViewCount: undefined,
+    sealedBands: [],
     frozenRawCount: 0,
     boundaryRole: '',
     boundaryChars: 0,
@@ -213,6 +267,121 @@ export function createFoldFreezeState(): FoldFreezeState {
     lastCallAt: 0,
     hotReuses: 0,
     epochs: 0,
+    lastTransitionReason: undefined,
+    lastFullRecomputeReason: undefined,
+  };
+}
+
+export interface SerializedFoldFreezeState {
+  version: 1;
+  frozenView: FoldMessage[] | null;
+  frozenViewChars: number;
+  lastAppendBoundaryViewCount?: number;
+  sealedBands: FoldFreezeSealedBandMetadata[];
+  frozenRawCount: number;
+  boundaryRole: string;
+  boundaryChars: number;
+  boundaryHash?: string;
+  thinningMode: string;
+  frozenToolPaths: string[];
+  frozenRelevantClaims: string[];
+  lastCallAt: number;
+  hotReuses: number;
+  epochs: number;
+  lastTransitionReason?: FoldFreezeTransitionReason;
+  lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
+}
+
+export interface FoldFreezeBoundaryMetadata {
+  rawIndex: number | null;
+  role: string;
+  chars: number;
+  hash?: string;
+}
+
+export interface FoldFreezeStateMetadata {
+  hasFrozenView: boolean;
+  frozenViewChars: number;
+  frozenRawCount: number;
+  rawFrontierIndex: number;
+  sealedBoundaryViewCount: number | null;
+  sealedBands: readonly FoldFreezeSealedBandMetadata[];
+  boundary: FoldFreezeBoundaryMetadata;
+  cache: {
+    lastCallAt: number;
+    hotReuses: number;
+    epochs: number;
+    lastTransitionReason?: FoldFreezeTransitionReason;
+    lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
+  };
+  fullRecomputeCauses: readonly FoldFreezeFullRecomputeCause[];
+}
+
+export function serializeFoldFreezeState(state: FoldFreezeState): SerializedFoldFreezeState {
+  return {
+    version: 1,
+    frozenView: state.frozenView ? state.frozenView.slice() : null,
+    frozenViewChars: state.frozenViewChars,
+    lastAppendBoundaryViewCount: state.lastAppendBoundaryViewCount,
+    sealedBands: state.sealedBands.map((band) => ({ ...band })),
+    frozenRawCount: state.frozenRawCount,
+    boundaryRole: state.boundaryRole,
+    boundaryChars: state.boundaryChars,
+    boundaryHash: state.boundaryHash,
+    thinningMode: state.thinningMode,
+    frozenToolPaths: Array.from(state.frozenToolPaths).sort(),
+    frozenRelevantClaims: Array.from(state.frozenRelevantClaims).sort(),
+    lastCallAt: state.lastCallAt,
+    hotReuses: state.hotReuses,
+    epochs: state.epochs,
+    lastTransitionReason: state.lastTransitionReason,
+    lastFullRecomputeReason: state.lastFullRecomputeReason,
+  };
+}
+
+export function restoreFoldFreezeState(snapshot: SerializedFoldFreezeState): FoldFreezeState {
+  return {
+    frozenView: snapshot.frozenView ? snapshot.frozenView.slice() : null,
+    frozenViewChars: snapshot.frozenViewChars,
+    lastAppendBoundaryViewCount: snapshot.lastAppendBoundaryViewCount,
+    sealedBands: snapshot.sealedBands.map((band) => ({ ...band })),
+    frozenRawCount: snapshot.frozenRawCount,
+    boundaryRole: snapshot.boundaryRole,
+    boundaryChars: snapshot.boundaryChars,
+    boundaryHash: snapshot.boundaryHash,
+    thinningMode: snapshot.thinningMode,
+    frozenToolPaths: new Set(snapshot.frozenToolPaths),
+    frozenRelevantClaims: new Set(snapshot.frozenRelevantClaims),
+    lastCallAt: snapshot.lastCallAt,
+    hotReuses: snapshot.hotReuses,
+    epochs: snapshot.epochs,
+    lastTransitionReason: snapshot.lastTransitionReason,
+    lastFullRecomputeReason: snapshot.lastFullRecomputeReason,
+  };
+}
+
+export function getFoldFreezeMetadata(state: FoldFreezeState): FoldFreezeStateMetadata {
+  return {
+    hasFrozenView: state.frozenView !== null,
+    frozenViewChars: state.frozenViewChars,
+    frozenRawCount: state.frozenRawCount,
+    rawFrontierIndex: state.frozenRawCount,
+    sealedBoundaryViewCount: state.lastAppendBoundaryViewCount ?? null,
+    sealedBands: state.sealedBands.map((band) => ({ ...band })),
+    boundary: {
+      rawIndex: state.frozenRawCount > 0 ? state.frozenRawCount - 1 : null,
+      role: state.boundaryRole,
+      chars: state.boundaryChars,
+      hash: state.boundaryHash,
+    },
+    cache: {
+      lastCallAt: state.lastCallAt,
+      hotReuses: state.hotReuses,
+      epochs: state.epochs,
+      lastTransitionReason: state.lastTransitionReason,
+      lastFullRecomputeReason: state.lastFullRecomputeReason,
+    },
+    fullRecomputeCauses: FOLD_FREEZE_FULL_RECOMPUTE_CAUSES,
   };
 }
 
@@ -230,13 +399,7 @@ export interface FoldFreezeContext {
 // Decision
 // ══════════════════════════════════════════════════════════════════════
 
-export type FoldFreezeRecomputeReason =
-  | 'first-call'
-  | 'cold-gap'
-  | 'context-changed'
-  | 'history-rewound'
-  | 'boundary-mismatch'
-  | 'tail-epoch';
+export type FoldFreezeRecomputeReason = FoldFreezeFullRecomputeCause;
 
 export type FoldFreezeDecision =
   | { action: 'reuse'; view: FoldMessage[]; tailChars: number; tailCount: number }
@@ -325,6 +488,7 @@ export function evaluateFoldFreeze(
 export function touchFoldFreeze(state: FoldFreezeState, now: number): void {
   state.lastCallAt = now;
   state.hotReuses += 1;
+  state.lastTransitionReason = 'hot-reuse';
 }
 
 /**
@@ -339,11 +503,13 @@ export function commitFoldFreeze(
   view: FoldMessage[],
   context: FoldFreezeContext,
   now: number,
+  recomputeReason: FoldFreezeFullRecomputeCause = 'first-call',
 ): void {
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
   state.frozenView = view.slice();
   state.frozenViewChars = countChars(view);
   state.lastAppendBoundaryViewCount = undefined;
+  state.sealedBands = [];
   state.frozenRawCount = history.length;
   state.boundaryRole = boundary?.role ?? '';
   state.boundaryChars = boundary ? countChars([boundary]) : 0;
@@ -363,6 +529,8 @@ export function commitFoldFreeze(
   state.lastCallAt = now;
   state.hotReuses = 0;
   state.epochs += 1;
+  state.lastTransitionReason = recomputeReason;
+  state.lastFullRecomputeReason = recomputeReason;
 }
 
 /**
@@ -382,16 +550,35 @@ export function appendFoldFreezeTailEpoch(
   if (history.length < state.frozenRawCount) return null;
 
   const sealedPrefixMessageCount = state.frozenView.length;
+  const sealedPrefixChars = state.frozenViewChars;
+  const rawStartIndex = state.frozenRawCount;
   const view = state.frozenView.concat(tailView);
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
+  const boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
+  const band: FoldFreezeSealedBandMetadata = {
+    sealedPrefixMessageCount,
+    sealedPrefixChars,
+    bandStartViewIndex: sealedPrefixMessageCount,
+    bandEndViewIndex: view.length,
+    bandViewCount: tailView.length,
+    bandViewChars: countChars(tailView),
+    rawStartIndex,
+    rawEndIndex: history.length,
+    rawCount: Math.max(0, history.length - rawStartIndex),
+    boundaryRole: boundary?.role ?? '',
+    boundaryChars: boundary ? countChars([boundary]) : 0,
+    boundaryHash,
+    createdAt: now,
+  };
 
   state.frozenView = view.slice();
   state.frozenViewChars = countChars(view);
   state.lastAppendBoundaryViewCount = sealedPrefixMessageCount;
+  state.sealedBands = state.sealedBands.concat(band);
   state.frozenRawCount = history.length;
   state.boundaryRole = boundary?.role ?? '';
   state.boundaryChars = boundary ? countChars([boundary]) : 0;
-  state.boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
+  state.boundaryHash = boundaryHash;
   state.thinningMode = context.thinningMode;
 
   const toolPaths = extractToolPathSet(history);
@@ -405,7 +592,7 @@ export function appendFoldFreezeTailEpoch(
   state.lastCallAt = now;
   state.hotReuses = 0;
   state.epochs += 1;
+  state.lastTransitionReason = 'append-tail-epoch';
 
   return { view, sealedPrefixMessageCount };
 }
-

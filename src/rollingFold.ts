@@ -117,7 +117,7 @@ export interface FoldEvictionInput {
   evictedSpans: readonly FoldEvictionSpan[];
   /** Ordinals below this may be NEWLY evicted this pass. */
   evictableThroughOrdinal: number;
-  /** Fold-block char threshold that arms eviction (WARP_FOLD_EVICT_THRESHOLD_CHARS). */
+  /** Fold-block char threshold that arms eviction (VOXXO_FOLD_EVICT_THRESHOLD_CHARS). */
   thresholdChars: number;
   /** Wall-clock stamp for spans created this pass (injected for determinism). */
   nowIso: string;
@@ -342,7 +342,7 @@ export const USER_MESSAGE_VAULT_END = '[/User Message Vault]';
  */
 export const FOLD_TOMBSTONE_PREFIX = '[Paged to episodic store — ';
 
-/** Default fold-block char ceiling that arms eviction (override: WARP_FOLD_EVICT_THRESHOLD_CHARS; '0' disables). */
+/** Default fold-block char ceiling that arms eviction (override: VOXXO_FOLD_EVICT_THRESHOLD_CHARS; '0' disables). */
 export const DEFAULT_FOLD_EVICT_THRESHOLD_CHARS = 22_000;
 
 /** Format the epoch stamp: `[Fold epoch #N — detail]`, detail capped at 120 chars. */
@@ -698,14 +698,13 @@ function truncate(s: string, max: number): string {
 }
 
 /**
- * Normalize an absolute monorepo path to repo-relative form by stripping a
- * leading `/home/<user>/<repo>/` prefix. This is the canonical normalization
- * used by claimed-path matching (`isClaimedPath`) and tool-arg path extraction
- * — exported so the fold freeze (foldFreeze.ts) can test claim relevance with
- * byte-identical semantics.
+ * Normalize an absolute voxxo-swarm path to repo-relative form. This is the
+ * canonical normalization used by claimed-path matching (`isClaimedPath`) and
+ * tool-arg path extraction — exported so the fold freeze (foldFreeze.ts) can
+ * test claim relevance with byte-identical semantics.
  */
 export function normalizeToolPath(p: string): string {
-  return p.replace(/^\/home\/[^/]+\/[^/]+\//, '');
+  return p.replace(/^\/home\/[^/]+\/voxxo-swarm\//, '');
 }
 
 /**
@@ -896,25 +895,25 @@ function beltVerbatim(text: string, max = 2): string {
 
 const RESEARCH_TOOLS = new Set([
   'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'ToolSearch',
-  'mcp__agent-bridge__atlas_query', 'mcp__brain-mcp__atlas_query',
-  'mcp__agent-bridge__atlas_graph', 'mcp__brain-mcp__atlas_graph',
-  'mcp__agent-bridge__atlas_audit', 'mcp__brain-mcp__atlas_audit',
-  'mcp__agent-bridge__search_docs', 'mcp__agent-bridge__devlog_query',
+  'mcp__voxxo-swarm-bridge__atlas_query', 'mcp__brain-mcp__atlas_query',
+  'mcp__voxxo-swarm-bridge__atlas_graph', 'mcp__brain-mcp__atlas_graph',
+  'mcp__voxxo-swarm-bridge__atlas_audit', 'mcp__brain-mcp__atlas_audit',
+  'mcp__voxxo-swarm-bridge__search_docs', 'mcp__voxxo-swarm-bridge__devlog_query',
 ]);
 
 const ACTION_TOOLS = new Set([
   'Edit', 'Write', 'NotebookEdit',
-  'mcp__agent-bridge__atlas_commit', 'mcp__brain-mcp__atlas_commit',
-  'mcp__agent-bridge__apply_migration', 'mcp__agent-bridge__execute_sql',
-  'mcp__agent-bridge__deploy_edge_function',
+  'mcp__voxxo-swarm-bridge__atlas_commit', 'mcp__brain-mcp__atlas_commit',
+  'mcp__voxxo-swarm-bridge__apply_migration', 'mcp__voxxo-swarm-bridge__execute_sql',
+  'mcp__voxxo-swarm-bridge__deploy_edge_function',
 ]);
 
 const COORDINATION_TOOLS = new Set([
-  'mcp__agent-bridge__chatroom', 'mcp__agent-bridge__tap_instance_messages',
-  'mcp__agent-bridge__tap_star', 'mcp__agent-bridge__spawn_instance',
-  'mcp__agent-bridge__kill_instance',
-  'mcp__agent-bridge__psychic_pov', 'mcp__agent-bridge__task_rail',
-  'mcp__agent-bridge__signal_overseer', 'mcp__agent-bridge__self_rebirth',
+  'mcp__voxxo-swarm-bridge__chatroom', 'mcp__voxxo-swarm-bridge__tap_instance_messages',
+  'mcp__voxxo-swarm-bridge__tap_star', 'mcp__voxxo-swarm-bridge__spawn_instance',
+  'mcp__voxxo-swarm-bridge__kill_instance',
+  'mcp__voxxo-swarm-bridge__psychic_pov', 'mcp__voxxo-swarm-bridge__task_rail',
+  'mcp__voxxo-swarm-bridge__signal_overseer', 'mcp__voxxo-swarm-bridge__self_rebirth',
   'mcp__brain-mcp__brain_rebirth', 'mcp__brain-mcp__brain_handoff', 'Agent',
 ]);
 

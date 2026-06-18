@@ -167,6 +167,15 @@ export interface FoldOutcome {
   readonly result?: FoldResult;
   readonly stats: FoldStats;
   /**
+   * Message index of the sealed freeze boundary — the last message of the frozen
+   * prefix band. Pass this to your provider's cache-breakpoint helper (e.g.
+   * `applyCacheBreakpoints` from `providers/anthropic`) so the frozen prefix is
+   * cached by the provider and reads back at 0.1× on subsequent hot reuses.
+   * `null` when no append-only boundary has been established yet (first epoch
+   * or freeze disabled).
+   */
+  readonly sealedBoundary?: number | null;
+  /**
    * The rendered Glyph Grammar Vault block appended to `messages` this turn, when
    * the vault companion is enabled and produced a non-empty block. Omitted when
    * the vault is off or self-gated to empty.
@@ -414,6 +423,7 @@ export class FoldSession {
       return this.applyVault({
         messages: decision.view,
         cacheHot: true,
+        sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
         stats: {
           totalTurns,
           cacheHot: true,
@@ -443,6 +453,7 @@ export class FoldSession {
     return this.applyVault({
       messages: result.messages,
       cacheHot: false,
+      sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
       result,
       stats: {
         ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
