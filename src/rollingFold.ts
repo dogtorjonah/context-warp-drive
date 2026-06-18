@@ -358,6 +358,25 @@ export const TEMPORAL_CONTEXT_PREFIX = '[Temporal Context]';
 /** Synthetic relay continuation note prepended after context-pressure folds. */
 export const SYSTEM_NOTE_PREFIX = '[System Note:';
 
+const AMBIENT_ATLAS_PREFIX = '[Ambient Atlas]';
+const AMBIENT_ATLAS_END = '[END Ambient Atlas]';
+const DIGEST_DELTA_PREFIX = '[DIGEST DELTA';
+const DIGEST_DELTA_END = '[END DIGEST DELTA]';
+const RELAY_DIGEST_DELTA_PREFIX = '[RELAY DIGEST DELTA]';
+const RELAY_DIGEST_DELTA_END = '[END RELAY DIGEST DELTA]';
+const CHATROOM_SIGNALS_PREFIX = '[CHATROOM SIGNALS]';
+const CHATROOM_SIGNALS_END = '[END CHATROOM SIGNALS]';
+const CHATROOM_PREFIX = '[CHATROOM]';
+const CHATROOM_END = '[END CHATROOM]';
+
+const LEADING_PAIRED_SYNTHETIC_USER_CONTEXT_BLOCKS = [
+  { prefix: AMBIENT_ATLAS_PREFIX, end: AMBIENT_ATLAS_END },
+  { prefix: DIGEST_DELTA_PREFIX, end: DIGEST_DELTA_END },
+  { prefix: RELAY_DIGEST_DELTA_PREFIX, end: RELAY_DIGEST_DELTA_END },
+  { prefix: CHATROOM_SIGNALS_PREFIX, end: CHATROOM_SIGNALS_END },
+  { prefix: CHATROOM_PREFIX, end: CHATROOM_END },
+] as const;
+
 /**
  * Prefix of tombstone lines inside the fold block marking spans whose detail
  * was evicted to the episodic store (E10). Lives INSIDE the block (never
@@ -400,6 +419,11 @@ export function isSyntheticContextText(text: string): boolean {
     || text.startsWith(RECALL_HINT_PREFIX)
     || text.startsWith(FOLD_EPOCH_STAMP_PREFIX)
     || text.startsWith(USER_MESSAGE_VAULT_PREFIX)
+    || text.startsWith(AMBIENT_ATLAS_PREFIX)
+    || text.startsWith(DIGEST_DELTA_PREFIX)
+    || text.startsWith(RELAY_DIGEST_DELTA_PREFIX)
+    || text.startsWith(CHATROOM_SIGNALS_PREFIX)
+    || text.startsWith(CHATROOM_PREFIX)
     || text.startsWith(EPISODIC_RECALL_PREFIX);
 }
 
@@ -425,6 +449,12 @@ function stripOneLeadingSyntheticUserContextBlock(text: string): string | null {
 
   if (body.startsWith(TEMPORAL_CONTEXT_PREFIX)) {
     const lineEnd = body.indexOf('\n');
+    const firstLine = lineEnd < 0 ? body : body.slice(0, lineEnd).replace(/\r$/, '');
+    if (firstLine.trimEnd() === TEMPORAL_CONTEXT_PREFIX) {
+      const paragraphEnd = body.search(/\r?\n[ \t]*\r?\n/);
+      const after = paragraphEnd < 0 ? '' : body.slice(paragraphEnd).replace(/^(?:[ \t]*\r?\n)+/, '');
+      return `${leading}${after}`;
+    }
     const after = lineEnd < 0 ? '' : body.slice(lineEnd + 1).replace(/^(?:[ \t]*\r?\n)+/, '');
     return `${leading}${after}`;
   }
@@ -433,6 +463,14 @@ function stripOneLeadingSyntheticUserContextBlock(text: string): string | null {
     const note = /^\[System Note:[\s\S]*?\](?:[ \t]*(?:\r?\n|$))?/.exec(body);
     if (!note) return null;
     const after = body.slice(note[0].length).replace(/^(?:[ \t]*\r?\n)+/, '');
+    return `${leading}${after}`;
+  }
+
+  for (const block of LEADING_PAIRED_SYNTHETIC_USER_CONTEXT_BLOCKS) {
+    if (!body.startsWith(block.prefix)) continue;
+    const end = body.indexOf(block.end, block.prefix.length);
+    if (end < 0) return null;
+    const after = body.slice(end + block.end.length).replace(/^(?:[ \t]*\r?\n)+/, '');
     return `${leading}${after}`;
   }
 

@@ -317,6 +317,48 @@ describe('extractActiveWindowText (tier-2 active-window query source)', () => {
     expect(text).not.toContain('SECRET TOOL OUTPUT');
   });
 
+  test('strips resumed-turn relay envelopes from active-window user text', () => {
+    const wrappedAsk = `[Temporal Context] Session age: 4h 3m
+
+[Ambient Atlas]
+Nearby codebase context from recent language:
+- relay/src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
+[END Ambient Atlas]
+
+[DIGEST DELTA seq 26-68]
+  * peer-agent: touched relay/src/foldSummary.ts
+[END DIGEST DELTA]
+
+[RELAY DIGEST DELTA]
+[CHATROOM MEMBERSHIP]
+  peer-agent in #fold-repair
+[END CHATROOM MEMBERSHIP]
+[END RELAY DIGEST DELTA]
+
+[CHATROOM SIGNALS]
+#result peer landed a related change
+[END CHATROOM SIGNALS]
+
+[System Note: Context pressure limits were reached during your execution.
+Your context has been successfully folded for efficiency.
+Please seamlessly continue your previous turn from where you were interrupted.
+Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
+
+Patch the fold recall query source`;
+    const raw: FoldMessage[] = [
+      userMsg('older folded turn'),
+      userMsg(wrappedAsk),
+      assistantMsg('fold recall query source is being patched'),
+    ];
+
+    const text = extractActiveWindowText(raw, 1);
+    expect(text).toContain('Patch the fold recall query source');
+    expect(text).toContain('fold recall query source is being patched');
+    expect(text).not.toContain('[DIGEST DELTA');
+    expect(text).not.toContain('Nearby codebase context');
+    expect(text).not.toContain('[System Note:');
+  });
+
   test('recency-favored cap keeps the newest cognition when the tail exceeds the budget', () => {
     const oldChunk = 'startmarker-should-drop ' + 'alpha '.repeat(400); // > 1600 chars, oldest
     const raw: FoldMessage[] = [

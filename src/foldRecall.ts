@@ -50,6 +50,7 @@ import {
   normalizeToolPath,
   RECALL_CARD_PREFIX,
   RECALL_HINT_PREFIX,
+  stripSyntheticUserContextBlocks,
   type FoldMessage,
   type Turn,
   type TurnCategory,
@@ -430,14 +431,20 @@ function extractFirstUserText(messages: readonly FoldMessage[]): string {
   for (const msg of messages) {
     if (msg.role !== 'user') continue;
     if (typeof msg.content === 'string') {
-      if (msg.content.length > 0 && !isSyntheticContextText(msg.content)) return msg.content;
+      const cleaned = stripSyntheticUserContextBlocks(msg.content).trim();
+      if (cleaned.length > 0 && !isSyntheticContextText(cleaned)) return cleaned;
       continue;
     }
     if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
-        if (typeof block === 'string' && block.length > 0 && !isSyntheticContextText(block)) return block;
-        if (block?.type === 'text' && typeof block.text === 'string' && block.text.length > 0 && !isSyntheticContextText(block.text)) {
-          return block.text;
+        if (typeof block === 'string') {
+          const cleaned = stripSyntheticUserContextBlocks(block).trim();
+          if (cleaned.length > 0 && !isSyntheticContextText(cleaned)) return cleaned;
+          continue;
+        }
+        if (block?.type === 'text' && typeof block.text === 'string') {
+          const cleaned = stripSyntheticUserContextBlocks(block.text).trim();
+          if (cleaned.length > 0 && !isSyntheticContextText(cleaned)) return cleaned;
         }
       }
     }

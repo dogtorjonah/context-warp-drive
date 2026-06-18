@@ -1964,6 +1964,34 @@ Please seamlessly continue your previous turn from where you were interrupted.
 Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
 
 ${vault}`;
+  const fullRelayResumeWrapper = `[Temporal Context]
+Session age: 4h 3m
+
+[Ambient Atlas]
+Nearby codebase context from recent language:
+- relay/src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
+[END Ambient Atlas]
+
+[DIGEST DELTA seq 26-68]
+  * peer-agent: touched relay/src/foldSummary.ts
+[END DIGEST DELTA]
+
+[RELAY DIGEST DELTA]
+[CHATROOM MEMBERSHIP]
+  peer-agent in #fold-repair
+[END CHATROOM MEMBERSHIP]
+[END RELAY DIGEST DELTA]
+
+[CHATROOM SIGNALS]
+#result peer landed a related change
+[END CHATROOM SIGNALS]
+
+[System Note: Context pressure limits were reached during your execution.
+Your context has been successfully folded for efficiency.
+Please seamlessly continue your previous turn from where you were interrupted.
+Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
+
+${vault}`;
 
   test('standalone vault text is synthetic and never a turn boundary', () => {
     expect(isSyntheticContextText(vault)).toBe(true);
@@ -1990,6 +2018,14 @@ ${vault}`;
 
     expect(stripSyntheticUserContextBlocks(mixed)).toBe('real request');
     expect(extractUserText([userMsg(mixed)])).toBe('real request');
+  });
+
+  test('full relay resume envelopes are stripped before extracting genuine user text', () => {
+    const mixed = `${fullRelayResumeWrapper}\n\nreal request`;
+
+    expect(stripSyntheticUserContextBlocks(mixed)).toBe('real request');
+    expect(extractUserText([userMsg(mixed)])).toBe('real request');
+    expect(detectTurns([userMsg(fullRelayResumeWrapper), assistantMsg('continuing')])).toHaveLength(0);
   });
 
   test('wrapper-only resume notes do not become user text or turn boundaries', () => {

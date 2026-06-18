@@ -225,6 +225,38 @@ Synthetic relay continuity note.
 [operator message @ 2026-06-18 20:00]
 Ok do that for both standalone repo and Voxxo swarm relay please
 [/User Message Vault]`;
+  const fullRelayResumeWrapper = `[Temporal Context] Session age: 4h 3m
+
+[Ambient Atlas]
+Nearby codebase context from recent language:
+- relay/src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
+[END Ambient Atlas]
+
+[DIGEST DELTA seq 26-68]
+  * peer-agent: touched relay/src/foldSummary.ts
+[END DIGEST DELTA]
+
+[RELAY DIGEST DELTA]
+[CHATROOM MEMBERSHIP]
+  peer-agent in #fold-repair
+[END CHATROOM MEMBERSHIP]
+[END RELAY DIGEST DELTA]
+
+[CHATROOM SIGNALS]
+#result peer landed a related change
+[END CHATROOM SIGNALS]
+
+[System Note: Context pressure limits were reached during your execution.
+Your context has been successfully folded for efficiency.
+Please seamlessly continue your previous turn from where you were interrupted.
+Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
+
+[User Message Vault]
+Synthetic relay continuity note.
+
+[operator message @ 2026-06-18 20:00]
+Ok do that for both standalone repo and Voxxo swarm relay please
+[/User Message Vault]`;
 
   it('mines the nearest genuine operator ask onto the burst it drove', () => {
     const ask = 'Fix the recall ranker so cold zones keep directory proximity';
@@ -267,6 +299,18 @@ Ok do that for both standalone repo and Voxxo swarm relay please
     const ask = 'Patch the intent miner so wrappers do not become the ask';
     const messages: FoldMessage[] = [
       userAsk(`${relayResumeWrapper}\n\n${ask}`),
+      editCall('t1', 'src/foldEpisodeCapture.ts'),
+      toolResult('t1'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].intent).toBe(ask);
+  });
+
+  it('strips the full resumed-turn envelope before choosing the operator intent', () => {
+    const ask = 'Patch the intent miner so wrapper stacks do not become the ask';
+    const messages: FoldMessage[] = [
+      userAsk(`${fullRelayResumeWrapper}\n\n${ask}`),
       editCall('t1', 'src/foldEpisodeCapture.ts'),
       toolResult('t1'),
     ];
