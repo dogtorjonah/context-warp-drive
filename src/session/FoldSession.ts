@@ -62,6 +62,10 @@ import {
   recordUserMessageVaultEntry,
   recordAssistantGlyphVaultEntry,
   appendUserMessageVaultToView,
+  selectVaultRows,
+  selectVaultDeltaRows,
+  renderVaultRowsBlock,
+  vaultRowFingerprint,
   type UserMessageVaultEntry,
   type AssistantGlyphVaultEntry,
 } from '../userMessageVault.ts';
@@ -310,6 +314,13 @@ export class FoldSession {
   private readonly vaultTailWindow: number | undefined;
   private readonly userMessageVaultEntries: UserMessageVaultEntry[] = [];
   private readonly assistantGlyphVaultEntries: AssistantGlyphVaultEntry[] = [];
+  /**
+   * Vault row fingerprints already sealed into the current frozen view (the full
+   * render baked at the last full recompute + every per-band delta since).
+   * Cleared on every full recompute, mirroring commitFoldFreeze resetting
+   * sealedBands — so a row seals into exactly one band per freeze generation.
+   */
+  private sealedVaultFingerprints = new Set<string>();
   private foldEpochs = 0;
   private foldEvictedSpans: FoldEvictionSpan[] = [];
   private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
@@ -424,6 +435,31 @@ export class FoldSession {
     const messages = appendUserMessageVaultToView(outcome.messages, vault, this.vaultTailWindow);
     if (messages === outcome.messages) return { ...outcome, vault };
     return { ...outcome, messages, vault };
+  }
+
+  /**
+   * Bake the vault INTO a folded view before it is sealed into the frozen prefix,
+   * so the vault rides the cached prefix at no per-send cost (vs. the legacy
+   * per-send tail append). mode='full' renders the whole selection and resets the
+   * sealed set (matches commitFoldFreeze clearing sealedBands); mode='delta'
+   * renders only the rows not yet sealed into an earlier band this freeze
+   * generation. The block is appended to the newest text-bearing message of
+   * `view` (alternation-safe, like applyVault) and opens with
+   * USER_MESSAGE_VAULT_PREFIX so the fold pipeline treats it as synthetic context
+   * (skipped by turn detection / eviction / recall). Never mutates raw history.
+   */
+  private bakeVault(view: FoldMessage[], mode: 'full' | 'delta'): FoldMessage[] {
+    if (!this.vaultEnabled) return view;
+    const rows = selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
+      visibleUserMessages: view,
+    });
+    if (mode === 'full') this.sealedVaultFingerprints.clear();
+    const bakeRows = mode === 'full' ? rows : selectVaultDeltaRows(rows, this.sealedVaultFingerprints);
+    if (bakeRows.length === 0) return view;
+    const block = renderVaultRowsBlock(bakeRows, mode);
+    if (!block) return view;
+    for (const row of bakeRows) this.sealedVaultFingerprints.add(vaultRowFingerprint(row));
+    return appendUserMessageVaultToView(view, block);
   }
 
   /** Count conversational turns in a provider-shaped message array. */
@@ -670,7 +706,10 @@ export class FoldSession {
 
     if (decision.action === 'reuse' && !pressureCeilingTriggered) {
       touchFoldFreeze(this.freezeState, now);
-      return this.applyVault({
+      // Vault already lives in the cached frozen prefix (baked at the last
+      // epoch) — hot reuse re-sends it for free, with no per-send re-render or
+      // tail append. The byte-frozen prefix stays identical across reuses.
+      return {
         messages: decision.view,
         cacheHot: true,
         sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -682,7 +721,7 @@ export class FoldSession {
           epochs: this.freezeState.epochs,
           ...this.pressureStats(false),
         },
-      });
+      };
     }
 
     const recomputeReason = decision.action === 'recompute' ? decision.reason : undefined;
@@ -706,10 +745,13 @@ export class FoldSession {
         undefined,
         this.syntheticContext,
       );
-      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, tailResult.messages, ctx, now);
+      // Seal only the per-band DELTA (rows not already sealed into an earlier
+      // band) into this folded tail band before it joins the byte-frozen prefix.
+      const sealedTail = this.bakeVault(tailResult.messages, 'delta');
+      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, sealedTail, ctx, now);
       if (appendCommit) {
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
-        return this.applyVault({
+        return {
           messages: appendCommit.view,
           cacheHot: false,
           sealedBoundary: appendCommit.sealedPrefixMessageCount,
@@ -719,7 +761,7 @@ export class FoldSession {
             ...this.statsFromResult(totalTurns, false, tailResult, false),
             epochReason: 'tail-epoch-append',
           },
-        });
+        };
       }
     }
     const result = foldContext(
@@ -731,15 +773,19 @@ export class FoldSession {
       undefined,
       this.syntheticContext,
     );
-    commitFoldFreeze(this.freezeState, messages, result.messages, ctx, now);
+    // Full recompute: render the whole vault and bake it into the frozen view
+    // before sealing (resets the sealed set, mirroring commitFoldFreeze clearing
+    // sealedBands). Subsequent append epochs seal only deltas on top of this.
+    const sealedView = this.bakeVault(result.messages, 'full');
+    commitFoldFreeze(this.freezeState, messages, sealedView, ctx, now);
     this.commitEvictionEpoch(result, this.freezeState.epochs);
     const epochReason = pressureCeilingTriggered
       ? recomputeReason ? `pressure-ceiling+${recomputeReason}` : 'pressure-ceiling'
       : recomputeReason === 'tail-epoch' && !runway.ok
         ? `tail-runway-gate+${recomputeReason}`
         : recomputeReason;
-    return this.applyVault({
-      messages: result.messages,
+    return {
+      messages: sealedView,
       cacheHot: false,
       sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
       result,
@@ -748,7 +794,7 @@ export class FoldSession {
         ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
         ...(epochReason ? { epochReason } : {}),
       },
-    });
+    };
   }
 
   /** Freeze-layer telemetry: hot reuses since last epoch, lifetime epochs, frozen size. */

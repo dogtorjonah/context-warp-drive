@@ -5,6 +5,7 @@ import {
   DEFAULT_FOLD_PRESSURE_CEILING_TOKENS,
   FOLD_TOMBSTONE_PREFIX,
   FoldSession,
+  type FoldConfig,
   type FoldMessage,
 } from '../src/fold.js';
 
@@ -200,5 +201,113 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
     expect(recomputed.sealedBoundary).toBeNull();
     expect(session.telemetry.epochs).toBe(2);
+  });
+});
+
+const VAULT_FOLD_CONFIG: FoldConfig = {
+  activeWindowTurns: 0,
+  softThresholdChars: 1_000_000,
+  hardThresholdChars: 2_000_000,
+  maxTurnsBeforeFold: 100,
+  continuous: true,
+  assistantTextBudget: {
+    fullRetentionChars: 10,
+    essenceRetentionChars: 0,
+  },
+  verbatimKeepChars: 0,
+};
+
+function vaultTwoTurns(): FoldMessage[] {
+  return [
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'alpha beta gamma' },
+    { role: 'user', content: 'second question' },
+    { role: 'assistant', content: 'second answer stays active' },
+  ];
+}
+
+function vaultGrow(history: FoldMessage[], text: string): FoldMessage[] {
+  return [
+    ...history,
+    { role: 'user', content: `next ${text}` },
+    { role: 'assistant', content: `answer ${text}` },
+  ];
+}
+
+function vaultJoin(messages: FoldMessage[]): string {
+  return messages
+    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+    .join('\n');
+}
+
+function makeVaultSession(overrides: Record<string, unknown> = {}): FoldSession {
+  return new FoldSession({
+    foldConfig: VAULT_FOLD_CONFIG,
+    freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
+    vault: true,
+    now: () => 1_000,
+    ...overrides,
+  });
+}
+
+describe('FoldSession per-band vault sealing', () => {
+  test('bakes the full vault into the frozen view at a full recompute', () => {
+    const session = makeVaultSession();
+    session.recordOperatorMessage('OPERATOR-ALPHA wants the build green', '2026-06-19T10:00:00Z');
+    const epoch = session.prepare(vaultTwoTurns());
+
+    expect(epoch.cacheHot).toBe(false);
+    const joined = vaultJoin(epoch.messages);
+    expect(joined).toContain('[User Message Vault]');
+    expect(joined).toContain('OPERATOR-ALPHA wants the build green');
+  });
+
+  test('keeps the vault byte-identical across hot reuses (cached prefix, no per-send re-append)', () => {
+    const session = makeVaultSession();
+    session.recordOperatorMessage('OPERATOR-BETA pivoted to the parser', '2026-06-19T10:00:00Z');
+    const epoch = session.prepare(vaultTwoTurns());
+    const hot = session.prepare(vaultTwoTurns());
+
+    expect(hot.cacheHot).toBe(true);
+    expect(hot.messages).toEqual(epoch.messages);
+    expect(vaultJoin(hot.messages).split('[User Message Vault]').length - 1).toBe(1);
+  });
+
+  test('seals only the delta into an appended band, never re-sealing prior rows', () => {
+    const session = makeVaultSession({
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 125_000,
+    });
+    session.recordOperatorMessage('OPERATOR-GAMMA first directive', '2026-06-19T10:00:00Z');
+    const first = vaultTwoTurns();
+    const epoch = session.prepare(first);
+    session.recordOperatorMessage('OPERATOR-DELTA second directive', '2026-06-19T10:05:00Z');
+    const appended = session.prepare(vaultGrow(first, 'tail one'));
+
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    const boundary = appended.sealedBoundary as number;
+    const bandText = vaultJoin(appended.messages.slice(boundary));
+    expect(bandText).toContain('OPERATOR-DELTA second directive');
+    expect(bandText).not.toContain('OPERATOR-GAMMA first directive');
+    expect(vaultJoin(appended.messages.slice(0, boundary))).toContain('OPERATOR-GAMMA first directive');
+    expect(appended.messages.slice(0, boundary)).toEqual(epoch.messages);
+  });
+
+  test('re-renders the full vault on a full recompute (sealed set reset)', () => {
+    const session = makeVaultSession({
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 111_000,
+    });
+    session.recordOperatorMessage('OPERATOR-EPSILON one', '2026-06-19T10:00:00Z');
+    const first = vaultTwoTurns();
+    session.prepare(first);
+    session.recordOperatorMessage('OPERATOR-ZETA two', '2026-06-19T10:05:00Z');
+    const recomputed = session.prepare(vaultGrow(first, 'tail one'));
+
+    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
+    const joined = vaultJoin(recomputed.messages);
+    expect(joined).toContain('OPERATOR-EPSILON one');
+    expect(joined).toContain('OPERATOR-ZETA two');
+    expect(joined.split('[User Message Vault]').length - 1).toBe(1);
   });
 });

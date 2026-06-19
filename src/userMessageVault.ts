@@ -457,7 +457,7 @@ const GLYPH_DISPLAY: Record<MessageGlyphMode, string> = {
   blocked: '❓',
 };
 
-interface VaultRenderRow {
+export interface VaultRenderRow {
   role: 'user' | 'assistant';
   text: string;
   createdAt?: string;
@@ -485,30 +485,65 @@ function renderVaultRow(row: VaultRenderRow, isNewest: boolean): string {
   return `${title}\n${excerptForSurface(row.text, surface)}`;
 }
 
-function renderGlyphVaultBlock(rows: readonly VaultRenderRow[]): string {
+const VAULT_DELTA_HEADER = [
+  USER_MESSAGE_VAULT_PREFIX,
+  'Synthetic continuity note: incremental band delta — verbatim wording for the operator messages and your own glyph-tagged turns that folded into THIS band, sealed once into the cached prefix. Earlier bands and current instructions outside this block remain authoritative.',
+].join('\n');
+
+/**
+ * Assemble a vault block from already-selected rows. mode='full' uses the
+ * standing glyph-grammar header (byte-identical to the legacy interleaved
+ * render); mode='delta' uses the per-band delta header. Both open with
+ * USER_MESSAGE_VAULT_PREFIX so isSyntheticContextText recognizes and skips the
+ * block during turn detection, eviction, and recall indexing.
+ */
+export function renderVaultRowsBlock(
+  rows: readonly VaultRenderRow[],
+  mode: 'full' | 'delta' = 'full',
+): string {
+  if (rows.length === 0) return '';
+  const header = mode === 'delta' ? VAULT_DELTA_HEADER : GLYPH_GRAMMAR_HEADER;
   const body = rows
     .map((row, index) => renderVaultRow(row, index === rows.length - 1))
     .join('\n\n');
-  return `${GLYPH_GRAMMAR_HEADER}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
+  return `${header}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
 }
 
 /**
- * Interleaved glyph-grammar vault: operator entries (protected floor, last
- * maxMessages) merged chronologically with a bounded slice of assistant glyph
- * entries (top assistantMax by glyph priority then recency). When the rendered
- * block exceeds the char cap, assistant rows are evicted first — lowest glyph
- * priority then oldest — so operator wording is never dropped while any AI row
- * remains; only when no assistant rows are left does it fall back to shrinking
- * the operator floor like the operator-only path.
+ * Stable per-row identity used by the per-band seal to dedupe a row across band
+ * epochs (so each operator/glyph entry seals into exactly one band until the
+ * next full recompute resets the sealed set). FNV-1a over the normalized text,
+ * namespaced by role.
  */
-function renderInterleavedGlyphVault(
+export function vaultRowFingerprint(row: Pick<VaultRenderRow, 'role' | 'text'>): string {
+  const normalized = normalizeEntryText(row.text);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash ^= normalized.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${row.role}:${(hash >>> 0).toString(36)}`;
+}
+
+/**
+ * Shared selection for the interleaved vault: operator entries (protected floor,
+ * last maxMessages) merged chronologically with a bounded slice of assistant
+ * glyph entries (top assistantMax by glyph priority then recency), deduped
+ * against visible text. When the rendered block exceeds the char cap, assistant
+ * rows are evicted first — lowest glyph priority then oldest — so operator
+ * wording is never dropped while any AI row remains; only when no assistant rows
+ * are left does it shrink the operator floor. Returns the final rows so the full
+ * render AND the per-band seal/delta path agree on exactly which rows exist.
+ */
+export function selectVaultRows(
   userEntries: readonly UserMessageVaultEntry[],
   assistantEntries: readonly AssistantGlyphVaultEntry[],
   options?: UserMessageVaultRenderOptions,
-): string {
-  const maxMessages = resolveUserMessageVaultMaxMessages(process.env);
-  const maxChars = resolveUserMessageVaultMaxChars(process.env);
-  const assistantMax = resolveAssistantGlyphVaultMaxMessages(process.env);
+  env: NodeJS.ProcessEnv = process.env,
+): VaultRenderRow[] {
+  const maxMessages = resolveUserMessageVaultMaxMessages(env);
+  const maxChars = resolveUserMessageVaultMaxChars(env);
+  const assistantMax = resolveAssistantGlyphVaultMaxMessages(env);
   const visibleUserTexts = normalizedVisibleUserTexts(options);
   const visibleAssistantTexts = normalizedVisibleAssistantTexts(options);
 
@@ -541,12 +576,12 @@ function renderInterleavedGlyphVault(
     }));
 
   let rows: VaultRenderRow[] = [...userRows, ...assistantRows];
-  if (rows.length === 0) return '';
+  if (rows.length === 0) return [];
   rows.sort((a, b) => entryMs(a.createdAt) - entryMs(b.createdAt));
 
   for (;;) {
-    const block = renderGlyphVaultBlock(rows);
-    if (block.length <= maxChars) return block;
+    const block = renderVaultRowsBlock(rows, 'full');
+    if (block.length <= maxChars) return rows;
     const assistantCandidates = rows
       .map((row, idx) => ({ row, idx }))
       .filter(({ row }) => row.role === 'assistant');
@@ -559,8 +594,28 @@ function renderInterleavedGlyphVault(
       continue;
     }
     rows = rows.slice(1);
-    if (rows.length === 0) return '';
+    if (rows.length === 0) return [];
   }
+}
+
+/**
+ * Rows newly eligible to seal into the current band: the selected rows whose
+ * fingerprint has not already been sealed into an earlier band this freeze
+ * generation. The caller adds these fingerprints to its sealed set after baking.
+ */
+export function selectVaultDeltaRows(
+  allRows: readonly VaultRenderRow[],
+  sealedFingerprints: ReadonlySet<string>,
+): VaultRenderRow[] {
+  return allRows.filter((row) => !sealedFingerprints.has(vaultRowFingerprint(row)));
+}
+
+function renderInterleavedGlyphVault(
+  userEntries: readonly UserMessageVaultEntry[],
+  assistantEntries: readonly AssistantGlyphVaultEntry[],
+  options?: UserMessageVaultRenderOptions,
+): string {
+  return renderVaultRowsBlock(selectVaultRows(userEntries, assistantEntries, options), 'full');
 }
 
 interface AppendableMessage extends VisibleUserMessage {
