@@ -350,32 +350,44 @@ export const FOLD_EPOCH_STAMP_PREFIX = '[Fold epoch #';
  */
 export const EPISODIC_RECALL_PREFIX = '[Episodic recall —';
 
-/** Synthetic relay note appended to live user turns with bounded operator-message excerpts. */
+/** Synthetic vault note appended to live user turns with bounded operator-message excerpts. */
 export const USER_MESSAGE_VAULT_PREFIX = '[User Message Vault]';
 export const USER_MESSAGE_VAULT_END = '[/User Message Vault]';
-/** Synthetic relay time hint prepended to resumed/fold-pressure user turns. */
-export const TEMPORAL_CONTEXT_PREFIX = '[Temporal Context]';
-/** Synthetic relay continuation note prepended after context-pressure folds. */
-export const SYSTEM_NOTE_PREFIX = '[System Note:';
 
-const AMBIENT_ATLAS_PREFIX = '[Ambient Atlas]';
-const AMBIENT_ATLAS_END = '[END Ambient Atlas]';
-const DIGEST_DELTA_PREFIX = '[DIGEST DELTA';
-const DIGEST_DELTA_END = '[END DIGEST DELTA]';
-const RELAY_DIGEST_DELTA_PREFIX = '[RELAY DIGEST DELTA]';
-const RELAY_DIGEST_DELTA_END = '[END RELAY DIGEST DELTA]';
-const CHATROOM_SIGNALS_PREFIX = '[CHATROOM SIGNALS]';
-const CHATROOM_SIGNALS_END = '[END CHATROOM SIGNALS]';
-const CHATROOM_PREFIX = '[CHATROOM]';
-const CHATROOM_END = '[END CHATROOM]';
+export type SyntheticContextStripMode =
+  | 'line'
+  | 'line-or-paragraph'
+  | 'paragraph'
+  | 'bracketed'
+  | 'paired';
 
-const LEADING_PAIRED_SYNTHETIC_USER_CONTEXT_BLOCKS = [
-  { prefix: AMBIENT_ATLAS_PREFIX, end: AMBIENT_ATLAS_END },
-  { prefix: DIGEST_DELTA_PREFIX, end: DIGEST_DELTA_END },
-  { prefix: RELAY_DIGEST_DELTA_PREFIX, end: RELAY_DIGEST_DELTA_END },
-  { prefix: CHATROOM_SIGNALS_PREFIX, end: CHATROOM_SIGNALS_END },
-  { prefix: CHATROOM_PREFIX, end: CHATROOM_END },
-] as const;
+export interface LeadingSyntheticContextBlock {
+  readonly prefix: string;
+  readonly mode: SyntheticContextStripMode;
+  readonly end?: string;
+}
+
+export type SyntheticContextMatcher = (text: string) => boolean;
+
+/**
+ * Host-supplied synthetic context markers.
+ *
+ * The standalone package owns only Context Warp's fold/recall/vault markers.
+ * Hosts that prepend their own envelopes (for example a runtime resume wrapper,
+ * chat digest, or lifecycle package) pass those markers here so turn detection,
+ * fold-recall, and episode capture can ignore them without baking host strings
+ * into the generic engine.
+ */
+export interface SyntheticContextOptions {
+  /** Extra standalone prefixes that mark a whole text block as synthetic. */
+  readonly prefixes?: readonly string[];
+  /** Leading user-message blocks to strip before mining genuine operator text. */
+  readonly leadingBlocks?: readonly LeadingSyntheticContextBlock[];
+  /** Whole-text predicates for envelopes that should be consumed completely. */
+  readonly wholeTextMatchers?: readonly SyntheticContextMatcher[];
+}
+
+const EMPTY_SYNTHETIC_CONTEXT_OPTIONS: SyntheticContextOptions = Object.freeze({});
 
 /**
  * Prefix of tombstone lines inside the fold block marking spans whose detail
@@ -404,27 +416,39 @@ export function formatFoldEpochStamp(epoch: number, detail: string): string {
  */
 export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves closet items — ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
 
+function matchesHostSyntheticContext(text: string, options: SyntheticContextOptions): boolean {
+  for (const prefix of options.prefixes ?? []) {
+    if (text.startsWith(prefix)) return true;
+  }
+  for (const block of options.leadingBlocks ?? []) {
+    if (text.startsWith(block.prefix)) return true;
+  }
+  for (const matcher of options.wholeTextMatchers ?? []) {
+    if (matcher(text)) return true;
+  }
+  return false;
+}
+
 /**
- * Synthetic relay-injected context text — fold blocks, fold-recall
- * cards/hints, and fold-epoch stamps — is never a real user turn boundary.
- * Recall payloads therefore
+ * Synthetic Context Warp text — fold blocks, fold-recall cards/hints,
+ * fold-epoch stamps, and host-supplied markers — is never a real user turn
+ * boundary. Recall payloads therefore
  * attach to the turn they follow, so they skeletonize away at later fold
  * epochs (page-out-again, fully cyclic) and never inflate turn-count
  * triggers. Exported so foldRecall.ts can apply the same exclusion when
  * extracting real user text.
  */
-export function isSyntheticContextText(text: string): boolean {
+export function isSyntheticContextText(
+  text: string,
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
+): boolean {
   return text.startsWith(FOLD_MARKER)
     || text.startsWith(RECALL_CARD_PREFIX)
     || text.startsWith(RECALL_HINT_PREFIX)
     || text.startsWith(FOLD_EPOCH_STAMP_PREFIX)
     || text.startsWith(USER_MESSAGE_VAULT_PREFIX)
-    || text.startsWith(AMBIENT_ATLAS_PREFIX)
-    || text.startsWith(DIGEST_DELTA_PREFIX)
-    || text.startsWith(RELAY_DIGEST_DELTA_PREFIX)
-    || text.startsWith(CHATROOM_SIGNALS_PREFIX)
-    || text.startsWith(CHATROOM_PREFIX)
-    || text.startsWith(EPISODIC_RECALL_PREFIX);
+    || text.startsWith(EPISODIC_RECALL_PREFIX)
+    || matchesHostSyntheticContext(text, syntheticContext);
 }
 
 export function stripUserMessageVaultBlocks(text: string): string {
@@ -442,57 +466,86 @@ export function stripUserMessageVaultBlocks(text: string): string {
   return result;
 }
 
-function stripOneLeadingSyntheticUserContextBlock(text: string): string | null {
+function stripLeadingLine(body: string, leading: string): string {
+  const lineEnd = body.indexOf('\n');
+  const after = lineEnd < 0 ? '' : body.slice(lineEnd + 1).replace(/^(?:[ \t]*\r?\n)+/, '');
+  return `${leading}${after}`;
+}
+
+function stripLeadingParagraph(body: string, leading: string): string {
+  const paragraphEnd = body.search(/\r?\n[ \t]*\r?\n/);
+  const after = paragraphEnd < 0 ? '' : body.slice(paragraphEnd).replace(/^(?:[ \t]*\r?\n)+/, '');
+  return `${leading}${after}`;
+}
+
+function stripOneLeadingSyntheticUserContextBlock(
+  text: string,
+  syntheticContext: SyntheticContextOptions,
+): string | null {
   const leadingMatch = /^[ \t]*(?:\r?\n)*/.exec(text);
   const leading = leadingMatch?.[0] ?? '';
   const body = text.slice(leading.length);
 
-  if (body.startsWith(TEMPORAL_CONTEXT_PREFIX)) {
-    const lineEnd = body.indexOf('\n');
-    const firstLine = lineEnd < 0 ? body : body.slice(0, lineEnd).replace(/\r$/, '');
-    if (firstLine.trimEnd() === TEMPORAL_CONTEXT_PREFIX) {
-      const paragraphEnd = body.search(/\r?\n[ \t]*\r?\n/);
-      const after = paragraphEnd < 0 ? '' : body.slice(paragraphEnd).replace(/^(?:[ \t]*\r?\n)+/, '');
-      return `${leading}${after}`;
-    }
-    const after = lineEnd < 0 ? '' : body.slice(lineEnd + 1).replace(/^(?:[ \t]*\r?\n)+/, '');
-    return `${leading}${after}`;
+  for (const matcher of syntheticContext.wholeTextMatchers ?? []) {
+    if (matcher(body)) return leading;
   }
 
-  if (body.startsWith(SYSTEM_NOTE_PREFIX)) {
-    const note = /^\[System Note:[\s\S]*?\](?:[ \t]*(?:\r?\n|$))?/.exec(body);
-    if (!note) return null;
-    const after = body.slice(note[0].length).replace(/^(?:[ \t]*\r?\n)+/, '');
-    return `${leading}${after}`;
+  for (const prefix of syntheticContext.prefixes ?? []) {
+    if (body.startsWith(prefix)) return leading;
   }
 
-  for (const block of LEADING_PAIRED_SYNTHETIC_USER_CONTEXT_BLOCKS) {
+  for (const block of syntheticContext.leadingBlocks ?? []) {
     if (!body.startsWith(block.prefix)) continue;
-    const end = body.indexOf(block.end, block.prefix.length);
-    if (end < 0) return null;
-    const after = body.slice(end + block.end.length).replace(/^(?:[ \t]*\r?\n)+/, '');
-    return `${leading}${after}`;
+    switch (block.mode) {
+      case 'line':
+        return stripLeadingLine(body, leading);
+      case 'paragraph':
+        return stripLeadingParagraph(body, leading);
+      case 'line-or-paragraph': {
+        const lineEnd = body.indexOf('\n');
+        const firstLine = lineEnd < 0 ? body : body.slice(0, lineEnd).replace(/\r$/, '');
+        return firstLine.trimEnd() === block.prefix
+          ? stripLeadingParagraph(body, leading)
+          : stripLeadingLine(body, leading);
+      }
+      case 'bracketed': {
+        const end = body.indexOf(']', block.prefix.length);
+        if (end < 0) return null;
+        const after = body.slice(end + 1).replace(/^(?:[ \t]*\r?\n)+/, '');
+        return `${leading}${after}`;
+      }
+      case 'paired': {
+        if (!block.end) return null;
+        const end = body.indexOf(block.end, block.prefix.length);
+        if (end < 0) return null;
+        const after = body.slice(end + block.end.length).replace(/^(?:[ \t]*\r?\n)+/, '');
+        return `${leading}${after}`;
+      }
+    }
   }
 
   return null;
 }
 
-export function stripSyntheticUserContextBlocks(text: string): string {
+export function stripSyntheticUserContextBlocks(
+  text: string,
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
+): string {
   let result = stripUserMessageVaultBlocks(text);
   for (let guard = 0; guard < 20; guard += 1) {
-    const next = stripOneLeadingSyntheticUserContextBlock(result);
+    const next = stripOneLeadingSyntheticUserContextBlock(result, syntheticContext);
     if (next === null || next === result) break;
     result = next;
   }
   return result;
 }
 
-function isUserTurnBoundary(msg: FoldMessage): boolean {
+function isUserTurnBoundary(msg: FoldMessage, syntheticContext: SyntheticContextOptions): boolean {
   if (msg.role !== 'user') return false;
   const content = msg.content;
   if (typeof content === 'string') {
-    const cleaned = stripSyntheticUserContextBlocks(content).trim();
-    return cleaned.length > 0 && !isSyntheticContextText(cleaned);
+    const cleaned = stripSyntheticUserContextBlocks(content, syntheticContext).trim();
+    return cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext);
   }
   if (Array.isArray(content)) {
     return content.some((block: any) => {
@@ -501,28 +554,31 @@ function isUserTurnBoundary(msg: FoldMessage): boolean {
         : typeof block === 'string'
           ? block
           : '';
-      const cleaned = stripSyntheticUserContextBlocks(text).trim();
-      return cleaned.length > 0 && !isSyntheticContextText(cleaned);
+      const cleaned = stripSyntheticUserContextBlocks(text, syntheticContext).trim();
+      return cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext);
     });
   }
   const parts = (msg as any).parts;
   if (Array.isArray(parts)) {
     return parts.some((part: any) => {
       const cleaned = typeof part?.text === 'string'
-        ? stripSyntheticUserContextBlocks(part.text).trim()
+        ? stripSyntheticUserContextBlocks(part.text, syntheticContext).trim()
         : '';
-      return cleaned.length > 0 && !isSyntheticContextText(cleaned);
+      return cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext);
     });
   }
   return false;
 }
 
-export function detectTurns(messages: FoldMessage[]): Turn[] {
+export function detectTurns(
+  messages: FoldMessage[],
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
+): Turn[] {
   const turns: Turn[] = [];
   let turnStart = -1;
 
   for (let i = 0; i < messages.length; i++) {
-    if (isUserTurnBoundary(messages[i])) {
+    if (isUserTurnBoundary(messages[i], syntheticContext)) {
       if (turnStart >= 0) {
         turns.push({ startIndex: turnStart, endIndex: i, messages: messages.slice(turnStart, i) });
       }
@@ -616,8 +672,9 @@ export interface StepFoldOptions {
 export function planActiveTurnStepFold(
   messages: FoldMessage[],
   opts: StepFoldOptions,
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
 ): StepFoldPlan | null {
-  const turns = detectTurns(messages);
+  const turns = detectTurns(messages, syntheticContext);
   if (turns.length === 0) return null;
 
   const active = turns[turns.length - 1];
@@ -768,18 +825,21 @@ export function extractAssistantText(turnMessages: FoldMessage[]): string {
  * pointless double-carry. Used only to feed the capped user-verbatim closet
  * lane (P1b) so operator-pasted ids/paths/ports are conserved when a turn folds.
  */
-export function extractUserText(turnMessages: FoldMessage[]): string {
+export function extractUserText(
+  turnMessages: FoldMessage[],
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
+): string {
   const texts: string[] = [];
   for (const msg of turnMessages) {
     if (msg.role !== 'user') continue;
     if (typeof msg.content === 'string' && msg.content.trim()) {
-      const cleaned = stripSyntheticUserContextBlocks(msg.content).trim();
+      const cleaned = stripSyntheticUserContextBlocks(msg.content, syntheticContext).trim();
       if (cleaned) texts.push(cleaned);
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
         // Only genuine text blocks — tool_result blocks are tool output.
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-          const cleaned = stripSyntheticUserContextBlocks(block.text).trim();
+          const cleaned = stripSyntheticUserContextBlocks(block.text, syntheticContext).trim();
           if (cleaned) texts.push(cleaned);
         }
       }
@@ -787,7 +847,7 @@ export function extractUserText(turnMessages: FoldMessage[]): string {
       for (const part of (msg as any).parts as any[]) {
         if (part?.functionResponse) continue; // tool output, not user text
         if (typeof part?.text === 'string' && part.text.trim()) {
-          const cleaned = stripSyntheticUserContextBlocks(part.text).trim();
+          const cleaned = stripSyntheticUserContextBlocks(part.text, syntheticContext).trim();
           if (cleaned) texts.push(cleaned);
         }
       }
@@ -1301,9 +1361,10 @@ export function collapseSequences(foldedTurns: FoldedTurn[]): FoldedTurn[] {
 export function checkFoldTrigger(
   messages: FoldMessage[],
   config: FoldConfig = DEFAULT_FOLD_CONFIG,
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
 ): FoldTrigger {
   const totalChars = countChars(messages);
-  const turns = detectTurns(messages);
+  const turns = detectTurns(messages, syntheticContext);
   const turnCount = turns.length;
 
   if (turnCount <= config.activeWindowTurns) {
@@ -1481,6 +1542,7 @@ export function foldContext(
   eviction?: FoldEvictionInput,
   counterStamp?: string,
   precomputedTurns?: Turn[],
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
 ): FoldResult {
   const originalChars = countChars(messages);
 
@@ -1491,7 +1553,7 @@ export function foldContext(
       foldedChars: originalChars,
       savingsPercent: 0,
       turnsFolded: 0,
-      turnsRetained: detectTurns(messages).length,
+      turnsRetained: detectTurns(messages, syntheticContext).length,
       foldSummaries: [],
     };
   }
@@ -1499,7 +1561,7 @@ export function foldContext(
   // precomputedTurns lets callers inject a custom segmentation (e.g. step-granular
   // segments of one oversized marathon turn) while reusing the entire fold engine
   // below. When omitted, behaviour is byte-identical to detectTurns(messages).
-  const turns = precomputedTurns ?? detectTurns(messages);
+  const turns = precomputedTurns ?? detectTurns(messages, syntheticContext);
   const actualFoldCount = Math.min(turnsToFold, Math.max(0, turns.length - 1));
 
   if (actualFoldCount <= 0) {
@@ -1588,7 +1650,7 @@ export function foldContext(
     const turnChars = countChars(turn.messages);
 
     const nominationText = toolCalls.map(tc => tc.resultText).join('\n') + '\n' + assistantText;
-    const userNominationText = extractUserText(turn.messages);
+    const userNominationText = extractUserText(turn.messages, syntheticContext);
     const toolSkeletons = toolCalls.map(tc => skeletonizeTool(tc));
 
     let retained: string | undefined;
@@ -2293,6 +2355,7 @@ function foldTurnToolResults(
 export function intraTurnFold(
   messages: FoldMessage[],
   config: IntraTurnFoldConfig = DEFAULT_INTRA_FOLD_CONFIG,
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
 ): IntraTurnFoldResult {
   const originalChars = countChars(messages);
 
@@ -2300,7 +2363,7 @@ export function intraTurnFold(
     return { messages, originalChars, foldedChars: originalChars, savingsPercent: 0, toolResultsFolded: 0, toolResultsKept: 0 };
   }
 
-  const turns = detectTurns(messages);
+  const turns = detectTurns(messages, syntheticContext);
   const prefixEnd = turns.length > 0 ? turns[0].startIndex : 0;
 
   let totalFolded = 0;

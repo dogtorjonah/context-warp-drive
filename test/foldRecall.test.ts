@@ -317,29 +317,37 @@ describe('extractActiveWindowText (tier-2 active-window query source)', () => {
     expect(text).not.toContain('SECRET TOOL OUTPUT');
   });
 
-  test('strips resumed-turn relay envelopes from active-window user text', () => {
-    const wrappedAsk = `[Temporal Context] Session age: 4h 3m
+  test('strips host-supplied resumed-turn envelopes from active-window user text', () => {
+    const hostSyntheticContext = {
+      leadingBlocks: [
+        { prefix: '[Host Time]', mode: 'line-or-paragraph' },
+        { prefix: '[Host Memory]', end: '[END Host Memory]', mode: 'paired' },
+        { prefix: '[Host Digest', end: '[END Host Digest]', mode: 'paired' },
+        { prefix: '[Host Thread]', end: '[END Host Thread]', mode: 'paired' },
+        { prefix: '[Host Signals]', end: '[END Host Signals]', mode: 'paired' },
+        { prefix: '[Host Note:', mode: 'bracketed' },
+      ],
+    } as const;
+    const wrappedAsk = `[Host Time] Session age: 4h 3m
 
-[Ambient Atlas]
+[Host Memory]
 Nearby codebase context from recent language:
-- relay/src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
-[END Ambient Atlas]
+- src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
+[END Host Memory]
 
-[DIGEST DELTA seq 26-68]
-  * peer-agent: touched relay/src/foldSummary.ts
-[END DIGEST DELTA]
+[Host Digest seq 26-68]
+  * peer-agent: touched src/foldSummary.ts
+[END Host Digest]
 
-[RELAY DIGEST DELTA]
-[CHATROOM MEMBERSHIP]
+[Host Thread]
   peer-agent in #fold-repair
-[END CHATROOM MEMBERSHIP]
-[END RELAY DIGEST DELTA]
+[END Host Thread]
 
-[CHATROOM SIGNALS]
+[Host Signals]
 #result peer landed a related change
-[END CHATROOM SIGNALS]
+[END Host Signals]
 
-[System Note: Context pressure limits were reached during your execution.
+[Host Note: Context pressure limits were reached during your execution.
 Your context has been successfully folded for efficiency.
 Please seamlessly continue your previous turn from where you were interrupted.
 Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
@@ -351,12 +359,48 @@ Patch the fold recall query source`;
       assistantMsg('fold recall query source is being patched'),
     ];
 
-    const text = extractActiveWindowText(raw, 1);
+    const text = extractActiveWindowText(raw, 1, hostSyntheticContext);
     expect(text).toContain('Patch the fold recall query source');
     expect(text).toContain('fold recall query source is being patched');
-    expect(text).not.toContain('[DIGEST DELTA');
+    expect(text).not.toContain('[Host Digest');
     expect(text).not.toContain('Nearby codebase context');
-    expect(text).not.toContain('[System Note:');
+    expect(text).not.toContain('[Host Note:');
+  });
+
+  test('drops a host continuity package from active-window user text when supplied', () => {
+    const hostSyntheticContext = {
+      leadingBlocks: [
+        { prefix: '[Host Time]', mode: 'line-or-paragraph' },
+        { prefix: '[Host Digest', end: '[END Host Digest]', mode: 'paired' },
+      ],
+      wholeTextMatchers: [
+        (text: string) => text.startsWith('[Host Continuity]')
+          || /^package_version:\s*\d+\n\[Host Continuity\]/.test(text),
+      ],
+    } as const;
+    const hostPkg = `[Host Time] Session age: 2h 6m
+
+[Host Digest seq 514-529]
+  * peer-agent: touched src/foldSummary.ts
+[END Host Digest]
+
+package_version: 5
+[Host Continuity] You are the continuation of "agent". Read Last User + AI Messages first, then Current Thread.
+
+── Current Thread ──
+👤 USER (active request):
+Make your fixes`;
+    const raw: FoldMessage[] = [
+      userMsg(hostPkg),
+      userMsg('Now run the recall trace'),
+      assistantMsg('running the recall trace now'),
+    ];
+    const text = extractActiveWindowText(raw, 0, hostSyntheticContext);
+    expect(text).toContain('Now run the recall trace');
+    expect(text).toContain('running the recall trace now');
+    expect(text).not.toContain('[Host Continuity]');
+    expect(text).not.toContain('You are the continuation');
+    expect(text).not.toContain('Make your fixes');
   });
 
   test('recency-favored cap keeps the newest cognition when the tail exceeds the budget', () => {

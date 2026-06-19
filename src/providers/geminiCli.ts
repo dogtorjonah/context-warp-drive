@@ -20,6 +20,7 @@ import {
   type FoldConfig,
   type FoldMessage,
   type FoldResult,
+  type SyntheticContextOptions,
 } from '../rollingFold.ts';
 
 export const DEFAULT_GEMINI_CLI_FOLD_TARGET_TOKENS = 250_000;
@@ -73,6 +74,7 @@ export interface BuildGeminiCliFoldViewOptions {
   bandTokens?: number;
   foldConfig?: FoldConfig;
   idFactory?: () => string;
+  syntheticContext?: SyntheticContextOptions;
 }
 
 export interface BuildGeminiCliFoldViewResult {
@@ -237,9 +239,10 @@ export function buildGeminiCliFoldView(
   const foldConfig = options.foldConfig ?? resolveFoldConfigForBand(
     options.bandTokens ?? DEFAULT_GEMINI_CLI_FOLD_BAND_TOKENS,
   );
-  const trigger = checkFoldTrigger(rawMessages, foldConfig);
+  const syntheticContext = options.syntheticContext ?? {};
+  const trigger = checkFoldTrigger(rawMessages, foldConfig, syntheticContext);
   const fold = trigger.shouldFold
-    ? foldContext(rawMessages, trigger.turnsToFold, foldConfig)
+    ? foldContext(rawMessages, trigger.turnsToFold, foldConfig, undefined, undefined, undefined, syntheticContext)
     : null;
   const foldedMessages = fold ? fold.messages : rawMessages;
   const rawChars = countChars(rawMessages);

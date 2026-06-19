@@ -1951,42 +1951,54 @@ describe('formatFoldEpochStamp', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// User Message Vault — synthetic relay note inside user turns
+// User Message Vault — synthetic host note inside user turns
 // ══════════════════════════════════════════════════════════════════════
 
 describe('User Message Vault synthetic filtering', () => {
   const vault = `${USER_MESSAGE_VAULT_PREFIX}\nold operator copy\n${USER_MESSAGE_VAULT_END}`;
-  const relayResumeWrapper = `[Temporal Context] Session age: 4h 3m
+  const hostSyntheticContext = {
+    leadingBlocks: [
+      { prefix: '[Host Time]', mode: 'line-or-paragraph' },
+      { prefix: '[Host Memory]', end: '[END Host Memory]', mode: 'paired' },
+      { prefix: '[Host Digest', end: '[END Host Digest]', mode: 'paired' },
+      { prefix: '[Host Thread]', end: '[END Host Thread]', mode: 'paired' },
+      { prefix: '[Host Signals]', end: '[END Host Signals]', mode: 'paired' },
+      { prefix: '[Host Note:', mode: 'bracketed' },
+    ],
+    wholeTextMatchers: [
+      (text: string) => text.startsWith('[Host Continuity]')
+        || /^package_version:\s*\d+\n\[Host Continuity\]/.test(text),
+    ],
+  } as const;
+  const hostResumeWrapper = `[Host Time] Session age: 4h 3m
 
-[System Note: Context pressure limits were reached during your execution.
+[Host Note: Context pressure limits were reached during your execution.
 Your context has been successfully folded for efficiency.
 Please seamlessly continue your previous turn from where you were interrupted.
 Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
 
 ${vault}`;
-  const fullRelayResumeWrapper = `[Temporal Context]
+  const fullHostResumeWrapper = `[Host Time]
 Session age: 4h 3m
 
-[Ambient Atlas]
+[Host Memory]
 Nearby codebase context from recent language:
-- relay/src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
-[END Ambient Atlas]
+- src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
+[END Host Memory]
 
-[DIGEST DELTA seq 26-68]
-  * peer-agent: touched relay/src/foldSummary.ts
-[END DIGEST DELTA]
+[Host Digest seq 26-68]
+  * peer-agent: touched src/foldSummary.ts
+[END Host Digest]
 
-[RELAY DIGEST DELTA]
-[CHATROOM MEMBERSHIP]
+[Host Thread]
   peer-agent in #fold-repair
-[END CHATROOM MEMBERSHIP]
-[END RELAY DIGEST DELTA]
+[END Host Thread]
 
-[CHATROOM SIGNALS]
+[Host Signals]
 #result peer landed a related change
-[END CHATROOM SIGNALS]
+[END Host Signals]
 
-[System Note: Context pressure limits were reached during your execution.
+[Host Note: Context pressure limits were reached during your execution.
 Your context has been successfully folded for efficiency.
 Please seamlessly continue your previous turn from where you were interrupted.
 Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
@@ -2013,25 +2025,25 @@ ${vault}`;
     expect(extractUserText([userMsg(mixed)])).toBe('real request');
   });
 
-  test('relay resume wrappers are stripped before extracting genuine user text', () => {
-    const mixed = `${relayResumeWrapper}\n\nreal request`;
+  test('host resume wrappers are stripped before extracting genuine user text when supplied', () => {
+    const mixed = `${hostResumeWrapper}\n\nreal request`;
 
-    expect(stripSyntheticUserContextBlocks(mixed)).toBe('real request');
-    expect(extractUserText([userMsg(mixed)])).toBe('real request');
+    expect(stripSyntheticUserContextBlocks(mixed, hostSyntheticContext)).toBe('real request');
+    expect(extractUserText([userMsg(mixed)], hostSyntheticContext)).toBe('real request');
   });
 
-  test('full relay resume envelopes are stripped before extracting genuine user text', () => {
-    const mixed = `${fullRelayResumeWrapper}\n\nreal request`;
+  test('full host resume envelopes are stripped before extracting genuine user text when supplied', () => {
+    const mixed = `${fullHostResumeWrapper}\n\nreal request`;
 
-    expect(stripSyntheticUserContextBlocks(mixed)).toBe('real request');
-    expect(extractUserText([userMsg(mixed)])).toBe('real request');
-    expect(detectTurns([userMsg(fullRelayResumeWrapper), assistantMsg('continuing')])).toHaveLength(0);
+    expect(stripSyntheticUserContextBlocks(mixed, hostSyntheticContext)).toBe('real request');
+    expect(extractUserText([userMsg(mixed)], hostSyntheticContext)).toBe('real request');
+    expect(detectTurns([userMsg(fullHostResumeWrapper), assistantMsg('continuing')], hostSyntheticContext)).toHaveLength(0);
   });
 
   test('wrapper-only resume notes do not become user text or turn boundaries', () => {
-    expect(stripSyntheticUserContextBlocks(relayResumeWrapper)).toBe('');
-    expect(extractUserText([userMsg(relayResumeWrapper)])).toBe('');
-    expect(detectTurns([userMsg(relayResumeWrapper), assistantMsg('continuing')])).toHaveLength(0);
+    expect(stripSyntheticUserContextBlocks(hostResumeWrapper, hostSyntheticContext)).toBe('');
+    expect(extractUserText([userMsg(hostResumeWrapper)], hostSyntheticContext)).toBe('');
+    expect(detectTurns([userMsg(hostResumeWrapper), assistantMsg('continuing')], hostSyntheticContext)).toHaveLength(0);
   });
 
   test('incomplete vault marker mentions stay user-authored text', () => {
@@ -2039,6 +2051,38 @@ ${vault}`;
 
     expect(stripUserMessageVaultBlocks(text)).toBe(text);
     expect(extractUserText([userMsg(text)])).toBe(text);
+  });
+
+  const hostContinuityPackage = `[Host Time] Session age: 2h 6m
+
+[Host Digest seq 514-529]
+  * peer-agent: touched src/foldSummary.ts
+[END Host Digest]
+
+package_version: 5
+[Host Continuity] You are the continuation of "agent". Read Last User + AI Messages first, then Current Thread.
+
+── Current Thread ──
+👤 USER (active request):
+Make your fixes`;
+
+  test('host continuity packages are inert by default and synthetic only when supplied', () => {
+    const legacyPkg = `[Host Continuity] You are the continuation of "agent". Pick up where it left off.`;
+    const versionedPkg = `package_version: 5\n[Host Continuity] You are the continuation of "agent".`;
+    expect(isSyntheticContextText(legacyPkg)).toBe(false);
+    expect(isSyntheticContextText(versionedPkg)).toBe(false);
+    expect(isSyntheticContextText(legacyPkg, hostSyntheticContext)).toBe(true);
+    expect(isSyntheticContextText(versionedPkg, hostSyntheticContext)).toBe(true);
+    expect(detectTurns([userMsg(legacyPkg), assistantMsg('continuing')], hostSyntheticContext)).toHaveLength(0);
+  });
+
+  test('host continuity package with leading wrappers is consumed whole; a later real ask still anchors a turn', () => {
+    expect(stripSyntheticUserContextBlocks(hostContinuityPackage, hostSyntheticContext)).toBe('');
+    expect(extractUserText([userMsg(hostContinuityPackage)], hostSyntheticContext)).toBe('');
+    expect(detectTurns([
+      userMsg(hostContinuityPackage), assistantMsg('continuing'),
+      userMsg('real follow-up'), assistantMsg('ok'),
+    ], hostSyntheticContext)).toHaveLength(1);
   });
 });
 

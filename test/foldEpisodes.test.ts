@@ -212,51 +212,75 @@ describe('operator intent (Episode.intent)', () => {
     ({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: file } }] });
   const toolResult = (id: string): FoldMessage =>
     ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] });
-  const relayResumeWrapper = `[Temporal Context] Session age: 4h 3m
+  const hostSyntheticContext = {
+    leadingBlocks: [
+      { prefix: '[Host Time]', mode: 'line-or-paragraph' },
+      { prefix: '[Host Memory]', end: '[END Host Memory]', mode: 'paired' },
+      { prefix: '[Host Digest', end: '[END Host Digest]', mode: 'paired' },
+      { prefix: '[Host Thread]', end: '[END Host Thread]', mode: 'paired' },
+      { prefix: '[Host Signals]', end: '[END Host Signals]', mode: 'paired' },
+      { prefix: '[Host Note:', mode: 'bracketed' },
+    ],
+    wholeTextMatchers: [
+      (text: string) => text.startsWith('[Host Continuity]')
+        || /^package_version:\s*\d+\n\[Host Continuity\]/.test(text),
+    ],
+  } as const;
+  const hostResumeWrapper = `[Host Time] Session age: 4h 3m
 
-[System Note: Context pressure limits were reached during your execution.
+[Host Note: Context pressure limits were reached during your execution.
 Your context has been successfully folded for efficiency.
 Please seamlessly continue your previous turn from where you were interrupted.
 Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
 
 [User Message Vault]
-Synthetic relay continuity note.
+Synthetic host continuity note.
 
 [operator message @ 2026-06-18 20:00]
-Ok do that for both standalone repo and Voxxo swarm relay please
+Ok do that for both standalone repo and the host app please
 [/User Message Vault]`;
-  const fullRelayResumeWrapper = `[Temporal Context] Session age: 4h 3m
+  const fullHostResumeWrapper = `[Host Time] Session age: 4h 3m
 
-[Ambient Atlas]
+[Host Memory]
 Nearby codebase context from recent language:
-- relay/src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
-[END Ambient Atlas]
+- src/voiceRecording.ts - Voice recording capture pipeline (high; fts)
+[END Host Memory]
 
-[DIGEST DELTA seq 26-68]
-  * peer-agent: touched relay/src/foldSummary.ts
-[END DIGEST DELTA]
+[Host Digest seq 26-68]
+  * peer-agent: touched src/foldSummary.ts
+[END Host Digest]
 
-[RELAY DIGEST DELTA]
-[CHATROOM MEMBERSHIP]
+[Host Thread]
   peer-agent in #fold-repair
-[END CHATROOM MEMBERSHIP]
-[END RELAY DIGEST DELTA]
+[END Host Thread]
 
-[CHATROOM SIGNALS]
+[Host Signals]
 #result peer landed a related change
-[END CHATROOM SIGNALS]
+[END Host Signals]
 
-[System Note: Context pressure limits were reached during your execution.
+[Host Note: Context pressure limits were reached during your execution.
 Your context has been successfully folded for efficiency.
 Please seamlessly continue your previous turn from where you were interrupted.
 Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
 
 [User Message Vault]
-Synthetic relay continuity note.
+Synthetic host continuity note.
 
 [operator message @ 2026-06-18 20:00]
-Ok do that for both standalone repo and Voxxo swarm relay please
+Ok do that for both standalone repo and the host app please
 [/User Message Vault]`;
+  const hostContinuityPackage = `[Host Time] Session age: 2h 6m
+
+[Host Digest seq 514-529]
+  * peer-agent: touched src/foldSummary.ts
+[END Host Digest]
+
+package_version: 5
+[Host Continuity] You are the continuation of "agent". Read Last User + AI Messages first, then Current Thread.
+
+── Current Thread ──
+👤 USER (active request):
+Make your fixes`;
 
   it('mines the nearest genuine operator ask onto the burst it drove', () => {
     const ask = 'Fix the recall ranker so cold zones keep directory proximity';
@@ -295,14 +319,14 @@ Ok do that for both standalone repo and Voxxo swarm relay please
     expect(episodes[0].intent).toBeUndefined();
   });
 
-  it('strips relay resume wrappers before choosing the operator intent', () => {
+  it('strips host resume wrappers before choosing the operator intent when supplied', () => {
     const ask = 'Patch the intent miner so wrappers do not become the ask';
     const messages: FoldMessage[] = [
-      userAsk(`${relayResumeWrapper}\n\n${ask}`),
+      userAsk(`${hostResumeWrapper}\n\n${ask}`),
       editCall('t1', 'src/foldEpisodeCapture.ts'),
       toolResult('t1'),
     ];
-    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true, syntheticContext: hostSyntheticContext });
     expect(episodes).toHaveLength(1);
     expect(episodes[0].intent).toBe(ask);
   });
@@ -310,24 +334,48 @@ Ok do that for both standalone repo and Voxxo swarm relay please
   it('strips the full resumed-turn envelope before choosing the operator intent', () => {
     const ask = 'Patch the intent miner so wrapper stacks do not become the ask';
     const messages: FoldMessage[] = [
-      userAsk(`${fullRelayResumeWrapper}\n\n${ask}`),
+      userAsk(`${fullHostResumeWrapper}\n\n${ask}`),
       editCall('t1', 'src/foldEpisodeCapture.ts'),
       toolResult('t1'),
     ];
-    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true, syntheticContext: hostSyntheticContext });
     expect(episodes).toHaveLength(1);
     expect(episodes[0].intent).toBe(ask);
   });
 
-  it('leaves intent undefined when only relay resume wrappers precede a burst', () => {
+  it('leaves intent undefined when only host resume wrappers precede a burst', () => {
     const messages: FoldMessage[] = [
-      userAsk(relayResumeWrapper),
+      userAsk(hostResumeWrapper),
       editCall('t1', 'src/foldEpisodeCapture.ts'),
       toolResult('t1'),
     ];
-    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true, syntheticContext: hostSyntheticContext });
     expect(episodes).toHaveLength(1);
     expect(episodes[0].intent).toBeUndefined();
+  });
+
+  it('leaves intent undefined at a host continuity boundary when supplied', () => {
+    const messages: FoldMessage[] = [
+      userAsk(hostContinuityPackage),
+      editCall('t1', 'src/rollingFold.ts'),
+      toolResult('t1'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true, syntheticContext: hostSyntheticContext });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].intent).toBeUndefined();
+  });
+
+  it('anchors a genuine post-continuity ask, not the preceding host package', () => {
+    const ask = 'Now add the host-continuity regression tests';
+    const messages: FoldMessage[] = [
+      userAsk(hostContinuityPackage),
+      userAsk(ask),
+      editCall('t1', 'test/foldEpisodes.test.ts'),
+      toolResult('t1'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true, syntheticContext: hostSyntheticContext });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].intent).toBe(ask);
   });
 
   it('renders the ask anchor first in the hot chapter when present, byte-identical when absent', () => {

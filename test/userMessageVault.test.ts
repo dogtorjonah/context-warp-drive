@@ -84,7 +84,7 @@ describe('userMessageVault', () => {
     recordUserMessageVaultEntry(entries, 'current request still visible');
 
     const vault = renderUserMessageVault(entries, {
-      visibleUserTexts: ['[Temporal Context]\nSession age: 2m\n\ncurrent request still visible'],
+      visibleUserTexts: ['[Host Context]\nSession age: 2m\n\ncurrent request still visible'],
     });
 
     expect(vault).toContain('origin instruction that paged out');

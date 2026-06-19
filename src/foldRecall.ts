@@ -52,6 +52,7 @@ import {
   RECALL_HINT_PREFIX,
   stripSyntheticUserContextBlocks,
   type FoldMessage,
+  type SyntheticContextOptions,
   type Turn,
   type TurnCategory,
 } from './rollingFold.ts';
@@ -417,9 +418,12 @@ function parseIntraMarker(content: string): ParsedIntraMarker | null {
   return null;
 }
 
-function buildTurnDigest(turnMessages: FoldMessage[]): string {
+function buildTurnDigest(
+  turnMessages: FoldMessage[],
+  syntheticContext: SyntheticContextOptions = {},
+): string {
   const parts: string[] = [];
-  const user = extractFirstUserText(turnMessages);
+  const user = extractFirstUserText(turnMessages, syntheticContext);
   if (user) parts.push(user);
   const assistant = extractAssistantText(turnMessages);
   if (assistant) parts.push(assistant);
@@ -427,24 +431,27 @@ function buildTurnDigest(turnMessages: FoldMessage[]): string {
 }
 
 /** First REAL user text in a slice (synthetic fold/recall blocks excluded). */
-function extractFirstUserText(messages: readonly FoldMessage[]): string {
+function extractFirstUserText(
+  messages: readonly FoldMessage[],
+  syntheticContext: SyntheticContextOptions = {},
+): string {
   for (const msg of messages) {
     if (msg.role !== 'user') continue;
     if (typeof msg.content === 'string') {
-      const cleaned = stripSyntheticUserContextBlocks(msg.content).trim();
-      if (cleaned.length > 0 && !isSyntheticContextText(cleaned)) return cleaned;
+      const cleaned = stripSyntheticUserContextBlocks(msg.content, syntheticContext).trim();
+      if (cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext)) return cleaned;
       continue;
     }
     if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
         if (typeof block === 'string') {
-          const cleaned = stripSyntheticUserContextBlocks(block).trim();
-          if (cleaned.length > 0 && !isSyntheticContextText(cleaned)) return cleaned;
+          const cleaned = stripSyntheticUserContextBlocks(block, syntheticContext).trim();
+          if (cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext)) return cleaned;
           continue;
         }
         if (block?.type === 'text' && typeof block.text === 'string') {
-          const cleaned = stripSyntheticUserContextBlocks(block.text).trim();
-          if (cleaned.length > 0 && !isSyntheticContextText(cleaned)) return cleaned;
+          const cleaned = stripSyntheticUserContextBlocks(block.text, syntheticContext).trim();
+          if (cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext)) return cleaned;
         }
       }
     }
@@ -470,10 +477,11 @@ const ACTIVE_WINDOW_MAX_CHARS = 1600;
 export function extractActiveWindowText(
   rawHistory: readonly FoldMessage[],
   foldedRawCount: number,
+  syntheticContext: SyntheticContextOptions = {},
 ): string {
   if (foldedRawCount < 0 || foldedRawCount >= rawHistory.length) return '';
   const tail = rawHistory.slice(foldedRawCount);
-  const user = extractFirstUserText(tail);
+  const user = extractFirstUserText(tail, syntheticContext);
   const assistant = extractAssistantText(tail);
   const combined = [user, assistant].filter((s) => s.length > 0).join(' ');
   return combined.length > ACTIVE_WINDOW_MAX_CHARS
@@ -488,8 +496,20 @@ export function extractActiveWindowText(
  * Feeds nominateVerbatim so the indexed tokens are the same family the Verbatim
  * Keep conserves.
  */
-function extractTurnVerbatimText(turnMessages: readonly FoldMessage[]): string {
+function extractTurnVerbatimText(
+  turnMessages: readonly FoldMessage[],
+  syntheticContext: SyntheticContextOptions = {},
+): string {
   const parts: string[] = [];
+  const pushText = (text: string, role: string | undefined): void => {
+    if (!text) return;
+    if (role === 'user') {
+      const cleaned = stripSyntheticUserContextBlocks(text, syntheticContext).trim();
+      if (cleaned && !isSyntheticContextText(cleaned, syntheticContext)) parts.push(cleaned);
+      return;
+    }
+    parts.push(text);
+  };
   const pushBlockContent = (content: unknown): void => {
     if (typeof content === 'string') {
       if (content) parts.push(content);
@@ -503,18 +523,18 @@ function extractTurnVerbatimText(turnMessages: readonly FoldMessage[]): string {
   for (const msg of turnMessages) {
     const content = (msg as any).content;
     if (typeof content === 'string') {
-      if (content) parts.push(content);
+      pushText(content, msg.role);
     } else if (Array.isArray(content)) {
       for (const block of content as any[]) {
-        if (typeof block === 'string') parts.push(block);
-        else if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text);
+        if (typeof block === 'string') pushText(block, msg.role);
+        else if (block?.type === 'text' && typeof block.text === 'string') pushText(block.text, msg.role);
         else if (block?.type === 'tool_result') pushBlockContent(block.content);
       }
     }
     // OpenAI role:'tool' string content is already captured by the string branch above.
     if (Array.isArray((msg as any).parts)) {
       for (const part of (msg as any).parts as any[]) {
-        if (typeof part?.text === 'string' && part.text) parts.push(part.text);
+        if (typeof part?.text === 'string' && part.text) pushText(part.text, msg.role);
         const resp = part?.functionResponse?.response;
         if (resp !== undefined) {
           try {
@@ -573,6 +593,7 @@ export function buildFoldIndex(
   rawHistory: readonly FoldMessage[],
   foldedView: readonly FoldMessage[],
   precomputedTurns?: readonly Turn[],
+  syntheticContext: SyntheticContextOptions = {},
 ): FoldRecallIndex {
   const entries: FoldIndexEntry[] = [];
 
@@ -587,7 +608,7 @@ export function buildFoldIndex(
     }
   }
   if (interFoldedCount > 0) {
-    const turns = precomputedTurns ?? detectTurns(rawHistory as FoldMessage[]);
+    const turns = precomputedTurns ?? detectTurns(rawHistory as FoldMessage[], syntheticContext);
     const count = Math.min(interFoldedCount, Math.max(0, turns.length - 1));
     for (let j = 0; j < count; j++) {
       const turn = turns[j];
@@ -595,7 +616,7 @@ export function buildFoldIndex(
       const bashPaths = extractBashPathsFromMessages(turn.messages);
       const compactTracePaths = extractCompactToolTracePaths(turn.messages);
       const paths = Array.from(new Set([...structuredPaths, ...bashPaths, ...compactTracePaths])).sort();
-      const verbatimTokens = nominateVerbatim(extractTurnVerbatimText(turn.messages)).sort();
+      const verbatimTokens = nominateVerbatim(extractTurnVerbatimText(turn.messages, syntheticContext)).sort();
       entries.push({
         kind: 'turn',
         id: `turn:${turn.startIndex}`,
@@ -604,7 +625,7 @@ export function buildFoldIndex(
         recency: turn.startIndex,
         category: classifyTurn(turn.messages),
         paths,
-        digest: buildTurnDigest(turn.messages),
+        digest: buildTurnDigest(turn.messages, syntheticContext),
         chars: countChars(turn.messages),
         ...(verbatimTokens.length > 0 ? { verbatimTokens } : {}),
       });
@@ -872,9 +893,10 @@ export function deriveBoundaryRecallSignals(
   rawHistory: readonly FoldMessage[],
   foldedRawCount: number,
   config: FoldRecallConfig,
+  syntheticContext: SyntheticContextOptions = {},
 ): { signals: RecallSignals; proceed: boolean } {
   const needActive = config.termRecallEnabled || config.verbatimRecallEnabled;
-  const activeText = needActive ? extractActiveWindowText(rawHistory, foldedRawCount) : '';
+  const activeText = needActive ? extractActiveWindowText(rawHistory, foldedRawCount, syntheticContext) : '';
   const signals = extractRecallSignals(toolInput, claimedPaths, activeText);
   // extractRecallSignals always derives terms from activeText; but the verbatim
   // tier also needs activeText, so when term recall is OFF keep terms OUT of the
@@ -1406,7 +1428,12 @@ function renderHint(item: RecallPlanItem): string {
 }
 
 /** Body text for a recall card, sliced from in-memory raw history only. */
-function renderEntryBody(entry: FoldIndexEntry, recallPaths: readonly string[], rawHistory: readonly FoldMessage[]): string | null {
+function renderEntryBody(
+  entry: FoldIndexEntry,
+  recallPaths: readonly string[],
+  rawHistory: readonly FoldMessage[],
+  syntheticContext: SyntheticContextOptions,
+): string | null {
   if (entry.kind === 'tool') {
     const text = findToolResultText(rawHistory, entry.toolId);
     return text === null ? null : stripRecallBlocks(text);
@@ -1414,7 +1441,7 @@ function renderEntryBody(entry: FoldIndexEntry, recallPaths: readonly string[], 
   if (entry.rawStart < 0 || entry.rawEnd > rawHistory.length || entry.rawStart >= entry.rawEnd) return null;
   const slice = rawHistory.slice(entry.rawStart, entry.rawEnd);
   const parts: string[] = [];
-  const user = extractFirstUserText(slice);
+  const user = extractFirstUserText(slice, syntheticContext);
   if (user) parts.push(`User asked: ${user.length > 300 ? charSafeSlice(user, 0, 299) + '…' : user}`);
   const assistant = extractAssistantText(slice as FoldMessage[]);
   if (assistant) parts.push(assistant);
@@ -1634,6 +1661,7 @@ export function buildFoldRecallContext(
   signals: RecallSignals,
   utilization: ContextUtilizationLevel,
   config: FoldRecallConfig,
+  syntheticContext: SyntheticContextOptions = {},
 ): FoldRecallOutcome {
   if (!config.enabled || !state.index || state.index.entries.length === 0) return EMPTY_OUTCOME;
   // Staleness guard: a rewound history invalidates raw ranges; the next
@@ -1697,7 +1725,7 @@ export function buildFoldRecallContext(
         level = 'hint'; // measured budget overflow → card degrades to hint
       } else {
         const recallPaths = recallZonePaths(item, state);
-        const body = renderEntryBody(item.entry, recallPaths, rawHistory);
+        const body = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext);
         if (body === null) continue; // raw no longer recoverable — skip silently
         // Curated Code Radar may take up to half the card body budget; the
         // excerpt keeps the rest. '' (empty carriers / flags off) ⇒ byte-identical.

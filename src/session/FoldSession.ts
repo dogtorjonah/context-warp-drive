@@ -35,6 +35,7 @@ import {
   type FoldEvictionInput,
   type FoldEvictionSpan,
   type FidelityOverrides,
+  type SyntheticContextOptions,
 } from '../rollingFold.ts';
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
@@ -126,6 +127,11 @@ export interface FoldSessionOptions {
    * measured pressure ceiling — a deferral, not an absolute pin. Default `false`.
    */
   readonly readBurstGuard?: boolean;
+  /**
+   * Host-supplied synthetic user-context markers to exclude from turn detection
+   * and fold text mining. Defaults empty so the package remains host-neutral.
+   */
+  readonly syntheticContext?: SyntheticContextOptions;
   /**
    * Glyph Grammar Vault companion. Off by default. When enabled, FoldSession
    * keeps a bounded buffer of recent operator messages and the agent's own
@@ -246,6 +252,7 @@ export class FoldSession {
   private readonly evictionThresholdChars: number;
   private readonly pressureCeilingTokens: number | null;
   private readonly readBurstGuardEnabled: boolean;
+  private readonly syntheticContext: SyntheticContextOptions;
   private readonly clock: () => number;
   private readonly vaultEnabled: boolean;
   private readonly vaultTailWindow: number | undefined;
@@ -261,6 +268,7 @@ export class FoldSession {
     this.foldConfig = options.foldConfig ?? DEFAULT_FOLD_CONFIG;
     this.activeFidelity = options.fidelity ?? null;
     this.readBurstGuardEnabled = options.readBurstGuard === true;
+    this.syntheticContext = options.syntheticContext ?? {};
     if (options.freeze === false) {
       this.freezeEnabled = false;
       this.freezeConfig = DEFAULT_FOLD_FREEZE_CONFIG;
@@ -343,11 +351,11 @@ export class FoldSession {
 
   /** Count conversational turns in a provider-shaped message array. */
   countTurns(messages: FoldMessage[]): number {
-    return detectTurns(messages).length;
+    return detectTurns(messages, this.syntheticContext).length;
   }
 
   private resolveTurnsToFold(messages: FoldMessage[], explicit?: number): number {
-    const total = detectTurns(messages).length;
+    const total = detectTurns(messages, this.syntheticContext).length;
     return typeof explicit === 'number'
       ? Math.max(0, Math.min(explicit, total))
       : Math.max(0, total - this.foldConfig.activeWindowTurns);
@@ -372,7 +380,7 @@ export class FoldSession {
     if (!this.readBurstGuardEnabled || pressureCeilingTriggered || base <= 0) return base;
     const { openBurstStartIndex } = computeOpenBurst(messages);
     if (openBurstStartIndex === null) return base;
-    const turns = detectTurns(messages);
+    const turns = detectTurns(messages, this.syntheticContext);
     let floor = 0;
     for (const turn of turns) {
       if (turn.endIndex <= openBurstStartIndex) floor += 1;
@@ -419,7 +427,15 @@ export class FoldSession {
    * prefer {@link prepare}.
    */
   fold(messages: FoldMessage[], turnsToFold?: number): FoldResult {
-    return foldContext(messages, this.resolveTurnsToFold(messages, turnsToFold), this.foldConfig);
+    return foldContext(
+      messages,
+      this.resolveTurnsToFold(messages, turnsToFold),
+      this.foldConfig,
+      undefined,
+      undefined,
+      undefined,
+      this.syntheticContext,
+    );
   }
 
   private resetEvictionState(): void {
@@ -437,7 +453,7 @@ export class FoldSession {
     if (!this.evictionEnabled || this.evictionThresholdChars <= 0) return undefined;
     const hasSpans = this.foldEvictedSpans.length > 0;
     const evictableThroughOrdinal = computeEvictableThroughOrdinal(
-      detectTurns(messages),
+      detectTurns(messages, this.syntheticContext),
       durableCursorIndex,
       this.foldEpochFrontiers,
       upcomingEpoch,
@@ -489,7 +505,7 @@ export class FoldSession {
    */
   prepare(messages: FoldMessage[], context: FoldPrepareContext = {}): FoldOutcome {
     const now = this.clock();
-    const totalTurns = detectTurns(messages).length;
+    const totalTurns = detectTurns(messages, this.syntheticContext).length;
     const durableCursorIndex = context.durableCursorIndex ?? messages.length;
     const pressureCeilingTriggered = this.isPressureCeilingTriggered(context.measuredInputTokens);
     // Rewind self-heal. A SHRINK in raw count (turns removed) drops now-stale
@@ -521,6 +537,9 @@ export class FoldSession {
         this.guardedTurnsToFold(messages, pressureCeilingTriggered),
         this.effectiveFoldConfig(desiredFidelity),
         this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
+        undefined,
+        undefined,
+        this.syntheticContext,
       );
       this.commitEvictionEpoch(result, upcomingEpoch);
       return this.applyVault({
@@ -569,6 +588,9 @@ export class FoldSession {
       this.guardedTurnsToFold(messages, pressureCeilingTriggered),
       this.effectiveFoldConfig(desiredFidelity),
       this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
+      undefined,
+      undefined,
+      this.syntheticContext,
     );
     commitFoldFreeze(this.freezeState, messages, result.messages, ctx, now);
     this.commitEvictionEpoch(result, this.freezeState.epochs);

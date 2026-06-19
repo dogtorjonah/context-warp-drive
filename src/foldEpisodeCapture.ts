@@ -52,7 +52,7 @@ import {
 } from './foldEpisodes.ts';
 import { canonicalizeExtractedPaths, type CanonContext } from './foldPathCanon.ts';
 import { extractPathsFromBashCommand, extractRecallSignals } from './foldRecall.ts';
-import { extractUserText, isSyntheticContextText, type FoldMessage } from './rollingFold.ts';
+import { extractUserText, isSyntheticContextText, type FoldMessage, type SyntheticContextOptions } from './rollingFold.ts';
 
 const EDIT_TOOL_HINTS = ['edit', 'write', 'apply_patch', 'notebookedit', 'str_replace', 'create_file'];
 const CHECK_TOOL_RE = /test|typecheck|tsc|vitest|build|lint/i;
@@ -121,6 +121,12 @@ export interface EpisodeCaptureOptions {
    * WARP_FOLD_EPISODES_NARRATION=0 kill switch through here).
    */
   narration?: boolean;
+  /**
+   * Host-supplied synthetic user-context markers to exclude from operator
+   * intent and narration mining. Defaults empty so the standalone package stays
+   * host-neutral.
+   */
+  syntheticContext?: SyntheticContextOptions;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -350,6 +356,7 @@ function mineNarrationForGap(
   gapEndExclusive: number,
   timestamps: readonly (string | undefined)[] | undefined,
   nowIso: string,
+  syntheticContext: SyntheticContextOptions,
 ): { eventIndex: number; annotation: EpisodeAnnotation }[] {
   const start = Math.max(0, scanStart);
   const end = Math.min(messages.length, gapEndExclusive);
@@ -367,10 +374,11 @@ function mineNarrationForGap(
     if (!isNarrationEligibleGlyph(glyph)) continue; // 🔍/▶/❓ self-exclude
     const kind = narrationKindForGlyph(glyph);
     if (kind === 'narration') continue;             // untagged → pass 2 only
-    if (isSyntheticContextText(text)) continue;
+    const isSynthetic = (candidate: string) => isSyntheticContextText(candidate, syntheticContext);
+    if (isSynthetic(text)) continue;
     const lines = extractNarrationLines(
       text,
-      isSyntheticContextText,
+      isSynthetic,
       NARRATION_MAX_LINES_TAGGED,
       { requireVerdictShape: false },
     );
@@ -403,10 +411,11 @@ function mineNarrationForGap(
       }
       continue;
     }
-    if (!isSyntheticContextText(text)) {
+    const isSynthetic = (candidate: string) => isSyntheticContextText(candidate, syntheticContext);
+    if (!isSynthetic(text)) {
       const kind = narrationKindForGlyph(glyph);
       const cap = kind === 'narration' ? NARRATION_MAX_LINES : NARRATION_MAX_LINES_TAGGED;
-      const lines = extractNarrationLines(text, isSyntheticContextText, cap);
+      const lines = extractNarrationLines(text, isSynthetic, cap);
       if (lines.length > 0) {
         const ts = timestamps?.[i] ?? nowIso;
         return lines.map((line) => ({
@@ -449,19 +458,23 @@ function structuralStep(call: ToolCallView, outcome: 'ok' | 'error' | undefined,
  * The verbatim operator ask that drove a burst: scan the raw window BACKWARD from
  * the burst's first touch for the nearest genuine user message. Reuses the
  * canonical operator-text gate — extractUserText drops tool_result / Gemini
- * functionResponse blocks and strips relay synthetic user-context wrappers,
+ * functionResponse blocks and strips host-supplied synthetic user-context wrappers,
  * while isSyntheticContextText drops fold / recall-card / epoch-stamp context —
  * so recalled cards and tool output can never launder into intent. Scans the
  * FULL messages array (not just [startIndex, …]) so an ask issued in a PRIOR
  * epoch still anchors the burst it motivated. Pure CPU, no I/O.
  */
-function mineIntentForBurst(messages: readonly FoldMessage[], burstStartIndex: number): string | undefined {
+function mineIntentForBurst(
+  messages: readonly FoldMessage[],
+  burstStartIndex: number,
+  syntheticContext: SyntheticContextOptions,
+): string | undefined {
   for (let i = Math.min(burstStartIndex, messages.length - 1); i >= 0; i--) {
     const message = messages[i];
     if (message.role !== 'user') continue;
-    const text = extractUserText([message]).trim();
+    const text = extractUserText([message], syntheticContext).trim();
     if (text.length === 0) continue;            // tool_result-only / empty user turn
-    if (isSyntheticContextText(text)) continue; // fold / recall / vault / epoch synthetic
+    if (isSyntheticContextText(text, syntheticContext)) continue; // fold / recall / vault / epoch synthetic
     return truncateVerbatim(text, INTENT_TEXT_CAP_CHARS);
   }
   return undefined;
@@ -486,6 +499,7 @@ export function deriveEpisodesFromMessages(
   const pivots: EpisodePivotMarker[] = [];
   const annotated: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
   const steps: { eventIndex: number; step: TraceStep }[] = [];
+  const syntheticContext = options.syntheticContext ?? {};
 
   for (const call of iterToolCalls(messages, startIndex)) {
     const touched = extractTouchPaths(call.input, options.canon);
@@ -561,7 +575,7 @@ export function deriveEpisodesFromMessages(
       const gapEnd = i + 1 < sealed.length
         ? sealed[i + 1].startEventIndex
         : openBurst ? openBurst.startEventIndex : messages.length;
-      sealedAnnotated.push(...mineNarrationForGap(messages, scanStart, burstFinalTouch, gapEnd, options.timestamps, identity.nowIso));
+      sealedAnnotated.push(...mineNarrationForGap(messages, scanStart, burstFinalTouch, gapEnd, options.timestamps, identity.nowIso, syntheticContext));
     }
   }
   const annotationsPerBurst = assignAnnotationsToBursts(sealed, sealedAnnotated);
@@ -587,7 +601,7 @@ export function deriveEpisodesFromMessages(
         : s.eventIndex >= burst.startEventIndex && s.eventIndex <= burst.endEventIndex)
       .map((s) => s.step);
     const annotations = annotationsPerBurst[index];
-    const intent = mineIntentForBurst(messages, burst.startEventIndex);
+    const intent = mineIntentForBurst(messages, burst.startEventIndex, syntheticContext);
     return {
       workspace: identity.workspace,
       instanceId: identity.instanceId,
