@@ -314,13 +314,6 @@ export class FoldSession {
   private readonly vaultTailWindow: number | undefined;
   private readonly userMessageVaultEntries: UserMessageVaultEntry[] = [];
   private readonly assistantGlyphVaultEntries: AssistantGlyphVaultEntry[] = [];
-  /**
-   * Vault row fingerprints already sealed into the current frozen view (the full
-   * render baked at the last full recompute + every per-band delta since).
-   * Cleared on every full recompute, mirroring commitFoldFreeze resetting
-   * sealedBands — so a row seals into exactly one band per freeze generation.
-   */
-  private sealedVaultFingerprints = new Set<string>();
   private foldEpochs = 0;
   private foldEvictedSpans: FoldEvictionSpan[] = [];
   private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
@@ -453,12 +446,12 @@ export class FoldSession {
     const rows = selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
       visibleUserMessages: view,
     });
-    if (mode === 'full') this.sealedVaultFingerprints.clear();
-    const bakeRows = mode === 'full' ? rows : selectVaultDeltaRows(rows, this.sealedVaultFingerprints);
+    if (mode === 'full') this.freezeState.sealedVaultFingerprints.clear();
+    const bakeRows = mode === 'full' ? rows : selectVaultDeltaRows(rows, this.freezeState.sealedVaultFingerprints);
     if (bakeRows.length === 0) return view;
     const block = renderVaultRowsBlock(bakeRows, mode);
     if (!block) return view;
-    for (const row of bakeRows) this.sealedVaultFingerprints.add(vaultRowFingerprint(row));
+    for (const row of bakeRows) this.freezeState.sealedVaultFingerprints.add(vaultRowFingerprint(row));
     return appendUserMessageVaultToView(view, block);
   }
 

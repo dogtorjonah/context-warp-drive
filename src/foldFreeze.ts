@@ -259,6 +259,15 @@ export interface FoldFreezeState {
    * the predecessor's cached prefix bytes without a cold-start epoch.
    */
   forceAcceptRestoredView?: boolean;
+  /**
+   * Vault row fingerprints already sealed into the frozen view (the full
+   * render baked at the last full recompute + every per-band delta since).
+   * Cleared on each full recompute, mirroring sealedBands resetting — so a
+   * row seals into exactly one band per freeze generation. Serialized so it
+   * survives rebirth: without it, a reborn session would see an empty set
+   * and re-bake rows already in the restored frozen prefix → duplication.
+   */
+  sealedVaultFingerprints: Set<string>;
 }
 
 export function createFoldFreezeState(): FoldFreezeState {
@@ -278,6 +287,7 @@ export function createFoldFreezeState(): FoldFreezeState {
     epochs: 0,
     lastTransitionReason: undefined,
     lastFullRecomputeReason: undefined,
+    sealedVaultFingerprints: new Set(),
   };
 }
 
@@ -300,6 +310,8 @@ export interface SerializedFoldFreezeState {
   lastTransitionReason?: FoldFreezeTransitionReason;
   lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
   forceAcceptRestoredView?: boolean;
+  /** Serialized form of sealedVaultFingerprints; defaults to [] for back-compat. */
+  sealedVaultFingerprints?: string[];
 }
 
 export interface FoldFreezeBoundaryMetadata {
@@ -347,6 +359,7 @@ export function serializeFoldFreezeState(state: FoldFreezeState): SerializedFold
     lastTransitionReason: state.lastTransitionReason,
     lastFullRecomputeReason: state.lastFullRecomputeReason,
     forceAcceptRestoredView: state.forceAcceptRestoredView,
+    sealedVaultFingerprints: Array.from(state.sealedVaultFingerprints).sort(),
   };
 }
 
@@ -369,6 +382,7 @@ export function restoreFoldFreezeState(snapshot: SerializedFoldFreezeState): Fol
     lastTransitionReason: snapshot.lastTransitionReason,
     lastFullRecomputeReason: snapshot.lastFullRecomputeReason,
     forceAcceptRestoredView: snapshot.forceAcceptRestoredView,
+    sealedVaultFingerprints: new Set(snapshot.sealedVaultFingerprints ?? []),
   };
 }
 
