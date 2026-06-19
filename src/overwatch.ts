@@ -128,6 +128,18 @@ export interface OverwatchPressure {
   readonly frozenPrefixTokens?: number | null;
   /** Optional measured raw-tail tokens; unknown stays null/undefined. */
   readonly rawTailTokens?: number | null;
+  /** S: modeled system/tools prefix reserve, from the host budget resolver. */
+  readonly systemToolsReserveTokens?: number | null;
+  /** M: modeled folded memory band after a full recompute, from the host budget resolver. */
+  readonly targetBandTokens?: number | null;
+  /** A: modeled size of one appended folded-tail band. */
+  readonly appendBandTargetTokens?: number | null;
+  /** T: preferred/default next raw-tail runway target. */
+  readonly tailEpochRunwayTokens?: number | null;
+  /** F: hard minimum next raw-tail runway that must remain after an append. */
+  readonly tailEpochMinRunwayTokens?: number | null;
+  /** Count of already-sealed appended tail bands in the current frozen prefix. */
+  readonly sealedAppendBandCount?: number | null;
 }
 
 export type OverwatchPressureLevel =
@@ -153,6 +165,9 @@ export interface OverwatchPressureActionRec {
   readonly hardAtTokens: number | null;
   readonly burstReserveTokens: number | null;
   readonly safetyMarginTokens: number | null;
+  readonly postAppendModeledTokens: number | null;
+  readonly postAppendRunwayTokens: number | null;
+  readonly requiredRunwayTokens: number | null;
 }
 
 /**
@@ -411,6 +426,10 @@ function finitePositive(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
+function finiteNonNegativeInteger(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+}
+
 function defaultBurstReserveTokens(windowTokens: number): number {
   if (windowTokens <= 213_000) return 37_000;
   if (windowTokens >= 900_000) return 50_000;
@@ -456,13 +475,16 @@ function pressureLevel(p: OverwatchPressure): PressureMath {
     };
   }
 
-  const configuredCeiling = finitePositive(p.pressureCeilingTokens)
+  const explicitPressureCeiling = finitePositive(p.pressureCeilingTokens);
+  const configuredCeiling = explicitPressureCeiling
     ?? finitePositive(p.messageCeilingTokens)
     ?? windowTokens;
   const ceiling = Math.min(windowTokens, configuredCeiling);
   const burstReserve = finitePositive(p.burstReserveTokens) ?? defaultBurstReserveTokens(windowTokens);
   const safetyMargin = finitePositive(p.safetyMarginTokens) ?? defaultSafetyMarginTokens(windowTokens);
-  const hardAt = Math.max(1, ceiling - burstReserve);
+  const hardAt = explicitPressureCeiling !== null
+    ? ceiling
+    : Math.max(1, ceiling - burstReserve);
   const warnAt = Math.max(1, hardAt - safetyMargin);
   const u = measuredTokens / windowTokens;
 
@@ -485,6 +507,9 @@ function pressureAction(pressure: OverwatchPressure, press: PressureMath): Overw
     hardAtTokens: press.hardAt,
     burstReserveTokens: press.burstReserve,
     safetyMarginTokens: press.safetyMargin,
+    postAppendModeledTokens: null,
+    postAppendRunwayTokens: null,
+    requiredRunwayTokens: null,
   };
   if (press.measured === null || press.warnAt === null || press.hardAt === null) {
     return { action: 'hold', reason: 'measured pressure unavailable', noProviderCallWithoutRelief: false, ...base };
@@ -500,6 +525,35 @@ function pressureAction(pressure: OverwatchPressure, press: PressureMath): Overw
       noProviderCallWithoutRelief,
       ...base,
     };
+  }
+
+  const systemToolsReserve = finitePositive(pressure.systemToolsReserveTokens);
+  const targetBand = finitePositive(pressure.targetBandTokens);
+  const appendBandTarget = finitePositive(pressure.appendBandTargetTokens);
+  const requiredRunway = finitePositive(pressure.tailEpochMinRunwayTokens)
+    ?? finitePositive(pressure.tailEpochRunwayTokens);
+  const sealedAppendBandCount = finiteNonNegativeInteger(pressure.sealedAppendBandCount);
+  if (
+    press.ceiling !== null
+    && systemToolsReserve !== null
+    && targetBand !== null
+    && appendBandTarget !== null
+    && requiredRunway !== null
+    && sealedAppendBandCount !== null
+  ) {
+    const postAppendModeledTokens = systemToolsReserve + targetBand + ((sealedAppendBandCount + 1) * appendBandTarget);
+    const postAppendRunwayTokens = press.ceiling - postAppendModeledTokens;
+    if (postAppendRunwayTokens < requiredRunway) {
+      return {
+        action: 'full_recompute_evict',
+        reason: `post-append modeled runway ${postAppendRunwayTokens} < required ${requiredRunway}`,
+        noProviderCallWithoutRelief,
+        ...base,
+        postAppendModeledTokens,
+        postAppendRunwayTokens,
+        requiredRunwayTokens: requiredRunway,
+      };
+    }
   }
 
   if (press.measured < press.warnAt) {

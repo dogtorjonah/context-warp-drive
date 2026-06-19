@@ -356,6 +356,71 @@ describe('governByTrace — derivation is always populated', () => {
 });
 
 describe('governByTrace — pressure action dynamic thresholds', () => {
+  it('treats explicit P150 pressure as a pre-ceiling warning band, not early critical pressure', () => {
+    const d = governByTrace([msg('working'), tool('search')], {
+      measuredTokens: 122_000,
+      windowTokens: 1_000_000,
+      pressureCeilingTokens: 150_000,
+      safetyMarginTokens: 28_000,
+      rawTailTokens: 45_000,
+      systemToolsReserveTokens: 37_000,
+      targetBandTokens: 40_000,
+      appendBandTargetTokens: 5_000,
+      tailEpochRunwayTokens: 45_000,
+      tailEpochMinRunwayTokens: 30_000,
+      sealedAppendBandCount: 0,
+    }, 40_000);
+
+    expect(d.pressure.level).toBe('warning');
+    expect(d.pressure.warnAtTokens).toBe(122_000);
+    expect(d.pressure.hardAtTokens).toBe(150_000);
+    expect(d.pressureAction.action).toBe('pressure_tail_append');
+    expect(d.pressureAction.noProviderCallWithoutRelief).toBe(false);
+  });
+
+  it('keeps appending when the next runway is below the 45k target but above the 30k floor', () => {
+    const d = governByTrace([msg('working'), tool('search')], {
+      measuredTokens: 122_000,
+      windowTokens: 1_000_000,
+      pressureCeilingTokens: 150_000,
+      safetyMarginTokens: 28_000,
+      rawTailTokens: 45_000,
+      systemToolsReserveTokens: 37_000,
+      targetBandTokens: 40_000,
+      appendBandTargetTokens: 5_000,
+      tailEpochRunwayTokens: 45_000,
+      tailEpochMinRunwayTokens: 30_000,
+      sealedAppendBandCount: 5,
+    }, 40_000);
+
+    expect(d.pressure.level).toBe('warning');
+    expect(d.pressureAction.action).toBe('pressure_tail_append');
+    expect(d.pressureAction.postAppendRunwayTokens).toBeNull();
+    expect(d.pressureAction.requiredRunwayTokens).toBeNull();
+  });
+
+  it('uses S/M/A/F signposts to force recompute when the next append would leave short runway', () => {
+    const d = governByTrace([msg('working'), tool('search')], {
+      measuredTokens: 60_000,
+      windowTokens: 1_000_000,
+      pressureCeilingTokens: 150_000,
+      safetyMarginTokens: 28_000,
+      rawTailTokens: 45_000,
+      systemToolsReserveTokens: 37_000,
+      targetBandTokens: 40_000,
+      appendBandTargetTokens: 5_000,
+      tailEpochRunwayTokens: 45_000,
+      tailEpochMinRunwayTokens: 30_000,
+      sealedAppendBandCount: 8,
+    }, 40_000);
+
+    expect(d.pressure.level).toBe('healthy');
+    expect(d.pressureAction.action).toBe('full_recompute_evict');
+    expect(d.pressureAction.postAppendRunwayTokens).toBe(28_000);
+    expect(d.pressureAction.requiredRunwayTokens).toBe(30_000);
+    expect(d.pressureAction.reason).toContain('post-append modeled runway 28000 < required 30000');
+  });
+
   it('uses burst reserve + safety runway so a 200k Sonnet Atlas burst triggers relief before 80%', () => {
     const pressure = {
       measuredTokens: 153_500,
@@ -418,4 +483,3 @@ describe('governByTrace — pressure action dynamic thresholds', () => {
     expect(d.pressureAction.noProviderCallWithoutRelief).toBe(false);
   });
 });
-

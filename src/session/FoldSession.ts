@@ -26,9 +26,9 @@ import {
   foldContext,
   detectTurns,
   computeEvictableThroughOrdinal,
-  DEFAULT_FOLD_CONFIG,
   DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
   DEFAULT_ASSISTANT_TEXT_BUDGET,
+  resolveFoldConfigForBand,
   type FoldMessage,
   type FoldConfig,
   type FoldResult,
@@ -42,12 +42,21 @@ import {
   createFoldFreezeState,
   evaluateFoldFreeze,
   commitFoldFreeze,
+  appendFoldFreezeTailEpoch,
   touchFoldFreeze,
   DEFAULT_FOLD_FREEZE_CONFIG,
   type FoldFreezeState,
   type FoldFreezeConfig,
   type FoldFreezeContext,
 } from '../foldFreeze.ts';
+import {
+  DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS,
+  DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS,
+  DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS,
+  DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS,
+  DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS,
+  DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS,
+} from '../contextBudget.ts';
 import {
   renderUserMessageVault,
   recordUserMessageVaultEntry,
@@ -58,7 +67,23 @@ import {
 } from '../userMessageVault.ts';
 
 const EMPTY_CLAIMED: ReadonlySet<string> = new Set<string>();
-export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = 240_000;
+// Standalone Context Warp geometry signposts:
+//   S = system/tools reserve before folded memory
+//   M = full-recompute folded memory band
+//   A = expected appended folded-tail band
+//   T = preferred/default next live-tail runway
+//   F = hard minimum append runway
+//   P = measured pressure ceiling
+//
+// Runtime invariant: append a folded tail band only when
+//   P - (S + M + stacked A bands) >= F.
+// Otherwise the tail-epoch boundary becomes a full recompute and saws back down.
+export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
+export const DEFAULT_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS = DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS;
+export const DEFAULT_FOLD_TARGET_BAND_TOKENS = DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS;
+export const DEFAULT_FOLD_APPEND_BAND_TARGET_TOKENS = DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS;
+export const DEFAULT_FOLD_TAIL_EPOCH_RUNWAY_TOKENS = DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
+export const DEFAULT_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS = DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS;
 
 /**
  * Default retention fractions of the fold band (mirrors rollingFold's
@@ -69,6 +94,10 @@ export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = 240_000;
 const DEFAULT_FULL_RETENTION_FRACTION = 0.125;
 const DEFAULT_ESSENCE_RETENTION_FRACTION = 0.25;
 
+function positiveFinite(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 export interface FoldPressureCeilingConfig {
   /**
    * Absolute measured input-token ceiling. FoldSession never estimates tokens:
@@ -77,12 +106,24 @@ export interface FoldPressureCeilingConfig {
   readonly tokens?: number;
 }
 
+export interface FoldTailEpochRunwayConfig {
+  /** S: modeled system/tools prefix reserve tokens. */
+  readonly systemToolsReserveTokens?: number;
+  /** M: modeled folded memory band after a full recompute. */
+  readonly targetBandTokens?: number;
+  /** A: modeled size of one appended folded-tail band. */
+  readonly appendBandTargetTokens?: number;
+  /** T: preferred/default next raw-tail runway used for geometry signposts. */
+  readonly runwayTokens?: number;
+  /** F: hard minimum next raw-tail runway that must remain after an append. */
+  readonly minRunwayTokens?: number;
+}
+
 export interface FoldSessionOptions {
   /**
-   * Rolling-fold config. Defaults to DEFAULT_FOLD_CONFIG (folds past char/turn
-   * thresholds, 20-turn full-fidelity window). For always-lean continuous
-   * folding pass `{ ...DEFAULT_FOLD_CONFIG, continuous: true }` (or import
-   * ALWAYS_ON_FOLD_CONFIG and tune `activeWindowTurns` up if you do not rebirth).
+   * Rolling-fold config. Defaults to the standalone tuned M40 always-on fold
+   * config. Pass an explicit config when you need legacy threshold-gated folding
+   * or a wider active window.
    */
   readonly foldConfig?: FoldConfig;
   /**
@@ -110,10 +151,16 @@ export interface FoldSessionOptions {
   readonly eviction?: boolean | { readonly thresholdChars?: number };
   /**
    * Absolute pressure guard for large-window models. Enabled by default at
-   * 240k measured input tokens; pass false to disable or a number/config to
+   * 150k measured input tokens; pass false to disable or a number/config to
    * tune. The host must pass measuredInputTokens to prepare() for it to fire.
    */
   readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
+  /**
+   * Standalone S/M/A/T/F runway geometry for append-only tail epochs. Defaults
+   * to S37/M40/A5/T45/F30; pass false to disable the runway gate while keeping
+   * ordinary pressure-ceiling recomputes.
+   */
+  readonly tailEpochRunway?: false | FoldTailEpochRunwayConfig;
 
   /**
    * Read-burst fold guard (rail-f1b6c230). When `true`, an epoch-time fold keeps
@@ -251,6 +298,11 @@ export class FoldSession {
   private readonly evictionEnabled: boolean;
   private readonly evictionThresholdChars: number;
   private readonly pressureCeilingTokens: number | null;
+  private readonly tailEpochSystemToolsReserveTokens: number;
+  private readonly tailEpochTargetBandTokens: number;
+  private readonly tailEpochAppendBandTargetTokens: number;
+  private readonly tailEpochRunwayTokens: number | null;
+  private readonly tailEpochMinRunwayTokens: number | null;
   private readonly readBurstGuardEnabled: boolean;
   private readonly syntheticContext: SyntheticContextOptions;
   private readonly clock: () => number;
@@ -265,7 +317,7 @@ export class FoldSession {
   private activeFidelity: FidelityOverrides | null = null;
 
   constructor(options: FoldSessionOptions = {}) {
-    this.foldConfig = options.foldConfig ?? DEFAULT_FOLD_CONFIG;
+    this.foldConfig = options.foldConfig ?? resolveFoldConfigForBand(DEFAULT_FOLD_TARGET_BAND_TOKENS);
     this.activeFidelity = options.fidelity ?? null;
     this.readBurstGuardEnabled = options.readBurstGuard === true;
     this.syntheticContext = options.syntheticContext ?? {};
@@ -295,6 +347,31 @@ export class FoldSession {
         ? options.pressureCeiling
         : options.pressureCeiling?.tokens ?? DEFAULT_FOLD_PRESSURE_CEILING_TOKENS;
       this.pressureCeilingTokens = Number.isFinite(configured) && configured > 0 ? configured : null;
+    }
+    if (options.tailEpochRunway === false) {
+      this.tailEpochRunwayTokens = null;
+      this.tailEpochMinRunwayTokens = null;
+      this.tailEpochSystemToolsReserveTokens = DEFAULT_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS;
+      this.tailEpochTargetBandTokens = DEFAULT_FOLD_TARGET_BAND_TOKENS;
+      this.tailEpochAppendBandTargetTokens = DEFAULT_FOLD_APPEND_BAND_TARGET_TOKENS;
+    } else {
+      const runway = options.tailEpochRunway ?? {};
+      this.tailEpochRunwayTokens = positiveFinite(runway.runwayTokens, DEFAULT_FOLD_TAIL_EPOCH_RUNWAY_TOKENS);
+      this.tailEpochMinRunwayTokens = positiveFinite(
+        runway.minRunwayTokens,
+        runway.runwayTokens === undefined
+          ? Math.min(this.tailEpochRunwayTokens, DEFAULT_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
+          : this.tailEpochRunwayTokens,
+      );
+      this.tailEpochSystemToolsReserveTokens = positiveFinite(
+        runway.systemToolsReserveTokens,
+        DEFAULT_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS,
+      );
+      this.tailEpochTargetBandTokens = positiveFinite(runway.targetBandTokens, DEFAULT_FOLD_TARGET_BAND_TOKENS);
+      this.tailEpochAppendBandTargetTokens = positiveFinite(
+        runway.appendBandTargetTokens,
+        DEFAULT_FOLD_APPEND_BAND_TARGET_TOKENS,
+      );
     }
     if (options.vault === true) {
       this.vaultEnabled = true;
@@ -495,6 +572,37 @@ export class FoldSession {
     };
   }
 
+  private tailEpochRunwayCheck(): {
+    readonly ok: boolean;
+    readonly sealedAppendBandCount: number;
+    readonly postAppendModeledTokens: number | null;
+    readonly postAppendRunwayTokens: number | null;
+    readonly requiredRunwayTokens: number | null;
+  } {
+    const sealedAppendBandCount = this.freezeState.sealedBands.length;
+    if (this.pressureCeilingTokens === null || this.tailEpochMinRunwayTokens === null) {
+      return {
+        ok: true,
+        sealedAppendBandCount,
+        postAppendModeledTokens: null,
+        postAppendRunwayTokens: null,
+        requiredRunwayTokens: this.tailEpochMinRunwayTokens,
+      };
+    }
+    const postAppendModeledTokens =
+      this.tailEpochSystemToolsReserveTokens
+      + this.tailEpochTargetBandTokens
+      + ((sealedAppendBandCount + 1) * this.tailEpochAppendBandTargetTokens);
+    const postAppendRunwayTokens = this.pressureCeilingTokens - postAppendModeledTokens;
+    return {
+      ok: postAppendRunwayTokens >= this.tailEpochMinRunwayTokens,
+      sealedAppendBandCount,
+      postAppendModeledTokens,
+      postAppendRunwayTokens,
+      requiredRunwayTokens: this.tailEpochMinRunwayTokens,
+    };
+  }
+
   /**
    * Prepare the message array to send this turn. Reuses the byte-identical frozen
    * prefix while the provider cache is hot; recomputes the fold only at an epoch.
@@ -582,7 +690,38 @@ export class FoldSession {
       this.resetEvictionState();
     }
     this.activeFidelity = desiredFidelity;
+    const runway = this.tailEpochRunwayCheck();
     const upcomingEpoch = this.foldEpochs + 1;
+    const appendOnlyTailEpoch = recomputeReason === 'tail-epoch'
+      && !pressureCeilingTriggered
+      && runway.ok;
+    if (appendOnlyTailEpoch) {
+      const tail = messages.slice(this.freezeState.frozenRawCount);
+      const tailResult = foldContext(
+        tail,
+        this.guardedTurnsToFold(tail, false),
+        this.effectiveFoldConfig(desiredFidelity),
+        undefined,
+        undefined,
+        undefined,
+        this.syntheticContext,
+      );
+      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, tailResult.messages, ctx, now);
+      if (appendCommit) {
+        this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
+        return this.applyVault({
+          messages: appendCommit.view,
+          cacheHot: false,
+          sealedBoundary: appendCommit.sealedPrefixMessageCount,
+          result: tailResult,
+          appliedFidelity: this.activeFidelity,
+          stats: {
+            ...this.statsFromResult(totalTurns, false, tailResult, false),
+            epochReason: 'tail-epoch-append',
+          },
+        });
+      }
+    }
     const result = foldContext(
       messages,
       this.guardedTurnsToFold(messages, pressureCeilingTriggered),
@@ -596,7 +735,9 @@ export class FoldSession {
     this.commitEvictionEpoch(result, this.freezeState.epochs);
     const epochReason = pressureCeilingTriggered
       ? recomputeReason ? `pressure-ceiling+${recomputeReason}` : 'pressure-ceiling'
-      : recomputeReason;
+      : recomputeReason === 'tail-epoch' && !runway.ok
+        ? `tail-runway-gate+${recomputeReason}`
+        : recomputeReason;
     return this.applyVault({
       messages: result.messages,
       cacheHot: false,

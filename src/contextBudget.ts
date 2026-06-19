@@ -8,7 +8,21 @@
 
 import { contextWindowForModel } from './contextWindow.ts';
 
-export const DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS = 100_000;
+// Context Warp geometry signposts (Jonah, 2026-06-19):
+//   S = 37K static system/tools prefix reserve (provider-measured floor model)
+//   M = 40K folded memory after full recompute
+//   A = 5K expected appended folded-tail band
+//   T = 45K preferred/default live-tail runway
+//   F = 30K hard minimum append runway
+//   P = 150K normal pressure ceiling
+//
+// Runtime invariant: at a boundary, append a folded tail band only if the
+// post-append prompt can still guarantee F=30K runway before P. The default tail
+// cap still aims for T=45K; F only gates whether append is still viable.
+// Otherwise do a full recompute and saw the prompt back down to the floor.
+export const DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS = 37_000;
+export const DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS = 40_000;
+export const DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS = 5_000;
 /**
  * Fold TRIGGER ceiling — peak measured prompt tokens before a fold/reconstruct
  * fires. Distinct from the steady-state band (~100K post-fold orbit) and the
@@ -17,22 +31,24 @@ export const DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS = 100_000;
  * continuously and uses the band as its retention target instead. 170K per Jonah
  * (2026-06-18): fold at 170K, crush below the band, average ~100K, reserve 240K.
  */
-export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 170_000;
+export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 150_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
 export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
-export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 240_000;
+export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 150_000;
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION = 0.9;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_HEADROOM_SAFETY = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION = 0.15;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION = 0.25;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS = 45_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS = 30_000;
 /**
  * Headroom (tokens) kept between the hot-tail epoch cap and the pressure ceiling
  * so a turn's growth folds into a fresh tail-epoch BEFORE S + band + tail trips
  * the ceiling (which forces an expensive full recompute). Used as the cap for the
  * window-scaled margin; see defaultTailEpochPressureMarginTokens.
  */
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 16_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 28_000;
 /** Absolute floor for the tail-epoch cap so a tight window never collapses to a ~0 tail (fold-every-turn pathology). */
 export const MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS = 4_000;
 
@@ -67,11 +83,14 @@ export interface ContextBudgetEnv {
   VOXXO_FOLD_BAND_MAX_WINDOW_FRACTION?: string;
   VOXXO_FOLD_PRESSURE_CEILING_TOKENS?: string;
   VOXXO_FOLD_PRESSURE_MAX_WINDOW_FRACTION?: string;
+  VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS?: string;
   VOXXO_FOLD_APPEND_ONLY_MAX_WINDOW_FRACTION?: string;
   VOXXO_FOLD_PREFIX_SATURATION_FRACTION?: string;
   VOXXO_FOLD_TOOLRESULT_HEADROOM_SAFETY?: string;
   VOXXO_FOLD_TOOLRESULT_MIN_WINDOW_FRACTION?: string;
   VOXXO_FOLD_TAIL_EPOCH_BAND_FRACTION?: string;
+  VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS?: string;
+  VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS?: string;
   VOXXO_FOLD_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS?: string;
   VOXXO_FOLD_OUTPUT_RESERVE_TOKENS?: string;
   VOXXO_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS?: string;
@@ -91,10 +110,13 @@ export interface ResolveContextBudgetInput {
   bandMaxWindowFraction?: number;
   pressureCeilingTokens?: number | null;
   pressureMaxWindowFraction?: number;
+  appendBandTargetTokens?: number;
   appendOnlyMaxWindowFraction?: number;
   toolResultHeadroomSafety?: number;
   toolResultMinWindowFraction?: number;
   tailEpochBandFraction?: number;
+  tailEpochRunwayTokens?: number;
+  tailEpochMinRunwayTokens?: number;
   tailEpochCapTokens?: number;
   tailEpochPressureMarginTokens?: number;
   outputReserveTokens?: number;
@@ -128,9 +150,12 @@ export interface ContextBudgetResolution {
   appendOnlyPressureCeilingTokens: number | null;
   prefixSaturationTokens: number | null;
   prefixSaturationChars: number | null;
+  appendBandTargetTokens: number;
   tailEpochCapTokens: number;
   tailEpochCapChars: number;
   tailEpochBandFraction: number;
+  tailEpochRunwayTokens: number;
+  tailEpochMinRunwayTokens: number;
   tailEpochPressureMarginTokens: number;
   toolResultHeadroomSafety: number;
   toolResultMinWindowFraction: number;
@@ -266,7 +291,7 @@ function defaultOutputReserveTokens(windowTokens: number): number {
 }
 
 function defaultSystemToolsReserveTokens(windowTokens: number): number {
-  return reserveFloor(windowTokens, 0.08, 8_000, 80_000);
+  return reserveFloor(windowTokens, 0.08, 8_000, DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS);
 }
 
 function defaultEmergencyMarginTokens(windowTokens: number): number {
@@ -274,7 +299,7 @@ function defaultEmergencyMarginTokens(windowTokens: number): number {
 }
 
 function defaultTailEpochPressureMarginTokens(windowTokens: number): number {
-  return reserveFloor(windowTokens, 0.015, 4_000, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS);
+  return reserveFloor(windowTokens, 0.027, 4_000, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS);
 }
 
 export function resolveContextBudget(input: ResolveContextBudgetInput = {}): ContextBudgetResolution {
@@ -377,6 +402,12 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   // tail-epoch exists to avoid is tripping the pressure ceiling, which forces a
   // FULL recompute — so the tail should be as large as fits UNDER that ceiling:
   //   tail = pressureCeiling − S − band − margin
+  // By default, margin is derived from the preferred next-runway target:
+  //   margin = pressureCeiling − S − band − T
+  // so the raw tail folds at T=45K. At the fold boundary, live runtimes still
+  // gate append eligibility against the stacked append bands: if appending the
+  // next A=5K band would leave less than F=30K runway before P, they
+  // full-recompute instead of extending the staircase.
   // This shrinks automatically under heavy tool load (large S) and grows when there
   // is headroom, unlike the old pressure-blind band×fraction default that ignored S
   // and let S+band+tail breach the ceiling at high tool counts. The band fraction
@@ -387,9 +418,24 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     env.VOXXO_FOLD_TAIL_EPOCH_BAND_FRACTION,
     DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION,
   );
+  const appendBandTargetTokens = positiveInt(input.appendBandTargetTokens)
+    ?? parsePositiveInt(env.VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS)
+    ?? DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS;
+  const explicitTailEpochRunwayTokens = positiveInt(input.tailEpochRunwayTokens)
+    ?? parsePositiveInt(env.VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS);
+  const tailEpochRunwayTokens = explicitTailEpochRunwayTokens
+    ?? DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
+  const tailEpochMinRunwayTokens = positiveInt(input.tailEpochMinRunwayTokens)
+    ?? parsePositiveInt(env.VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
+    ?? (explicitTailEpochRunwayTokens === undefined
+      ? Math.min(tailEpochRunwayTokens, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
+      : tailEpochRunwayTokens);
+  const defaultPressureMarginTokens = pressureCeilingTokens === null
+    ? defaultTailEpochPressureMarginTokens(hardWindowTokens)
+    : Math.max(0, pressureCeilingTokens - systemToolsReserveTokens - bandTokens - tailEpochRunwayTokens);
   const tailEpochPressureMarginTokens = positiveInt(input.tailEpochPressureMarginTokens)
     ?? parsePositiveInt(env.VOXXO_FOLD_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS)
-    ?? defaultTailEpochPressureMarginTokens(hardWindowTokens);
+    ?? defaultPressureMarginTokens;
   const bandFractionTailTokens = Math.max(1, Math.round(bandTokens * tailEpochBandFraction));
   const pressureGeometryTailTokens = pressureCeilingTokens === null
     ? null
@@ -458,9 +504,12 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     appendOnlyPressureCeilingTokens: prefixSaturationTokens,
     prefixSaturationTokens,
     prefixSaturationChars,
+    appendBandTargetTokens,
     tailEpochCapTokens,
     tailEpochCapChars,
     tailEpochBandFraction,
+    tailEpochRunwayTokens,
+    tailEpochMinRunwayTokens,
     tailEpochPressureMarginTokens,
     toolResultHeadroomSafety,
     toolResultMinWindowFraction,

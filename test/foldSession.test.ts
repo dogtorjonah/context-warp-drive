@@ -165,3 +165,40 @@ describe('FoldSession E10 sawtooth eviction', () => {
     expect(prepared.stats.pressureCeilingTriggered).toBe(false);
   });
 });
+
+describe('FoldSession tail-epoch runway gate', () => {
+  test('appends a folded tail epoch when runway is below 45k target but above 30k floor', () => {
+    const session = new FoldSession({
+      foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 125_000,
+      now: () => 1_000,
+    });
+    const first = turn(0);
+    const epoch = session.prepare(first);
+    const appended = session.prepare([...first, ...turn(1)]);
+
+    expect(epoch.cacheHot).toBe(false);
+    expect(appended.cacheHot).toBe(false);
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(appended.sealedBoundary).toBe(epoch.messages.length);
+    expect(session.telemetry.epochs).toBe(2);
+  });
+
+  test('full-recomputes a tail epoch when appending would leave less than the 30k floor', () => {
+    const session = new FoldSession({
+      foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 111_000,
+      now: () => 1_000,
+    });
+    const first = turn(0);
+    session.prepare(first);
+    const recomputed = session.prepare([...first, ...turn(1)]);
+
+    expect(recomputed.cacheHot).toBe(false);
+    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
+    expect(recomputed.sealedBoundary).toBeNull();
+    expect(session.telemetry.epochs).toBe(2);
+  });
+});
