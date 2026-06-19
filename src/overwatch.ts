@@ -337,7 +337,7 @@ export const DEFAULT_OVERWATCH_CONFIG: OverwatchConfig = {
     recallCards: 2,
     recallChars: 12_000,
     ttlPasses: 3,
-    pressureBandTokens: 80_000,
+    pressureBandTokens: 40_000,
   },
 };
 

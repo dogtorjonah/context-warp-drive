@@ -11,6 +11,7 @@ import {
   type RailAck,
   type OverwatchToolClass,
 } from '../overwatch.ts';
+import { DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS } from '../contextBudget.ts';
 
 // ── tiny builders ─────────────────────────────────────────────────────────────
 
@@ -339,6 +340,10 @@ describe('governByTrace — hard pressure overrides everything', () => {
     const window: TraceToken[] = [msg('working'), tool('read')];
     const d = governByTrace(window, CRITICAL, 170_000);
     expect(d.pressure.level).toBe('critical');
+    expect(DEFAULT_OVERWATCH_CONFIG.defaults.pressureBandTokens).toBe(40_000);
+    expect(DEFAULT_OVERWATCH_CONFIG.defaults.pressureBandTokens).toBe(
+      DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS,
+    );
     expect(d.bandTokens).toBe(DEFAULT_OVERWATCH_CONFIG.defaults.pressureBandTokens);
     expect(d.recall.maxCards).toBe(1);
     expect(d.freeze.action).toBe('epoch');
