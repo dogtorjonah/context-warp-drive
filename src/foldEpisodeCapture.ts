@@ -127,6 +127,16 @@ export interface EpisodeCaptureOptions {
    * host-neutral.
    */
   syntheticContext?: SyntheticContextOptions;
+  /**
+   * Host-supplied behavioral affinity matrix (path -> neighbor -> score).
+   * When present, high-affinity current/incoming path pairs widen the grouping
+   * gap via groupTouchesIntoEpisodes. Omitted/empty = byte-identical.
+   */
+  affinityFloor?: Readonly<Record<string, Record<string, number>>>;
+  /** Affinity score threshold above which a gap is widened (default 0.5). */
+  affinityGapThreshold?: number;
+  /** Multiplier applied to gapMs when affinity >= threshold (default 2.0). */
+  affinityGapMultiplier?: number;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -522,7 +532,63 @@ export function deriveEpisodesFromMessages(
     steps.push({ eventIndex: call.eventIndex, step: structuralStep(call, outcome, touched) });
   }
 
-  const bursts = groupTouchesIntoEpisodes(touches, { pivots });
+  // Voice floor: pass voice event indexes to grouping so bursts with zero
+  // voice annotations refuse to seal on gap alone — producing fewer, fatter
+  // episodes that each carry voice by construction.
+  const voiceEventIndexes = annotated.map((a) => a.eventIndex).sort((a, b) => a - b);
+
+  // Intent voice floor: collect indexes of user messages carrying REAL intent
+  // (non-synthetic, non-tool-result user text). The operator's ask that
+  // motivates a burst is voice too — without this, 91.7% of the remaining
+  // "voiceless" episodes are ones that carry intent but no annotations.
+  const intentEventIndexes: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role !== 'user') continue;
+    const text = extractUserText([msg], syntheticContext).trim();
+    if (text.length === 0) continue;
+    if (isSyntheticContextText(text, syntheticContext)) continue;
+    intentEventIndexes.push(i);
+  }
+
+  // TAP-STAR FLOOR: collect event indexes of deliberate operator pins
+  // (star:decision, star:pivot, star:gotcha, star:discovery). These are the
+  // strongest "resurface this" signals — the burst holding a pin should hold
+  // open longest (gapMs × 2.0) and never seal voiceless. Stars are explicit
+  // operator acts, so the floor is always-on like voiceFloor (not env-gated).
+  const STAR_PIN_PREFIX = 'star:';
+  const tapStarFloorEventIndexes = annotated
+    .filter((a) => typeof a.annotation.kind === 'string' && a.annotation.kind.startsWith(STAR_PIN_PREFIX))
+    .map((a) => a.eventIndex)
+    .sort((a, b) => a - b);
+
+  const bursts = groupTouchesIntoEpisodes(touches, {
+    pivots,
+    ...(voiceEventIndexes.length > 0 || intentEventIndexes.length > 0
+      ? { voiceFloor: true, ...(voiceEventIndexes.length > 0 ? { voiceEventIndexes } : {}), ...(intentEventIndexes.length > 0 ? { intentEventIndexes } : {}) }
+      : {}),
+    // VALUE FLOOR: env-gated — permanently rewrites chunk boundaries, so opt-in.
+    // When enabled, compute high-value paths and widen their burst gaps.
+    ...(process.env.VOXXO_FOLD_VALUE_FIDELITY === '1'
+      ? (() => {
+          const vfp = computeValueFloorPaths(messages, touches);
+          return vfp.length > 0 ? { valueFloorPaths: vfp } : {};
+        })()
+      : {}),
+    // TAP-STAR FLOOR: always-on (stars are explicit operator acts). Widens
+    // gap for bursts containing a deliberate pin so they accumulate more voice.
+    ...(tapStarFloorEventIndexes.length > 0 ? { tapStarFloorEventIndexes } : {}),
+    // AFFINITY FLOOR: host-supplied co-activation scores from the worker. The
+    // capture layer only threads the matrix through; scoring remains outside
+    // this pure package path.
+    ...(options.affinityFloor
+      ? {
+          affinityFloor: options.affinityFloor,
+          affinityGapThreshold: options.affinityGapThreshold,
+          affinityGapMultiplier: options.affinityGapMultiplier,
+        }
+      : {}),
+  });
   if (bursts.length === 0) return { episodes: [], openBurstStartIndex: null };
 
   const sealTrailing = options.sealTrailing === true;
@@ -716,4 +782,62 @@ export function computeOpenBurst(
     heldPaths: lastBurst.members.map((m) => m.path),
     burstCount: bursts.length,
   };
+}
+
+/**
+ * VALUE FLOOR: compute paths that carry forward-reference value for episodic
+ * burst grouping. For each touched path, scan DOWNSTREAM tool calls (messages
+ * AFTER the first touch) and weight re-references by kind: read=1, claim=3,
+ * edit=4. Paths with total downstream weight ≥ minRefCount are returned,
+ * highest first, bounded to maxPaths. Pure CPU, no I/O.
+ *
+ * Used by the session layer to pass valueFloorPaths to groupTouchesIntoEpisodes
+ * so high-value bursts hold open longer (see EpisodeGroupingOptions.valueFloorPaths).
+ */
+export function computeValueFloorPaths(
+  messages: readonly FoldMessage[],
+  touches: readonly { eventIndex: number; path: string; kind: string }[],
+  options?: { maxPaths?: number; minRefCount?: number },
+): string[] {
+  const maxPaths = options?.maxPaths ?? 20;
+  const minRefCount = options?.minRefCount ?? 1;
+  if (touches.length === 0 || messages.length === 0) return [];
+
+  // Map each path to its first-touch event index so we only count downstream refs.
+  const firstTouchIdx = new Map<string, number>();
+  for (const t of touches) {
+    const existing = firstTouchIdx.get(t.path);
+    if (existing === undefined || t.eventIndex < existing) {
+      firstTouchIdx.set(t.path, t.eventIndex);
+    }
+  }
+
+  // Weight per path: read=1, claim=3, edit=4 (matches FidelityValueWeights).
+  const weights = new Map<string, number>();
+  for (const [path, firstIdx] of firstTouchIdx) {
+    weights.set(path, 0);
+    // Scan downstream tool calls for re-references to this path.
+    for (let i = firstIdx + 1; i < messages.length; i++) {
+      const msg = messages[i];
+      if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+      for (const block of msg.content) {
+        if (typeof block !== 'object' || block === null) continue;
+        const tu = block as { type?: string; name?: string; input?: Record<string, unknown> };
+        if (tu.type !== 'tool_use' || typeof tu.name !== 'string' || typeof tu.input !== 'object') continue;
+        const touchPaths = extractTouchPaths(tu.input);
+        if (touchPaths.includes(path)) {
+          const isEdit = isEditTool(tu.name);
+          const isClaim = shortToolName(tu.name).toLowerCase().includes('claim');
+          const w = isEdit ? 4 : isClaim ? 3 : 1;
+          weights.set(path, (weights.get(path) ?? 0) + w);
+        }
+      }
+    }
+  }
+
+  return Array.from(weights.entries())
+    .filter(([, w]) => w >= minRefCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, maxPaths)
+    .map(([p]) => p);
 }

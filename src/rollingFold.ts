@@ -253,6 +253,53 @@ export interface FidelityOverrides {
 }
 
 /**
+ * Cherry-picked graduated fidelity — intrinsic trace value weights.
+ *
+ * The default budget allocation is a pure recency ramp (newest folded turns win
+ * full/essence, oldest collapse to skeleton) regardless of whether an old turn
+ * is still relevant. FidelityOverrides only tunes the GLOBAL full/essence
+ * fractions; it cannot promote a specific high-value old turn. These weights
+ * drive that per-turn cherry-pick, scoring value INTRINSICALLY from the trace
+ * (forward path re-reference + durable glyph) — never from the episodic store.
+ */
+export interface FidelityValueWeights {
+  /** Downstream reference where a later turn READS the same path. */
+  read: number;
+  /** Downstream reference where a later turn CLAIMS the same path (commits to working there). */
+  claim: number;
+  /** Downstream reference where a later turn EDITS the same path. */
+  edit: number;
+  /** Multiplier when the downstream reference is in the live active window, not just a later folded turn. */
+  activeWindowMultiplier: number;
+  /** Additive bonus when the folded turn's assistant text opens with a durable register glyph (🏁 verdict / ⚠️ hazard). */
+  glyphDurableBonus: number;
+}
+
+export const DEFAULT_FIDELITY_VALUE_WEIGHTS: FidelityValueWeights = {
+  read: 1,
+  claim: 3,
+  edit: 4,
+  activeWindowMultiplier: 2,
+  glyphDurableBonus: 2,
+};
+
+/** Newest folded turns always allocated before value ranking — the working-set recency floor. */
+export const DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS = 8;
+
+/**
+ * Per-call input enabling intrinsic value-aware graduated fidelity. Provided
+ * ONLY by the freeze EPOCH full-recompute path (cache-safe by construction, the
+ * same gate as FoldEvictionInput); append/hot-reuse must never pass it. Absent →
+ * the newest-first recency ramp runs byte-identically.
+ */
+export interface FoldFidelityValueInput {
+  /** Per-call weight overrides; omitted fields fall back to DEFAULT_FIDELITY_VALUE_WEIGHTS. */
+  weights?: Partial<FidelityValueWeights>;
+  /** Newest K folded turns kept on the recency floor (budget priority before value). Default 8. */
+  recencyFloorTurns?: number;
+}
+
+/**
  * Pure arithmetic — derive the dependent fold budgets from a target
  * steady-state band. `charsPerToken` converts the token target into chars;
  * the default (4) preserves ratio math, while a lower per-engine ratio keeps
@@ -1542,6 +1589,103 @@ function renderFoldedBlock(
   return lines.join('\n');
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Cherry-picked graduated fidelity — intrinsic per-turn value (full-recompute)
+// ══════════════════════════════════════════════════════════════════════
+
+const DURABLE_GLYPH_PREFIXES = ['🏁', '⚠️', '⚠'] as const;
+/**
+ * 🏁 verdict / ⚠️ hazard are the durable narration registers (canonical
+ * classifier: glyphs.ts classifyAssistantRegister). Inlined here as a leading-
+ * glyph test to preserve this module's zero-import purity; this is a heuristic
+ * fidelity-value signal, not the episodic narration trust parse.
+ */
+function turnOpensWithDurableGlyph(assistantText: string): boolean {
+  return DURABLE_GLYPH_PREFIXES.some(g => assistantText.startsWith(g));
+}
+
+export function resolveFidelityValueWeights(
+  overrides?: Partial<FidelityValueWeights>,
+): FidelityValueWeights {
+  return overrides ? { ...DEFAULT_FIDELITY_VALUE_WEIGHTS, ...overrides } : DEFAULT_FIDELITY_VALUE_WEIGHTS;
+}
+
+type FidelityRefKind = 'read' | 'claim' | 'edit';
+
+/** Strip a trailing line-range suffix (":20-45" / ":20") so a claim/edit of a
+ *  range matches a read of the whole file. */
+function fidelityPathKey(rawPath: string): string {
+  return rawPath.replace(/:\d+(?:-\d+)?$/, '');
+}
+
+function fidelityRefKind(toolName: string): FidelityRefKind {
+  if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') return 'edit';
+  if (toolName.includes('claim_file')) return 'claim';
+  return 'read';
+}
+
+/**
+ * Pure intrinsic per-folded-turn fidelity value (cherry-picked graduated
+ * fidelity). Value = downstream relevance measured from the TRACE ITSELF (no
+ * episodic store, no I/O, deterministic): for each folded turn, sum the
+ * weighted downstream references — later folded turns + the live active window —
+ * to the paths it touched (claim/edit weighted over read; active-window refs
+ * multiplied), plus an additive bonus for a durable register glyph (🏁/⚠️).
+ *
+ * `turns` is the full detected turn list; the first `foldCount` are the folded
+ * turns being scored. Returns one score per folded turn (aligned to
+ * turns[0..foldCount)); active-window turns are turns[foldCount..].
+ */
+export function scoreTurnFidelityValue(
+  turns: readonly Turn[],
+  foldCount: number,
+  weights: FidelityValueWeights = DEFAULT_FIDELITY_VALUE_WEIGHTS,
+): number[] {
+  const n = turns.length;
+  const fold = Math.max(0, Math.min(Math.floor(foldCount), n));
+  const turnPaths: { key: string; kind: FidelityRefKind }[][] = new Array(n);
+  for (let g = 0; g < n; g++) {
+    const refs: { key: string; kind: FidelityRefKind }[] = [];
+    for (const tc of extractToolCalls(turns[g].messages)) {
+      const path = extractPath(tc.input);
+      if (!path) continue;
+      refs.push({ key: fidelityPathKey(path), kind: fidelityRefKind(tc.name) });
+    }
+    turnPaths[g] = refs;
+  }
+  // Forward index: path key → ascending list of {turn index, ref kind}.
+  const refsByKey = new Map<string, { g: number; kind: FidelityRefKind }[]>();
+  for (let g = 0; g < n; g++) {
+    for (const r of turnPaths[g]) {
+      const arr = refsByKey.get(r.key);
+      if (arr) arr.push({ g, kind: r.kind });
+      else refsByKey.set(r.key, [{ g, kind: r.kind }]);
+    }
+  }
+  const kindWeight = (kind: FidelityRefKind): number =>
+    kind === 'edit' ? weights.edit : kind === 'claim' ? weights.claim : weights.read;
+  const scores: number[] = new Array(fold).fill(0);
+  for (let i = 0; i < fold; i++) {
+    let score = 0;
+    const seen = new Set<string>();
+    for (const { key } of turnPaths[i]) {
+      if (seen.has(key)) continue; // dedupe a turn's own repeated path
+      seen.add(key);
+      const refs = refsByKey.get(key);
+      if (!refs) continue;
+      for (const ref of refs) {
+        if (ref.g <= i) continue; // downstream references only
+        score += kindWeight(ref.kind) * (ref.g >= fold ? weights.activeWindowMultiplier : 1);
+      }
+    }
+    if (turnOpensWithDurableGlyph(extractAssistantText(turns[i].messages))) {
+      score += weights.glyphDurableBonus;
+    }
+    scores[i] = score;
+  }
+  return scores;
+}
+
 /**
  * Apply rolling fold compaction to a message array.
  * Returns a NEW array — never mutates input.
@@ -1554,6 +1698,7 @@ export function foldContext(
   counterStamp?: string,
   precomputedTurns?: Turn[],
   syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
+  fidelityValue?: FoldFidelityValueInput,
 ): FoldResult {
   const originalChars = countChars(messages);
 
@@ -1624,16 +1769,51 @@ export function foldContext(
   let fullBudgetLeft = budget.fullRetentionChars;
   let essenceBudgetLeft = budget.essenceRetentionChars;
 
-  for (let j = turnsToCompress.length - 1; j >= 0; j--) {
-    if (j < initialEvictedThrough) continue; // evicted ordinals never consume budget
-    const len = turnAssistantTexts[j].length;
-    if (len === 0) continue;
-    if (fullBudgetLeft >= len) {
-      retentionLevels[j] = 'full';
-      fullBudgetLeft -= len;
-    } else if (essenceBudgetLeft >= len) {
-      retentionLevels[j] = 'essence';
-      essenceBudgetLeft -= len;
+  if (!fidelityValue) {
+    // Default: pure recency ramp — newest folded turns win full, then essence,
+    // oldest collapse to skeleton. Byte-identical to the pre-value behavior.
+    for (let j = turnsToCompress.length - 1; j >= 0; j--) {
+      if (j < initialEvictedThrough) continue; // evicted ordinals never consume budget
+      const len = turnAssistantTexts[j].length;
+      if (len === 0) continue;
+      if (fullBudgetLeft >= len) {
+        retentionLevels[j] = 'full';
+        fullBudgetLeft -= len;
+      } else if (essenceBudgetLeft >= len) {
+        retentionLevels[j] = 'essence';
+        essenceBudgetLeft -= len;
+      }
+    }
+  } else {
+    // Cherry-picked graduated fidelity (full-recompute only): the newest K folded
+    // turns keep budget priority (working-set recency floor), then the SAME
+    // full/essence budget is spent on the remainder ranked by intrinsic trace
+    // value (forward path re-reference + durable glyph) instead of pure age — so a
+    // still-relevant OLD turn can hold fidelity over a never-revisited newer one.
+    const valueWeights = resolveFidelityValueWeights(fidelityValue.weights);
+    const recencyFloor = Math.max(
+      0,
+      Math.floor(fidelityValue.recencyFloorTurns ?? DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS),
+    );
+    const values = scoreTurnFidelityValue(turns, turnsToCompress.length, valueWeights);
+    const floorStart = Math.max(initialEvictedThrough, turnsToCompress.length - recencyFloor);
+    const order: number[] = [];
+    for (let j = turnsToCompress.length - 1; j >= floorStart; j--) order.push(j); // recency floor, newest-first
+    const rest: number[] = [];
+    for (let j = initialEvictedThrough; j < floorStart; j++) rest.push(j);
+    rest.sort((a, b) => (values[b] !== values[a] ? values[b] - values[a] : b - a)); // value desc, newer-first tie
+    for (const j of rest) order.push(j);
+    for (const j of order) {
+      if (j < initialEvictedThrough) continue; // evicted ordinals never consume budget
+      const len = turnAssistantTexts[j].length;
+      if (len === 0) continue;
+      if (fullBudgetLeft >= len) {
+        retentionLevels[j] = 'full';
+        fullBudgetLeft -= len;
+      } else if (essenceBudgetLeft >= len) {
+        retentionLevels[j] = 'essence';
+        essenceBudgetLeft -= len;
+      }
     }
   }
 

@@ -15,8 +15,8 @@ import { contextWindowForModel } from './contextWindow.ts';
 //   T = 45K preferred/default live-tail runway
 //   F = 30K hard minimum append runway
 //   P = 150K normal pressure ceiling
-//   CLI codex = full-recompute safety valve, defaulting to message ceiling − F
-//               (still clamped by pressureMaxWindowFraction)
+//   CLI codex = full-recompute-only transport, using the shared trigger by
+//               default while still clamping to message ceiling − F runway
 //
 // Runtime invariant: at a boundary, append a folded tail band only if the
 // post-append prompt can still guarantee F=30K runway before P. The default tail
@@ -313,12 +313,12 @@ function defaultCodexCliReconstructTriggerTokens(
   hardWindowTokens: number,
   pressureMaxWindowFraction: number,
 ): number {
-  const runwayTarget = Math.max(
+  const runwayCappedTarget = Math.max(
     1,
     messageCeilingTokens - DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS,
   );
   return clampPositiveTokensToWindow(
-    runwayTarget,
+    Math.min(DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS, runwayCappedTarget),
     hardWindowTokens,
     pressureMaxWindowFraction,
   );

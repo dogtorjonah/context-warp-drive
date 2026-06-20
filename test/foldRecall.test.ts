@@ -162,10 +162,7 @@ describe('buildFoldIndex', () => {
     const raw = buildAnthropicHistory();
     // A live (tail-buffer) result whose content merely QUOTES a fold marker.
     raw.push(anthropicToolUse('tu_quote', 'Read', { file_path: ABS('relay/src/transcript.txt') }));
-    raw.push(anthropicToolResult(
-      'tu_quote',
-      'transcript says: [Folded: Read relay/src/old.ts — 1,234 chars | self-tap to recover] and more text',
-    ));
+    raw.push(anthropicToolResult('tu_quote', 'transcript says: [Folded: Read relay/src/old.ts — 1,234 chars | self-tap to recover] and more text'));
     const index = indexFor(raw);
     expect(index.entries.some(e => e.kind === 'tool' && e.toolId === 'tu_quote')).toBe(false);
     expect(index.entries.some(e => e.kind === 'tool' && e.path === 'relay/src/old.ts')).toBe(false);
@@ -226,7 +223,7 @@ describe('buildFoldIndex', () => {
     // With the step tiling, every folded step becomes a recall-addressable turn entry.
     const tiled = buildFoldIndex(raw, view, plan!.turns);
     expect(tiled.entries.length).toBe(plan!.turnsToFold);
-    expect(tiled.entries.every((e) => e.kind === 'turn')).toBe(true);
+    expect(tiled.entries.every(e => e.kind === 'turn')).toBe(true);
   });
 });
 
@@ -236,10 +233,7 @@ describe('buildFoldIndex', () => {
 
 describe('extractRecallSignals', () => {
   test('normalizes single and multi path args plus claims, sorted', () => {
-    const signals = extractRecallSignals(
-      { file_path: ABS('relay/src/zeta.ts'), paths: [ABS('relay/src/alpha.ts'), 'relay/src/beta.ts'] },
-      new Set([ABS('relay/src/claimed.ts')]),
-    );
+    const signals = extractRecallSignals({ file_path: ABS('relay/src/zeta.ts'), paths: [ABS('relay/src/alpha.ts'), 'relay/src/beta.ts'] }, new Set([ABS('relay/src/claimed.ts')]));
     expect(signals.touchedPaths).toEqual(['relay/src/alpha.ts', 'relay/src/beta.ts', 'relay/src/zeta.ts']);
     expect(signals.claimedPaths).toEqual(['relay/src/claimed.ts']);
   });
@@ -263,14 +257,7 @@ function toolEntry(toolId: string, path: string, recency: number, chars = 5_000)
   return { kind: 'tool', id: `tool:${toolId}`, toolId, tool: 'Read', path, recency, chars };
 }
 
-function turnEntry(
-  id: string,
-  digest: string,
-  recency: number,
-  paths: string[] = [],
-  rawStart = 0,
-  rawEnd = 2,
-): InterTurnIndexEntry {
+function turnEntry(id: string, digest: string, recency: number, paths: string[] = [], rawStart = 0, rawEnd = 2): InterTurnIndexEntry {
   return {
     kind: 'turn',
     id: `turn:${id}`,
@@ -353,11 +340,7 @@ Please seamlessly continue your previous turn from where you were interrupted.
 Do not repeat your prior output; simply resume your sentence, tool call, or task directly.]
 
 Patch the fold recall query source`;
-    const raw: FoldMessage[] = [
-      userMsg('older folded turn'),
-      userMsg(wrappedAsk),
-      assistantMsg('fold recall query source is being patched'),
-    ];
+    const raw: FoldMessage[] = [userMsg('older folded turn'), userMsg(wrappedAsk), assistantMsg('fold recall query source is being patched')];
 
     const text = extractActiveWindowText(raw, 1, hostSyntheticContext);
     expect(text).toContain('Patch the fold recall query source');
@@ -373,10 +356,7 @@ Patch the fold recall query source`;
         { prefix: '[Host Time]', mode: 'line-or-paragraph' },
         { prefix: '[Host Digest', end: '[END Host Digest]', mode: 'paired' },
       ],
-      wholeTextMatchers: [
-        (text: string) => text.startsWith('[Host Continuity]')
-          || /^package_version:\s*\d+\n\[Host Continuity\]/.test(text),
-      ],
+      wholeTextMatchers: [(text: string) => text.startsWith('[Host Continuity]') || /^package_version:\s*\d+\n\[Host Continuity\]/.test(text)],
     } as const;
     const hostPkg = `[Host Time] Session age: 2h 6m
 
@@ -390,11 +370,7 @@ package_version: 5
 ── Current Thread ──
 👤 USER (active request):
 Make your fixes`;
-    const raw: FoldMessage[] = [
-      userMsg(hostPkg),
-      userMsg('Now run the recall trace'),
-      assistantMsg('running the recall trace now'),
-    ];
+    const raw: FoldMessage[] = [userMsg(hostPkg), userMsg('Now run the recall trace'), assistantMsg('running the recall trace now')];
     const text = extractActiveWindowText(raw, 0, hostSyntheticContext);
     expect(text).toContain('Now run the recall trace');
     expect(text).toContain('running the recall trace now');
@@ -405,11 +381,7 @@ Make your fixes`;
 
   test('recency-favored cap keeps the newest cognition when the tail exceeds the budget', () => {
     const oldChunk = 'startmarker-should-drop ' + 'alpha '.repeat(400); // > 1600 chars, oldest
-    const raw: FoldMessage[] = [
-      userMsg('folded'),
-      assistantMsg(oldChunk),
-      assistantMsg('omega-distinctive-marker zeta-distinctive-marker'),
-    ];
+    const raw: FoldMessage[] = [userMsg('folded'), assistantMsg(oldChunk), assistantMsg('omega-distinctive-marker zeta-distinctive-marker')];
     const text = extractActiveWindowText(raw, 1); // tail = oldChunk + fresh marker line
     expect(text.length).toBeLessThanOrEqual(1600);
     expect(text).toContain('omega-distinctive-marker'); // newest retained
@@ -434,11 +406,14 @@ describe('deriveBoundaryRecallSignals (live fold-recall GET-path wiring seam)', 
     ];
   }
   function wiringIndex(): FoldRecallIndex {
-    return makeIndex([
-      turnEntry('target', 'pathless demand-paging reel now follows live vocabulary', 30, [], 0, 2),
-      turnEntry('common-a', 'context fold system filler one', 20, [], 2, 4),
-      turnEntry('common-b', 'context fold system filler two', 10, [], 4, 6),
-    ], 6); // rawCount=6 → active tail = raw.slice(6)
+    return makeIndex(
+      [
+        turnEntry('target', 'pathless demand-paging reel now follows live vocabulary', 30, [], 0, 2),
+        turnEntry('common-a', 'context fold system filler one', 20, [], 2, 4),
+        turnEntry('common-b', 'context fold system filler two', 10, [], 4, 6),
+      ],
+      6,
+    ); // rawCount=6 → active tail = raw.slice(6)
   }
 
   test('default-off: a pathless boundary does not proceed and carries no term signals (byte-identical)', () => {
@@ -454,7 +429,7 @@ describe('deriveBoundaryRecallSignals (live fold-recall GET-path wiring seam)', 
     expect(proceed).toBe(true);
     expect(signals.touchedPaths).toHaveLength(0);
     expect(signals.claimedPaths).toHaveLength(0);
-    expect(signals.terms ?? []).toEqual(expect.arrayContaining(['pathless', 'demand-paging', 'reel']));
+    expect(signals.terms ?? []).toEqual(expect.arrayContaining(['pathless', 'demand-pag', 'reel']));
 
     const state = createFoldRecallState();
     state.index = wiringIndex();
@@ -465,9 +440,7 @@ describe('deriveBoundaryRecallSignals (live fold-recall GET-path wiring seam)', 
   });
 
   test('path-touch still proceeds with term recall OFF (tier-0 wiring unaffected by the seam)', () => {
-    const { signals, proceed } = deriveBoundaryRecallSignals(
-      { file_path: ABS('relay/src/x.ts') }, new Set(), wiringRaw(), 6, DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const { signals, proceed } = deriveBoundaryRecallSignals({ file_path: ABS('relay/src/x.ts') }, new Set(), wiringRaw(), 6, DEFAULT_FOLD_RECALL_CONFIG);
     expect(proceed).toBe(true);
     expect(signals.touchedPaths).toEqual(['relay/src/x.ts']);
     expect(signals.terms).toBeUndefined();
@@ -483,15 +456,7 @@ describe('planRecall', () => {
       toolEntry('b', 'relay/src/claimed.ts', 99), // most recent but only claim-matched
       toolEntry('c', 'relay/src/touched.ts', 50),
     ]);
-    const plan = planRecall(
-      index,
-      new Map(),
-      new Map(),
-      1,
-      { touchedPaths: ['relay/src/touched.ts'], claimedPaths: ['relay/src/claimed.ts'] },
-      'healthy',
-      config,
-    );
+    const plan = planRecall(index, new Map(), new Map(), 1, { touchedPaths: ['relay/src/touched.ts'], claimedPaths: ['relay/src/claimed.ts'] }, 'healthy', config);
     expect(plan.items.map(i => i.entry.id)).toEqual(['tool:c', 'tool:a', 'tool:b']);
     expect(plan.items.map(i => i.tier)).toEqual([0, 0, 1]);
     expect(plan.items[0].trigger).toBe('path-touch relay/src/touched.ts');
@@ -501,23 +466,12 @@ describe('planRecall', () => {
   });
 
   test('resident card suppresses; resident hint escalates on a fresh hard trigger', () => {
-    const index = makeIndex([
-      toolEntry('a', 'relay/src/a.ts', 10),
-      toolEntry('b', 'relay/src/b.ts', 20),
-    ]);
+    const index = makeIndex([toolEntry('a', 'relay/src/a.ts', 10), toolEntry('b', 'relay/src/b.ts', 20)]);
     const resident = new Map([
       ['tool:a', { level: 'card' as const, expiresAtPass: 10 }],
       ['tool:b', { level: 'hint' as const, expiresAtPass: 10 }],
     ]);
-    const plan = planRecall(
-      index,
-      resident,
-      new Map(),
-      5,
-      { touchedPaths: ['relay/src/a.ts', 'relay/src/b.ts'], claimedPaths: [] },
-      'healthy',
-      config,
-    );
+    const plan = planRecall(index, resident, new Map(), 5, { touchedPaths: ['relay/src/a.ts', 'relay/src/b.ts'], claimedPaths: [] }, 'healthy', config);
     expect(plan.suppressed).toBe(1); // a (resident card)
     expect(plan.items).toHaveLength(1);
     expect(plan.items[0].entry.id).toBe('tool:b');
@@ -534,10 +488,7 @@ describe('planRecall', () => {
   });
 
   test('pressure ladder: critical allows 1 card; auto_compact allows none', () => {
-    const index = makeIndex([
-      toolEntry('a', 'relay/src/a.ts', 10),
-      toolEntry('b', 'relay/src/b.ts', 20),
-    ]);
+    const index = makeIndex([toolEntry('a', 'relay/src/a.ts', 10), toolEntry('b', 'relay/src/b.ts', 20)]);
     const signals = { touchedPaths: ['relay/src/a.ts', 'relay/src/b.ts'], claimedPaths: [] };
 
     const critical = planRecall(index, new Map(), new Map(), 1, signals, 'critical', config);
@@ -569,15 +520,11 @@ describe('planRecall', () => {
     expect(on.items).toHaveLength(1);
     expect(on.items[0].entry.id).toBe('turn:target');
     expect(on.items[0].tier).toBe(2);
-    expect(on.items[0].trigger).toBe('term-overlap pathless, demand-paging, reel');
+    expect(on.items[0].trigger).toBe('term-overlap pathless, demand-pag, reel');
   });
 
   test('tier 2 anti-noise: common-word-only overlap does not fault', () => {
-    const index = makeIndex([
-      turnEntry('a', 'context fold system alpha', 30),
-      turnEntry('b', 'context fold system beta', 20),
-      turnEntry('c', 'context fold system gamma', 10),
-    ]);
+    const index = makeIndex([turnEntry('a', 'context fold system alpha', 30), turnEntry('b', 'context fold system beta', 20), turnEntry('c', 'context fold system gamma', 10)]);
     const signals = extractRecallSignals(null, new Set(), 'context fold system');
     const plan = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', { ...config, termRecallEnabled: true });
     expect(plan.items).toHaveLength(0);
@@ -591,8 +538,8 @@ describe('planRecall', () => {
     ]);
     const signals = extractRecallSignals({ file_path: 'relay/src/hit.ts' }, new Set(), 'pathless demand-paging reel');
     const plan = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', { ...config, termRecallEnabled: true });
-    expect(plan.items.map((i) => i.entry.id)).toEqual(['turn:path', 'turn:term']);
-    expect(plan.items.map((i) => i.tier)).toEqual([0, 2]);
+    expect(plan.items.map(i => i.entry.id)).toEqual(['turn:path', 'turn:term']);
+    expect(plan.items.map(i => i.tier)).toEqual([0, 2]);
   });
 });
 
@@ -608,11 +555,7 @@ describe('planRecall — exact verbatim-token tier', () => {
   });
 
   test('disabled (=0) suppresses; default config (ON) pages in the source turn', () => {
-    const index = makeIndex([
-      tokenTurn('target', 30, [HASH]),
-      tokenTurn('other-a', 90, ['aaaaaaaaaaaa']),
-      tokenTurn('other-b', 80, []),
-    ]);
+    const index = makeIndex([tokenTurn('target', 30, [HASH]), tokenTurn('other-a', 90, ['aaaaaaaaaaaa']), tokenTurn('other-b', 80, [])]);
     const signals = { touchedPaths: [], claimedPaths: [], verbatimTokens: [HASH] };
 
     const off = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', {
@@ -642,11 +585,7 @@ describe('planRecall — exact verbatim-token tier', () => {
   });
 
   test('path-touch and claim tiers still outrank the verbatim-token tier', () => {
-    const index = makeIndex([
-      tokenTurn('touch', 10, [], ['relay/src/hit.ts']),
-      tokenTurn('claimed', 20, [], ['relay/src/claimed.ts']),
-      tokenTurn('tok', 99, [HASH]),
-    ]);
+    const index = makeIndex([tokenTurn('touch', 10, [], ['relay/src/hit.ts']), tokenTurn('claimed', 20, [], ['relay/src/claimed.ts']), tokenTurn('tok', 99, [HASH])]);
     const signals = {
       touchedPaths: ['relay/src/hit.ts'],
       claimedPaths: ['relay/src/claimed.ts'],
@@ -656,14 +595,12 @@ describe('planRecall — exact verbatim-token tier', () => {
       ...DEFAULT_FOLD_RECALL_CONFIG,
       verbatimRecallEnabled: true,
     });
-    expect(plan.items.map((i) => i.entry.id)).toEqual(['turn:touch', 'turn:claimed', 'turn:tok']);
-    expect(plan.items.map((i) => i.tier)).toEqual([0, 1, 2]);
+    expect(plan.items.map(i => i.entry.id)).toEqual(['turn:touch', 'turn:claimed', 'turn:tok']);
+    expect(plan.items.map(i => i.tier)).toEqual([0, 1, 2]);
   });
 
   test('exact-token beats fuzzy term overlap within tier 2 (stronger trigger evaluated first)', () => {
-    const index = makeIndex([
-      { ...turnEntry('both', 'pathless demand-paging reel adaptation', 30), verbatimTokens: [HASH] },
-    ]);
+    const index = makeIndex([{ ...turnEntry('both', 'pathless demand-paging reel adaptation', 30), verbatimTokens: [HASH] }]);
     const signals = {
       touchedPaths: [],
       claimedPaths: [],
@@ -719,7 +656,7 @@ describe('verbatim-token recall — buildFoldIndex + end-to-end (Tier-2 integrat
     const on = buildFoldRecallContext(onState, raw, onSig.signals, 'healthy', onCfg);
     expect(on.text).not.toBeNull();
     expect(on.cards).toBeGreaterThanOrEqual(1);
-    expect(on.triggers.some((t) => t.includes(`verbatim-token ${HASH}`))).toBe(true);
+    expect(on.triggers.some(t => t.includes(`verbatim-token ${HASH}`))).toBe(true);
 
     // Disabled (WARP_FOLD_RECALL_VERBATIM=0): no active-window derivation, no token signal, no recall.
     const offCfg: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, verbatimRecallEnabled: false };
@@ -758,8 +695,7 @@ describe('buildFoldRecallContext', () => {
     return state;
   }
 
-  const touchBigfile = () =>
-    extractRecallSignals({ file_path: ABS(BIGFILE) }, new Set());
+  const touchBigfile = () => extractRecallSignals({ file_path: ABS(BIGFILE) }, new Set());
 
   test('tier-0 path re-touch pages folded turn content back in as a card', () => {
     const raw = buildAnthropicHistory();
@@ -779,11 +715,11 @@ describe('buildFoldRecallContext', () => {
     expect(state.recallChars).toBe(out.chars);
   });
 
-  test('live source delta renders when recalled body is stale vs current box source', () => {
+  test('live source delta: changed current source becomes the card body + delta notifier', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
-    // Simulate the worker supplying a live source snapshot that differs from
-    // the historical folded body ('BIGFILE CONTENT START ...').
+    // Worker supplies a live source snapshot that differs from the historical
+    // folded body ('BIGFILE CONTENT START ...').
     state.pathSourceDeltas.set(BIGFILE, {
       path: BIGFILE,
       liveHash: 'abcd1234',
@@ -792,31 +728,38 @@ describe('buildFoldRecallContext', () => {
     const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
-    expect(out.text!).toContain('Live Source Delta');
-    expect(out.text!).toContain('current box source differs');
+    // Body is the CURRENT source from disk; the notifier shows the delta.
+    expect(out.text!).toContain('Δ Source changed since fold');
+    expect(out.text!).toContain('relay/src/bigfile.ts (liveHash=abcd1234)');
+    expect(out.text!).toContain('↻ CURRENT box source — relay/src/bigfile.ts:');
     expect(out.text!).toContain('COMPLETELY NEW CONTENT ON DISK NOW');
+    // Stale folded tail is gone from the body.
+    expect(out.text!).not.toContain('BIGFILE CONTENT END');
   });
 
-  test('live source delta suppressed when recalled body still matches current source', () => {
+  test('live source delta: live source matching historical ⇒ no notifier, byte-identical legacy body', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
-    // Worker supplies a live snapshot that IS a substring of the historical body.
+    // Live snapshot equals the historical body ⇒ no genuine change.
     state.pathSourceDeltas.set(BIGFILE, {
       path: BIGFILE,
       liveHash: 'abcd1234',
-      liveSource: 'BIGFILE CONTENT START',
+      liveSource: BIGFILE_CONTENT,
     });
     const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
-    expect(out.text!).not.toContain('Live Source Delta');
+    expect(out.text!).not.toContain('Δ Source changed since fold');
+    expect(out.text!).not.toContain('Δ Fold-recall live-source check');
+    expect(out.text!).not.toContain('↻ CURRENT box source');
+    expect(out.text!).toContain('BIGFILE CONTENT START');
   });
 
-  test('source delta: truncated live source renders delta even when prefix matches historical', () => {
+  test('source delta: truncated snapshot with no in-window change keeps historical body + warns fresh-read (beyond-window)', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
-    // Simulate a TRUNCATED live source whose prefix matches the historical body.
-    // The file may have changed beyond the truncation point — delta MUST render.
+    // A truncated single-line snapshot: its only line is a partial of the
+    // historical, so nothing is comparable in-window — flag, don't fabricate.
     state.pathSourceDeltas.set(BIGFILE, {
       path: BIGFILE,
       liveHash: 'ghi789',
@@ -825,13 +768,15 @@ describe('buildFoldRecallContext', () => {
     });
     const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out.cards).toBe(1);
-    // The delta should render because truncated=true — we can't know if the
-    // rest of the file changed beyond the truncation point.
-    expect(out.text!).toContain('Live Source Delta');
-    expect(out.text!).toContain('live snapshot truncated');
+    expect(out.text!).toContain('Δ Fold-recall live-source check:');
+    expect(out.text!).toContain('snapshot truncated');
+    expect(out.text!).toContain('fresh-read to verify current code');
+    // Historical body retained — no current content for the region beyond the window.
+    expect(out.text!).toContain('BIGFILE CONTENT END');
+    expect(out.text!).not.toContain('↻ CURRENT box source');
   });
 
-  test('touching one folded read-burst member carries sibling source deltas', () => {
+  test('touching one folded read-burst member pages the CHANGED sibling back as CURRENT source + delta notifier', () => {
     const alpha = 'relay/src/alpha.ts';
     const beta = 'relay/src/beta.ts';
     const raw: FoldMessage[] = [
@@ -843,30 +788,66 @@ describe('buildFoldRecallContext', () => {
       assistantMsg('Alpha and beta were reviewed in one temporal burst.'),
     ];
     const state = createFoldRecallState();
-    state.index = makeIndex([
-      turnEntry('burst', 'alpha beta reviewed together', 30, [alpha, beta], 0, raw.length),
-    ], raw.length);
+    state.index = makeIndex([turnEntry('burst', 'alpha beta reviewed together', 30, [alpha, beta], 0, raw.length)], raw.length);
+    // beta changed on disk since the fold; alpha did not.
     state.pathSourceDeltas.set(beta, {
       path: beta,
       liveHash: 'beta-new',
       liveSource: 'BETA NEW CONTENT',
     });
 
-    const out = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals({ file_path: ABS(alpha) }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(alpha) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
     expect(out.text!).toContain('trigger: path-touch relay/src/alpha.ts');
+    // alpha has no delta ⇒ its body stays the historical (legacy) content, not swapped.
     expect(out.text!).toContain('ALPHA OLD CONTENT');
-    expect(out.text!).toContain('BETA OLD CONTENT');
-    expect(out.text!).toContain('Live Source Delta (relay/src/beta.ts)');
+    expect(out.text!).not.toContain('↻ CURRENT box source — relay/src/alpha.ts');
+    // beta changed ⇒ its body becomes CURRENT box source; stale beta only survives as a `−` line.
+    expect(out.text!).toContain('Δ Source changed since fold');
+    expect(out.text!).toContain('relay/src/beta.ts (liveHash=beta-new)');
+    expect(out.text!).toContain('↻ CURRENT box source — relay/src/beta.ts:');
     expect(out.text!).toContain('BETA NEW CONTENT');
-    expect(out.text!).not.toContain('Live Source Delta (relay/src/alpha.ts)');
+    expect(out.text!).toMatch(/−\s*BETA OLD CONTENT/);
+  });
+
+  test('source delta: reviewing a peer-edited file pages back CURRENT source, never the stale folded body (processChat trap)', () => {
+    const reviewed = 'src/lib/chatJob/processChat.ts';
+    const staleBody = [
+      'export function resolveClinicId(evidenceClinicId, practiceToolClinicId) {',
+      '  if (evidenceClinicId) {',
+      '    return evidenceClinicId;',
+      '  }',
+      '  return null;',
+      '}',
+    ].join('\n');
+    const currentSource = ['export function resolveClinicId(evidenceClinicId, practiceToolClinicId) {', '  return evidenceClinicId ?? practiceToolClinicId;', '}'].join('\n');
+    const raw: FoldMessage[] = [
+      userMsg('Review the G2 fix in processChat.ts'),
+      anthropicToolUse('tu_pc', 'Read', { file_path: ABS(reviewed) }),
+      anthropicToolResult('tu_pc', staleBody),
+      assistantMsg('Reviewing the clinic id resolution.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([toolEntry('tu_pc', reviewed, 10)], raw.length);
+    // The reviewer's read folded the PRE-edit gate; the file on disk now has the fix.
+    state.pathSourceDeltas.set(reviewed, {
+      path: reviewed,
+      liveHash: '2ffe6f651e65e8a7',
+      liveSource: currentSource,
+    });
+
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(reviewed) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.cards).toBe(1);
+    // Card body is the CURRENT source from disk — the landed `??` fix, not the gate.
+    expect(out.text!).toContain('↻ CURRENT box source — src/lib/chatJob/processChat.ts:');
+    expect(out.text!).toContain('return evidenceClinicId ?? practiceToolClinicId;');
+    // Notifier shows the delta; the stale gate only survives as a `−` deletion line.
+    expect(out.text!).toContain('Δ Source changed since fold');
+    expect(out.text!).toContain('liveHash=2ffe6f651e65e8a7');
+    expect(out.text!).toMatch(/−\s*if \(evidenceClinicId\) \{/);
+    expect(out.text!).toMatch(/\+\s*return evidenceClinicId \?\? practiceToolClinicId;/);
   });
 
   test('zone fan-out residency stays exact-path: later sibling touch is not suppressed', () => {
@@ -886,20 +867,14 @@ describe('buildFoldRecallContext', () => {
     ];
     const state = createFoldRecallState();
     // Two separate entries: a shared burst (alpha+beta) and a later beta-only turn.
-    state.index = makeIndex([
-      turnEntry('burst', 'alpha beta reviewed together', 30, [alpha, beta], 0, 6),
-      turnEntry('later-beta', 'beta revisited separately', 20, [beta], 6, raw.length),
-    ], raw.length);
+    state.index = makeIndex(
+      [turnEntry('burst', 'alpha beta reviewed together', 30, [alpha, beta], 0, 6), turnEntry('later-beta', 'beta revisited separately', 20, [beta], 6, raw.length)],
+      raw.length,
+    );
 
     // Pass 1: touch alpha → matches the burst entry. Card injected; residency
     // keys on matchedPath (alpha), NOT the zone.
-    const out1 = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals({ file_path: ABS(alpha) }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out1 = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(alpha) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out1.cards).toBe(1);
     expect(out1.text!).toContain('trigger: path-touch relay/src/alpha.ts');
 
@@ -907,13 +882,7 @@ describe('buildFoldRecallContext', () => {
     // the later-beta entry is a different entry and must still produce a card.
     // If residency incorrectly used the zone, beta would be path-resident from
     // pass 1 and the later-beta entry would be suppressed too.
-    const out2 = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals({ file_path: ABS(beta) }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out2 = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(beta) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out2.cards).toBe(1);
     expect(out2.text!).toContain('trigger: path-touch relay/src/beta.ts');
   });
@@ -936,22 +905,14 @@ describe('buildFoldRecallContext', () => {
       assistantMsg('Core, helper, extra, and package config reviewed together.'),
     ];
     const state = createFoldRecallState();
-    state.index = makeIndex([
-      turnEntry('burst', 'core helper extra pkg reviewed', 30, [core, helper, extra, pkg], 0, raw.length),
-    ], raw.length);
+    state.index = makeIndex([turnEntry('burst', 'core helper extra pkg reviewed', 30, [core, helper, extra, pkg], 0, raw.length)], raw.length);
     // Highlights for all 4 paths so enrichment (radar) is observable.
     state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(extra, [{ label: 'EXTRA-NESTED', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(pkg, [{ label: 'PKG-INCIDENTAL', startLine: 10, endLine: 20 }]);
 
-    const out = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals({ file_path: ABS(core) }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(core) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
     // Body is uncapped: all 4 tool-result bodies are present.
@@ -971,8 +932,8 @@ describe('buildFoldRecallContext', () => {
 
   test('tier-1: affinity carrier overrides proximity ordering for enrichment', () => {
     const core = 'relay/src/core.ts';
-    const helper = 'relay/src/helper.ts';       // same-dir sibling (proximity=2)
-    const shared = 'shared/types.ts';           // cross-cluster (proximity=0)
+    const helper = 'relay/src/helper.ts'; // same-dir sibling (proximity=2)
+    const shared = 'shared/types.ts'; // cross-cluster (proximity=0)
     const raw: FoldMessage[] = [
       userMsg('Read core, helper, and shared types together'),
       anthropicToolUse('tu_core', 'Read', { file_path: ABS(core) }),
@@ -984,9 +945,7 @@ describe('buildFoldRecallContext', () => {
       assistantMsg('Core, helper, and shared types reviewed together.'),
     ];
     const state = createFoldRecallState();
-    state.index = makeIndex([
-      turnEntry('burst', 'core helper shared reviewed', 30, [core, helper, shared], 0, raw.length),
-    ], raw.length);
+    state.index = makeIndex([turnEntry('burst', 'core helper shared reviewed', 30, [core, helper, shared], 0, raw.length)], raw.length);
     // Highlights for all 3 paths.
     state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
@@ -996,13 +955,7 @@ describe('buildFoldRecallContext', () => {
     state.pathAffinity.set(`${core}\x00${shared}`, 0.9);
     state.pathAffinity.set(`${core}\x00${helper}`, 0.1);
 
-    const out = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals({ file_path: ABS(core) }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(core) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
     // All bodies present (uncapped).
@@ -1044,22 +997,14 @@ describe('buildFoldRecallContext', () => {
       assistantMsg('Core, helper, extra, and package config reviewed together.'),
     ];
     const state = createFoldRecallState();
-    state.index = makeIndex([
-      turnEntry('burst', 'core helper extra pkg reviewed', 30, [core, helper, extra, pkg], 0, raw.length),
-    ], raw.length);
+    state.index = makeIndex([turnEntry('burst', 'core helper extra pkg reviewed', 30, [core, helper, extra, pkg], 0, raw.length)], raw.length);
     // pathAffinity is empty (default) → tier-0 proximity fallback.
     state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(extra, [{ label: 'EXTRA-NESTED', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(pkg, [{ label: 'PKG-INCIDENTAL', startLine: 10, endLine: 20 }]);
 
-    const out = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals({ file_path: ABS(core) }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(core) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
     // Proximity fallback: same-dir siblings in top-K=3, cross-cluster excluded.
@@ -1089,9 +1034,7 @@ describe('buildFoldRecallContext', () => {
     const state = createFoldRecallState();
     // Insertion order deliberately puts cross-cluster pkg SECOND, so the old
     // insertion-order tie-break would rank pkg into top-K and drop extra.
-    state.index = makeIndex([
-      turnEntry('burst', 'core pkg helper extra reviewed', 30, [core, pkg, helper, extra], 0, raw.length),
-    ], raw.length);
+    state.index = makeIndex([turnEntry('burst', 'core pkg helper extra reviewed', 30, [core, pkg, helper, extra], 0, raw.length)], raw.length);
     state.pathHighlights.set(core, [{ label: 'CORE-ANCHOR', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(helper, [{ label: 'HELPER-SIBLING', startLine: 10, endLine: 20 }]);
     state.pathHighlights.set(extra, [{ label: 'EXTRA-NESTED', startLine: 10, endLine: 20 }]);
@@ -1101,13 +1044,7 @@ describe('buildFoldRecallContext', () => {
     // proximity); post-F7 it falls back to proximity per-anchor.
     state.pathAffinity.set('unrelated/anchor.ts\x00unrelated/zone.ts', 0.9);
 
-    const out = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals({ file_path: ABS(core) }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(core) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
     // Proximity preserved: anchor + same-dir siblings make top-K=3; cross-cluster
@@ -1137,20 +1074,20 @@ describe('buildFoldRecallContext', () => {
       assistantMsg('context fold system filler'),
     ];
     const state = createFoldRecallState();
-    state.index = makeIndex([
-      turnEntry('target', 'pathless demand-paging reel now follows live vocabulary', 30, [], 0, 2),
-      turnEntry('common-a', 'context fold system filler', 20, [], 2, 4),
-      turnEntry('common-b', 'context fold system filler', 10, [], 4, 6),
-    ], raw.length);
-    const out = buildFoldRecallContext(
-      state,
-      raw,
-      extractRecallSignals(null, new Set(), 'pathless demand-paging reel'),
-      'healthy',
-      { ...DEFAULT_FOLD_RECALL_CONFIG, termRecallEnabled: true },
+    state.index = makeIndex(
+      [
+        turnEntry('target', 'pathless demand-paging reel now follows live vocabulary', 30, [], 0, 2),
+        turnEntry('common-a', 'context fold system filler', 20, [], 2, 4),
+        turnEntry('common-b', 'context fold system filler', 10, [], 4, 6),
+      ],
+      raw.length,
     );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals(null, new Set(), 'pathless demand-paging reel'), 'healthy', {
+      ...DEFAULT_FOLD_RECALL_CONFIG,
+      termRecallEnabled: true,
+    });
     expect(out.cards).toBe(1);
-    expect(out.triggers).toEqual(['term-overlap pathless, demand-paging, reel']);
+    expect(out.triggers).toEqual(['term-overlap pathless, demand-pag, reel']);
     expect(out.text).toContain('pathless demand-paging reel now follows');
   });
 
@@ -1279,7 +1216,8 @@ describe('buildFoldRecallContext', () => {
     // that fits one card plus a hint but not two cards.
     const probeState = freshState(raw);
     const probe = buildFoldRecallContext(
-      probeState, raw,
+      probeState,
+      raw,
       extractRecallSignals({ paths: [ABS('relay/src/helper0.ts'), ABS('relay/src/helper1.ts')] }, new Set()),
       'healthy',
       DEFAULT_FOLD_RECALL_CONFIG,
@@ -1289,12 +1227,7 @@ describe('buildFoldRecallContext', () => {
     const oneCardChars = Math.ceil(probe.chars / 2);
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, maxTotalChars: oneCardChars + 300 };
-    const out = buildFoldRecallContext(
-      state, raw,
-      extractRecallSignals({ paths: [ABS('relay/src/helper0.ts'), ABS('relay/src/helper1.ts')] }, new Set()),
-      'healthy',
-      config,
-    );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ paths: [ABS('relay/src/helper0.ts'), ABS('relay/src/helper1.ts')] }, new Set()), 'healthy', config);
     expect(out.cards).toBe(1);
     expect(out.hints).toBe(1);
     expect(out.text!).toContain(RECALL_CARD_PREFIX);
@@ -1304,12 +1237,7 @@ describe('buildFoldRecallContext', () => {
   test('intra-turn entry recalls the ORIGINAL pre-fold tool result body by tool id', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
-    const out = buildFoldRecallContext(
-      state, raw,
-      extractRecallSignals({ file_path: ABS('relay/src/helper0.ts') }, new Set()),
-      'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
-    );
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS('relay/src/helper0.ts') }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out.cards).toBe(1);
     expect(out.text!).toContain('Read relay/src/helper0.ts');
     expect(out.text!).toContain('HELPER0 BODY');
@@ -1325,7 +1253,10 @@ describe('buildFoldRecallContext', () => {
     const rewound = buildFoldRecallContext(state, raw.slice(0, 2), touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(rewound.text).toBeNull();
 
-    const disabled = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', { ...DEFAULT_FOLD_RECALL_CONFIG, enabled: false });
+    const disabled = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', {
+      ...DEFAULT_FOLD_RECALL_CONFIG,
+      enabled: false,
+    });
     expect(disabled.text).toBeNull();
     expect(state.passSeq).toBe(0); // all three calls are guard no-ops — no pass consumed
   });
@@ -1368,10 +1299,7 @@ describe('excerptForRecall', () => {
 
 describe('findToolResultText', () => {
   test('recovers Anthropic block content and OpenAI tool message content by id', () => {
-    const msgs: FoldMessage[] = [
-      anthropicToolResult('tu_x', 'ANTHROPIC BODY'),
-      openaiToolResult('call_y', 'OPENAI BODY'),
-    ];
+    const msgs: FoldMessage[] = [anthropicToolResult('tu_x', 'ANTHROPIC BODY'), openaiToolResult('call_y', 'OPENAI BODY')];
     expect(findToolResultText(msgs, 'tu_x')).toBe('ANTHROPIC BODY');
     expect(findToolResultText(msgs, 'call_y')).toBe('OPENAI BODY');
     expect(findToolResultText(msgs, 'missing')).toBeNull();
@@ -1604,18 +1532,12 @@ describe('extractRecallSignals — bash arm', () => {
   });
 
   test('bash command and file_path contribute additively to touchedPaths, sorted', () => {
-    const signals = extractRecallSignals(
-      { file_path: ABS('relay/src/zeta.ts'), command: `cat ${ABS('relay/src/alpha.ts')}` },
-      new Set(),
-    );
+    const signals = extractRecallSignals({ file_path: ABS('relay/src/zeta.ts'), command: `cat ${ABS('relay/src/alpha.ts')}` }, new Set());
     expect(signals.touchedPaths).toEqual(['relay/src/alpha.ts', 'relay/src/zeta.ts']);
   });
 
   test('duplicate path from both file_path and command is deduped', () => {
-    const signals = extractRecallSignals(
-      { file_path: ABS(BIGFILE), command: `cat ${ABS(BIGFILE)}` },
-      new Set(),
-    );
+    const signals = extractRecallSignals({ file_path: ABS(BIGFILE), command: `cat ${ABS(BIGFILE)}` }, new Set());
     expect(signals.touchedPaths).toEqual([BIGFILE]);
   });
 });

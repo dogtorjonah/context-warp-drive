@@ -146,8 +146,8 @@ describe('resolveContextBudget', () => {
     expect(cli.compressionProfile).toBe('survival');
     expect(cli.bandTokens).toBe(40_000);
     expect(cli.messageCeilingTokens).toBe(231_680);
-    expect(cli.pressureCeilingTokens).toBe(201_680);
-    expect(cli.foldTriggerTokens).toBe(201_680);
+    expect(cli.pressureCeilingTokens).toBe(150_000);
+    expect(cli.foldTriggerTokens).toBe(150_000);
     expect(api.contextWindowTokens).toBe(1_048_576);
     expect(api.compressionProfile).toBe('cache-economic');
     expect(api.bandTokens).toBe(40_000);
@@ -181,13 +181,21 @@ describe('resolveContextBudget', () => {
     expect(budget.pressureCeilingTokens).toBe(150_000);
   });
 
-  it('resolves a late Codex CLI fold trigger distinct from the 40k band and honors overrides', () => {
+  it('resolves Codex CLI under the 200k danger line while preserving runway clamps and overrides', () => {
     const codex = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5' });
-    // 40k is the steady-state orbit, NOT the trigger: CLI fold reconstruction is a late safety valve.
+    // 40k is the steady-state orbit, NOT the trigger: CLI fold reconstruction
+    // uses the shared 150k trigger unless a smaller window needs more runway.
     expect(codex.bandTokens).toBe(40_000);
-    expect(codex.foldTriggerTokens).toBe(201_680);
+    expect(codex.foldTriggerTokens).toBe(150_000);
+    expect(codex.foldTriggerTokens).toBeLessThan(200_000);
     expect(codex.foldTriggerTokens).toBeGreaterThan(codex.bandTokens);
     expect(codex.foldTriggerTokens).toBeLessThanOrEqual(codex.pressureCeilingTokens ?? Number.POSITIVE_INFINITY);
+
+    // A 200k explicit window keeps the hard F=30k runway, so it clamps below
+    // the default trigger instead of waiting near the wall.
+    const twoHundredK = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5', contextWindowTokens: 200_000 });
+    expect(twoHundredK.messageCeilingTokens).toBe(176_000);
+    expect(twoHundredK.foldTriggerTokens).toBe(146_000);
 
     // Lowering the band must NOT drag the trigger down — the regression that made Codex thrash at band size.
     const lowBand = resolveContextBudget({
@@ -196,7 +204,7 @@ describe('resolveContextBudget', () => {
       env: { VOXXO_FOLD_TARGET_BAND_TOKENS: '30000' },
     });
     expect(lowBand.bandTokens).toBe(30_000);
-    expect(lowBand.foldTriggerTokens).toBe(201_680);
+    expect(lowBand.foldTriggerTokens).toBe(150_000);
 
     // Explicit trigger override is honored, clamped between band and pressure ceiling.
     const overridden = resolveContextBudget({

@@ -100,6 +100,18 @@ export interface FoldRecallConfig {
    * (operator-blessed, Jonah 2026-06-17). Same residency/byte-identity contract.
    */
   hazardsEnabled: boolean;
+  /**
+   * Episodic voice carriers (WARP_FOLD_RECALL_EPISODES).
+   * Prepends self-lineage episode voice lines for recalled paths. Default ON.
+   * Same residency/byte-identity contract.
+   */
+  episodesEnabled: boolean;
+  /**
+   * Atlas identity metadata carrier (WARP_FOLD_RECALL_ATLAS_META).
+   * Prepends purpose/blurb and tags for recalled paths. Default ON; renders
+   * only when pathAtlasMeta is resident, so empty/missing remains byte-identical.
+   */
+  atlasMetaEnabled: boolean;
 }
 
 export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
@@ -112,6 +124,8 @@ export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
   verbatimRecallEnabled: true,
   highlightsEnabled: true,
   hazardsEnabled: true,
+  episodesEnabled: true,
+  atlasMetaEnabled: true,
 };
 
 /** Hints injected per pass never exceed this, regardless of pressure. */
@@ -140,16 +154,18 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
  *   WARP_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
  *   WARP_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
  *   WARP_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
+ *   WARP_FOLD_RECALL_EPISODES=0|false|off|no → disable episodic voice (default ON)
+ *   WARP_FOLD_RECALL_ATLAS_META=0|false|off|no → disable Atlas identity meta (default ON)
  */
-export function resolveFoldRecallConfig(
-  env: Record<string, string | undefined> = process.env,
-): FoldRecallConfig {
+export function resolveFoldRecallConfig(env: Record<string, string | undefined> = process.env): FoldRecallConfig {
   const raw = (env.WARP_FOLD_RECALL ?? '').trim().toLowerCase();
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
   const termRaw = (env.WARP_FOLD_RECALL_TERMS ?? '').trim().toLowerCase();
   const verbatimRaw = (env.WARP_FOLD_RECALL_VERBATIM ?? '').trim().toLowerCase();
   const highlightsRaw = (env.WARP_FOLD_RECALL_HIGHLIGHTS ?? '').trim().toLowerCase();
   const hazardsRaw = (env.WARP_FOLD_RECALL_HAZARDS ?? '').trim().toLowerCase();
+  const episodesRaw = (env.WARP_FOLD_RECALL_EPISODES ?? '').trim().toLowerCase();
+  const atlasMetaRaw = (env.WARP_FOLD_RECALL_ATLAS_META ?? '').trim().toLowerCase();
   return {
     enabled,
     maxCards: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARDS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
@@ -158,14 +174,15 @@ export function resolveFoldRecallConfig(
     ttlPasses: parsePositiveInt(env.WARP_FOLD_RECALL_TTL_PASSES) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
     termRecallEnabled: termRaw === '1' || termRaw === 'true' || termRaw === 'on' || termRaw === 'yes',
     // Default ON (operator-blessed); only explicit disable values turn it off.
-    verbatimRecallEnabled:
-      verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
+    verbatimRecallEnabled: verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
     // Curated Code Radar (operator-blessed, Jonah 2026-06-17): both default ON;
     // only explicit 0/false/off/no disable. Same idiom as verbatimRecallEnabled.
-    highlightsEnabled:
-      highlightsRaw === '' || (highlightsRaw !== '0' && highlightsRaw !== 'false' && highlightsRaw !== 'off' && highlightsRaw !== 'no'),
-    hazardsEnabled:
-      hazardsRaw === '' || (hazardsRaw !== '0' && hazardsRaw !== 'false' && hazardsRaw !== 'off' && hazardsRaw !== 'no'),
+    highlightsEnabled: highlightsRaw === '' || (highlightsRaw !== '0' && highlightsRaw !== 'false' && highlightsRaw !== 'off' && highlightsRaw !== 'no'),
+    hazardsEnabled: hazardsRaw === '' || (hazardsRaw !== '0' && hazardsRaw !== 'false' && hazardsRaw !== 'off' && hazardsRaw !== 'no'),
+    // Episodic voice: default ON; only explicit 0/false/off/no disable.
+    episodesEnabled: episodesRaw === '' || (episodesRaw !== '0' && episodesRaw !== 'false' && episodesRaw !== 'off' && episodesRaw !== 'no'),
+    // Atlas identity meta: default ON; only explicit 0/false/off/no disable.
+    atlasMetaEnabled: atlasMetaRaw === '' || (atlasMetaRaw !== '0' && atlasMetaRaw !== 'false' && atlasMetaRaw !== 'off' && atlasMetaRaw !== 'no'),
   };
 }
 
@@ -260,7 +277,11 @@ function extractBashPathsFromMessages(messages: readonly FoldMessage[]): string[
       for (const tc of (msg as any).tool_calls as any[]) {
         if (tc?.id && tc?.function?.name && BASH_TOOL_NAME_RE.test(tc.function.name)) {
           let args: Record<string, unknown> = {};
-          try { args = JSON.parse(tc.function.arguments ?? '{}'); } catch { /* skip */ }
+          try {
+            args = JSON.parse(tc.function.arguments ?? '{}');
+          } catch {
+            /* skip */
+          }
           const cmd = args.command;
           if (typeof cmd === 'string') {
             for (const p of extractPathsFromBashCommand(cmd)) paths.add(p);
@@ -390,7 +411,7 @@ function parseMarkerChars(raw: string): number {
 function blockContentText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    return content.map((b: any) => (typeof b === 'string' ? b : b?.text ?? JSON.stringify(b))).join('\n');
+    return content.map((b: any) => (typeof b === 'string' ? b : (b?.text ?? JSON.stringify(b)))).join('\n');
   }
   return JSON.stringify(content ?? '');
 }
@@ -418,10 +439,7 @@ function parseIntraMarker(content: string): ParsedIntraMarker | null {
   return null;
 }
 
-function buildTurnDigest(
-  turnMessages: FoldMessage[],
-  syntheticContext: SyntheticContextOptions = {},
-): string {
+function buildTurnDigest(turnMessages: FoldMessage[], syntheticContext: SyntheticContextOptions = {}): string {
   const parts: string[] = [];
   const user = extractFirstUserText(turnMessages, syntheticContext);
   if (user) parts.push(user);
@@ -431,10 +449,7 @@ function buildTurnDigest(
 }
 
 /** First REAL user text in a slice (synthetic fold/recall blocks excluded). */
-function extractFirstUserText(
-  messages: readonly FoldMessage[],
-  syntheticContext: SyntheticContextOptions = {},
-): string {
+function extractFirstUserText(messages: readonly FoldMessage[], syntheticContext: SyntheticContextOptions = {}): string {
   for (const msg of messages) {
     if (msg.role !== 'user') continue;
     if (typeof msg.content === 'string') {
@@ -474,19 +489,13 @@ const ACTIVE_WINDOW_MAX_CHARS = 1600;
  * the unfolded tail is empty. The live caller passes activeText only when term
  * recall is flag-enabled, so default-off behavior is unaffected.
  */
-export function extractActiveWindowText(
-  rawHistory: readonly FoldMessage[],
-  foldedRawCount: number,
-  syntheticContext: SyntheticContextOptions = {},
-): string {
+export function extractActiveWindowText(rawHistory: readonly FoldMessage[], foldedRawCount: number, syntheticContext: SyntheticContextOptions = {}): string {
   if (foldedRawCount < 0 || foldedRawCount >= rawHistory.length) return '';
   const tail = rawHistory.slice(foldedRawCount);
   const user = extractFirstUserText(tail, syntheticContext);
   const assistant = extractAssistantText(tail);
-  const combined = [user, assistant].filter((s) => s.length > 0).join(' ');
-  return combined.length > ACTIVE_WINDOW_MAX_CHARS
-    ? combined.slice(combined.length - ACTIVE_WINDOW_MAX_CHARS)
-    : combined;
+  const combined = [user, assistant].filter(s => s.length > 0).join(' ');
+  return combined.length > ACTIVE_WINDOW_MAX_CHARS ? combined.slice(combined.length - ACTIVE_WINDOW_MAX_CHARS) : combined;
 }
 
 /**
@@ -496,10 +505,7 @@ export function extractActiveWindowText(
  * Feeds nominateVerbatim so the indexed tokens are the same family the Verbatim
  * Keep conserves.
  */
-function extractTurnVerbatimText(
-  turnMessages: readonly FoldMessage[],
-  syntheticContext: SyntheticContextOptions = {},
-): string {
+function extractTurnVerbatimText(turnMessages: readonly FoldMessage[], syntheticContext: SyntheticContextOptions = {}): string {
   const parts: string[] = [];
   const pushText = (text: string, role: string | undefined): void => {
     if (!text) return;
@@ -546,6 +552,44 @@ function extractTurnVerbatimText(
       }
     }
   }
+  return parts.join('\n');
+}
+
+/**
+ * Build the episodic voice block for a recall card: pre-rendered voice lines
+ * from the caller's own-lineage episode chain for this path. Reads
+ * state.pathEpisodes safely; returns '' when empty, disabled, or missing.
+ * Does NOT parse annotation kinds — the worker already rendered/attribution.
+ */
+function buildEpisodeVoiceBlock(item: RecallPlanItem, state: FoldRecallState, config: FoldRecallConfig, charBudget: number, suppressPaths: ReadonlySet<string>): string {
+  if (charBudget <= 0 || !config.episodesEnabled) return '';
+  const path = item.matchedPath;
+  if (suppressPaths.has(path)) return '';
+  const voices = state.pathEpisodes?.get(path);
+  if (!voices || voices.length === 0) return '';
+
+  const parts: string[] = ['🗣 Your lineage:'];
+  let used = parts[0].length + 1;
+
+  for (const ev of voices) {
+    if (used >= charBudget) break;
+    // Intent (the operator ask) — strongest voice signal.
+    if (ev.intent && used + ev.intent.length + 10 < charBudget) {
+      const line = `  ask: "${ev.intent}"`;
+      parts.push(line);
+      used += line.length + 1;
+    }
+    // Pre-rendered voice lines from the episode chain.
+    for (const vl of ev.voiceLines) {
+      if (used >= charBudget) break;
+      const line = `  ${vl}`;
+      parts.push(line);
+      used += line.length + 1;
+    }
+  }
+
+  // If only the header fits, return nothing.
+  if (parts.length <= 1) return '';
   return parts.join('\n');
 }
 
@@ -715,6 +759,44 @@ export interface RecallSourceDelta {
   truncated?: boolean;
 }
 
+/**
+ * Pre-rendered episodic voice for a recalled path. Each entry carries the
+ * agent's own words from past work bursts on this path — already rendered
+ * and attributed by the fold-episodes worker using the canonical episode
+ * voice renderer helpers (changelog, tap_star, chatroom). foldRecall must NOT
+ * parse annotation kinds or invent a second attribution scheme; it renders
+ * voiceLines verbatim into the recall card.
+ */
+export interface EpisodeVoice {
+  /** Normalized workspace-relative path that triggered the episode recall. */
+  path: string;
+  /** Pre-rendered, already-attributed voice lines from the episode chain. */
+  voiceLines: string[];
+  /** The operator ask that motivated the work burst, or null. */
+  intent: string | null;
+  /** Chapter IDs in the episode chain for this path. */
+  chapterIds: number[];
+  /** ISO-8601 timestamp of when the episode ended. */
+  endedAt: string;
+}
+
+/**
+ * Atlas file identity metadata for a recalled path. Carries the timeless
+ * identity fields (purpose, blurb, tags) from the Atlas record — the same
+ * fields that appear in Ambient Atlas blocks. Does NOT duplicate
+ * highlights/hazards (those already ride pathHighlights/pathHazards).
+ */
+export interface AtlasFileMeta {
+  /** Normalized workspace-relative path. */
+  path: string;
+  /** Timeless file purpose from Atlas (null when not curated). */
+  purpose: string | null;
+  /** Short one-line file identity from Atlas (null when not curated). */
+  blurb: string | null;
+  /** Canonical tag list from Atlas (empty when not curated). */
+  tags: string[];
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // State (per-session; lives beside foldFreezeState)
 // ══════════════════════════════════════════════════════════════════════
@@ -757,6 +839,21 @@ export interface FoldRecallState {
    * standalone/no-host mode → orderZoneByRelevance falls back to tier-0 proximity.
    */
   pathAffinity: Map<string, number>;
+  /**
+   * Episodic voice carriers: normalized path → EpisodeVoice entries from the
+   * caller's own lineage episode chain. Populated OFF-THREAD by the relay
+   * after epoch boundaries via foldEpisodes:recallEnrichment. Empty in
+   * standalone/no-host mode → recall degrades to byte-identical output.
+   */
+  pathEpisodes: Map<string, EpisodeVoice[]>;
+  /**
+   * Optional Atlas file identity metadata carriers: normalized path →
+   * AtlasFileMeta (purpose, blurb, tags). Populated OFF-THREAD by the relay
+   * alongside the atlas:recallEnrichment batch. Optional for package API
+   * compatibility; missing = empty (byte-identical). Does NOT duplicate
+   * pathHighlights/pathHazards.
+   */
+  pathAtlasMeta?: Map<string, AtlasFileMeta>;
   /** Recall pass counter — one pass per tool boundary that carried signals. */
   passSeq: number;
   // ── Lifetime telemetry counters ──
@@ -775,6 +872,8 @@ export function createFoldRecallState(): FoldRecallState {
     pathHazards: new Map(),
     pathSourceDeltas: new Map(),
     pathAffinity: new Map(),
+    pathEpisodes: new Map(),
+    pathAtlasMeta: new Map(),
     passSeq: 0,
     cardsInjected: 0,
     hintsInjected: 0,
@@ -802,7 +901,7 @@ export interface RecallSignals {
    * that file's full source_highlights+hazards live, so the compressed radar
    * would just parrot the tool output. Omitted unless the relay supplies it; the
    * folded card BODY still pages in, and tier matching is unaffected.
-  */
+   */
   atlasReadPaths?: string[];
 }
 
@@ -818,7 +917,11 @@ function normalizeAtlasReadToolLeaf(toolName: string | null | undefined): string
   if (!raw) return '';
   const doubleUnderscoreLeaf = raw.split('__').at(-1) ?? raw;
   const dottedLeaf = doubleUnderscoreLeaf.split('.').at(-1) ?? doubleUnderscoreLeaf;
-  return dottedLeaf.replace(/^mcp_to_/, '').replace(/^mcp_/, '').trim().toLowerCase();
+  return dottedLeaf
+    .replace(/^mcp_to_/, '')
+    .replace(/^mcp_/, '')
+    .trim()
+    .toLowerCase();
 }
 
 /**
@@ -832,10 +935,7 @@ function normalizeAtlasReadToolLeaf(toolName: string | null | undefined): string
  * and provider-prefixed forms match — not only bare names. search/history/graph/
  * diff do NOT match: they do not render the curated per-file record.
  */
-export function radarDuplicatesActiveAtlasRead(
-  toolName: string | null | undefined,
-  action: unknown,
-): boolean {
+export function radarDuplicatesActiveAtlasRead(toolName: string | null | undefined, action: unknown): boolean {
   const leaf = normalizeAtlasReadToolLeaf(toolName);
   if (leaf === 'atlas_lookup' || leaf === 'atlas_brief' || leaf === 'atlas_snippet') return true;
   if (leaf === 'atlas_query') return action === 'lookup' || action === 'brief' || action === 'snippet';
@@ -878,12 +978,7 @@ const ATLAS_RESULT_PATH_RE = /^`?((?:\/?[A-Za-z0-9_.@+\-=]+\/)+[^\s`]+?)`?(?:\s+
  * trigger source. Bounded by construction: at most the first 200 lines are
  * scanned and at most maxPaths anchors are returned.
  */
-export function extractAtlasSearchResultPaths(
-  toolName: string | null | undefined,
-  action: unknown,
-  output: string | null | undefined,
-  maxPaths = 12,
-): string[] {
+export function extractAtlasSearchResultPaths(toolName: string | null | undefined, action: unknown, output: string | null | undefined, maxPaths = 12): string[] {
   if (!output || !isAtlasDiscoveryResultTool(toolName, action)) return [];
   const seen = new Set<string>();
   const paths: string[] = [];
@@ -909,11 +1004,7 @@ export function extractAtlasSearchResultPaths(
  * the current global claims set, and optional active-window text for tier-2
  * distinctive-term matching. The term tier is config-gated default OFF.
  */
-export function extractRecallSignals(
-  toolInput: Record<string, unknown> | null,
-  claimedPaths: ReadonlySet<string>,
-  activeText: string | readonly string[] = '',
-): RecallSignals {
+export function extractRecallSignals(toolInput: Record<string, unknown> | null, claimedPaths: ReadonlySet<string>, activeText: string | readonly string[] = ''): RecallSignals {
   const touched = new Set<string>();
   if (toolInput) {
     const primary = extractPath(toolInput);
@@ -972,8 +1063,7 @@ export function deriveBoundaryRecallSignals(
   }
   const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
   const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
-  const proceed =
-    signals.touchedPaths.length > 0 || signals.claimedPaths.length > 0 || hasTermSignals || hasVerbatimSignals;
+  const proceed = signals.touchedPaths.length > 0 || signals.claimedPaths.length > 0 || hasTermSignals || hasVerbatimSignals;
   return { signals, proceed };
 }
 
@@ -1081,26 +1171,20 @@ function affinityKey(anchor: string, zonePath: string): string {
  * even when the carrier is non-empty for some OTHER anchor. An empty carrier
  * short-circuits straight to proximity (byte-identical standalone behavior).
  */
-function orderZoneByRelevance(
-  anchor: string,
-  paths: readonly string[],
-  affinity: ReadonlyMap<string, number>,
-): string[] {
+function orderZoneByRelevance(anchor: string, paths: readonly string[], affinity: ReadonlyMap<string, number>): string[] {
   if (affinity.size === 0) return orderZoneByProximity(anchor, paths);
   // Proximity rank is the fallback ordering: it tie-breaks equal affinity scores
   // and fully orders a zone whose anchor has no affinity keys (all score -1),
   // preserving tier-0 proximity rather than collapsing to insertion order.
-  const proximityRank = new Map(
-    orderZoneByProximity(anchor, paths).map((p, rank) => [p, rank] as const),
-  );
+  const proximityRank = new Map(orderZoneByProximity(anchor, paths).map((p, rank) => [p, rank] as const));
   return paths
-    .map((p) => ({
+    .map(p => ({
       p,
       rank: proximityRank.get(p) ?? Number.MAX_SAFE_INTEGER,
       score: p === anchor ? Infinity : (affinity.get(affinityKey(anchor, p)) ?? -1),
     }))
     .sort((x, y) => y.score - x.score || x.rank - y.rank)
-    .map((z) => z.p);
+    .map(z => z.p);
 }
 
 // ── Tier-1b booster math (BENCHED) ──────────────────────────────────────────
@@ -1154,9 +1238,7 @@ function recallZonePaths(item: RecallPlanItem, state?: FoldRecallState): readonl
   if (item.entry.kind === 'turn' || isSyntheticRecallKey(item.matchedPath)) {
     if (isSyntheticRecallKey(item.matchedPath)) return entryPaths(item.entry);
     const affinity = state?.pathAffinity;
-    return affinity
-      ? orderZoneByRelevance(item.matchedPath, entryPaths(item.entry), affinity)
-      : orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
+    return affinity ? orderZoneByRelevance(item.matchedPath, entryPaths(item.entry), affinity) : orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
   }
   return [item.matchedPath];
 }
@@ -1177,10 +1259,7 @@ function turnTerms(entry: FoldIndexEntry): string[] {
   return entry.kind === 'turn' ? extractDistinctiveTerms(entry.digest) : [];
 }
 
-function idfForTurnDigests(
-  entries: readonly FoldIndexEntry[],
-  getTerms: (entry: FoldIndexEntry) => string[] = turnTerms,
-): Map<string, number> {
+function idfForTurnDigests(entries: readonly FoldIndexEntry[], getTerms: (entry: FoldIndexEntry) => string[] = turnTerms): Map<string, number> {
   const df = new Map<string, number>();
   let total = 0;
   for (const entry of entries) {
@@ -1230,9 +1309,7 @@ export function planRecall(
     }
     return terms;
   };
-  const termIdf = queryTerms.length >= TERM_RECALL_MIN_DISTINCTIVE_COUNT
-    ? idfForTurnDigests(index.entries, getTurnTerms)
-    : null;
+  const termIdf = queryTerms.length >= TERM_RECALL_MIN_DISTINCTIVE_COUNT ? idfForTurnDigests(index.entries, getTurnTerms) : null;
   let suppressed = 0;
 
   for (const entry of index.entries) {
@@ -1240,11 +1317,8 @@ export function planRecall(
     // Exact verbatim-token re-surface: a single kept hash/id matching the active
     // window pages this turn in. Stronger than fuzzy term overlap (evaluated
     // first within tier 2), but path-touch/claim still outrank.
-    const tokenEligible =
-      queryTokens.length > 0 && entry.kind === 'turn' && (entry.verbatimTokens?.length ?? 0) > 0;
-    const tokenHit = tokenEligible
-      ? firstIntersection(entry.verbatimTokens ?? [], queryTokens)
-      : null;
+    const tokenEligible = queryTokens.length > 0 && entry.kind === 'turn' && (entry.verbatimTokens?.length ?? 0) > 0;
+    const tokenHit = tokenEligible ? firstIntersection(entry.verbatimTokens ?? [], queryTokens) : null;
     if (paths.length === 0 && (termIdf === null || entry.kind !== 'turn') && tokenHit === null) continue;
     let tier: RecallTier | null = null;
     let matchedPath: string | null = null;
@@ -1268,7 +1342,7 @@ export function planRecall(
         const overlap = scoreTermOverlap(queryTerms, getTurnTerms(entry), termIdf);
         if (overlap.distinctiveCount >= TERM_RECALL_MIN_DISTINCTIVE_COUNT) {
           tier = 2;
-          const matchedTerms = overlap.matched.map((m) => m.term);
+          const matchedTerms = overlap.matched.map(m => m.term);
           matchedPath = `term:${matchedTerms.join('+')}`;
           trigger = `term-overlap ${matchedTerms.join(', ')}`;
         }
@@ -1422,16 +1496,28 @@ export function findToolResultText(rawHistory: readonly FoldMessage[], toolId: s
   return null;
 }
 
-/** Collect tool result texts within a turn slice whose tool-arg path matches any recall-zone path. */
-function collectToolResultTextsForPaths(slice: readonly FoldMessage[], paths: readonly string[]): string[] {
+/**
+ * Collect tool result texts within a turn slice whose tool-arg path matches any
+ * recall-zone path, each paired with the matched path. Tool-id encounter order
+ * and global dedup are identical to legacy single-text collection, so callers
+ * that ignore the path produce byte-identical output; the path lets a caller
+ * substitute current box source for an individually-changed path.
+ */
+function collectToolResultEntriesForPaths(slice: readonly FoldMessage[], paths: readonly string[]): Array<{ path: string; text: string }> {
   if (paths.length === 0) return [];
   const wanted = new Set(paths);
   const ids: string[] = [];
+  const idPath = new Map<string, string>();
   const seenIds = new Set<string>();
-  const pushId = (id: string): void => {
+  const pushId = (id: string, matched: string): void => {
     if (seenIds.has(id)) return;
     seenIds.add(id);
     ids.push(id);
+    idPath.set(id, matched);
+  };
+  const firstWanted = (cmdPaths: readonly string[]): string | null => {
+    for (const p of cmdPaths) if (wanted.has(p)) return p;
+    return null;
   };
   for (const msg of slice) {
     if (msg.role !== 'assistant') continue;
@@ -1440,12 +1526,11 @@ function collectToolResultTextsForPaths(slice: readonly FoldMessage[], paths: re
         if (block?.type === 'tool_use' && typeof block.id === 'string') {
           const path = extractPath(block.input ?? {});
           if (path && wanted.has(path)) {
-            pushId(block.id);
+            pushId(block.id, path);
           } else if (typeof block.name === 'string' && BASH_TOOL_NAME_RE.test(block.name)) {
             const cmd = (block.input as any)?.command;
-            if (typeof cmd === 'string' && extractPathsFromBashCommand(cmd).some(p => wanted.has(p))) {
-              pushId(block.id);
-            }
+            const matched = typeof cmd === 'string' ? firstWanted(extractPathsFromBashCommand(cmd)) : null;
+            if (matched) pushId(block.id, matched);
           }
         }
       }
@@ -1454,26 +1539,29 @@ function collectToolResultTextsForPaths(slice: readonly FoldMessage[], paths: re
       for (const tc of (msg as any).tool_calls) {
         if (tc?.id && tc?.function?.name) {
           let args: Record<string, unknown> = {};
-          try { args = JSON.parse(tc.function.arguments ?? '{}'); } catch { /* skip */ }
+          try {
+            args = JSON.parse(tc.function.arguments ?? '{}');
+          } catch {
+            /* skip */
+          }
           const path = extractPath(args);
           if (path && wanted.has(path)) {
-            pushId(tc.id);
+            pushId(tc.id, path);
           } else if (BASH_TOOL_NAME_RE.test(tc.function.name)) {
             const cmd = args.command;
-            if (typeof cmd === 'string' && extractPathsFromBashCommand(cmd).some(p => wanted.has(p))) {
-              pushId(tc.id);
-            }
+            const matched = typeof cmd === 'string' ? firstWanted(extractPathsFromBashCommand(cmd)) : null;
+            if (matched) pushId(tc.id, matched);
           }
         }
       }
     }
   }
-  const texts: string[] = [];
+  const out: Array<{ path: string; text: string }> = [];
   for (const id of ids) {
     const text = findToolResultText(slice, id);
-    if (text) texts.push(text);
+    if (text) out.push({ path: idPath.get(id) as string, text });
   }
-  return texts;
+  return out;
 }
 
 function describeEntry(entry: FoldIndexEntry): string {
@@ -1489,16 +1577,50 @@ function renderHint(item: RecallPlanItem): string {
   return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} folded earlier (${formatChars(item.entry.chars)} chars) | trigger: ${item.trigger} | self-tap to recover]`;
 }
 
-/** Body text for a recall card, sliced from in-memory raw history only. */
+/** Per-path live-source substitution applied to a recall body; drives the notifier. */
+interface AppliedSourceDelta {
+  path: string;
+  liveHash: string;
+  /** Bounded "what changed" hunk for a visible change; '' for a beyond-window flag. */
+  diff: string;
+  truncated: boolean;
+  /** Truncated snapshot whose changed region (if any) lies beyond the window. */
+  beyond?: boolean;
+}
+
+/** Rendered recall body plus the current-source swaps applied to it. */
+interface RenderedEntryBody {
+  body: string;
+  applied: AppliedSourceDelta[];
+}
+
+/**
+ * Body text for a recall card, sliced from in-memory raw history only. When a
+ * recalled path's CURRENT box source (worker-fetched liveSource) genuinely
+ * differs from the historical folded copy, that path's body section is replaced
+ * with the current source and an AppliedSourceDelta is recorded so renderCard can
+ * surface the delta. A truncated snapshot whose change is beyond the window keeps
+ * the historical body but records a beyond-window flag. No carrier / no genuine
+ * change ⇒ byte-identical legacy body.
+ */
 function renderEntryBody(
   entry: FoldIndexEntry,
   recallPaths: readonly string[],
   rawHistory: readonly FoldMessage[],
   syntheticContext: SyntheticContextOptions,
-): string | null {
+  sourceDeltas: ReadonlyMap<string, RecallSourceDelta>,
+): RenderedEntryBody | null {
+  const applied: AppliedSourceDelta[] = [];
   if (entry.kind === 'tool') {
     const text = findToolResultText(rawHistory, entry.toolId);
-    return text === null ? null : stripRecallBlocks(text);
+    if (text === null) return null;
+    const historical = stripRecallBlocks(text);
+    const swap = entry.path ? swapPathToCurrentSource(entry.path, historical, sourceDeltas) : null;
+    if (swap) {
+      applied.push(swap.applied);
+      return { body: swap.body ?? historical, applied };
+    }
+    return { body: historical, applied };
   }
   if (entry.rawStart < 0 || entry.rawEnd > rawHistory.length || entry.rawStart >= entry.rawEnd) return null;
   const slice = rawHistory.slice(entry.rawStart, entry.rawEnd);
@@ -1508,12 +1630,19 @@ function renderEntryBody(
   const assistant = extractAssistantText(slice as FoldMessage[]);
   if (assistant) parts.push(assistant);
   if (recallPaths.length > 0) {
-    for (const text of collectToolResultTextsForPaths(slice, recallPaths)) {
-      parts.push(stripRecallBlocks(text));
+    for (const { path, text } of collectToolResultEntriesForPaths(slice, recallPaths)) {
+      const historical = stripRecallBlocks(text);
+      const swap = swapPathToCurrentSource(path, historical, sourceDeltas);
+      if (swap) {
+        parts.push(swap.body ?? historical);
+        applied.push(swap.applied);
+      } else {
+        parts.push(historical);
+      }
     }
   }
   const body = parts.join('\n\n');
-  return body.trim() ? body : null;
+  return body.trim() ? { body, applied } : null;
 }
 
 // ── Curated Code Radar formatters (deterministic, bounded, char-safe) ──
@@ -1577,11 +1706,7 @@ export function formatHazardRadar(hazards: readonly RecallHazard[], charBudget: 
  * matched a real file path; tier 2 (verbatim/term) keys are synthetic, so fall
  * back to the entry's own paths. Deduped across paths.
  */
-function resolveItemEnrichment(
-  item: RecallPlanItem,
-  state: FoldRecallState,
-  suppressPaths: ReadonlySet<string>,
-): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
+function resolveItemEnrichment(item: RecallPlanItem, state: FoldRecallState, suppressPaths: ReadonlySet<string>): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
   const keys = recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
   const highlights: RecallSourceHighlight[] = [];
   const hazards: RecallHazard[] = [];
@@ -1612,72 +1737,238 @@ function resolveItemEnrichment(
  * urgency), then highlight radar — each flag-gated, the two sharing charBudget.
  * Returns '' when both flags are off, nothing is resident, or nothing fits.
  */
-function buildRadar(
-  item: RecallPlanItem,
-  state: FoldRecallState,
-  config: FoldRecallConfig,
-  charBudget: number,
-  suppressPaths: ReadonlySet<string>,
-): string {
+function buildRadar(item: RecallPlanItem, state: FoldRecallState, config: FoldRecallConfig, charBudget: number, suppressPaths: ReadonlySet<string>): string {
   if (charBudget <= 0 || (!config.highlightsEnabled && !config.hazardsEnabled)) return '';
   const { highlights, hazards } = resolveItemEnrichment(item, state, suppressPaths);
   const parts: string[] = [];
   let used = 0;
   if (config.hazardsEnabled && hazards.length > 0) {
     const block = formatHazardRadar(hazards, charBudget - used);
-    if (block) { parts.push(block); used += block.length + 1; }
+    if (block) {
+      parts.push(block);
+      used += block.length + 1;
+    }
   }
   if (config.highlightsEnabled && highlights.length > 0) {
     const block = formatHighlightsRadar(highlights, charBudget - used);
-    if (block) { parts.push(block); used += block.length + 1; }
+    if (block) {
+      parts.push(block);
+      used += block.length + 1;
+    }
   }
   return parts.join('\n');
 }
 
-function normalizeSourceForComparison(text: string): string {
-  return text.replace(/\r\n/g, '\n').trim();
-}
+/**
+ * Build the Atlas identity metadata block for a recall card: purpose + tags
+ * from the Atlas record for this path. Compact, budget-bounded, and '' when
+ * empty or missing. Does NOT duplicate highlights/hazards.
+ */
+function buildAtlasMetaBlock(item: RecallPlanItem, state: FoldRecallState, config: FoldRecallConfig, charBudget: number, _suppressPaths: ReadonlySet<string>): string {
+  if (!config.atlasMetaEnabled) return '';
+  if (charBudget <= 0) return '';
+  const meta = state.pathAtlasMeta?.get(item.matchedPath);
+  if (!meta) return '';
 
-function resolveItemSourceDeltas(item: RecallPlanItem, state: FoldRecallState): RecallSourceDelta[] {
-  const keys = recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
-  const deltas: RecallSourceDelta[] = [];
-  const seen = new Set<string>();
-  for (const key of keys) {
-    const delta = state.pathSourceDeltas.get(key);
-    if (!delta || seen.has(delta.path)) continue;
-    seen.add(delta.path);
-    deltas.push(delta);
+  const parts: string[] = [];
+  let used = 0;
+
+  const identity = meta.purpose ?? meta.blurb;
+  if (identity && used + identity.length + 5 < charBudget) {
+    const line = `  📌 ${identity}`;
+    parts.push(line);
+    used += line.length + 1;
   }
-  return deltas;
+  if (meta.tags.length > 0) {
+    const tagLine = `  🏷 ${meta.tags.slice(0, 5).join(', ')}`;
+    if (used + tagLine.length + 1 < charBudget) {
+      parts.push(tagLine);
+      used += tagLine.length + 1;
+    }
+  }
+
+  if (parts.length === 0) return '';
+  return parts.join('\n');
 }
 
-function formatSourceDelta(delta: RecallSourceDelta, historicalBody: string, charBudget: number): string {
-  if (charBudget < 160) return '';
-  const live = normalizeSourceForComparison(delta.liveSource);
-  if (!live) return '';
-  const historical = normalizeSourceForComparison(historicalBody);
-  // Truncated live sources are only a prefix — the file may have changed
-  // beyond the truncation point. Skip suppression so the delta always renders.
-  if (!delta.truncated && historical.includes(live)) return '';
-  const heading = `⚠ Live Source Delta (${delta.path}): current box source differs from this historical fold-recall body; liveHash=${delta.liveHash}${delta.truncated ? '; live snapshot truncated' : ''}`;
-  const bodyBudget = charBudget - heading.length - '\nCurrent source excerpt:\n'.length;
-  if (bodyBudget < 80) return '';
-  return `${heading}\nCurrent source excerpt:\n${excerptForRecall(live, bodyBudget)}`;
-}
+const DELTA_MAX_LINES = 14;
+const DELTA_LINE_MAX_CHARS = 200;
+const DELTA_NOTIFIER_BUDGET = 900;
+const SOURCE_GUTTER_RE = /^\s*\d+\t/;
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, sourceDeltas: readonly RecallSourceDelta[]): string {
-  // Radar (hazard + highlight guideposts) and live-source delta both prepend the
-  // body excerpt and share the card budget — subtract their footprint so the
-  // total card stays bounded. Empty carriers ⇒ output is byte-identical to
-  // legacy recall.
-  const radarBlock = radar ? `${radar}\n` : '';
-  const deltaBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length) / 2);
-  const perDeltaBudget = sourceDeltas.length > 0 ? Math.floor(deltaBudget / sourceDeltas.length) : 0;
-  const deltaBlock = sourceDeltas
-    .map(delta => formatSourceDelta(delta, body, perDeltaBudget))
-    .filter(Boolean)
+/**
+ * Strip the cat -n line-number gutter ("   123\tcode") that Read tool results
+ * carry, so a historical folded body is comparable to raw on-disk liveSource
+ * (which has no gutter) and removed-side diff lines read as code. No-op when no
+ * tab gutter is present.
+ */
+function stripSourceGutter(text: string): string {
+  if (!text.includes('\t')) return text;
+  return text
+    .split('\n')
+    .map(line => line.replace(SOURCE_GUTTER_RE, ''))
     .join('\n');
-  const prefixBlock = deltaBlock ? `${radarBlock}${deltaBlock}\n` : radarBlock;
+}
+
+function splitNormalizedLines(text: string): string[] {
+  return text
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/[ \t]+$/, ''));
+}
+
+type SourceDeltaResult = { kind: 'changed'; diff: string } | { kind: 'beyond' } | null;
+
+/**
+ * Bounded, deterministic line delta between a historical folded body and the
+ * current box source. 'changed' carries the minimal "what changed" hunk; 'beyond'
+ * means a truncated snapshot showed no in-window divergence but the file extends
+ * past the char cap (real state unknown — flag, don't fabricate a deletion diff);
+ * null means identical (gutter-normalized) ⇒ no genuine change. For a truncated
+ * snapshot the partial final line and the historical tail beyond the window are
+ * dropped so comparison stays within the region both sides cover; common
+ * prefix/suffix are then trimmed to a minimal hunk.
+ */
+function computeSourceDelta(historicalBody: string, liveSource: string, truncated: boolean, budget: number): SourceDeltaResult {
+  if (budget < 80) return null;
+  const histFull = splitNormalizedLines(stripSourceGutter(historicalBody));
+  let liveLines = splitNormalizedLines(liveSource);
+  let histLines = histFull;
+  if (truncated) {
+    // The live snapshot is a char-capped prefix: its final line is a truncation
+    // artifact (a partial line, or a trailing empty from a boundary newline).
+    // Drop it and cap the historical side to the same window so the tail beyond
+    // the snapshot is never mistaken for a deletion.
+    liveLines = liveLines.slice(0, Math.max(0, liveLines.length - 1));
+    histLines = histFull.slice(0, liveLines.length);
+  }
+  let pre = 0;
+  const maxPre = Math.min(histLines.length, liveLines.length);
+  while (pre < maxPre && histLines[pre] === liveLines[pre]) pre++;
+  let post = 0;
+  const maxPost = Math.min(histLines.length - pre, liveLines.length - pre);
+  while (post < maxPost && histLines[histLines.length - 1 - post] === liveLines[liveLines.length - 1 - post]) post++;
+  const removed = histLines.slice(pre, histLines.length - post);
+  const added = liveLines.slice(pre, liveLines.length - post);
+  if (removed.length === 0 && added.length === 0) {
+    // Identical within the comparable region. For a truncated snapshot the real
+    // current state past the window is unknown ⇒ flag; else genuinely unchanged.
+    return truncated ? { kind: 'beyond' } : null;
+  }
+  const out: string[] = [`@@ ~line ${pre + 1} @@`];
+  let used = out[0].length + 1;
+  let shown = 0;
+  let omitted = 0;
+  const push = (marker: string, text: string): void => {
+    if (shown >= DELTA_MAX_LINES) {
+      omitted++;
+      return;
+    }
+    const clipped = text.length > DELTA_LINE_MAX_CHARS ? `${charSafeSlice(text, 0, DELTA_LINE_MAX_CHARS - 1)}…` : text;
+    const line = `${marker} ${clipped}`;
+    if (used + line.length + 1 > budget) {
+      omitted++;
+      return;
+    }
+    out.push(line);
+    used += line.length + 1;
+    shown++;
+  };
+  for (const r of removed) push('−', r);
+  for (const a of added) push('+', a);
+  if (omitted > 0) out.push(`…(${omitted} more changed line${omitted === 1 ? '' : 's'} — self-tap/fresh-read for full)`);
+  return { kind: 'changed', diff: out.join('\n') };
+}
+
+function currentSourceLabel(path: string, truncated: boolean): string {
+  return truncated ? `↻ CURRENT box source — ${path} (snapshot truncated; fresh-read for full file):` : `↻ CURRENT box source — ${path}:`;
+}
+
+/**
+ * Decide how to render `path`'s worker-fetched live snapshot:
+ * - genuine visible change ⇒ body becomes current box source + a recorded diff;
+ * - truncated change beyond the window ⇒ body stays historical (null) + a
+ *   beyond-window flag so the notifier warns to fresh-read;
+ * - no carrier / no change ⇒ null (caller keeps historical, byte-identical legacy).
+ */
+function swapPathToCurrentSource(
+  path: string,
+  historical: string,
+  sourceDeltas: ReadonlyMap<string, RecallSourceDelta>,
+): { body: string | null; applied: AppliedSourceDelta } | null {
+  const delta = sourceDeltas.get(path);
+  if (!delta || !delta.liveSource.trim()) return null;
+  const res = computeSourceDelta(historical, delta.liveSource, !!delta.truncated, DELTA_NOTIFIER_BUDGET);
+  if (res === null) return null;
+  if (res.kind === 'beyond') {
+    return { body: null, applied: { path, liveHash: delta.liveHash, diff: '', truncated: true, beyond: true } };
+  }
+  return {
+    body: `${currentSourceLabel(path, !!delta.truncated)}\n${delta.liveSource}`,
+    applied: { path, liveHash: delta.liveHash, diff: res.diff, truncated: !!delta.truncated },
+  };
+}
+
+function resolveItemSourceDeltaMap(item: RecallPlanItem, state: FoldRecallState): Map<string, RecallSourceDelta> {
+  const map = new Map<string, RecallSourceDelta>();
+  for (const key of recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS)) {
+    const delta = state.pathSourceDeltas.get(key);
+    if (delta && !map.has(delta.path)) map.set(delta.path, delta);
+  }
+  return map;
+}
+
+/**
+ * Notifier block, rendered before the body excerpt so it always survives body
+ * truncation. For changed paths the heading announces the body is CURRENT box
+ * source and lists each path's "what changed" hunk; when any path is a beyond-
+ * window flag (truncated snapshot whose change lies past the cap) the heading
+ * stays neutral — that path's body is NOT current — and the path warns to
+ * fresh-read. '' when nothing was applied ⇒ byte-identical legacy.
+ */
+function formatDeltaNotifier(applied: readonly AppliedSourceDelta[], budget: number): string {
+  if (applied.length === 0 || budget < 80) return '';
+  const allChanged = applied.every(a => !a.beyond);
+  const heading = allChanged
+    ? applied.length === 1
+      ? 'Δ Source changed since fold — body below is CURRENT box source; what changed:'
+      : `Δ ${applied.length} sources changed since fold — bodies below are CURRENT box source; what changed:`
+    : 'Δ Fold-recall live-source check:';
+  const out: string[] = [heading];
+  let used = heading.length + 1;
+  for (const a of applied) {
+    if (a.beyond) {
+      const head = `${a.path} (liveHash=${a.liveHash}) [snapshot truncated] — body may be stale beyond the shown prefix; fresh-read to verify current code`;
+      if (used + head.length + 1 > budget) break;
+      out.push(head);
+      used += head.length + 1;
+    } else {
+      const head = `${a.path} (liveHash=${a.liveHash})`;
+      if (used + head.length + 1 > budget) break;
+      out.push(head);
+      used += head.length + 1;
+      for (const line of a.diff.split('\n')) {
+        if (used + line.length + 1 > budget) break;
+        out.push(line);
+        used += line.length + 1;
+      }
+    }
+  }
+  return out.length > 1 ? out.join('\n') : '';
+}
+
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, applied: readonly AppliedSourceDelta[], episodeVoice = '', atlasMeta = ''): string {
+  // Radar (hazard + highlight guideposts), episodic voice, and the source-delta
+  // notifier all prepend the body excerpt and share the card budget. The body
+  // itself is already CURRENT box source for any changed path (swapped in
+  // renderEntryBody); the notifier shows what changed. Empty carriers ⇒ byte-identical.
+  const radarBlock = radar ? `${radar}\n` : '';
+  const voiceBlock = episodeVoice ? `${episodeVoice}\n` : '';
+  const metaBlock = atlasMeta ? `${atlasMeta}\n` : '';
+  const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - metaBlock.length) / 2);
+  const notifier = formatDeltaNotifier(applied, notifierBudget);
+  const notifierBlock = notifier ? `${notifier}\n` : '';
+  const prefixBlock = `${metaBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
   const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - prefixBlock.length));
   const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
   return `${header}\n${prefixBlock}${excerpt}\n[End fold recall]`;
@@ -1699,11 +1990,7 @@ export interface FoldRecallOutcome {
 
 const EMPTY_OUTCOME: FoldRecallOutcome = { text: null, cards: 0, hints: 0, chars: 0, suppressed: 0, triggers: [] };
 
-function refreshResidency(
-  map: Map<string, ResidencyRecord>,
-  key: string,
-  expiresAtPass: number,
-): void {
+function refreshResidency(map: Map<string, ResidencyRecord>, key: string, expiresAtPass: number): void {
   const existing = map.get(key);
   if (existing) map.set(key, { ...existing, expiresAtPass });
 }
@@ -1731,12 +2018,7 @@ export function buildFoldRecallContext(
   if (rawHistory.length < state.index.rawCount) return EMPTY_OUTCOME;
   const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
   const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
-  if (
-    signals.touchedPaths.length === 0 &&
-    signals.claimedPaths.length === 0 &&
-    !hasTermSignals &&
-    !hasVerbatimSignals
-  ) {
+  if (signals.touchedPaths.length === 0 && signals.claimedPaths.length === 0 && !hasTermSignals && !hasVerbatimSignals) {
     return EMPTY_OUTCOME;
   }
 
@@ -1787,13 +2069,15 @@ export function buildFoldRecallContext(
         level = 'hint'; // measured budget overflow → card degrades to hint
       } else {
         const recallPaths = recallZonePaths(item, state);
-        const body = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext);
-        if (body === null) continue; // raw no longer recoverable — skip silently
-        // Curated Code Radar may take up to half the card body budget; the
-        // excerpt keeps the rest. '' (empty carriers / flags off) ⇒ byte-identical.
+        const sourceDeltas = resolveItemSourceDeltaMap(item, state);
+        const rb = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext, sourceDeltas);
+        if (rb === null) continue; // raw no longer recoverable — skip silently
+        // Curated Code Radar may take up to a third of the card body budget; the
+        // notifier + excerpt share the rest. '' (empty carriers / flags off) ⇒ byte-identical.
         const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
-        const sourceDeltas = resolveItemSourceDeltas(item, state);
-        rendered = renderCard(item, body, bodyBudget, radar, sourceDeltas);
+        const episodeVoice = buildEpisodeVoiceBlock(item, state, config, Math.floor(bodyBudget / 4), radarSuppressPaths);
+        const atlasMeta = buildAtlasMetaBlock(item, state, config, Math.floor(bodyBudget / 5), radarSuppressPaths);
+        rendered = renderCard(item, rb.body, bodyBudget, radar, rb.applied, episodeVoice, atlasMeta);
         if (rendered.length > remaining) {
           level = 'hint';
           rendered = null;

@@ -160,6 +160,63 @@ export interface EpisodeGroupingOptions {
   maxBurstMs?: number;
   /** star:pivot markers — an agent-declared chapter break seals the burst. */
   pivots?: readonly EpisodePivotMarker[];
+  /**
+   * VOICE FLOOR: when true, a burst is NOT sealed by a gap/pivot alone unless
+   * it contains at least one voice event (from voiceEventIndexes) OR the
+   * force-split cap (maxBurstEvents/maxBurstMs) fires. This produces fewer,
+   * fatter episodes that each carry voice by construction — the chunk boundary
+   * flexes to where the voice actually is instead of cutting before it arrives.
+   * Force-split always overrides — a burst can't grow indefinitely.
+   */
+  voiceFloor?: boolean;
+  /**
+   * Sorted event indexes where voice annotations (changelog/star/chat) were
+   * emitted. Used by voiceFloor to check if the current burst has voice.
+   * If absent or empty, voiceFloor is a no-op (no voice data → never hold).
+   */
+  voiceEventIndexes?: readonly number[];
+  /**
+   * Sorted event indexes where operator INTENT messages (the user's ask)
+   * appear. Intent typically sits BEFORE a burst's first touch (the ask
+   * motivates the work), so burstHasVoice checks a WIDER range for intent
+   * than for annotations: [prevBurstEnd, currentLast] vs [first, last].
+   * This prevents the 91.7% of "voiceless" episodes that actually carry
+   * the operator's ask from being counted as voice-deprived.
+   */
+  intentEventIndexes?: readonly number[];
+  /**
+   * VALUE FLOOR: paths that carry forward-reference value (e.g. actively edited
+   * files, claim&edit > read). A burst containing any valueFloorPath gets its
+   * gapMs multiplied by valueFloorGapMultiplier so high-value paths hold open
+   * longer to accumulate more voice before sealing. Omitting the array or
+   * passing multiplier ≤ 1 ⇒ byte-identical to not having the option.
+   */
+  valueFloorPaths?: readonly string[];
+  /** Multiplier applied to gapMs when a burst contains a value-floor path. */
+  valueFloorGapMultiplier?: number;
+  /**
+   * TAP-STAR FLOOR: event indexes carrying a deliberate operator pin
+   * (star:decision, star:pivot, star:gotcha). A deliberately-pinned waypoint
+   * is the strongest 'resurface this' signal — stronger than mined narration.
+   * A burst containing any tapStarFloor event holds open gapMs ×
+   * tapStarFloorGapMultiplier (default 2.0) AND is never sealed voiceless.
+   * Omitting = byte-identical.
+   */
+  tapStarFloorEventIndexes?: readonly number[];
+  /** Multiplier applied to gapMs when a burst contains a tap-star pin. */
+  tapStarFloorGapMultiplier?: number;
+  /**
+   * AFFINITY FLOOR: behavioral co-occurrence scores. When a gap would seal but
+   * a (currentBurstPath, nextEventPath) pair has affinity ≥ affinityGapThreshold,
+   * extend gapMs by affinityGapMultiplier. This keeps a burst open when the
+   * agent likely stayed in the same conceptual zone. Path→neighbor→score (0-1).
+   * Omitting = byte-identical.
+   */
+  affinityFloor?: Readonly<Record<string, Record<string, number>>>;
+  /** Affinity score threshold above which a gap is widened (default 0.5). */
+  affinityGapThreshold?: number;
+  /** Multiplier applied to gapMs when affinity ≥ threshold (default 2.0). */
+  affinityGapMultiplier?: number;
 }
 
 export interface EpisodeBurst {
@@ -522,8 +579,11 @@ function episodeEventRange(episode: Episode): { first: number; last: number } {
  * two touches, OR the current burst has already SPANNED past maxBurstEvents
  * events / maxBurstMs wall-clock from its FIRST touch (the force-split cap that
  * stops a continuous run from forming one perpetually-open, never-sealing
- * burst). Members are aggregated per path with the strongest touch kind; when
- * trimming to memberCap, edits are prioritized, then touch volume.
+ * burst). When voiceFloor is enabled, a burst that would seal on gap/pivot
+ * alone is held open until it contains at least one voice event (from
+ * voiceEventIndexes), UNLESS force-split fires. Members are aggregated per path
+ * with the strongest touch kind; when trimming to memberCap, edits are
+ * prioritized, then touch volume.
  */
 export function groupTouchesIntoEpisodes(
   touches: readonly EpisodeTouch[],
@@ -538,14 +598,85 @@ export function groupTouchesIntoEpisodes(
     .map((pivot) => pivot.eventIndex)
     .sort((a, b) => a - b);
 
+  // VOICE FLOOR: if enabled, a burst with zero voice annotations refuses to
+  // seal on gap/pivot alone — it stays open until voice arrives or force-split
+  // fires. This produces fewer, fatter episodes where each carries voice by
+  // construction. The chunk boundary flexes to where voice actually is instead
+  // of cutting before it arrives (the 54% voicelessness problem).
+  const voiceFloor = opts.voiceFloor === true;
+  const voiceIdxSet = voiceFloor && opts.voiceEventIndexes && opts.voiceEventIndexes.length > 0
+    ? new Set(opts.voiceEventIndexes)
+    : null;
+  // INTENT VOICE: operator intent (the ask) sits BEFORE the burst's first touch
+  // — it motivated the work. Annotation voice lives INSIDE [first, last]; intent
+  // lives in the preceding gap, so we check a wider range [prevBurstEnd, last].
+  const intentIdxSet = voiceFloor && opts.intentEventIndexes && opts.intentEventIndexes.length > 0
+    ? new Set(opts.intentEventIndexes)
+    : null;
+
+  // VALUE FLOOR: when provided, a burst containing any valueFloorPath gets its
+  // gapMs multiplied so high-value paths hold open longer. Multiplier ≤ 1 or
+  // no valueFloorPaths = byte-identical (no effect on seal timing).
+  const valueFloorSet = opts.valueFloorPaths && opts.valueFloorPaths.length > 0
+    ? new Set(opts.valueFloorPaths)
+    : null;
+  const valueFloorMult = opts.valueFloorGapMultiplier ?? 1.5;
+
+  // TAP-STAR FLOOR: when provided, a burst containing a deliberate operator pin
+  // (star:decision/pivot/gotcha) holds open gapMs × tapStarFloorGapMultiplier
+  // AND is never sealed voiceless. Omitting = byte-identical.
+  const tapStarFloorSet = opts.tapStarFloorEventIndexes && opts.tapStarFloorEventIndexes.length > 0
+    ? new Set(opts.tapStarFloorEventIndexes)
+    : null;
+  const tapStarFloorMult = opts.tapStarFloorGapMultiplier ?? 2.0;
+
+  // AFFINITY FLOOR defaults
+  const affinityGapThreshold = opts.affinityGapThreshold ?? 0.5;
+  const affinityGapMult = opts.affinityGapMultiplier ?? 2.0;
+
   const sorted = touches
     .filter((touch) => isEpisodeMemberPath(touch.path))
     .sort(
       (a, b) => a.eventIndex - b.eventIndex || comparePaths(a.path, b.path) || TOUCH_KIND_RANK[b.kind] - TOUCH_KIND_RANK[a.kind],
     );
 
+  // Helper: check whether the current burst has voice. Two channels:
+  //  1. ANNOTATION voice (changelog/star/chat/narration): lives INSIDE [first, last]
+  //  2. INTENT voice (operator's ask): lives in the gap BEFORE the burst, so we
+  //     check [prevBurstEnd, last] — wider than annotations. Without this, 91.7%
+  //     of voiceless bursts would still be held open despite carrying the operator's
+  //     ask that motivated them.
+  const burstHasVoice = (burstTouches: EpisodeTouch[], prevBurstEnd: number): boolean => {
+    if (!voiceIdxSet && !intentIdxSet) return true; // no voice data → never hold
+    const first = burstTouches[0]?.eventIndex ?? 0;
+    const last = burstTouches[burstTouches.length - 1]?.eventIndex ?? 0;
+    // Annotation voice: must be inside the burst's touch range
+    if (voiceIdxSet) {
+      for (const idx of voiceIdxSet) {
+        if (idx >= first && idx <= last) return true;
+      }
+    }
+    // Intent voice: check the wider range [prevBurstEnd, last] — the ask that
+    // motivated this burst sits in the gap before its first touch.
+    if (intentIdxSet) {
+      for (const idx of intentIdxSet) {
+        if (idx >= prevBurstEnd && idx <= last) return true;
+      }
+    }
+    return false;
+  };
+
+  /** Check if any touch in the burst has an event index in the given set. */
+  const burstHasEvent = (burstTouches: EpisodeTouch[], eventSet: Set<number>): boolean => {
+    for (const t of burstTouches) {
+      if (eventSet.has(t.eventIndex)) return true;
+    }
+    return false;
+  };
+
   const bursts: EpisodeTouch[][] = [];
   let current: EpisodeTouch[] = [];
+  let prevBurstEnd = 0; // End event index of the last sealed burst (for intent range)
   let pivotCursor = 0;
 
   for (const touch of sorted) {
@@ -557,6 +688,28 @@ export function groupTouchesIntoEpisodes(
       const prevMs = parseTsMs(prev.ts);
       const touchMs = parseTsMs(touch.ts);
       const msGap = prevMs !== undefined && touchMs !== undefined ? touchMs - prevMs : undefined;
+      // VALUE FLOOR: if the current burst contains a value-floor path, widen
+      // the time gap threshold so high-value bursts absorb more before sealing.
+      // TAP-STAR FLOOR: if the burst contains a deliberate operator pin, widen
+      // even further (tap-star multiplier > value multiplier by default).
+      const hasValueFloor = valueFloorSet && valueFloorMult > 1
+        && current.some((t) => valueFloorSet.has(t.path));
+      const hasTapStarFloor = tapStarFloorSet && tapStarFloorMult > 1
+        && burstHasEvent(current, tapStarFloorSet);
+      // AFFINITY FLOOR: if any current-burst path has affinity ≥ threshold
+      // with the incoming touch's path, widen the gap.
+      const hasAffinity = !!opts.affinityFloor
+        && current.some((t) => {
+          const neighbors = opts.affinityFloor![t.path];
+          return neighbors && (neighbors[touch.path] ?? 0) >= affinityGapThreshold;
+        });
+      const effectiveGapMs = hasTapStarFloor
+        ? gapMs * tapStarFloorMult
+        : hasValueFloor
+          ? gapMs * valueFloorMult
+          : hasAffinity
+            ? gapMs * affinityGapMult
+            : gapMs;
       // FORCE-SPLIT: cap the SPAN of one uninterrupted burst, measured from its
       // FIRST touch (not prev). A continuous run never gaps, so without this it
       // never seals — its voice is dropped and the cursor parks. See
@@ -566,9 +719,23 @@ export function groupTouchesIntoEpisodes(
       const burstStartMs = parseTsMs(burstStart.ts);
       const spanMs = burstStartMs !== undefined && touchMs !== undefined ? touchMs - burstStartMs : undefined;
       const spanExceeded = spanEvents > maxBurstEvents || (spanMs !== undefined && spanMs > maxBurstMs);
-      if (eventGap > gapEvents || (msGap !== undefined && msGap > gapMs) || pivotBetween || spanExceeded) {
-        bursts.push(current);
-        current = [];
+
+      const shouldSeal = eventGap > gapEvents || (msGap !== undefined && msGap > effectiveGapMs) || pivotBetween || spanExceeded;
+
+      if (shouldSeal) {
+        // VOICE FLOOR GATE: if enabled and the burst about to seal has NO voice
+        // (neither annotations nor intent), hold it open — UNLESS force-split
+        // fires (can't grow indefinitely). The burst absorbs this touch and
+        // stays open for voice.
+        const hasVoiceData = voiceIdxSet !== null || intentIdxSet !== null;
+        if (hasVoiceData && !spanExceeded && !burstHasVoice(current, prevBurstEnd)) {
+          // Don't seal — keep growing. The burst now spans into this touch's
+          // territory, and will seal on the NEXT gap once voice arrives.
+        } else {
+          bursts.push(current);
+          prevBurstEnd = current[current.length - 1]?.eventIndex ?? 0;
+          current = [];
+        }
       }
     }
     current.push(touch);
@@ -882,6 +1049,29 @@ function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   if (annotation.kind === 'changelog') return `  ✎${who}:"${text}"${at}`;
   if (annotation.kind.startsWith('narration')) return `  🗣${who}:"${text}"${at}`;
   return `  💬${who}:"${text}"${at}`;
+}
+
+/**
+ * Compact pre-rendered voice lines for one episode, for the unified fold-recall
+ * card. Reuses the EXISTING selectVoiceInlays + episodeAuthorLabel +
+ * renderVoiceLine chain so glyph/attribution/timestamp rendering is byte-identical
+ * to full chain cards. Returns voice lines only (no members/trace/deltas — those
+ * live in the fold-recall card body already). The intent anchor is returned
+ * separately so the caller can place it on the EpisodeVoice without re-parsing.
+ *
+ * Pure CPU: no I/O, no ambient reads. Safe from worker handlers and pure tests.
+ */
+export function renderEpisodeVoiceLines(
+  episode: Episode,
+  opts: Pick<ChainCardOptions, 'ownLineage' | 'selfName'>,
+  maxLines = 2,
+): { voiceLines: string[]; intent: string | null } {
+  const voiceLabel = episodeAuthorLabel(episode, opts);
+  const voiceLines = selectVoiceInlays(episode.annotations, maxLines).map((inlay) =>
+    renderVoiceLine(inlay, voiceLabel),
+  );
+  const intent = episode.intent ?? null;
+  return { voiceLines, intent };
 }
 
 function renderMembersLine(episode: Episode): string {

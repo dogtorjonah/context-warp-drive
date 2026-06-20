@@ -41,6 +41,156 @@
  */
 import { tokenize } from './persistence/sparseVector.ts';
 
+// ── Stemming (pure-CPU morphological normalization) ──
+
+/**
+ * Light suffix-stripping stemmer. Collapses inflectional variants so that
+ * fold/folded/folding/folds share one canonical stem. Pure string ops — no
+ * imports, no model, no corpus lookup — so it respects the FENCE.
+ *
+ * Strategy: strip common English inflectional suffixes in order from longest
+ * to shortest, with a minimum stem length guard (MIN_STEM_LEN) to prevent
+ * over-stemming short words (e.g. "is" → "" or "files" → "fi"). Words shorter
+ * than the shortest suffix are returned unchanged.
+ *
+ * This is intentionally NOT a full Porter/Snowball stemmer — those are heavier
+ * and would require either a dependency (breaking the fence) or ~200 lines of
+ * hand-written rules. This ~30-line function catches 80%+ of the morphological
+ * fragmentation quantified in the live store (866 stems with 2+ variants,
+ * 2,183 terms split across inflections — rail-2d53647f).
+ *
+ * Suffixes are ordered longest-first so that multi-suffix words like
+ * "rationalization" strip "-ization" before "-ation" would fire.
+ */
+const MIN_STEM_LEN = 4;
+
+/**
+ * Inflectional suffixes in descending-length order for correct greedy
+ * stripping (longer suffixes tried first so "rationalization" → "rational"
+ * not "rationalizat"). Deduplicated at construction time.
+ */
+const STEM_SUFFIXES: readonly string[] = [
+  // 7-char
+  'ization', 'ational', 'fulness', 'ousness', 'iveness',
+  // 6-char
+  'ation', 'ition', 'ement', 'ously', 'izing', 'ising',
+  // 5-char
+  'ities', 'iness', 'ality',
+  // 4-char
+  'tion', 'sion', 'ions', 'ized', 'izer', 'izes', 'ings', 'iest', 'edly',
+  // 3-char
+  'ing', 'ies', 'ied', 'ier', 'ers', 'est', 'ity', 'ize',
+  // 2-char
+  'ed', 'er', 'es', 'ly',
+  // 1-char (plural only)
+  's',
+];
+
+/**
+ * Apply light suffix-stripping stemming. Returns the stem of a single token.
+ * Pure function, no side effects, deterministic.
+ *
+ * Special rules:
+ *   -ies → -y  ("queries" → "query", "retries" → "retry")
+ *   -ied → -y  ("carried" → "carry")
+ *   -es  → -e  ("instances" → "instance", "files" → "file")
+ *   -ss  preserved ("compress" stays "compress", not "compres")
+ *
+ * All other suffixes are stripped directly: "folding" → "fold", "blocked" →
+ * "block", "files" → "file", "compressed" → "compress". Imperfections (e.g.
+ * "compression" → "compres" vs "compress") are caught by the synonym map.
+ */
+export function stem(token: string): string {
+  if (token.length <= MIN_STEM_LEN) return token;
+  for (const suffix of STEM_SUFFIXES) {
+    if (token.length - suffix.length >= MIN_STEM_LEN && token.endsWith(suffix)) {
+      if (suffix === 'ies') return token.slice(0, -3) + 'y';
+      if (suffix === 'ied') return token.slice(0, -3) + 'y';
+      // Guard against stripping -es from words ending in -ss/-se (compress →
+      // "compres", instances → "instanc"): preserve the 'e' so the stem stays
+      // closer to the root surface form.
+      if (suffix === 'es') {
+        const before = token.slice(0, -2);
+        // "instances" → "instance" (preserve e), "tables" → "table"
+        return before + 'e';
+      }
+      // Guard -s on double-s words ("class" → should stay "class", not "clas")
+      // and -s on -ss words ("compress" → should not strip s after "ss").
+      if (suffix === 's' && token.endsWith('ss')) return token;
+      return token.slice(0, -suffix.length);
+    }
+  }
+  return token;
+}
+
+// ── Synonym Map (pre-computed offline, loaded as static lookup) ──
+
+/**
+ * Module-level synonym map. Populated once at init via setSynonymMap() with
+ * a pre-computed { stem → Set<stem> } table built offline by embedding the
+ * distinctive terms with text-embedding-3-small, building HNSW, and querying
+ * k-NN at 0.80+ cosine threshold. See build-synonym-map.py.
+ *
+ * This is the SAME class of operation as the IDF map: a static lookup table
+ * loaded at init, not a search or model call on the recall path. The FENCE
+ * holds because the embedding model only breathes during the offline build
+ * step, never at tool-boundary recall time.
+ *
+ * The map operates on STEMS (post-stem()), not surface forms, so both sides
+ * of the lookup are normalized before intersection.
+ */
+let synonymMap: ReadonlyMap<string, ReadonlySet<string>> = new Map();
+
+/**
+ * Synonym expansion cap. Each distinctive query stem expands to at most this
+ * many synonym stems, preventing noise explosion on common-but-distinctive
+ * terms. Default 3.
+ */
+const SYNONYM_EXPANSION_CAP = 3;
+
+/**
+ * Load a pre-computed synonym map at init time. Keys and values must be stems
+ * (not surface forms) — the build script normalizes via the same stem()
+ * function. Pass an empty map to disable synonym expansion.
+ */
+export function setSynonymMap(
+  map: ReadonlyMap<string, readonly string[]>,
+): void {
+  const out = new Map<string, ReadonlySet<string>>();
+  for (const [key, syns] of map) {
+    out.set(key, new Set(syns.slice(0, SYNONYM_EXPANSION_CAP)));
+  }
+  synonymMap = out;
+}
+
+/**
+ * Whether the synonym map has been loaded. Used by tests and diagnostics.
+ */
+export function isSynonymMapLoaded(): boolean {
+  return synonymMap.size > 0;
+}
+
+/**
+ * Expand a set of query stems through the synonym map. Returns a NEW set
+ * containing all original stems plus up to SYNONYM_EXPANSION_CAP synonyms per
+ * stem. Pure — does not mutate the input.
+ */
+function expandWithSynonyms(
+  stems: ReadonlySet<string>,
+): Set<string> {
+  if (synonymMap.size === 0) return new Set(stems);
+  const expanded = new Set(stems);
+  for (const s of stems) {
+    const syns = synonymMap.get(s);
+    if (syns === undefined) continue;
+    for (const syn of syns) {
+      if (expanded.size >= stems.size * (1 + SYNONYM_EXPANSION_CAP)) break;
+      expanded.add(syn);
+    }
+  }
+  return expanded;
+}
+
 /**
  * Generic-English grammatical stopwords ONLY. Corpus-common technical jargon is
  * intentionally absent here — it is suppressed by IDF at match time (see file
@@ -122,9 +272,10 @@ export function extractDistinctiveTerms(text: string, opts: ExtractOpts = {}): s
   for (const tok of tokenize(text)) {
     if (tok.length < minLen) continue;
     if (STOPWORDS.has(tok) || CODE_STOPWORDS.has(tok)) continue;
-    if (seen.has(tok)) continue;
-    seen.add(tok);
-    out.push(tok);
+    const s = stem(tok);
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
     if (out.length >= cap) break;
   }
   return out;
@@ -180,13 +331,27 @@ export function scoreTermOverlap(
 ): OverlapResult {
   const idfFloor = opts.idfFloor ?? 0.3;
   const unseenIdf = opts.unseenIdf ?? 1.0;
-  const cand = new Set(candTerms);
+  // Normalize IDF map to stem space. Production maps from
+  // idfFromDocumentFrequency are already stemmed (idempotent re-stem here);
+  // test/direct maps may carry surface forms. O(|idf|) — negligible for the
+  // ~64-200 term maps typical in recall passes.
+  const sidf = new Map<string, number>();
+  for (const [k, v] of idf) {
+    sidf.set(stem(k), v);
+  }
+  // Stem candidate terms into a set for intersection.
+  const cand = new Set<string>();
+  for (const t of candTerms) cand.add(stem(t));
+  // Stem query terms, then expand through synonym map if loaded.
+  const queryStems = new Set<string>();
+  for (const t of queryTerms) queryStems.add(stem(t));
+  const expanded = expandWithSynonyms(queryStems);
   let score = 0;
   let distinctiveCount = 0;
   const matched: OverlapMatch[] = [];
-  for (const t of queryTerms) {
+  for (const t of expanded) {
     if (!cand.has(t)) continue;
-    const w = idf.get(t) ?? unseenIdf;
+    const w = sidf.get(t) ?? unseenIdf;
     if (w <= 0) continue; // present in ~every doc ⇒ zero signal, never faults
     score += w;
     if (w >= idfFloor) distinctiveCount += 1;
@@ -209,7 +374,15 @@ export function idfFromDocumentFrequency(
 ): Map<string, number> {
   const idf = new Map<string, number>();
   if (totalDocuments <= 0) return idf;
+  // Merge document frequencies by stem so that fold(df=202) + folded(df=47)
+  // + folding(df=36) → fold(df=285). This makes IDF properly weight the
+  // unified concept rather than treating each inflection as separately rare.
+  const mergedDf = new Map<string, number>();
   for (const [term, df] of documentFrequency) {
+    const s = stem(term);
+    mergedDf.set(s, (mergedDf.get(s) ?? 0) + df);
+  }
+  for (const [term, df] of mergedDf) {
     idf.set(term, Math.log(totalDocuments / (1 + df)));
   }
   return idf;

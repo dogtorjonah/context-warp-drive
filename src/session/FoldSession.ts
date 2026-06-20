@@ -35,6 +35,8 @@ import {
   type FoldEvictionInput,
   type FoldEvictionSpan,
   type FidelityOverrides,
+  type FidelityValueWeights,
+  type FoldFidelityValueInput,
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
@@ -179,6 +181,18 @@ export interface FoldSessionOptions {
    */
   readonly readBurstGuard?: boolean;
   /**
+   * Intrinsic value-aware graduated fidelity (cherry-picked, full-recompute
+   * only). When `enabled`, a freeze EPOCH full-recompute spends the same
+   * full/essence budget by intrinsic trace value (forward path re-reference +
+   * durable glyph) past a recency floor, instead of the pure newest-first ramp.
+   * Append/hot-reuse never apply it. Default OFF (byte-identical fold).
+   */
+  readonly valueFidelity?: {
+    readonly enabled?: boolean;
+    readonly weights?: Partial<FidelityValueWeights>;
+    readonly recencyFloorTurns?: number;
+  };
+  /**
    * Host-supplied synthetic user-context markers to exclude from turn detection
    * and fold text mining. Defaults empty so the package remains host-neutral.
    */
@@ -308,6 +322,7 @@ export class FoldSession {
   private readonly tailEpochRunwayTokens: number | null;
   private readonly tailEpochMinRunwayTokens: number | null;
   private readonly readBurstGuardEnabled: boolean;
+  private readonly valueFidelityInput: FoldFidelityValueInput | undefined;
   private readonly syntheticContext: SyntheticContextOptions;
   private readonly clock: () => number;
   private readonly vaultEnabled: boolean;
@@ -324,6 +339,9 @@ export class FoldSession {
     this.foldConfig = options.foldConfig ?? resolveFoldConfigForBand(DEFAULT_FOLD_TARGET_BAND_TOKENS);
     this.activeFidelity = options.fidelity ?? null;
     this.readBurstGuardEnabled = options.readBurstGuard === true;
+    this.valueFidelityInput = options.valueFidelity?.enabled === true
+      ? { weights: options.valueFidelity.weights, recencyFloorTurns: options.valueFidelity.recencyFloorTurns }
+      : undefined;
     this.syntheticContext = options.syntheticContext ?? {};
     if (options.freeze === false) {
       this.freezeEnabled = false;
@@ -694,6 +712,7 @@ export class FoldSession {
         undefined,
         undefined,
         this.syntheticContext,
+        this.valueFidelityInput,
       );
       this.commitEvictionEpoch(result, upcomingEpoch);
       return this.applyVault({
@@ -785,6 +804,7 @@ export class FoldSession {
       undefined,
       undefined,
       this.syntheticContext,
+      this.valueFidelityInput,
     );
     // Full recompute: render the whole vault and bake it into the frozen view
     // before sealing (resets the sealed set, mirroring commitFoldFreeze clearing
