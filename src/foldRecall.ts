@@ -757,6 +757,13 @@ export interface RecallSourceDelta {
   liveSource: string;
   /** True when liveSource is a prefix because the file exceeded the worker cap. */
   truncated?: boolean;
+  /**
+   * Set by the relay when this path's full-file liveHash is unchanged since the
+   * prior epoch's snapshot. Lets the renderer suppress a *repeat* beyond-window
+   * fresh-read nudge for a settled (unchanged) file, while the first epoch a
+   * change appears (liveHash differs) still warns.
+   */
+  stableSincePrior?: boolean;
 }
 
 /**
@@ -1828,6 +1835,11 @@ type SourceDeltaResult = { kind: 'changed'; diff: string } | { kind: 'beyond' } 
  * snapshot the partial final line and the historical tail beyond the window are
  * dropped so comparison stays within the region both sides cover; common
  * prefix/suffix are then trimmed to a minimal hunk.
+ *
+ * LIMITATION: the hunk is a single contiguous prefix/suffix block, not an LCS
+ * diff — scattered edits collapse into one coarse removed+added block. This only
+ * coarsens the NOTIFIER; on a 'changed' result the card BODY still pages back the
+ * full current box source, so no current content is lost.
  */
 function computeSourceDelta(historicalBody: string, liveSource: string, truncated: boolean, budget: number): SourceDeltaResult {
   if (budget < 80) return null;
@@ -1901,6 +1913,12 @@ function swapPathToCurrentSource(
   const res = computeSourceDelta(historical, delta.liveSource, !!delta.truncated, DELTA_NOTIFIER_BUDGET);
   if (res === null) return null;
   if (res.kind === 'beyond') {
+    // A truncated snapshot whose in-window region matched the historical body and
+    // whose full-file hash is unchanged since the prior epoch is not a fresh
+    // divergence — suppress the repeat fresh-read nudge and keep the historical
+    // body byte-identical. The first epoch a change appears (liveHash differs)
+    // still flags beyond-window.
+    if (delta.stableSincePrior) return null;
     return { body: null, applied: { path, liveHash: delta.liveHash, diff: '', truncated: true, beyond: true } };
   }
   return {

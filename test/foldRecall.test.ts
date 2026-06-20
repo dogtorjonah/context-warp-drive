@@ -776,6 +776,27 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).not.toContain('↻ CURRENT box source');
   });
 
+  test('source delta: a truncated snapshot whose hash is stable since the prior epoch suppresses the repeat beyond-window nudge', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    // Same truncated snapshot as the beyond-window case, but flagged stable (the
+    // file's full liveHash is unchanged since the prior epoch) ⇒ no fresh-read nag.
+    state.pathSourceDeltas.set(BIGFILE, {
+      path: BIGFILE,
+      liveHash: 'ghi789',
+      liveSource: BIGFILE_CONTENT.slice(0, 500),
+      truncated: true,
+      stableSincePrior: true,
+    });
+    const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+    expect(out.cards).toBe(1);
+    // Suppressed: no fresh-read warning, historical body retained byte-identical.
+    expect(out.text!).not.toContain('Δ Fold-recall live-source check:');
+    expect(out.text!).not.toContain('snapshot truncated');
+    expect(out.text!).not.toContain('↻ CURRENT box source');
+    expect(out.text!).toContain('BIGFILE CONTENT END');
+  });
+
   test('touching one folded read-burst member pages the CHANGED sibling back as CURRENT source + delta notifier', () => {
     const alpha = 'relay/src/alpha.ts';
     const beta = 'relay/src/beta.ts';
