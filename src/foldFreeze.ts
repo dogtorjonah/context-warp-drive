@@ -59,7 +59,7 @@
  * Pure CPU, zero I/O, no timers — event-loop safe by construction. State
  * lives on the session object and resets naturally on rebirth.
  *
- * Kill switch: WARP_FOLD_FREEZE=0 reverts to per-call recompute (the
+ * Kill switch: VOXXO_FOLD_FREEZE=0 reverts to per-call recompute (the
  * pre-freeze always-on behavior). TTL and tail cap are env-tunable; callers may
  * also provide model-aware defaults so the hot-tail sawtooth tracks the fold
  * target band unless explicitly overridden.
@@ -104,9 +104,16 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
 
 /**
  * Resolve config from environment. Default ON.
- *   WARP_FOLD_FREEZE=0|false|off|no      → disable (legacy per-call recompute)
- *   WARP_FOLD_FREEZE_TTL_MS=<ms>          → override cache TTL
- *   WARP_FOLD_FREEZE_MAX_TAIL_CHARS=<n>   → override raw overhang cap
+ *   VOXXO_FOLD_FREEZE=0|false|off|no      → disable (legacy per-call recompute)
+ *   WARP_FOLD_FREEZE=0|false|off|no        → disable (standalone alias)
+ *   VOXXO_FOLD_FREEZE_TTL_MS=<ms>          → override cache TTL
+ *   WARP_FOLD_FREEZE_TTL_MS=<ms>           → override cache TTL (standalone alias)
+ *   VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS=<n>   → override raw overhang cap
+ *   WARP_FOLD_FREEZE_MAX_TAIL_CHARS=<n>    → override raw overhang cap (standalone alias)
+ *
+ * Both VOXXO_ and WARP_ prefixes are accepted so the canonical source stays
+ * byte-identical across the relay (packages/context-warp) and standalone
+ * (context-warp-drive) repos. VOXXO_ takes precedence (relay-native).
  *
  * `defaults.ttlMs` lets a session inject its PROVIDER's actual cache TTL
  * (e.g. claude-api with 1h extended-TTL breakpoints passes 3_600_000) so the
@@ -119,13 +126,18 @@ export function resolveFoldFreezeConfig(
   env: Record<string, string | undefined> = process.env,
   defaults?: { ttlMs?: number; maxTailChars?: number },
 ): FoldFreezeConfig {
-  const raw = (env.WARP_FOLD_FREEZE ?? '').trim().toLowerCase();
+  const raw = (env.VOXXO_FOLD_FREEZE ?? env.WARP_FOLD_FREEZE ?? '').trim().toLowerCase();
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
   return {
     enabled,
-    ttlMs: parsePositiveInt(env.WARP_FOLD_FREEZE_TTL_MS) ?? defaults?.ttlMs ?? DEFAULT_FOLD_FREEZE_CONFIG.ttlMs,
+    ttlMs:
+      parsePositiveInt(env.VOXXO_FOLD_FREEZE_TTL_MS)
+      ?? parsePositiveInt(env.WARP_FOLD_FREEZE_TTL_MS)
+      ?? defaults?.ttlMs
+      ?? DEFAULT_FOLD_FREEZE_CONFIG.ttlMs,
     maxTailChars:
-      parsePositiveInt(env.WARP_FOLD_FREEZE_MAX_TAIL_CHARS)
+      parsePositiveInt(env.VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS)
+      ?? parsePositiveInt(env.WARP_FOLD_FREEZE_MAX_TAIL_CHARS)
       ?? defaults?.maxTailChars
       ?? DEFAULT_FOLD_FREEZE_CONFIG.maxTailChars,
   };
@@ -173,6 +185,16 @@ export type FoldFreezeFullRecomputeCause =
   | 'history-rewound'
   | 'boundary-mismatch'
   | 'tail-epoch'
+  // A restored (rebirth/fork) frozen prefix whose CURRENT raw tail exceeds
+  // maxTailChars. Deliberately distinct from 'tail-epoch': the append-only
+  // tail-epoch path seals the existing frozen view byte-identically and
+  // appends only a folded tail — which would PRESERVE the oversized restored
+  // prefix the rebirth was supposed to recompute away. Both the relay
+  // (FcBaseSession) and standalone (FoldSession) callers gate append-only on
+  // `reason === 'tail-epoch'` exactly, so this distinct cause routes the
+  // restored overcap through full recompute + eviction instead.
+  | 'restored-overcap'
+  | 'pressure-ceiling'
   | 'prefix-saturation';
 
 export type FoldFreezeTransitionReason =
@@ -187,6 +209,8 @@ export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecompute
   'history-rewound',
   'boundary-mismatch',
   'tail-epoch',
+  'restored-overcap',
+  'pressure-ceiling',
   'prefix-saturation',
 ];
 
@@ -254,9 +278,12 @@ export interface FoldFreezeState {
    * One-shot bypass set by rebirth fold-state restoration: when true, the
    * next evaluateFoldFreeze call skips boundary/hash validation and trusts the
    * restored frozen view as-is (accepting the tail from current raw history).
-   * Cleared after that single evaluation regardless of outcome — normal
-   * boundary checking resumes immediately. This lets the reborn session reuse
-   * the predecessor's cached prefix bytes without a cold-start epoch.
+   * It still honors maxTailChars: an oversized restored tail forces a
+   * 'restored-overcap' full recompute + eviction (NOT an append-only tail
+   * epoch, which would preserve the bloated rebirth/fork prefix). Cleared
+   * after that single evaluation regardless of outcome — normal boundary
+   * checking resumes immediately. This lets the reborn session reuse the
+   * predecessor's cached prefix bytes without a cold-start epoch.
    */
   forceAcceptRestoredView?: boolean;
   /**
@@ -468,6 +495,13 @@ export function evaluateFoldFreeze(
     if (state.frozenView && history.length >= state.frozenRawCount) {
       const tail = history.slice(state.frozenRawCount);
       const tailChars = tail.length > 0 ? countChars(tail) : 0;
+      if (tailChars > config.maxTailChars) {
+        // Distinct cause (NOT 'tail-epoch'): the append-only tail-epoch path
+        // would seal and keep the oversized restored prefix. 'restored-overcap'
+        // routes both callers through full recompute + eviction so the bloated
+        // rebirth/fork prefix is recomputed away instead of carried forward.
+        return { action: 'recompute', reason: 'restored-overcap', gapMs, detail: 'restored-tail-overcap' };
+      }
       return {
         action: 'reuse',
         view: state.frozenView.concat(tail),

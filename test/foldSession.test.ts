@@ -109,6 +109,45 @@ describe('FoldSession E10 sawtooth eviction', () => {
     expect(session.telemetry.evictedTurnCount).toBe(0);
   });
 
+  test('pressure recomputes can use vault-backed coverage when the host cursor is pinned', () => {
+    const makePressureSession = (): FoldSession => {
+      let now = Date.parse('2026-06-16T00:00:00.000Z');
+      return new FoldSession({
+        foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+        freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 1_000_000 },
+        eviction: { thresholdChars: 1_000_000 },
+        pressureCeiling: 10,
+        vault: true,
+        now: () => {
+          now += 1_000;
+          return now;
+        },
+      });
+    };
+    const messages: FoldMessage[] = [];
+    for (let i = 0; i < 6; i++) messages.push(...turn(i));
+
+    const blocked = makePressureSession();
+    let blockedView: FoldMessage[] = [];
+    for (let epoch = 0; epoch < 3; epoch++) {
+      blockedView = blocked.prepare(messages, { durableCursorIndex: 0, measuredInputTokens: 10 }).messages;
+    }
+    expect(extractFoldBlock(blockedView)).not.toContain(FOLD_TOMBSTONE_PREFIX);
+    expect(blocked.telemetry.evictedTurnCount).toBe(0);
+
+    const covered = makePressureSession();
+    covered.recordOperatorMessage('OPERATOR-VAULT-COVERS pressure eviction continuity');
+    let coveredView: FoldMessage[] = [];
+    for (let epoch = 0; epoch < 3; epoch++) {
+      coveredView = covered.prepare(messages, { durableCursorIndex: 0, measuredInputTokens: 10 }).messages;
+    }
+    const coveredBlock = extractFoldBlock(coveredView);
+    expect(coveredBlock).toContain(FOLD_TOMBSTONE_PREFIX);
+    expect(coveredBlock).not.toContain(noteToken(0));
+    expect(covered.telemetry.evictedTurnCount).toBeGreaterThan(0);
+    expect(vaultJoin(coveredView)).toContain('OPERATOR-VAULT-COVERS pressure eviction continuity');
+  });
+
   test('eviction:false preserves the pre-E10 monotonic fold block behavior', () => {
     const session = makeSession({ thresholdChars: 1, eviction: false });
     const messages: FoldMessage[] = [];

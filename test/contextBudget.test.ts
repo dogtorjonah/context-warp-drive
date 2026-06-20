@@ -145,7 +145,9 @@ describe('resolveContextBudget', () => {
     expect(cli.contextWindowTokens).toBe(258_000);
     expect(cli.compressionProfile).toBe('survival');
     expect(cli.bandTokens).toBe(40_000);
-    expect(cli.foldTriggerTokens).toBe(150_000);
+    expect(cli.messageCeilingTokens).toBe(231_680);
+    expect(cli.pressureCeilingTokens).toBe(201_680);
+    expect(cli.foldTriggerTokens).toBe(201_680);
     expect(api.contextWindowTokens).toBe(1_048_576);
     expect(api.compressionProfile).toBe('cache-economic');
     expect(api.bandTokens).toBe(40_000);
@@ -179,11 +181,11 @@ describe('resolveContextBudget', () => {
     expect(budget.pressureCeilingTokens).toBe(150_000);
   });
 
-  it('resolves a 150k fold trigger distinct from the 40k band and honors overrides', () => {
+  it('resolves a late Codex CLI fold trigger distinct from the 40k band and honors overrides', () => {
     const codex = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5' });
-    // 40k is the steady-state orbit, NOT the trigger: fold fires at 150k, then crushes back toward the band.
+    // 40k is the steady-state orbit, NOT the trigger: CLI fold reconstruction is a late safety valve.
     expect(codex.bandTokens).toBe(40_000);
-    expect(codex.foldTriggerTokens).toBe(150_000);
+    expect(codex.foldTriggerTokens).toBe(201_680);
     expect(codex.foldTriggerTokens).toBeGreaterThan(codex.bandTokens);
     expect(codex.foldTriggerTokens).toBeLessThanOrEqual(codex.pressureCeilingTokens ?? Number.POSITIVE_INFINITY);
 
@@ -194,7 +196,7 @@ describe('resolveContextBudget', () => {
       env: { VOXXO_FOLD_TARGET_BAND_TOKENS: '30000' },
     });
     expect(lowBand.bandTokens).toBe(30_000);
-    expect(lowBand.foldTriggerTokens).toBe(150_000);
+    expect(lowBand.foldTriggerTokens).toBe(201_680);
 
     // Explicit trigger override is honored, clamped between band and pressure ceiling.
     const overridden = resolveContextBudget({

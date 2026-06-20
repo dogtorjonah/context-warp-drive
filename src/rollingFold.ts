@@ -77,7 +77,11 @@ export interface FoldResult {
   evictedSpans?: FoldEvictionSpan[];
   /** Turns newly tombstoned this pass (present only when a FoldEvictionInput was provided). */
   newlyEvictedTurns?: number;
+  /** Full-recompute eviction decision when a caller supplied a targeted eviction frontier. */
+  evictionOutcome?: FoldEvictionOutcome;
 }
+
+export type FoldEvictionOutcome = 'evicted' | 'partial_frontier_limited' | 'nothing_eligible';
 
 export interface FoldTrigger {
   shouldFold: boolean;
@@ -87,7 +91,7 @@ export interface FoldTrigger {
 
 /**
  * A contiguous run of evicted fold ordinals rendered as ONE tombstone line
- * (E10 sawtooth eviction). Ordinals are detectTurns positions over the folded
+ * (E10 eviction). Ordinals are detectTurns positions over the folded
  * history — stable across epochs because raw history is append-only and
  * eviction is strictly oldest-first, so spans always tile a contiguous prefix
  * [0, toOrdinalExclusive) of the fold zone.
@@ -117,7 +121,13 @@ export interface FoldEvictionInput {
   evictedSpans: readonly FoldEvictionSpan[];
   /** Ordinals below this may be NEWLY evicted this pass. */
   evictableThroughOrdinal: number;
-  /** Fold-block char threshold that arms eviction (VOXXO_FOLD_EVICT_THRESHOLD_CHARS). */
+  /**
+   * Optional full-recompute target: advance the tombstone frontier at least this
+   * far, clamped by evictableThroughOrdinal and the current fold zone. When
+   * absent, foldContext keeps the legacy threshold sawtooth behavior.
+   */
+  targetEvictThroughOrdinal?: number;
+  /** Fold-block char threshold/enabled gate (VOXXO_FOLD_EVICT_THRESHOLD_CHARS). */
   thresholdChars: number;
   /** Wall-clock stamp for spans created this pass (injected for determinism). */
   nowIso: string;
@@ -1408,24 +1418,25 @@ export function checkFoldTrigger(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Episodic eviction (E10) — bounded skeleton floor (sawtooth)
+// Episodic eviction (E10) — bounded standing fold skeletons
 //
 // The continuous fold accretes one skeleton per folded turn for the life of a
-// session, so the standing fold block grows monotonically. Eviction bounds
-// it: at freeze EPOCH commits only (the prefix is recomputing anyway —
-// cache-safe by construction), when the block exceeds the char threshold, the
-// OLDEST folded spans collapse to one tombstone line each. Eligibility is the
-// session's call (fcBaseSession.buildFoldEvictionInput): a turn is evictable
-// only when its content is durably covered by the episodic store (the capture
-// cursor advances past episode-bearing ranges only after the store CONFIRMS
-// the write) AND it has been folded for ≥2 epochs. Evicted content is not
-// gone: episodic recall serves it as cards on member-path touch, and
-// fold-recall still pages the raw turns back transiently — the block header
-// count includes evicted turns on purpose so buildFoldIndex keeps indexing
-// them.
+// session, so the standing fold block grows monotonically. Eviction bounds it:
+// at full-recompute freeze EPOCH commits only (the prefix is recomputing anyway
+// — cache-safe by construction), the OLDEST folded spans collapse to tombstone
+// lines. Relay/FoldSession callers pass a target frontier so every full
+// recompute attempts eviction; direct foldContext callers without a target keep
+// the legacy char-threshold sawtooth. Eligibility is the session's call
+// (fcBaseSession.buildFoldEvictionInput): a turn is evictable only when its
+// content is durably covered by the episodic store (the capture cursor advances
+// past episode-bearing ranges only after the store CONFIRMS the write) AND it
+// has been folded for ≥2 epochs. Evicted content is not gone: episodic recall
+// serves it as cards on member-path touch, and fold-recall still pages the raw
+// turns back transiently — the block header count includes evicted turns on
+// purpose so buildFoldIndex keeps indexing them.
 // ══════════════════════════════════════════════════════════════════════
 
-/** Evict down to threshold × this ratio — real sawtooth teeth instead of a one-turn eviction every epoch. */
+/** Legacy direct-call mode: evict down to threshold × this ratio. */
 const EVICTION_TARGET_RATIO = 0.7;
 
 /** Max tombstone lines kept in the block; the oldest spans merge beyond this. */
@@ -1787,14 +1798,14 @@ export function foldContext(
     return { collapsed, closetLine, blockChars, tombstoneLines };
   };
 
-  // ── E10 eviction: when the assembled block exceeds the threshold, advance
-  // the tombstone frontier over eligible ordinals down to threshold × ratio.
-  // Pre-collapse sizes overstate the body (collapse only shrinks), so one
-  // pass can under-evict; bounded re-passes converge. Runs only when the
-  // freeze EPOCH recompute path provides an eviction input — never on the
-  // legacy/dry-run paths.
+  // ── E10 eviction.
+  // Targeted full-recompute callers pass targetEvictThroughOrdinal, making
+  // eviction an epoch contract: advance oldest-first through the requested safe
+  // frontier. Direct legacy callers without a target keep the old threshold
+  // sawtooth behavior.
   let evictionSpans: FoldEvictionSpan[] = eviction ? eviction.evictedSpans.map(s => ({ ...s })) : [];
   let evictedThrough = initialEvictedThrough;
+  let evictionOutcome: FoldEvictionOutcome | undefined;
   const spansFor = (through: number): FoldEvictionSpan[] => {
     if (through <= initialEvictedThrough) return mergeEvictionSpans(evictionSpans);
     const stamp = eviction?.nowIso ?? new Date().toISOString();
@@ -1813,20 +1824,39 @@ export function foldContext(
   let block = assembleBlock(evictedThrough, spansFor(evictedThrough));
   if (eviction && eviction.thresholdChars > 0) {
     const evictCeil = Math.min(Math.max(eviction.evictableThroughOrdinal, 0), actualFoldCount);
-    const target = Math.floor(eviction.thresholdChars * EVICTION_TARGET_RATIO);
-    let passes = 0;
-    while (block.blockChars > eviction.thresholdChars && evictedThrough < evictCeil && passes < 3) {
-      let projected = block.blockChars;
-      let next = evictedThrough;
-      while (projected > target && next < evictCeil) {
-        const built = builtTurns[next - initialEvictedThrough];
-        projected -= built.folded.skeleton.length + (built.folded.retained?.length ?? 0);
-        next++;
+    const requestedTarget = typeof eviction.targetEvictThroughOrdinal === 'number'
+      ? Math.min(Math.max(Math.floor(eviction.targetEvictThroughOrdinal), 0), actualFoldCount)
+      : undefined;
+    if (requestedTarget !== undefined) {
+      const next = Math.min(Math.max(requestedTarget, initialEvictedThrough), evictCeil);
+      if (next > evictedThrough) {
+        evictedThrough = next;
+        block = assembleBlock(evictedThrough, spansFor(evictedThrough));
       }
-      if (next === evictedThrough) break;
-      evictedThrough = next;
-      block = assembleBlock(evictedThrough, spansFor(evictedThrough));
-      passes++;
+      if (requestedTarget <= initialEvictedThrough || evictCeil <= initialEvictedThrough) {
+        evictionOutcome = 'nothing_eligible';
+      } else if (evictCeil < requestedTarget) {
+        evictionOutcome = evictedThrough > initialEvictedThrough ? 'partial_frontier_limited' : 'nothing_eligible';
+      } else {
+        evictionOutcome = evictedThrough > initialEvictedThrough ? 'evicted' : 'nothing_eligible';
+      }
+    } else {
+      const target = Math.floor(eviction.thresholdChars * EVICTION_TARGET_RATIO);
+      let passes = 0;
+      while (block.blockChars > eviction.thresholdChars && evictedThrough < evictCeil && passes < 3) {
+        let projected = block.blockChars;
+        let next = evictedThrough;
+        while (projected > target && next < evictCeil) {
+          const built = builtTurns[next - initialEvictedThrough];
+          projected -= built.folded.skeleton.length + (built.folded.retained?.length ?? 0);
+          next++;
+        }
+        if (next === evictedThrough) break;
+        evictedThrough = next;
+        block = assembleBlock(evictedThrough, spansFor(evictedThrough));
+        passes++;
+      }
+      if (evictedThrough > initialEvictedThrough) evictionOutcome = 'evicted';
     }
   }
   const newlyEvictedTurns = Math.max(0, evictedThrough - initialEvictedThrough);
@@ -1878,7 +1908,11 @@ export function foldContext(
     turnsFolded: actualFoldCount,
     turnsRetained: turns.length - actualFoldCount,
     foldSummaries: block.collapsed,
-    ...(eviction ? { evictedSpans: evictionSpans, newlyEvictedTurns } : {}),
+    ...(eviction ? {
+      evictedSpans: evictionSpans,
+      newlyEvictedTurns,
+      ...(evictionOutcome ? { evictionOutcome } : {}),
+    } : {}),
   };
 }
 

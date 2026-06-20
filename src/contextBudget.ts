@@ -15,6 +15,8 @@ import { contextWindowForModel } from './contextWindow.ts';
 //   T = 45K preferred/default live-tail runway
 //   F = 30K hard minimum append runway
 //   P = 150K normal pressure ceiling
+//   CLI codex = full-recompute safety valve, defaulting to message ceiling − F
+//               (still clamped by pressureMaxWindowFraction)
 //
 // Runtime invariant: at a boundary, append a folded tail band only if the
 // post-append prompt can still guarantee F=30K runway before P. The default tail
@@ -23,13 +25,16 @@ import { contextWindowForModel } from './contextWindow.ts';
 export const DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS = 37_000;
 export const DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS = 40_000;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS = 5_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS = 45_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS = 30_000;
+export const DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS =
+  DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS;
 /**
- * Fold TRIGGER ceiling — peak measured prompt tokens before a fold/reconstruct
- * fires. Distinct from the steady-state band (~100K post-fold orbit) and the
- * pressure ceiling (240K hard relief). Engines that gate folding on a token
- * threshold (Codex/Gemini reconstruction) read foldTriggerTokens; FC folds
- * continuously and uses the band as its retention target instead. 170K per Jonah
- * (2026-06-18): fold at 170K, crush below the band, average ~100K, reserve 240K.
+ * Fold TRIGGER ceiling — peak measured prompt tokens before engines that gate
+ * folding on a token threshold should reconstruct. Distinct from the steady-state
+ * band (M=40K folded memory) and the pressure ceiling (P=150K hard relief). FC
+ * folds continuously and uses the band/tail runway instead; CLI engines read
+ * foldTriggerTokens and clamp it under pressureCeilingTokens.
  */
 export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 150_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
@@ -40,13 +45,10 @@ export const DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION = 0.9;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_HEADROOM_SAFETY = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION = 0.15;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION = 0.25;
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS = 45_000;
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS = 30_000;
 /**
- * Headroom (tokens) kept between the hot-tail epoch cap and the pressure ceiling
- * so a turn's growth folds into a fresh tail-epoch BEFORE S + band + tail trips
- * the ceiling (which forces an expensive full recompute). Used as the cap for the
- * window-scaled margin; see defaultTailEpochPressureMarginTokens.
+ * Headroom (tokens) kept between S + M + T and the pressure ceiling. For the
+ * default 1M-class geometry this is P150 − S37 − M40 − T45 = 28K, which leaves
+ * burst/vault tax space before the hard wall.
  */
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 28_000;
 /** Absolute floor for the tail-epoch cap so a tight window never collapses to a ~0 tail (fold-every-turn pathology). */
@@ -83,11 +85,11 @@ export interface ContextBudgetEnv {
   VOXXO_FOLD_BAND_MAX_WINDOW_FRACTION?: string;
   VOXXO_FOLD_PRESSURE_CEILING_TOKENS?: string;
   VOXXO_FOLD_PRESSURE_MAX_WINDOW_FRACTION?: string;
-  VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS?: string;
   VOXXO_FOLD_APPEND_ONLY_MAX_WINDOW_FRACTION?: string;
   VOXXO_FOLD_PREFIX_SATURATION_FRACTION?: string;
   VOXXO_FOLD_TOOLRESULT_HEADROOM_SAFETY?: string;
   VOXXO_FOLD_TOOLRESULT_MIN_WINDOW_FRACTION?: string;
+  VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS?: string;
   VOXXO_FOLD_TAIL_EPOCH_BAND_FRACTION?: string;
   VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS?: string;
   VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS?: string;
@@ -110,10 +112,10 @@ export interface ResolveContextBudgetInput {
   bandMaxWindowFraction?: number;
   pressureCeilingTokens?: number | null;
   pressureMaxWindowFraction?: number;
-  appendBandTargetTokens?: number;
   appendOnlyMaxWindowFraction?: number;
   toolResultHeadroomSafety?: number;
   toolResultMinWindowFraction?: number;
+  appendBandTargetTokens?: number;
   tailEpochBandFraction?: number;
   tailEpochRunwayTokens?: number;
   tailEpochMinRunwayTokens?: number;
@@ -302,10 +304,31 @@ function defaultTailEpochPressureMarginTokens(windowTokens: number): number {
   return reserveFloor(windowTokens, 0.027, 4_000, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS);
 }
 
+function isCodexCliEngine(engine: string): boolean {
+  return engine.trim().toLowerCase() === 'codex';
+}
+
+function defaultCodexCliReconstructTriggerTokens(
+  messageCeilingTokens: number,
+  hardWindowTokens: number,
+  pressureMaxWindowFraction: number,
+): number {
+  const runwayTarget = Math.max(
+    1,
+    messageCeilingTokens - DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS,
+  );
+  return clampPositiveTokensToWindow(
+    runwayTarget,
+    hardWindowTokens,
+    pressureMaxWindowFraction,
+  );
+}
+
 export function resolveContextBudget(input: ResolveContextBudgetInput = {}): ContextBudgetResolution {
   const env = input.env ?? {};
   const model = input.model?.trim() ?? '';
   const engine = input.engine?.trim() ?? '';
+  const codexCliFullRecomputeOnly = isCodexCliEngine(engine);
   const explicitWindowTokens = positiveInt(input.contextWindowTokens);
   const contextWindowTokens = explicitWindowTokens
     ?? contextWindowForModel(model, engine || undefined);
@@ -352,12 +375,20 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     env.VOXXO_FOLD_PRESSURE_MAX_WINDOW_FRACTION,
     DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION,
   );
+  const codexCliDefaultReconstructTriggerTokens = codexCliFullRecomputeOnly
+    ? defaultCodexCliReconstructTriggerTokens(
+      messageCeilingTokens,
+      hardWindowTokens,
+      pressureMaxWindowFraction,
+    )
+    : null;
   let pressureCeilingTokens: number | null;
   if (input.pressureCeilingTokens === null || isDisabled(env.VOXXO_FOLD_PRESSURE_CEILING_TOKENS)) {
     pressureCeilingTokens = null;
   } else {
     const requestedPressure = positiveInt(input.pressureCeilingTokens)
       ?? parsePositiveInt(env.VOXXO_FOLD_PRESSURE_CEILING_TOKENS)
+      ?? codexCliDefaultReconstructTriggerTokens
       ?? clampPositiveTokensToWindow(
         DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS,
         hardWindowTokens,
@@ -368,10 +399,11 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
 
   // Fold trigger sits between the steady-state band and the pressure ceiling:
   // band ≤ trigger ≤ min(pressureCeiling, messageCeiling). Engines fold/reconstruct
-  // when measured occupancy crosses this, then crush back toward the band — so 100K
+  // when measured occupancy crosses this, then crush back toward the band — so M40
   // is the orbit, NOT the trigger. Tiny windows clamp the trigger down to the ceiling.
   const requestedFoldTriggerTokens = positiveInt(input.foldTriggerTokens)
     ?? parsePositiveInt(env.VOXXO_FOLD_TRIGGER_TOKENS)
+    ?? codexCliDefaultReconstructTriggerTokens
     ?? DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS;
   const foldTriggerUpperBound = Math.min(
     pressureCeilingTokens ?? messageCeilingTokens,

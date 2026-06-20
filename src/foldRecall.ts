@@ -843,6 +843,68 @@ export function radarDuplicatesActiveAtlasRead(
 }
 
 /**
+ * True when the dispatched tool is an Atlas DISCOVERY read whose text output
+ * leads each result line with a workspace path: search (`atlas_search` or
+ * `atlas_query action=search`), catalog, and cluster. lookup/brief/snippet/
+ * history/graph/diff are excluded — they render per-file bodies or analytics,
+ * not a path-led result list. Gating here is what keeps arbitrary tool stdout
+ * (and non-discovery Atlas reads) from ever becoming a recall trigger source.
+ */
+export function isAtlasDiscoveryResultTool(toolName: string | null | undefined, action: unknown): boolean {
+  const leaf = normalizeAtlasReadToolLeaf(toolName);
+  if (leaf === 'atlas_search') return true;
+  return leaf === 'atlas_query' && (action === 'search' || action === 'catalog' || action === 'cluster');
+}
+
+// Leading list/tree markers Atlas discovery outputs prepend before a result
+// path: catalog uses "- ", cluster uses "📄 "/"📁 "/"📂 "; search has none.
+// Stripped (after trim) so search/catalog/cluster lines all normalize to a
+// path-led head before the path regex runs. Requires a space after a bullet so
+// a path that legitimately begins with "-" is never truncated.
+const ATLAS_RESULT_LINE_MARKER_RE = /^(?:[-*•]\s+)?(?:📄|📁|📂)?\s*/u;
+
+// A result path leads the (marker-stripped) line and is delimited by an Atlas
+// separator: search uses " — "/"match:"/"score:", catalog uses " [cluster]" or
+// " (NN LOC)", cluster uses " (NN LOC)". The (?:…/)+ requires at least one "/"
+// so bare root files and prose words never qualify, and the "^" anchor means
+// only a LEADING path is read (paths embedded in a blurb are ignored).
+const ATLAS_RESULT_PATH_RE = /^`?((?:\/?[A-Za-z0-9_.@+\-=]+\/)+[^\s`]+?)`?(?:\s+(?:[—–-]|match:|score:|\[|\()|\s*$)/;
+
+/**
+ * Extract bounded path anchors from Atlas discovery result text (search,
+ * catalog, cluster). Intentionally narrower than generic output parsing: only
+ * Atlas discovery tools qualify (isAtlasDiscoveryResultTool) and only leading
+ * result paths are accepted, so arbitrary tool stdout cannot become a recall
+ * trigger source. Bounded by construction: at most the first 200 lines are
+ * scanned and at most maxPaths anchors are returned.
+ */
+export function extractAtlasSearchResultPaths(
+  toolName: string | null | undefined,
+  action: unknown,
+  output: string | null | undefined,
+  maxPaths = 12,
+): string[] {
+  if (!output || !isAtlasDiscoveryResultTool(toolName, action)) return [];
+  const seen = new Set<string>();
+  const paths: string[] = [];
+  for (const line of output.split('\n').slice(0, 200)) {
+    if (paths.length >= maxPaths) break;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.length > 512 || trimmed.includes('://')) continue;
+    const body = trimmed.replace(ATLAS_RESULT_LINE_MARKER_RE, '');
+    const match = ATLAS_RESULT_PATH_RE.exec(body);
+    if (!match) continue;
+    const candidate = match[1].replace(/[.,;:)\]}]+$/, '');
+    if (!candidate.includes('/') || candidate.length > 256) continue;
+    const normalized = normalizeToolPath(candidate);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    paths.push(normalized);
+  }
+  return paths.sort();
+}
+
+/**
  * Derive recall signals at a tool boundary from the just-executed tool call,
  * the current global claims set, and optional active-window text for tier-2
  * distinctive-term matching. The term tier is config-gated default OFF.

@@ -3,7 +3,7 @@
  *
  * The episodic store's join key is "the file touched" — an immutable fact.
  * That fact is only unambiguous when the path is repo-qualified: a bare
- * `src/lib/x.ts` names different files in vet-soap, example-med-app, and
+ * `src/lib/x.ts` names different files in vet-soap, voxxo-med-ai, and
  * knowledge-chat. This module turns raw extracted tool paths into canonical
  * ABSOLUTE paths — resolved against the toucher's cwd, a bridged workspace
  * root (the tool input's `workspace` argument), or (backfill only) disk

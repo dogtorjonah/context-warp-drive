@@ -2,9 +2,10 @@
  * context-warp/fold — the dependency-free rolling-fold engine.
  *
  * Rolling fold + Coordinate Closet, cache-hot fold freeze, ambient page-in recall,
- * provider context-window sizing, and distinctive-term primitives, plus the
- * FoldSession orchestrator. Zero runtime dependencies; pure CPU, zero I/O, zero
- * LLM calls, byte-identical output for identical inputs.
+ * provider context-window sizing, model-aware budget resolution, and
+ * distinctive-term primitives, plus the FoldSession orchestrator. Zero runtime
+ * dependencies; pure CPU, zero I/O, zero LLM calls, byte-identical output for
+ * identical inputs.
  */
 export * from './rollingFold.ts';
 export * from './foldFreeze.ts';

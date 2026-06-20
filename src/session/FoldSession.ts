@@ -550,17 +550,30 @@ export class FoldSession {
     this.foldEpochFrontiers = [];
   }
 
+  private hasVaultBackedEvictionCoverage(): boolean {
+    return this.vaultEnabled
+      && (this.userMessageVaultEntries.length > 0 || this.assistantGlyphVaultEntries.length > 0);
+  }
+
   private buildFoldEvictionInput(
     messages: FoldMessage[],
     durableCursorIndex: number,
     upcomingEpoch: number,
     now: number,
+    options: {
+      readonly allowVaultBackedCoverage?: boolean;
+      readonly targetSafeFrontier?: boolean;
+    } = {},
   ): FoldEvictionInput | undefined {
     if (!this.evictionEnabled || this.evictionThresholdChars <= 0) return undefined;
     const hasSpans = this.foldEvictedSpans.length > 0;
+    const effectiveDurableCursorIndex = Math.max(
+      durableCursorIndex,
+      options.allowVaultBackedCoverage && this.hasVaultBackedEvictionCoverage() ? messages.length : 0,
+    );
     const evictableThroughOrdinal = computeEvictableThroughOrdinal(
       detectTurns(messages, this.syntheticContext),
-      durableCursorIndex,
+      effectiveDurableCursorIndex,
       this.foldEpochFrontiers,
       upcomingEpoch,
     );
@@ -568,6 +581,7 @@ export class FoldSession {
     return {
       evictedSpans: this.foldEvictedSpans,
       evictableThroughOrdinal,
+      ...(options.targetSafeFrontier ? { targetEvictThroughOrdinal: evictableThroughOrdinal } : {}),
       thresholdChars: this.evictionThresholdChars,
       nowIso: new Date(now).toISOString(),
     };
@@ -673,7 +687,10 @@ export class FoldSession {
         messages,
         this.guardedTurnsToFold(messages, pressureCeilingTriggered),
         this.effectiveFoldConfig(desiredFidelity),
-        this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
+        this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
+          allowVaultBackedCoverage: pressureCeilingTriggered,
+          targetSafeFrontier: pressureCeilingTriggered,
+        }),
         undefined,
         undefined,
         this.syntheticContext,
@@ -761,7 +778,10 @@ export class FoldSession {
       messages,
       this.guardedTurnsToFold(messages, pressureCeilingTriggered),
       this.effectiveFoldConfig(desiredFidelity),
-      this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now),
+      this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
+        allowVaultBackedCoverage: pressureCeilingTriggered,
+        targetSafeFrontier: pressureCeilingTriggered,
+      }),
       undefined,
       undefined,
       this.syntheticContext,

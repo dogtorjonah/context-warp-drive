@@ -1197,12 +1197,20 @@ export const EPISODIC_ACTIVE_PIN_DEFAULT_MAX_CARDS = 2;
 export const EPISODIC_ACTIVE_PIN_DEFAULT_CHAR_BUDGET = 1200;
 
 /** Mirror of the worker's FoldEpisodesRecallCard (kept structural — this module imports nothing). */
+export interface EpisodicRecallCardDebugLike {
+  annotationBoost: number;
+  annotationBoostKind?: EpisodeAnnotationKind;
+  score?: number;
+}
+
 export interface EpisodicRecallCardLike {
   targetPath: string;
   renderedCard: string;
   chapterIds: number[];
   memberPaths: string[];
   kind: 'chain' | 'walk' | 'mention' | 'pointer' | 'term' | 'rail';
+  /** Optional worker-provided scoring trace; render-agnostic and safe to omit. */
+  debug?: EpisodicRecallCardDebugLike;
 }
 
 export interface EpisodicZoneResidency {
@@ -1221,6 +1229,211 @@ export interface EpisodicZoneResidency {
    * older-chapter cursor while the hot card remains the path anchor.
    */
   activeCard?: EpisodicRecallCardLike;
+  // ── Value-ledger engagement signals (additive; absent → neutral/legacy) ──
+  // Pure bookkeeping: populated on every inject/refresh even when the ledger is
+  // disabled, so the data is always available; only TTL/re-pin READ them, and
+  // only when the value-ledger config is enabled.
+  /** Boundary at which this zone first became resident. */
+  firstSeenBoundary?: number;
+  /** Last boundary the zone's exact target path was (re)engaged by a touch. */
+  lastEngagedBoundary?: number;
+  /** Distinct engagement events: initial inject + each exact-path refresh. */
+  engagementCount?: number;
+  /** Strongest card kind seen for this zone (anchor-strength signal). */
+  kind?: EpisodicRecallCardLike['kind'];
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Episodic card VALUE LEDGER (rail-c16912c9)
+// ══════════════════════════════════════════════════════════════════════
+//
+// Flat residency (every zone lives EPISODIC_ZONE_TTL_BOUNDARIES regardless of
+// worth) treats a deeply-walked, currently-engaged zone exactly like an
+// incidental one-touch. The value ledger scores each resident zone from signals
+// it ALREADY carries (engagement recency/frequency, walk depth, anchor kind)
+// plus optional host-fed MEASURED signals (claimed paths, rail target), then
+// PRESERVES high-value zones longer and DROPS low-value ones sooner, and picks
+// the most valuable cards first when the re-pin budget is tight.
+//
+// CACHE / EVENT-LOOP SAFETY: pure CPU, zero imports, zero ambient reads (module
+// invariant — boundary distance is the only clock; no Date.now, no randomness).
+// It only changes residency DECISIONS (how long a zone stays resident, which
+// cards re-pin under budget); it never mutates already-sent tail bytes. Re-pin
+// rides the existing excludeHeaderLines idempotency, so a card re-pastes only
+// after its live copy has folded away — "preserve / re-pin at the fold epoch" is
+// already wired, the ledger only makes that decision value-aware.
+//
+// ── Standalone knobs (host maps env → config; kill switch disables entirely) ──
+//   enabled            master switch; false → exact flat-TTL behavior (byte-identical)
+//   minTtlMultiplier   value=0 zones get baseTTL × this (drop sooner)
+//   maxTtlMultiplier   value=1 zones get baseTTL × this (preserve longer)
+//   repinInactive      re-pin a high-value zone NOT touched this boundary (default off)
+//   repinValueFloor    min value for an inactive re-pin (only when repinInactive)
+// Neutral value (0.5) maps to ×1.0 → unchanged TTL; only clearly high/low zones move.
+
+/**
+ * Measured prompt-pressure level (mirrors the host's ContextUtilizationLevel).
+ * Kept as a LOCAL union so this module imports nothing — the host passes
+ * measured token telemetry, never a character-derived estimate.
+ */
+export type EpisodicPressureLevel = 'healthy' | 'warning' | 'critical' | 'auto_compact';
+
+/** Host-fed live signals for value scoring. All optional; absent = neutral. */
+export interface EpisodicValueContext {
+  /** Paths the agent currently holds a file claim on (active-engagement signal). */
+  claimedPaths?: ReadonlySet<string>;
+  /** Active rail target/scope paths, when the host can supply them cheaply. */
+  railTargetPaths?: ReadonlySet<string>;
+  /** Measured prompt pressure (never char-derived). Informational; not scored in v1. */
+  pressure?: EpisodicPressureLevel;
+}
+
+/** Tunable weights + saturation points for the value score. */
+export interface EpisodicValueWeights {
+  recency: number;
+  frequency: number;
+  walkDepth: number;
+  anchorKind: number;
+  /** Additive bonus (NOT normalized) when the zone path is currently claimed. */
+  claimed: number;
+  /** Additive bonus (NOT normalized) when the zone path is an active rail target. */
+  railTarget: number;
+  /** Boundaries over which the recency component halves (engagement decay). */
+  recencyHalfLifeBoundaries: number;
+  /** engagementCount that saturates the frequency component. */
+  frequencySaturation: number;
+  /** Walk depth (chapterIds count) that saturates the depth component. */
+  walkDepthSaturation: number;
+}
+
+export const DEFAULT_EPISODIC_VALUE_WEIGHTS: EpisodicValueWeights = {
+  // Engagement components — normalized into the [0,1] base score.
+  recency: 1,
+  frequency: 0.8,
+  walkDepth: 0.6,
+  anchorKind: 0.8,
+  // Host-signal BONUSES — added on top of the base, then clamped to 1.
+  claimed: 0.25,
+  railTarget: 0.25,
+  recencyHalfLifeBoundaries: 6,
+  frequencySaturation: 5,
+  walkDepthSaturation: 4,
+};
+
+export interface EpisodicValueLedgerConfig {
+  /** Master switch. false → exact flat-TTL, path-sorted touch-only re-pin (byte-identical). */
+  enabled: boolean;
+  /** baseTTL multiplier for value 0 (low-value zones drop sooner). */
+  minTtlMultiplier: number;
+  /** baseTTL multiplier for value 1 (high-value zones are preserved longer). */
+  maxTtlMultiplier: number;
+  /** Re-pin a high-value zone NOT touched this boundary (more aggressive; default off). */
+  repinInactive: boolean;
+  /** Minimum value for an inactive re-pin (only consulted when repinInactive). */
+  repinValueFloor: number;
+}
+
+export const DEFAULT_EPISODIC_VALUE_LEDGER_CONFIG: EpisodicValueLedgerConfig = {
+  enabled: true,
+  minTtlMultiplier: 0.5,
+  maxTtlMultiplier: 2,
+  repinInactive: false,
+  repinValueFloor: 0.6,
+};
+
+/** Bundled optional value-ledger args threaded into note/refresh/pin (absent → flat behavior). */
+export interface EpisodicValueLedgerOptions {
+  config?: EpisodicValueLedgerConfig;
+  context?: EpisodicValueContext;
+  weights?: EpisodicValueWeights;
+}
+
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * clamp01(t);
+}
+
+/** Anchor strength by card kind: real work chains + rail targets are strongest. */
+export function anchorKindScore(kind: EpisodicRecallCardLike['kind'] | undefined): number {
+  switch (kind) {
+    case 'chain':
+    case 'rail':
+      return 1;
+    case 'mention':
+      return 0.6;
+    case 'walk':
+      return 0.5;
+    case 'pointer':
+    case 'term':
+      return 0.3;
+    default:
+      return 0.5;
+  }
+}
+
+/** Stronger of two kinds by anchor score (a zone keeps its strongest-seen anchor). */
+export function strongerEpisodicKind(
+  a: EpisodicRecallCardLike['kind'] | undefined,
+  b: EpisodicRecallCardLike['kind'],
+): EpisodicRecallCardLike['kind'] {
+  if (a === undefined) return b;
+  return anchorKindScore(a) >= anchorKindScore(b) ? a : b;
+}
+
+/**
+ * Pure value of a resident zone in [0,1]: a weighted blend of engagement recency
+ * (decays by boundary distance), engagement frequency, walk depth, anchor kind,
+ * and optional host signals (claimed path, rail target). Deterministic; no I/O,
+ * no Date.now — boundary distance is the only clock.
+ */
+export function scoreEpisodicZoneValue(
+  targetPath: string,
+  zone: EpisodicZoneResidency,
+  context: EpisodicValueContext = {},
+  boundarySeq: number = zone.lastEngagedBoundary ?? 0,
+  weights: EpisodicValueWeights = DEFAULT_EPISODIC_VALUE_WEIGHTS,
+): number {
+  const sinceEngaged = Math.max(0, boundarySeq - (zone.lastEngagedBoundary ?? boundarySeq));
+  const recency = Math.pow(0.5, sinceEngaged / Math.max(1, weights.recencyHalfLifeBoundaries));
+  const frequency = clamp01((zone.engagementCount ?? 1) / Math.max(1, weights.frequencySaturation));
+  const walkDepth = clamp01((zone.chapterIds?.length ?? 0) / Math.max(1, weights.walkDepthSaturation));
+  const anchor = anchorKindScore(zone.kind);
+  // Base: normalized weighted blend of always-available engagement signals (0..1).
+  const engagementWeight = weights.recency + weights.frequency + weights.walkDepth + weights.anchorKind;
+  const base =
+    engagementWeight > 0
+      ? (weights.recency * recency +
+          weights.frequency * frequency +
+          weights.walkDepth * walkDepth +
+          weights.anchorKind * anchor) /
+        engagementWeight
+      : 0;
+  // Host signals are ADDITIVE bonuses so an unwired host (no claims/rail) still
+  // gets the full base range instead of a deflated score.
+  const claimedBonus = context.claimedPaths?.has(targetPath) ? weights.claimed : 0;
+  const railBonus = context.railTargetPaths?.has(targetPath) ? weights.railTarget : 0;
+  return clamp01(base + claimedBonus + railBonus);
+}
+
+/** TTL multiplier anchored so value 0.5 → ×1.0 (neutral/unchanged), 0 → min, 1 → max. */
+export function episodicValueTtlMultiplier(value: number, config: EpisodicValueLedgerConfig): number {
+  const v = clamp01(value);
+  return v <= 0.5
+    ? lerp(config.minTtlMultiplier, 1, v / 0.5)
+    : lerp(1, config.maxTtlMultiplier, (v - 0.5) / 0.5);
+}
+
+/** Effective residency TTL for a zone given its value; flat baseTtl when disabled. */
+export function effectiveEpisodicZoneTtl(
+  baseTtlBoundaries: number,
+  value: number,
+  config: EpisodicValueLedgerConfig,
+): number {
+  if (!config.enabled) return baseTtlBoundaries;
+  return Math.max(1, Math.round(baseTtlBoundaries * episodicValueTtlMultiplier(value, config)));
 }
 
 export interface EpisodicInjectionState {
@@ -1246,7 +1459,7 @@ export interface EpisodicInjectionState {
    * Active-path pin cards re-emitted as working memory while a zone stays live.
    * Deliberately separate from chainCardsInjected/episodicChars: pins re-page an
    * already-served hot card, so folding them into the served-set counters would
-   * double-count. Bounded only by WARP_FOLD_EPISODES_PIN_BUDGET_CHARS.
+   * double-count. Bounded only by VOXXO_FOLD_EPISODES_PIN_BUDGET_CHARS.
    */
   episodicPinsInjected: number;
   /** Chars emitted via active-path pin blocks (NOT included in episodicChars). */
@@ -1311,6 +1524,7 @@ function cloneEpisodicCard(card: EpisodicRecallCardLike): EpisodicRecallCardLike
     chapterIds: [...card.chapterIds],
     memberPaths: [...card.memberPaths],
     kind: card.kind,
+    ...(card.debug ? { debug: { ...card.debug } } : {}),
   };
 }
 
@@ -1318,14 +1532,8 @@ function isActivePathAnchorCard(card: EpisodicRecallCardLike): boolean {
   return card.kind === 'chain' || card.kind === 'mention';
 }
 
-function zoneMatchesTouchedPath(targetPath: string, zone: EpisodicZoneResidency, touched: ReadonlySet<string>): boolean {
-  if (touched.has(targetPath)) return true;
-  const active = zone.activeCard;
-  if (!active) return false;
-  for (const memberPath of active.memberPaths) {
-    if (touched.has(memberPath)) return true;
-  }
-  return false;
+function zoneMatchesTouchedPath(targetPath: string, touched: ReadonlySet<string>): boolean {
+  return touched.has(targetPath);
 }
 
 /**
@@ -1357,7 +1565,9 @@ export function noteEpisodicInjection(
   state: EpisodicInjectionState,
   cards: readonly EpisodicRecallCardLike[],
   ttlBoundaries: number = EPISODIC_ZONE_TTL_BOUNDARIES,
+  valueOptions?: EpisodicValueLedgerOptions,
 ): void {
+  const config = valueOptions?.config;
   for (const card of cards) {
     const existing = state.zones.get(card.targetPath);
     const merged = new Set(existing ? existing.chapterIds : []);
@@ -1365,11 +1575,28 @@ export function noteEpisodicInjection(
     const activeCard = isActivePathAnchorCard(card)
       ? cloneEpisodicCard(card)
       : existing?.activeCard;
-    state.zones.set(card.targetPath, {
+    // Engagement bookkeeping (always, even when the ledger is off — pure data,
+    // never rendered; only effectiveEpisodicZoneTtl reads it, and only when on).
+    const zone: EpisodicZoneResidency = {
       expiresAtBoundary: state.boundarySeq + ttlBoundaries,
       chapterIds: Array.from(merged).sort((a, b) => a - b),
       ...(activeCard ? { activeCard } : {}),
-    });
+      firstSeenBoundary: existing?.firstSeenBoundary ?? state.boundarySeq,
+      lastEngagedBoundary: state.boundarySeq,
+      engagementCount: (existing?.engagementCount ?? 0) + 1,
+      kind: strongerEpisodicKind(existing?.kind, card.kind),
+    };
+    if (config?.enabled) {
+      const value = scoreEpisodicZoneValue(
+        card.targetPath,
+        zone,
+        valueOptions?.context,
+        state.boundarySeq,
+        valueOptions?.weights,
+      );
+      zone.expiresAtBoundary = state.boundarySeq + effectiveEpisodicZoneTtl(ttlBoundaries, value, config);
+    }
+    state.zones.set(card.targetPath, zone);
     if (card.kind === 'pointer') state.completedChainTargetPaths.add(card.targetPath);
     else state.completedChainTargetPaths.delete(card.targetPath);
     if (card.kind === 'mention') state.episodeCardsInjected++;
@@ -1380,23 +1607,34 @@ export function noteEpisodicInjection(
 
 /**
  * Sliding TTL: touching a live zone again pushes its expiry forward. Touch is
- * the ONLY residency-extending signal — a zone refreshes when touchPaths hits
- * its targetPath OR any member path of its active pin card. Mentions are handled
- * separately by activeEpisodicPathCards: a mention re-surfaces an existing pin
- * but intentionally does NOT extend the zone's TTL, so a path that is only
- * talked about (never re-touched) lets its pin age out and fold on schedule.
- * "Pin until the agent leaves the path" == until the agent stops touching it.
+ * the ONLY residency-extending signal — a zone refreshes only when touchPaths
+ * hits its exact targetPath. Mention-path recall is caller opt-in and never
+ * extends TTL by itself, so a path that is only talked about (never re-touched)
+ * lets its pin age out and fold on schedule. "Pin until the agent leaves the
+ * path" == until the agent stops touching that same target path.
  */
 export function refreshEpisodicZones(
   state: EpisodicInjectionState,
   touchPaths: readonly string[],
   ttlBoundaries: number = EPISODIC_ZONE_TTL_BOUNDARIES,
+  valueOptions?: EpisodicValueLedgerOptions,
 ): void {
   if (touchPaths.length === 0) return;
   const touched = new Set(touchPaths);
+  const config = valueOptions?.config;
   for (const [targetPath, zone] of state.zones) {
-    if (zoneMatchesTouchedPath(targetPath, zone, touched)) {
-      zone.expiresAtBoundary = state.boundarySeq + ttlBoundaries;
+    if (zoneMatchesTouchedPath(targetPath, touched)) {
+      // Engagement bookkeeping (always — pure data; only the TTL below reads it).
+      zone.lastEngagedBoundary = state.boundarySeq;
+      zone.engagementCount = (zone.engagementCount ?? 1) + 1;
+      const ttl = config?.enabled
+        ? effectiveEpisodicZoneTtl(
+            ttlBoundaries,
+            scoreEpisodicZoneValue(targetPath, zone, valueOptions?.context, state.boundarySeq, valueOptions?.weights),
+            config,
+          )
+        : ttlBoundaries;
+      zone.expiresAtBoundary = state.boundarySeq + ttl;
     }
   }
 }
@@ -1415,6 +1653,33 @@ export interface ActiveEpisodicPathCardOptions {
    * line, never the full rendered text.
    */
   excludeHeaderLines?: ReadonlySet<string>;
+  // ── Value-ledger (additive; absent/disabled → legacy path-sorted touch-only) ──
+  /** When enabled: rank pins by value and (if repinInactive) re-pin high-value untouched zones. */
+  valueConfig?: EpisodicValueLedgerConfig;
+  /** Host-fed measured signals for value scoring (claimed paths, rail target). */
+  valueContext?: EpisodicValueContext;
+  /** Optional weight overrides for value scoring. */
+  valueWeights?: EpisodicValueWeights;
+}
+
+export type EpisodicPinDecisionReason = 'touched' | 'inactive';
+export type EpisodicPinSkipReason = 'rendered_duplicate' | 'resident_header' | 'inactive_below_floor' | 'budget';
+
+export interface EpisodicPinSelectionDecision {
+  targetPath: string;
+  reason: EpisodicPinDecisionReason;
+  value: number;
+  selected: boolean;
+  skipped?: EpisodicPinSkipReason;
+}
+
+export interface ActiveEpisodicPathCardSelection {
+  cards: EpisodicRecallCardLike[];
+  decisions: EpisodicPinSelectionDecision[];
+  enabled: boolean;
+  repinInactive: boolean;
+  repinValueFloor: number;
+  maxCards: number;
 }
 
 /**
@@ -1492,25 +1757,100 @@ export function activeEpisodicPathCards(
   touchPaths: readonly string[],
   options: ActiveEpisodicPathCardOptions = {},
 ): EpisodicRecallCardLike[] {
-  if (touchPaths.length === 0) return [];
+  return selectActiveEpisodicPathCards(state, touchPaths, options).cards;
+}
+
+export function selectActiveEpisodicPathCards(
+  state: EpisodicInjectionState,
+  touchPaths: readonly string[],
+  options: ActiveEpisodicPathCardOptions = {},
+): ActiveEpisodicPathCardSelection {
+  const config = options.valueConfig;
+  const enabled = config?.enabled === true;
+  const repinInactive = enabled && config?.repinInactive === true;
+  const repinValueFloor = config?.repinValueFloor ?? 1;
+  const maxCards = Math.max(0, options.maxCards ?? EPISODIC_ACTIVE_PIN_DEFAULT_MAX_CARDS);
+  const empty = (): ActiveEpisodicPathCardSelection => ({
+    cards: [],
+    decisions: [],
+    enabled,
+    repinInactive,
+    repinValueFloor,
+    maxCards,
+  });
+  // Legacy early-out preserved unless inactive re-pin is on (it can pin a
+  // high-value zone the agent did not touch this boundary).
+  if (touchPaths.length === 0 && !repinInactive) return empty();
   const touched = new Set(touchPaths);
   const excluded = new Set(options.excludeRenderedCards ?? []);
-  const maxCards = Math.max(0, options.maxCards ?? EPISODIC_ACTIVE_PIN_DEFAULT_MAX_CARDS);
-  if (maxCards === 0) return [];
-  const out: EpisodicRecallCardLike[] = [];
-  for (const [targetPath, zone] of [...state.zones.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+  if (maxCards === 0) return empty();
+  interface PinCandidate {
+    targetPath: string;
+    card: EpisodicRecallCardLike;
+    value: number;
+    reason: EpisodicPinDecisionReason;
+  }
+  const candidates: PinCandidate[] = [];
+  const decisions: EpisodicPinSelectionDecision[] = [];
+  for (const [targetPath, zone] of state.zones) {
     const card = zone.activeCard;
     if (!card) continue;
-    if (!zoneMatchesTouchedPath(targetPath, zone, touched)) continue;
-    if (excluded.has(card.renderedCard)) continue;
+    const isTouched = zoneMatchesTouchedPath(targetPath, touched);
+    const value = enabled
+      ? scoreEpisodicZoneValue(targetPath, zone, options.valueContext, state.boundarySeq, options.valueWeights)
+      : 0;
+    const reason: EpisodicPinDecisionReason = isTouched ? 'touched' : 'inactive';
+    if (!isTouched && (!repinInactive || value < repinValueFloor)) {
+      if (repinInactive) {
+        decisions.push({ targetPath, reason, value, selected: false, skipped: 'inactive_below_floor' });
+      }
+      continue;
+    }
+    if (excluded.has(card.renderedCard)) {
+      decisions.push({ targetPath, reason, value, selected: false, skipped: 'rendered_duplicate' });
+      continue;
+    }
     // Cross-boundary idempotency: a live copy of this card's header is already
     // resident in the send view, so re-pasting it would only duplicate. Skip
     // until it folds away (its header leaves the set) and the pin re-pastes full.
-    if (options.excludeHeaderLines && options.excludeHeaderLines.has(episodicCardHeaderLine(card))) continue;
-    out.push(cloneEpisodicCard(card));
-    if (out.length >= maxCards) break;
+    if (options.excludeHeaderLines && options.excludeHeaderLines.has(episodicCardHeaderLine(card))) {
+      decisions.push({ targetPath, reason, value, selected: false, skipped: 'resident_header' });
+      continue;
+    }
+    if (isTouched) {
+      candidates.push({ targetPath, card, value, reason });
+    } else {
+      candidates.push({ targetPath, card, value, reason });
+    }
   }
-  return out;
+  // Selection order: ledger ON → value desc (path asc tie-break); OFF → path asc,
+  // byte-identical to the legacy path-sorted, touch-only, first-maxCards walk.
+  candidates.sort((a, b) => {
+    if (enabled && b.value !== a.value) return b.value - a.value;
+    return a.targetPath < b.targetPath ? -1 : a.targetPath > b.targetPath ? 1 : 0;
+  });
+  const out: EpisodicRecallCardLike[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    if (out.length < maxCards) {
+      out.push(cloneEpisodicCard(candidate.card));
+      decisions.push({
+        targetPath: candidate.targetPath,
+        reason: candidate.reason,
+        value: candidate.value,
+        selected: true,
+      });
+    } else {
+      decisions.push({
+        targetPath: candidate.targetPath,
+        reason: candidate.reason,
+        value: candidate.value,
+        selected: false,
+        skipped: 'budget',
+      });
+    }
+  }
+  return { cards: out, decisions, enabled, repinInactive, repinValueFloor, maxCards };
 }
 
 function compactActivePathCard(card: EpisodicRecallCardLike, budget: number): string | null {
@@ -1584,7 +1924,7 @@ export function renderEpisodicBoundaryBlock(
   narrationReminder?: string,
 ): string | null {
   if (cards.length === 0) return null;
-  const header = `${syntheticPrefix} ${cards.length} zone card(s) — blast-radius memory; touch or mention any member path to unfold its zone]`;
+  const header = `${syntheticPrefix} ${cards.length} zone card(s) — path-scoped memory; touch a card's target path to unfold its zone]`;
   const parts = [header, ...cards.map((c) => c.renderedCard)];
   if (counterFooter) parts.push(counterFooter);
   // Self-bootstrapping compliance: append the reminder ONLY when the agent is
