@@ -1770,6 +1770,10 @@ function buildRadar(item: RecallPlanItem, state: FoldRecallState, config: FoldRe
  * Build the Atlas identity metadata block for a recall card: purpose + tags
  * from the Atlas record for this path. Compact, budget-bounded, and '' when
  * empty or missing. Does NOT duplicate highlights/hazards.
+ *
+ * When both purpose and blurb exist, purpose takes precedence for brevity
+ * (purpose is the longer timeless description; blurb is the tweet-length
+ * fallback used when purpose is absent). Tags are always rendered separately.
  */
 function buildAtlasMetaBlock(item: RecallPlanItem, state: FoldRecallState, config: FoldRecallConfig, charBudget: number, _suppressPaths: ReadonlySet<string>): string {
   if (!config.atlasMetaEnabled) return '';
