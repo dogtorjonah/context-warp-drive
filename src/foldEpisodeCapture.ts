@@ -35,6 +35,7 @@ import {
   DEFAULT_EPISODE_GROUPING,
   deriveEpisodeSummary,
   extractNarrationLines,
+  extractRationaleLines,
   groupTouchesIntoEpisodes,
   isNarrationEligibleGlyph,
   narrationKindForGlyph,
@@ -400,10 +401,22 @@ function mineNarrationForGap(
       deliberate.push({ eventIndex: i, annotation: { ts, kind, text: line } });
     }
   }
-  if (deliberate.length > 0) return deliberate;
+  // Rationale (the "why") is captured ADDITIVELY below, so a burst that BOTH
+  // states a verdict AND explains its reasoning keeps both. Pass 1's old early
+  // return dropped the reasoning in exactly that (common) case. Priority is
+  // preserved: deliberate 🏁/⚠️ > verdict-shaped narration > standalone rationale;
+  // rationale only ever rides ALONGSIDE the primary voice (appended last, never
+  // displacing it, deduped against voice already taken).
 
-  // PASS 2 — untagged closing-thought backstop. Identical to the original
-  // single-narration miner; only reached when pass 1 found no declared voice.
+  // PASS 2 + PASS 3 — one bounded closing-prose scan capturing the FIRST
+  // verdict-shaped narration AND the FIRST decision-rationale line. The scan
+  // budget (NARRATION_SCAN_MAX_MESSAGES) and the burst-final-touch exemption are
+  // unchanged. Verdict extraction is skipped once pass 1 already produced
+  // deliberate voice (rationale still rides alongside it). Narration is mined
+  // AFTER grouping (see deriveEpisodesFromMessages), so adding rationale here
+  // cannot change episode count.
+  let verdictResult: { eventIndex: number; annotation: EpisodeAnnotation }[] | null = null;
+  let rationale: { eventIndex: number; annotation: EpisodeAnnotation } | null = null;
   let scanned = 0;
   const touchIndex = Math.max(start, burstFinalTouch);
   for (let i = touchIndex; i < end; i++) {
@@ -423,25 +436,56 @@ function mineNarrationForGap(
     }
     const isSynthetic = (candidate: string) => isSyntheticContextText(candidate, syntheticContext);
     if (!isSynthetic(text)) {
-      const kind = narrationKindForGlyph(glyph);
-      const cap = kind === 'narration' ? NARRATION_MAX_LINES : NARRATION_MAX_LINES_TAGGED;
-      const lines = extractNarrationLines(text, isSynthetic, cap);
-      if (lines.length > 0) {
-        const ts = timestamps?.[i] ?? nowIso;
-        return lines.map((line) => ({
-          eventIndex: i,
-          annotation: { ts, kind, text: line },
-        }));
+      // Verdict-shaped narration — only needed when pass 1 found no declared voice.
+      if (deliberate.length === 0 && !verdictResult) {
+        const kind = narrationKindForGlyph(glyph);
+        const cap = kind === 'narration' ? NARRATION_MAX_LINES : NARRATION_MAX_LINES_TAGGED;
+        const lines = extractNarrationLines(text, isSynthetic, cap);
+        if (lines.length > 0) {
+          const ts = timestamps?.[i] ?? nowIso;
+          verdictResult = lines.map((line) => ({
+            eventIndex: i,
+            annotation: { ts, kind, text: line },
+          }));
+        }
       }
+      // Decision reasoning ("chose X over Y because…", "the trade-off was…") the
+      // verdict gate drops — the lowest-priority backstop, capped at one line and
+      // deduped against deliberate voice already taken in pass 1.
+      if (!rationale) {
+        const rationaleLines = extractRationaleLines(text, isSynthetic, 1);
+        const pick = rationaleLines.find((line) => !seen.has(line.trim().toLowerCase()));
+        if (pick) {
+          const ts = timestamps?.[i] ?? nowIso;
+          rationale = { eventIndex: i, annotation: { ts, kind: 'narration', text: pick } };
+        }
+      }
+      // Both surfaces filled (or deliberate already holds the primary): stop.
+      if ((deliberate.length > 0 || verdictResult) && rationale) break;
     }
-    // Eligible register but no verdict-shaped lines survived (or synthetic):
-    // spend a scan unit — except at the burst-final touch, which is free so the
-    // gap keeps its full forward reach (see isBurstFinalTouch note above).
+    // Eligible register but nothing taken yet (or synthetic): spend a scan unit —
+    // except at the burst-final touch, which is free so the gap keeps its full
+    // forward reach (see isBurstFinalTouch note above).
     if (!isBurstFinalTouch) {
       scanned += 1;
       if (scanned >= NARRATION_SCAN_MAX_MESSAGES) break;
     }
   }
+
+  // Combine. assignAnnotationsToBursts re-sorts by eventIndex, so append order
+  // here only needs to be dedup-correct, not chronological.
+  const appendRationale = (
+    primary: { eventIndex: number; annotation: EpisodeAnnotation }[],
+  ): { eventIndex: number; annotation: EpisodeAnnotation }[] => {
+    if (!rationale) return primary;
+    const key = rationale.annotation.text.trim().toLowerCase();
+    if (primary.some((r) => r.annotation.text.trim().toLowerCase() === key)) return primary;
+    return [...primary, rationale];
+  };
+
+  if (deliberate.length > 0) return appendRationale(deliberate);
+  if (verdictResult) return appendRationale(verdictResult);
+  if (rationale) return [rationale];
   return [];
 }
 
@@ -535,7 +579,18 @@ export function deriveEpisodesFromMessages(
   // Voice floor: pass voice event indexes to grouping so bursts with zero
   // voice annotations refuse to seal on gap alone — producing fewer, fatter
   // episodes that each carry voice by construction.
-  const voiceEventIndexes = annotated.map((a) => a.eventIndex).sort((a, b) => a - b);
+  //
+  // star:pivot is the ONE star that is a SPLIT boundary, not a hold signal:
+  // feeding it into the voice floor (or the tap-star floor below) lets the pivot
+  // ENABLE the floor that then suppresses its OWN seal (the burst absorbs the
+  // next one). Exclude it from both floors — it still drives grouping via the
+  // `pivots` array and still attaches to its closing burst as voice.
+  const isPivotAnnotation = (a: { annotation: EpisodeAnnotation }): boolean =>
+    a.annotation.kind === 'star:pivot';
+  const voiceEventIndexes = annotated
+    .filter((a) => !isPivotAnnotation(a))
+    .map((a) => a.eventIndex)
+    .sort((a, b) => a - b);
 
   // Intent voice floor: collect indexes of user messages carrying REAL intent
   // (non-synthetic, non-tool-result user text). The operator's ask that
@@ -558,7 +613,7 @@ export function deriveEpisodesFromMessages(
   // operator acts, so the floor is always-on like voiceFloor (not env-gated).
   const STAR_PIN_PREFIX = 'star:';
   const tapStarFloorEventIndexes = annotated
-    .filter((a) => typeof a.annotation.kind === 'string' && a.annotation.kind.startsWith(STAR_PIN_PREFIX))
+    .filter((a) => typeof a.annotation.kind === 'string' && a.annotation.kind.startsWith(STAR_PIN_PREFIX) && !isPivotAnnotation(a))
     .map((a) => a.eventIndex)
     .sort((a, b) => a - b);
 

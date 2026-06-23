@@ -394,6 +394,62 @@ export function truncateVerbatim(text: string, cap: number): string {
 
 // ── Narration (tier-B voice) ─────────────────────────────────────────────
 
+/**
+ * Rationale backstop: lines that express the agent's REASONING behind a
+ * decision — trade-offs, alternatives considered, why one approach was chosen
+ * over another. These lines don't match NARRATION_VERDICT_RE (they're not
+ * "Found/Fixed/Confirmed" verdicts) but carry the "why" that verdict-shaped
+ * mining drops. extractRationaleLines runs as the pass-3 backstop after
+ * narration pass 1 (deliberate glyphs) and pass 2 (verdict shape) both fail.
+ *
+ * The pattern matches the agent's own decision-reasoning vocabulary — NOT
+ * conclusions or outcomes (those are narration), but the reasoning that led
+ * to them. Provenance-marked as kind 'narration' (lowest priority deliberate
+ * voice), so declared glyphs and verdict narration always rank higher.
+ */
+// Tightened against non-decision prose: bare `alternative` dropped (covered by
+// instead of / rather than / rejected / chose-over); bare `as` removed from the
+// over-branch ("over the weekend as usual" was a false hit); `due to` excludes
+// resource-meta follow-ons ("due to time I'll stop here") via negative lookahead.
+export const RATIONALE_RE = /\b(?:chose|selected|prefer(?:red)?|went with|opt(?:ed)?|decided|trade[- ]?off|instead of|rather than|rejected|over .{1,40}\b(?:because|since|given)\b|the (?:reason|rationale)\b|due to(?! (?:time|space|length|brevity|budget|the hour)\b)|the (?:key|main|real) (?:reason|factor)\b)\b/i;
+
+/** Max rationale lines per episode (rationale is a supplementary backstop). */
+export const RATIONALE_MAX_LINES = 2;
+
+/**
+ * Deterministic rationale filter over assistant prose. Extracts lines that
+ * contain decision-reasoning markers — the "why" behind choices — that the
+ * verdict gate (NARRATION_VERDICT_RE) misses. Same safety gates as
+ * extractNarrationLines: code-block awareness, synthetic rejection, quoted-
+ * voice rejection, length bounds, truncation. Zero LLM, byte-identical for
+ * identical inputs.
+ *
+ * Used as the pass-3 backstop in mineNarrationForGap: runs ONLY when both the
+ * deliberate glyph pass (1) and the verdict-shape pass (2) found nothing.
+ */
+export function extractRationaleLines(
+  text: string,
+  isSyntheticLine: (line: string) => boolean,
+  cap = RATIONALE_MAX_LINES,
+): string[] {
+  if (!text) return [];
+  const out: string[] = [];
+  let inCodeBlock = false;
+  for (const rawLine of text.split('\n')) {
+    if (out.length >= cap) break;
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith('```')) { inCodeBlock = !inCodeBlock; continue; }
+    if (inCodeBlock || trimmed.length === 0) continue;
+    if (isSyntheticLine(trimmed) || NARRATION_QUOTED_VOICE_RE.test(trimmed) || NARRATION_NONVERDICT_LINE_RE.test(trimmed)) continue;
+    const stripped = trimmed.replace(NARRATION_DECORATION_RE, '');
+    if (stripped.length < NARRATION_MIN_LINE_CHARS || stripped.length > NARRATION_MAX_LINE_CHARS) continue;
+    if (stripped.endsWith('?')) continue;
+    if (!RATIONALE_RE.test(stripped)) continue;
+    out.push(truncateVerbatim(stripped, VOICE_TEXT_CAP_CHARS));
+  }
+  return out;
+}
+
 /** Max narration lines carried per episode (untagged backstop). */
 export const NARRATION_MAX_LINES = 2;
 /**
@@ -697,7 +753,8 @@ export function groupTouchesIntoEpisodes(
       const hasTapStarFloor = tapStarFloorSet && tapStarFloorMult > 1
         && burstHasEvent(current, tapStarFloorSet);
       // AFFINITY FLOOR: if any current-burst path has affinity ≥ threshold
-      // with the incoming touch's path, widen the gap.
+      // with the incoming touch's path, widen the gap — the agent likely
+      // stayed in the same conceptual zone.
       const hasAffinity = !!opts.affinityFloor
         && current.some((t) => {
           const neighbors = opts.affinityFloor![t.path];
@@ -728,7 +785,11 @@ export function groupTouchesIntoEpisodes(
         // fires (can't grow indefinitely). The burst absorbs this touch and
         // stays open for voice.
         const hasVoiceData = voiceIdxSet !== null || intentIdxSet !== null;
-        if (hasVoiceData && !spanExceeded && !burstHasVoice(current, prevBurstEnd)) {
+        // A pivot is an explicit operator split boundary; the voice floor must
+        // never suppress a pivot seal (else the pivot's own burst absorbs the
+        // next one). The closing burst still receives the pivot as its voice via
+        // assignAnnotationsToBursts, so it is not left voiceless.
+        if (hasVoiceData && !spanExceeded && !pivotBetween && !burstHasVoice(current, prevBurstEnd)) {
           // Don't seal — keep growing. The burst now spans into this touch's
           // territory, and will seal on the NEXT gap once voice arrives.
         } else {

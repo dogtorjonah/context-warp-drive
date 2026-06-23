@@ -1286,6 +1286,16 @@ const KEEP_RE = [
   /\bmu(st|stn't)\b/i,
   /\bbreaking change\b/i,
   /\bhazard\b/i,
+  // Reasoning markers — the "why" behind decisions. Without these, trade-off
+  // analysis and alternative-consideration prose gets dropped by the 250-char
+  // cutoff even when it's the most important reasoning in the turn.
+  /\b(?:chose|selected|prefer(?:red)?|went with|opt(?:ed)?|decided)\b/i,
+  /\btrade[- ]?off\b/i,
+  /\balternative\b/i,
+  /\binstead of\b/i,
+  /\brather than\b/i,
+  /\breject(?:ed|ing)?\b/i,
+  /\bdue to\b/i,
   /^[-*•]\s/,
   /^\d+\.\s/,
   /^#+\s/,
@@ -1327,8 +1337,10 @@ export function extractAssistantEssence(text: string): string {
     if (FILLER_RE.some(p => p.test(trimmed))) continue;
 
     // Drop verbose mid-paragraph prose without keep markers.
-    // 250 chars preserves most constraint statements and cross-file reasoning
-    // that the old 120-char cutoff was killing.
+    // Lines without KEEP_RE hits are capped at 250 chars. Lines with
+    // reasoning markers (chose, trade-off, instead of, etc.) are already
+    // captured unconditionally by the KEEP_RE check above, so the widened
+    // patterns are the real fix — this cutoff only governs generic prose.
     if (trimmed.length > 250) continue;
 
     // Line passed all filters — keep it.
