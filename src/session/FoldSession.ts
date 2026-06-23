@@ -568,11 +568,6 @@ export class FoldSession {
     this.foldEpochFrontiers = [];
   }
 
-  private hasVaultBackedEvictionCoverage(): boolean {
-    return this.vaultEnabled
-      && (this.userMessageVaultEntries.length > 0 || this.assistantGlyphVaultEntries.length > 0);
-  }
-
   private buildFoldEvictionInput(
     messages: FoldMessage[],
     durableCursorIndex: number,
@@ -585,9 +580,15 @@ export class FoldSession {
   ): FoldEvictionInput | undefined {
     if (!this.evictionEnabled || this.evictionThresholdChars <= 0) return undefined;
     const hasSpans = this.foldEvictedSpans.length > 0;
+    // Pressure-ceiling / forced-full-recompute epochs: the entire raw history
+    // is being recomputed through the fold pipeline, so ALL folded content is
+    // eligible for eviction regardless of vault state. The raw history is the
+    // durable backing — fold-recall pages evicted turns back from raw on touch,
+    // and the episodic store is a recall performance optimization, not a
+    // correctness prerequisite for tombstoning.
     const effectiveDurableCursorIndex = Math.max(
       durableCursorIndex,
-      options.allowVaultBackedCoverage && this.hasVaultBackedEvictionCoverage() ? messages.length : 0,
+      options.allowVaultBackedCoverage ? messages.length : 0,
     );
     const evictableThroughOrdinal = computeEvictableThroughOrdinal(
       detectTurns(messages, this.syntheticContext),

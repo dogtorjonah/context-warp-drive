@@ -80,6 +80,8 @@ export interface EpisodeCaptureIdentity {
   nowIso: string;
   railId?: string;
   railStep?: string;
+  /** Active task-rail objective, when the host can supply it cheaply. */
+  railObjective?: string;
   /**
    * When TRUE, derived episodes inherit the siloed tag — recall gate keeps
    * them invisible to unsealed callers. Capture-but-quarantine, not
@@ -311,7 +313,57 @@ function mineVoice(call: ToolCallView): EpisodeAnnotation | null {
     }
     return null;
   }
+  if (shortName === 'task_rail') {
+    // Rail ACK notes are deliberate, contemporaneous agent voice — the "what I
+    // did / why it's blocked" for a step the agent just closed. A batch shoot
+    // carries acks[].note; prefer a blocked/needs_review note (problems are the
+    // highest-signal thing to resurface), else the first non-empty note. The
+    // single-step ack form carries a top-level `note` instead. task_rail emits
+    // no file touches (extractRecallSignals only reads file_path/path keys), so
+    // this voice attaches to the work burst it concludes by event proximity.
+    const pickAckNote = (): string | null => {
+      const acks = Array.isArray(call.input.acks) ? call.input.acks : null;
+      if (acks) {
+        let firstNonEmpty: string | null = null;
+        for (const raw of acks) {
+          const a = asRecord(raw);
+          if (!a) continue;
+          const note = typeof a.note === 'string' ? a.note.trim() : '';
+          if (note.length === 0) continue;
+          const status = typeof a.ack_status === 'string' ? a.ack_status
+            : typeof a.ackStatus === 'string' ? a.ackStatus : '';
+          if (status === 'blocked' || status === 'needs_review') return note;
+          if (firstNonEmpty === null) firstNonEmpty = note;
+        }
+        if (firstNonEmpty !== null) return firstNonEmpty;
+      }
+      const single = typeof call.input.note === 'string' ? call.input.note.trim() : '';
+      const isAck = call.input.mode === 'shoot'
+        || typeof call.input.ack_status === 'string'
+        || typeof call.input.ackStatus === 'string'
+        || typeof call.input.ack_step_id === 'string'
+        || typeof call.input.ackStepId === 'string';
+      return single.length > 0 && isAck ? single : null;
+    };
+    const ackNote = pickAckNote();
+    if (ackNote) return { ts: '', kind: 'rail', text: truncateVerbatim(ackNote, VOICE_TEXT_CAP_CHARS) };
+    return null;
+  }
   return null;
+}
+
+function isTaskRailLifecycleBoundary(call: ToolCallView): boolean {
+  if (shortToolName(call.name).toLowerCase() !== 'task_rail') return false;
+  const mode = typeof call.input.mode === 'string' ? call.input.mode : '';
+  const operation = typeof call.input.operation === 'string' ? call.input.operation : '';
+  // draft/edit/template/role operations are bookkeeping. sprint opens real
+  // execution, shoot/audit ACK closes a unit, and load/start is a deliberate
+  // intent switch. The trailing-open seal path below is what makes ACK notes
+  // persist without waiting for an unrelated future file touch.
+  return mode === 'sprint'
+    || mode === 'shoot'
+    || mode === 'audit'
+    || (mode === 'load' && operation === 'start');
 }
 
 /** Concatenated assistant text blocks of one message ('' for non-assistant). */
@@ -496,6 +548,15 @@ function structuralStep(call: ToolCallView, outcome: 'ok' | 'error' | undefined,
     const head = typeof entry === 'string' ? truncateVerbatim(entry.split('\n')[0].trim(), COMMIT_DETAIL_CAP_CHARS) : '';
     return { tool: 'commit', ...(head ? { detail: head } : {}) };
   }
+  if (shortName.toLowerCase() === 'task_rail') {
+    // Compact lifecycle token rail:<phase> so the trace shows rail boundaries
+    // (rail:start / rail:sprint / rail:shoot / rail:update) instead of an opaque
+    // "task_rail". For mode=load the operation is the meaningful phase.
+    const mode = typeof call.input.mode === 'string' ? call.input.mode : '';
+    const operation = typeof call.input.operation === 'string' ? call.input.operation : '';
+    const phase = (mode === 'load' && operation) ? operation : (mode || operation || 'rail');
+    return { tool: `rail:${phase}`, ...(outcome ? { outcome } : {}) };
+  }
   const targetSource = typeof call.input.file_path === 'string'
     ? call.input.file_path
     : typeof call.input.path === 'string'
@@ -551,11 +612,13 @@ export function deriveEpisodesFromMessages(
 ): EpisodeCaptureResult {
   const touches: EpisodeTouch[] = [];
   const pivots: EpisodePivotMarker[] = [];
+  const railSealEventIndexes: number[] = [];
   const annotated: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
   const steps: { eventIndex: number; step: TraceStep }[] = [];
   const syntheticContext = options.syntheticContext ?? {};
 
   for (const call of iterToolCalls(messages, startIndex)) {
+    if (isTaskRailLifecycleBoundary(call)) railSealEventIndexes.push(call.eventIndex);
     const touched = extractTouchPaths(call.input, options.canon);
     const kind = isEditTool(call.name) ? 'edit' as const : 'read' as const;
     const ts = options.timestamps?.[call.eventIndex];
@@ -633,6 +696,7 @@ export function deriveEpisodesFromMessages(
     // TAP-STAR FLOOR: always-on (stars are explicit operator acts). Widens
     // gap for bursts containing a deliberate pin so they accumulate more voice.
     ...(tapStarFloorEventIndexes.length > 0 ? { tapStarFloorEventIndexes } : {}),
+    ...(railSealEventIndexes.length > 0 ? { railSealEventIndexes } : {}),
     // AFFINITY FLOOR: host-supplied co-activation scores from the worker. The
     // capture layer only threads the matrix through; scoring remains outside
     // this pure package path.
@@ -662,8 +726,10 @@ export function deriveEpisodesFromMessages(
   const trailingMsGap = lastBurst.endedAt !== undefined
     ? Date.parse(identity.nowIso) - Date.parse(lastBurst.endedAt)
     : Number.NaN;
+  const trailingRailSeal = railSealEventIndexes.some((idx) => idx > lastBurst.endEventIndex && idx < messages.length);
   const trailingSettled = !sealTrailing
-    && (trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
+    && (trailingRailSeal
+      || trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
       || (Number.isFinite(trailingMsGap) && trailingMsGap > DEFAULT_EPISODE_GROUPING.gapMs));
   const sealAll = sealTrailing || trailingSettled;
   const openBurst = sealAll ? null : lastBurst;
@@ -722,7 +788,20 @@ export function deriveEpisodesFromMessages(
         : s.eventIndex >= burst.startEventIndex && s.eventIndex <= burst.endEventIndex)
       .map((s) => s.step);
     const annotations = annotationsPerBurst[index];
-    const intent = mineIntentForBurst(messages, burst.startEventIndex, syntheticContext);
+    const railObjective = typeof identity.railObjective === 'string' && identity.railObjective.trim().length > 0
+      ? truncateVerbatim(identity.railObjective.trim(), INTENT_TEXT_CAP_CHARS)
+      : undefined;
+    // Scope the rail objective to its ACTIVE WINDOW — it is burst-independent, so
+    // applying it to every burst blankets older/unrelated work (worst under Codex,
+    // which re-derives from index 0 each epoch). In-window = a rail seal inside the
+    // burst span, or a closing ACK just after the trailing sealed burst; elsewhere
+    // the per-burst mined operator ask is preserved (objective never overrides it).
+    const burstInRailWindow = railObjective !== undefined
+      && railSealEventIndexes.some((idx) =>
+        (idx >= burst.startEventIndex && idx <= burst.endEventIndex)
+        || (index === sealed.length - 1 && idx > burst.endEventIndex));
+    const intent = (burstInRailWindow ? railObjective : undefined)
+      ?? mineIntentForBurst(messages, burst.startEventIndex, syntheticContext);
     return {
       workspace: identity.workspace,
       instanceId: identity.instanceId,
@@ -795,8 +874,9 @@ export interface OpenBurstResult {
  * Called WITHOUT timestamps/nowIso (the FoldSession default), the seal is pure
  * event-count (`trailingEventGap > gapEvents`) — the work-time basis, not wall-clock.
  * Pivots are not mined here (that needs voice mining); pass them only for exact
- * parity testing. A missing pivot merely holds the burst slightly longer (until the
- * next burst forms), which is harmless for fold-holding.
+ * parity testing. task_rail lifecycle boundaries are structural and cheap, so
+ * they are mined here too to keep ACK-sealed bursts from being over-held by the
+ * fold guard.
  */
 export function computeOpenBurst(
   messages: readonly FoldMessage[],
@@ -808,7 +888,9 @@ export function computeOpenBurst(
   } = {},
 ): OpenBurstResult {
   const touches: EpisodeTouch[] = [];
+  const railSealEventIndexes: number[] = [];
   for (const call of iterToolCalls(messages, 0)) {
+    if (isTaskRailLifecycleBoundary(call)) railSealEventIndexes.push(call.eventIndex);
     const touched = extractTouchPaths(call.input, options.canon);
     const kind = isEditTool(call.name) ? 'edit' as const : 'read' as const;
     const ts = options.timestamps?.[call.eventIndex];
@@ -817,7 +899,10 @@ export function computeOpenBurst(
     }
   }
 
-  const bursts = groupTouchesIntoEpisodes(touches, { pivots: options.pivots ?? [] });
+  const bursts = groupTouchesIntoEpisodes(touches, {
+    pivots: options.pivots ?? [],
+    ...(railSealEventIndexes.length > 0 ? { railSealEventIndexes } : {}),
+  });
   if (bursts.length === 0) return { openBurstStartIndex: null, heldPaths: [], burstCount: 0 };
 
   // ── trailing-settled seal — MUST mirror deriveEpisodesFromMessages (the
@@ -828,7 +913,9 @@ export function computeOpenBurst(
   const trailingMsGap = (options.nowIso !== undefined && lastBurst.endedAt !== undefined)
     ? Date.parse(options.nowIso) - Date.parse(lastBurst.endedAt)
     : Number.NaN;
-  const trailingSettled = trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
+  const trailingRailSeal = railSealEventIndexes.some((idx) => idx > lastBurst.endEventIndex && idx < messages.length);
+  const trailingSettled = trailingRailSeal
+    || trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
     || (Number.isFinite(trailingMsGap) && trailingMsGap > DEFAULT_EPISODE_GROUPING.gapMs);
   if (trailingSettled) return { openBurstStartIndex: null, heldPaths: [], burstCount: bursts.length };
 

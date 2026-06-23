@@ -49,6 +49,9 @@ export type EpisodeAnnotationKind =
   | 'star:result'
   | 'changelog'
   | 'chat'
+  // Rail ACK voice: a contemporaneous step-completion / blocker note the agent
+  // typed into task_rail. Deliberate operational voice (see ANNOTATION_PRIORITY).
+  | 'rail'
   /**
    * Tier-B voice: burst-final assistant prose through the deterministic verdict
    * gate. Three trust tiers, set by the register the agent DECLARED (SOP P23
@@ -160,6 +163,14 @@ export interface EpisodeGroupingOptions {
   maxBurstMs?: number;
   /** star:pivot markers — an agent-declared chapter break seals the burst. */
   pivots?: readonly EpisodePivotMarker[];
+  /**
+   * task_rail execution / ACK markers. These carry no file touch themselves,
+   * but they are deliberate lifecycle seams: sprint starts work, shoot/audit
+   * ACK closes it, and load/start switches intent. When one falls between two
+   * file touches, it seals the current burst like a pivot. Omitting =
+   * byte-identical legacy grouping.
+   */
+  railSealEventIndexes?: readonly number[];
   /**
    * VOICE FLOOR: when true, a burst is NOT sealed by a gap/pivot alone unless
    * it contains at least one voice event (from voiceEventIndexes) OR the
@@ -330,12 +341,16 @@ const ANNOTATION_PRIORITY: Record<EpisodeAnnotationKind, number> = {
   'narration:hazard': 6,
   'narration:verdict': 7,
   changelog: 8,
-  chat: 9,
+  // RAIL ACK voice: deliberate agent operational voice (step-completion / blocker
+  // evidence the agent typed into task_rail), peer to a changelog blurb and above
+  // ambient chat — it is an explicit, contemporaneous statement about the work.
+  rail: 9,
+  chat: 10,
   // UNTAGGED tier-B distillate: still always LAST, so it fills voice vacuum but
   // never displaces deliberate voice under the inlay cap. At 0% glyph
   // compliance all narration lands here — ranking stays byte-identical to the
   // pre-promotion engine.
-  narration: 10,
+  narration: 11,
 };
 
 /**
@@ -653,6 +668,7 @@ export function groupTouchesIntoEpisodes(
   const pivotIndexes = (opts.pivots ?? [])
     .map((pivot) => pivot.eventIndex)
     .sort((a, b) => a - b);
+  const railSealIndexes = [...(opts.railSealEventIndexes ?? [])].sort((a, b) => a - b);
 
   // VOICE FLOOR: if enabled, a burst with zero voice annotations refuses to
   // seal on gap/pivot alone — it stays open until voice arrives or force-split
@@ -734,12 +750,15 @@ export function groupTouchesIntoEpisodes(
   let current: EpisodeTouch[] = [];
   let prevBurstEnd = 0; // End event index of the last sealed burst (for intent range)
   let pivotCursor = 0;
+  let railSealCursor = 0;
 
   for (const touch of sorted) {
     const prev = current[current.length - 1];
     if (prev) {
       while (pivotCursor < pivotIndexes.length && pivotIndexes[pivotCursor] <= prev.eventIndex) pivotCursor++;
       const pivotBetween = pivotCursor < pivotIndexes.length && pivotIndexes[pivotCursor] <= touch.eventIndex;
+      while (railSealCursor < railSealIndexes.length && railSealIndexes[railSealCursor] <= prev.eventIndex) railSealCursor++;
+      const railSealBetween = railSealCursor < railSealIndexes.length && railSealIndexes[railSealCursor] <= touch.eventIndex;
       const eventGap = touch.eventIndex - prev.eventIndex;
       const prevMs = parseTsMs(prev.ts);
       const touchMs = parseTsMs(touch.ts);
@@ -777,7 +796,7 @@ export function groupTouchesIntoEpisodes(
       const spanMs = burstStartMs !== undefined && touchMs !== undefined ? touchMs - burstStartMs : undefined;
       const spanExceeded = spanEvents > maxBurstEvents || (spanMs !== undefined && spanMs > maxBurstMs);
 
-      const shouldSeal = eventGap > gapEvents || (msGap !== undefined && msGap > effectiveGapMs) || pivotBetween || spanExceeded;
+      const shouldSeal = eventGap > gapEvents || (msGap !== undefined && msGap > effectiveGapMs) || pivotBetween || railSealBetween || spanExceeded;
 
       if (shouldSeal) {
         // VOICE FLOOR GATE: if enabled and the burst about to seal has NO voice
@@ -785,11 +804,11 @@ export function groupTouchesIntoEpisodes(
         // fires (can't grow indefinitely). The burst absorbs this touch and
         // stays open for voice.
         const hasVoiceData = voiceIdxSet !== null || intentIdxSet !== null;
-        // A pivot is an explicit operator split boundary; the voice floor must
-        // never suppress a pivot seal (else the pivot's own burst absorbs the
-        // next one). The closing burst still receives the pivot as its voice via
+        // Pivot/rail markers are explicit split boundaries; the voice floor must
+        // never suppress them (else the boundary's own voice absorbs the next
+        // burst). The closing burst still receives gap voice via
         // assignAnnotationsToBursts, so it is not left voiceless.
-        if (hasVoiceData && !spanExceeded && !pivotBetween && !burstHasVoice(current, prevBurstEnd)) {
+        if (hasVoiceData && !spanExceeded && !pivotBetween && !railSealBetween && !burstHasVoice(current, prevBurstEnd)) {
           // Don't seal — keep growing. The burst now spans into this touch's
           // territory, and will seal on the NEXT gap once voice arrives.
         } else {
@@ -895,6 +914,7 @@ function renderVoiceInline(annotation: EpisodeAnnotation): string {
   if (annotation.kind.startsWith('star:')) return `⭐${annotation.kind.slice(5)}:"${text}"`;
   if (annotation.kind === 'changelog') return `✎:"${text}"`;
   if (annotation.kind.startsWith('narration')) return `🗣:"${text}"`;
+  if (annotation.kind === 'rail') return `🛤:"${text}"`;
   return `💬:"${text}"`;
 }
 
@@ -1109,6 +1129,7 @@ function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   if (annotation.kind.startsWith('star:')) return `  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}`;
   if (annotation.kind === 'changelog') return `  ✎${who}:"${text}"${at}`;
   if (annotation.kind.startsWith('narration')) return `  🗣${who}:"${text}"${at}`;
+  if (annotation.kind === 'rail') return `  🛤${who}:"${text}"${at}`;
   return `  💬${who}:"${text}"${at}`;
 }
 
@@ -2018,7 +2039,10 @@ export function selectActiveEpisodicPathCards(
 ): ActiveEpisodicPathCardSelection {
   const config = options.valueConfig;
   const enabled = config?.enabled === true;
-  const repinInactive = enabled && config?.repinInactive === true;
+  const configuredRepinInactive = enabled && config?.repinInactive === true;
+  const railTargetPaths = options.valueContext?.railTargetPaths;
+  const hasRailTargets = (railTargetPaths?.size ?? 0) > 0;
+  const repinInactive = configuredRepinInactive && (touchPaths.length > 0 || hasRailTargets);
   const repinValueFloor = config?.repinValueFloor ?? 1;
   const maxCards = Math.max(0, options.maxCards ?? EPISODIC_ACTIVE_PIN_DEFAULT_MAX_CARDS);
   const empty = (): ActiveEpisodicPathCardSelection => ({
@@ -2029,8 +2053,10 @@ export function selectActiveEpisodicPathCards(
     repinValueFloor,
     maxCards,
   });
-  // Legacy early-out preserved unless inactive re-pin is on (it can pin a
-  // high-value zone the agent did not touch this boundary).
+  // Legacy early-out preserved unless de-noised inactive re-pin is on. The old
+  // "scan every zone on every boundary" behavior churned relay-wide; now a
+  // pathless push needs an active rail target, and only matching target paths
+  // can pass below.
   if (touchPaths.length === 0 && !repinInactive) return empty();
   const touched = new Set(touchPaths);
   const excluded = new Set(options.excludeRenderedCards ?? []);
@@ -2051,7 +2077,11 @@ export function selectActiveEpisodicPathCards(
       ? scoreEpisodicZoneValue(targetPath, zone, options.valueContext, state.boundarySeq, options.valueWeights)
       : 0;
     const reason: EpisodicPinDecisionReason = isTouched ? 'touched' : 'inactive';
-    if (!isTouched && (!repinInactive || value < repinValueFloor)) {
+    const inactiveMatchesRailTarget = !isTouched && hasRailTargets && railTargetPaths?.has(targetPath) === true;
+    const inactiveAllowed = isTouched
+      ? true
+      : repinInactive && (touchPaths.length > 0 || inactiveMatchesRailTarget);
+    if (!isTouched && (!inactiveAllowed || value < repinValueFloor)) {
       if (repinInactive) {
         decisions.push({ targetPath, reason, value, selected: false, skipped: 'inactive_below_floor' });
       }
