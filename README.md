@@ -209,6 +209,25 @@ Pair it with FoldSession like this: raw transcript stays in your storage, folded
 
 See [`examples/task-rail.ts`](./examples/task-rail.ts) for a full runnable walkthrough (start → sprint → ack → shoot → serialize → restore, zero dependencies).
 
+## Raw rebirth seed — `context-warp-drive/raw-rebirth-seed`
+
+When a long-running agent chooses a hard epoch, it needs a deterministic wake seed that is computed from the trace, not summarized by a model. The raw rebirth seed renderer exposes that package shape directly: Last User + AI Messages, Current Thread, Raw Trace Coordinate Closet, Active Edit Delta, Task Rail, Activity Log, workspace context, and the orientation footer, with the same default section budgets and allocation priority used by the relay-style hard epoch.
+
+```ts
+import { buildRawRebirthSeedFromMessages } from 'context-warp-drive/raw-rebirth-seed';
+
+const seed = buildRawRebirthSeedFromMessages(history, {
+  predecessorName: 'agent-before-reset',
+  includeTrailingUserTurn: false,
+  workspaceContext: {
+    currentCwd: process.cwd(),
+    currentWorkspace: 'my-agent-runtime',
+  },
+});
+```
+
+`FoldSession` uses this renderer automatically when a pressure hard epoch fires and you do not pass `hardEpochSeed`. If your host has richer trace sections, call `renderRawRebirthSeed()` and pass those strings explicitly. See [`docs/raw-rebirth-seed.md`](./docs/raw-rebirth-seed.md) for exact parity boundaries and copy-paste examples.
+
 ---
 
 ## How it works

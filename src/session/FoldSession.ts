@@ -25,7 +25,9 @@
 import {
   foldContext,
   detectTurns,
+  planActiveTurnStepFold,
   computeEvictableThroughOrdinal,
+  countChars,
   DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
   DEFAULT_ASSISTANT_TEXT_BUDGET,
   resolveFoldConfigForBand,
@@ -34,6 +36,7 @@ import {
   type FoldResult,
   type FoldEvictionInput,
   type FoldEvictionSpan,
+  type StepFoldPlan,
   type FidelityOverrides,
   type FidelityValueWeights,
   type FoldFidelityValueInput,
@@ -46,10 +49,14 @@ import {
   commitFoldFreeze,
   appendFoldFreezeTailEpoch,
   touchFoldFreeze,
+  buildHardEpochSeedView,
+  buildRawHardEpochSeed,
+  DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS,
   DEFAULT_FOLD_FREEZE_CONFIG,
   type FoldFreezeState,
   type FoldFreezeConfig,
   type FoldFreezeContext,
+  type FoldFreezeAppendSkipReason,
 } from '../foldFreeze.ts';
 import {
   DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS,
@@ -90,7 +97,6 @@ export const DEFAULT_FOLD_TARGET_BAND_TOKENS = DEFAULT_CONTEXT_BUDGET_TARGET_BAN
 export const DEFAULT_FOLD_APPEND_BAND_TARGET_TOKENS = DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS;
 export const DEFAULT_FOLD_TAIL_EPOCH_RUNWAY_TOKENS = DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
 export const DEFAULT_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS = DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS;
-
 /**
  * Default retention fractions of the fold band (mirrors rollingFold's
  * resolveFoldBandBudgets defaults). A governor fidelity override is expressed
@@ -163,10 +169,17 @@ export interface FoldSessionOptions {
   readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
   /**
    * Standalone S/M/A/T/F runway geometry for append-only tail epochs. Defaults
-   * to S37/M40/A5/T45/F30; pass false to disable the runway gate while keeping
+   * to effective S37/M40/A5/T10/F10; pass false to disable the runway gate while keeping
    * ordinary pressure-ceiling recomputes.
    */
   readonly tailEpochRunway?: false | FoldTailEpochRunwayConfig;
+  /**
+   * Character budget for the standalone-computed raw hard-epoch seed used when
+   * the host does not pass FoldPrepareContext.hardEpochSeed. This is a clamp for
+   * local string size, not token telemetry. Defaults to the helper's 200K-char
+   * budget.
+   */
+  readonly rawHardEpochSeedMaxChars?: number;
 
   /**
    * Read-burst fold guard (rail-f1b6c230). When `true`, an epoch-time fold keeps
@@ -245,6 +258,15 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    * `null` clears any override back to the base config.
    */
   readonly fidelity?: FidelityOverrides | null;
+  /**
+   * Optional same-instance hard-epoch seed override. When measured pressure is
+   * RAW-triggered, FoldSession replaces the entire prepared view with a SINGLE
+   * compact continuity message and re-anchors the freeze boundary around it. If
+   * this override is omitted, FoldSession computes the raw seed synchronously from
+   * the supplied provider trace; richer hosts can pass their own already-rendered
+   * raw package string here. The old raw transcript remains recall backing.
+   */
+  readonly hardEpochSeed?: string | null;
 }
 
 export interface FoldStats {
@@ -269,6 +291,13 @@ export interface FoldStats {
   /** Absolute measured-token ceiling telemetry when the pressure guard is enabled. */
   readonly pressureCeilingTokens?: number;
   readonly pressureCeilingTriggered?: boolean;
+  /** Append-only tail epoch ROI decision for this call, when a tail epoch was considered. */
+  readonly appendDecision?: 'committed' | 'skipped';
+  readonly appendSkipReason?: FoldFreezeAppendSkipReason;
+  readonly appendRawTailChars?: number;
+  readonly appendBandChars?: number;
+  readonly appendSavedChars?: number;
+  readonly appendShrinkRatio?: number;
 }
 
 export interface FoldOutcome {
@@ -321,6 +350,7 @@ export class FoldSession {
   private readonly tailEpochAppendBandTargetTokens: number;
   private readonly tailEpochRunwayTokens: number | null;
   private readonly tailEpochMinRunwayTokens: number | null;
+  private readonly rawHardEpochSeedMaxChars: number;
   private readonly readBurstGuardEnabled: boolean;
   private readonly valueFidelityInput: FoldFidelityValueInput | undefined;
   private readonly syntheticContext: SyntheticContextOptions;
@@ -334,6 +364,7 @@ export class FoldSession {
   private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
   private lastPreparedRawCount = 0;
   private activeFidelity: FidelityOverrides | null = null;
+  private hardEpochCompactBaselineActive = false;
 
   constructor(options: FoldSessionOptions = {}) {
     this.foldConfig = options.foldConfig ?? resolveFoldConfigForBand(DEFAULT_FOLD_TARGET_BAND_TOKENS);
@@ -343,6 +374,10 @@ export class FoldSession {
       ? { weights: options.valueFidelity.weights, recencyFloorTurns: options.valueFidelity.recencyFloorTurns }
       : undefined;
     this.syntheticContext = options.syntheticContext ?? {};
+    this.rawHardEpochSeedMaxChars = positiveFinite(
+      options.rawHardEpochSeedMaxChars,
+      DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS,
+    );
     if (options.freeze === false) {
       this.freezeEnabled = false;
       this.freezeConfig = DEFAULT_FOLD_FREEZE_CONFIG;
@@ -513,6 +548,50 @@ export class FoldSession {
     return Math.min(base, floor);
   }
 
+  private planMarathonStepFold(
+    messages: FoldMessage[],
+    measuredInputTokens: number | undefined,
+    durableCursorIndex: number,
+    foldConfig: FoldConfig,
+  ): StepFoldPlan | null {
+    if (durableCursorIndex < messages.length) return null;
+    if (
+      typeof measuredInputTokens !== 'number'
+      || !Number.isFinite(measuredInputTokens)
+      || measuredInputTokens <= this.tailEpochTargetBandTokens
+    ) {
+      return null;
+    }
+    const budget = foldConfig.assistantTextBudget;
+    const budgetBasedActiveTurnChars = budget
+      ? budget.fullRetentionChars + budget.essenceRetentionChars
+      : 150_000;
+    const activeTurnCharBudget = Math.min(budgetBasedActiveTurnChars, this.freezeConfig.maxTailChars);
+    return planActiveTurnStepFold(messages, {
+      activeTurnCharBudget,
+      keepLastSteps: 12,
+    }, this.syntheticContext);
+  }
+
+  private foldMarathonSteps(
+    messages: FoldMessage[],
+    measuredInputTokens: number | undefined,
+    durableCursorIndex: number,
+    foldConfig: FoldConfig,
+  ): FoldResult | null {
+    const plan = this.planMarathonStepFold(messages, measuredInputTokens, durableCursorIndex, foldConfig);
+    if (!plan) return null;
+    return foldContext(
+      messages,
+      plan.turnsToFold,
+      foldConfig,
+      undefined,
+      undefined,
+      plan.turns,
+      this.syntheticContext,
+    );
+  }
+
   /**
    * Apply a governor fidelity override to the base fold config. The override is
    * expressed as a FRACTION of the band; FoldSession owns a fully-resolved config
@@ -624,6 +703,7 @@ export class FoldSession {
       && measuredInputTokens >= this.pressureCeilingTokens;
   }
 
+
   private pressureStats(
     pressureCeilingTriggered: boolean,
   ): Partial<Pick<FoldStats, 'pressureCeilingTokens' | 'pressureCeilingTriggered'>> {
@@ -699,13 +779,28 @@ export class FoldSession {
     // epoch-gated band/fidelity application.
     const desiredFidelity = context.fidelity === undefined ? this.activeFidelity : context.fidelity;
 
+    // ── HARD EPOCH (raw trace seed) ──
+    // When the measured ceiling is RAW-triggered, replace the whole prepared view
+    // with one compact seed message (live turn merged in) and re-anchor the freeze
+    // boundary around it. A host-supplied seed wins; otherwise the standalone
+    // engine computes a raw trace seed from `messages` itself. Fires independent
+    // of recompute-suppression because the topology reset lowers the stuck floor.
+    if (pressureCeilingTriggered) {
+      this.activeFidelity = desiredFidelity;
+      const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
+        maxChars: this.rawHardEpochSeedMaxChars,
+      });
+      return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns);
+    }
+
     if (!this.freezeEnabled) {
       this.activeFidelity = desiredFidelity;
       const upcomingEpoch = this.foldEpochs + 1;
+      const foldConfig = this.effectiveFoldConfig(desiredFidelity);
       const result = foldContext(
         messages,
         this.guardedTurnsToFold(messages, pressureCeilingTriggered),
-        this.effectiveFoldConfig(desiredFidelity),
+        foldConfig,
         this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
           allowVaultBackedCoverage: pressureCeilingTriggered,
           targetSafeFrontier: pressureCeilingTriggered,
@@ -715,14 +810,16 @@ export class FoldSession {
         this.syntheticContext,
         this.valueFidelityInput,
       );
-      this.commitEvictionEpoch(result, upcomingEpoch);
+      const stepResult = this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig);
+      const bookkeepingResult = result.turnsFolded > 0 ? result : stepResult ?? result;
+      this.commitEvictionEpoch(bookkeepingResult, upcomingEpoch);
       return this.applyVault({
-        messages: result.messages,
+        messages: stepResult?.messages ?? result.messages,
         cacheHot: false,
-        result,
+        result: bookkeepingResult,
         appliedFidelity: this.activeFidelity,
         stats: {
-          ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
+          ...this.statsFromResult(totalTurns, false, bookkeepingResult, pressureCeilingTriggered),
           ...(pressureCeilingTriggered ? { epochReason: 'pressure-ceiling' } : {}),
         },
       });
@@ -758,12 +855,17 @@ export class FoldSession {
     if (recomputeReason === 'history-rewound' || recomputeReason === 'boundary-mismatch') {
       this.resetEvictionState();
     }
+    const previousActiveFidelity = this.activeFidelity;
     this.activeFidelity = desiredFidelity;
     const runway = this.tailEpochRunwayCheck();
+    const hardEpochBaselineRunwayBypass = recomputeReason === 'tail-epoch'
+      && !pressureCeilingTriggered
+      && !runway.ok
+      && this.hardEpochCompactBaselineActive;
     const upcomingEpoch = this.foldEpochs + 1;
     const appendOnlyTailEpoch = recomputeReason === 'tail-epoch'
       && !pressureCeilingTriggered
-      && runway.ok;
+      && (runway.ok || hardEpochBaselineRunwayBypass);
     if (appendOnlyTailEpoch) {
       const tail = messages.slice(this.freezeState.frozenRawCount);
       const tailResult = foldContext(
@@ -779,7 +881,7 @@ export class FoldSession {
       // band) into this folded tail band before it joins the byte-frozen prefix.
       const sealedTail = this.bakeVault(tailResult.messages, 'delta');
       const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, sealedTail, ctx, now);
-      if (appendCommit) {
+      if (appendCommit.committed) {
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
         return {
           messages: appendCommit.view,
@@ -789,15 +891,44 @@ export class FoldSession {
           appliedFidelity: this.activeFidelity,
           stats: {
             ...this.statsFromResult(totalTurns, false, tailResult, false),
-            epochReason: 'tail-epoch-append',
+            epochReason: hardEpochBaselineRunwayBypass ? 'tail-epoch-append+hard-epoch-baseline' : 'tail-epoch-append',
+            appendDecision: 'committed',
+            appendRawTailChars: appendCommit.rawTailChars,
+            appendBandChars: appendCommit.bandViewChars,
+            appendSavedChars: appendCommit.savedChars,
+            appendShrinkRatio: appendCommit.shrinkRatio,
+          },
+        };
+      }
+      if (appendCommit.view) {
+        this.activeFidelity = previousActiveFidelity;
+        touchFoldFreeze(this.freezeState, now);
+        return {
+          messages: appendCommit.view,
+          cacheHot: true,
+          sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
+          appliedFidelity: this.activeFidelity,
+          stats: {
+            totalTurns,
+            cacheHot: true,
+            hotReuses: this.freezeState.hotReuses,
+            epochs: this.freezeState.epochs,
+            appendDecision: 'skipped',
+            appendSkipReason: appendCommit.skipReason,
+            appendRawTailChars: appendCommit.rawTailChars,
+            appendBandChars: appendCommit.bandViewChars,
+            appendSavedChars: appendCommit.savedChars,
+            ...(appendCommit.shrinkRatio === null ? {} : { appendShrinkRatio: appendCommit.shrinkRatio }),
+            ...this.pressureStats(false),
           },
         };
       }
     }
+    const foldConfig = this.effectiveFoldConfig(desiredFidelity);
     const result = foldContext(
       messages,
       this.guardedTurnsToFold(messages, pressureCeilingTriggered),
-      this.effectiveFoldConfig(desiredFidelity),
+      foldConfig,
       this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
         allowVaultBackedCoverage: pressureCeilingTriggered,
         targetSafeFrontier: pressureCeilingTriggered,
@@ -807,12 +938,15 @@ export class FoldSession {
       this.syntheticContext,
       this.valueFidelityInput,
     );
+    const stepResult = this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig);
+    const bookkeepingResult = result.turnsFolded > 0 ? result : stepResult ?? result;
     // Full recompute: render the whole vault and bake it into the frozen view
     // before sealing (resets the sealed set, mirroring commitFoldFreeze clearing
     // sealedBands). Subsequent append epochs seal only deltas on top of this.
-    const sealedView = this.bakeVault(result.messages, 'full');
+    const sealedView = this.bakeVault(stepResult?.messages ?? result.messages, 'full');
     commitFoldFreeze(this.freezeState, messages, sealedView, ctx, now);
-    this.commitEvictionEpoch(result, this.freezeState.epochs);
+    this.hardEpochCompactBaselineActive = false;
+    this.commitEvictionEpoch(bookkeepingResult, this.freezeState.epochs);
     const epochReason = pressureCeilingTriggered
       ? recomputeReason ? `pressure-ceiling+${recomputeReason}` : 'pressure-ceiling'
       : recomputeReason === 'tail-epoch' && !runway.ok
@@ -822,10 +956,10 @@ export class FoldSession {
       messages: sealedView,
       cacheHot: false,
       sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
-      result,
+      result: bookkeepingResult,
       appliedFidelity: this.activeFidelity,
       stats: {
-        ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
+        ...this.statsFromResult(totalTurns, false, bookkeepingResult, pressureCeilingTriggered),
         ...(epochReason ? { epochReason } : {}),
       },
     };
@@ -847,6 +981,53 @@ export class FoldSession {
       frozenRawCount: this.freezeState.frozenRawCount,
       evictedSpanCount: this.foldEvictedSpans.length,
       evictedTurnCount: this.foldEvictedSpans.reduce((sum, span) => sum + span.turnCount, 0),
+    };
+  }
+
+  /**
+   * Same-instance hard epoch: replace the prepared view with one compact seed
+   * message (live turn merged in by buildHardEpochSeedView) and re-anchor the
+   * freeze boundary around it. freezeState is readonly here, so we re-seal in
+   * place via commitFoldFreeze (which clears sealedBands on a full recompute)
+   * rather than reassigning a fresh state as the relay session does.
+   */
+  private commitHardEpoch(
+    messages: FoldMessage[],
+    seedPrompt: string,
+    context: FoldPrepareContext,
+    now: number,
+    totalTurns: number,
+  ): FoldOutcome {
+    const view = buildHardEpochSeedView(messages, seedPrompt);
+    const originalChars = countChars(messages);
+    const foldedChars = countChars(view);
+    const result: FoldResult = {
+      messages: view,
+      originalChars,
+      foldedChars,
+      savingsPercent: originalChars > 0 ? ((originalChars - foldedChars) / originalChars) * 100 : 0,
+      turnsFolded: totalTurns,
+      turnsRetained: 0,
+      foldSummaries: [],
+    };
+    if (this.freezeEnabled) {
+      const ctx: FoldFreezeContext = {
+        thinningMode: context.thinningMode ?? '',
+        claimedPaths: context.claimedPaths ?? EMPTY_CLAIMED,
+      };
+      commitFoldFreeze(this.freezeState, messages, view, ctx, now, 'hard-epoch');
+      this.hardEpochCompactBaselineActive = true;
+    }
+    return {
+      messages: view,
+      cacheHot: false,
+      sealedBoundary: this.freezeEnabled ? (this.freezeState.lastAppendBoundaryViewCount ?? null) : undefined,
+      result,
+      appliedFidelity: this.activeFidelity,
+      stats: {
+        ...this.statsFromResult(totalTurns, false, result, true),
+        epochReason: 'hard-epoch',
+      },
     };
   }
 

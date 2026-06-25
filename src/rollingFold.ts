@@ -33,7 +33,7 @@ export interface AssistantTextBudget {
 }
 
 export interface FoldConfig {
-  /** Number of recent turns to keep at full fidelity. */
+  /** Number of recent turns kept out of threshold-gated, non-continuous folds. */
   activeWindowTurns: number;
   /** Char-count soft threshold — fold oldest ~30% of foldable turns when exceeded. */
   softThresholdChars: number;
@@ -44,11 +44,10 @@ export interface FoldConfig {
   /** Budget-based graduated compression for assistant text in folded turns.
    *  Replaces the old category-gated approach where nav/coord/error turns lost all text. */
   assistantTextBudget?: AssistantTextBudget;
-  /** When true, fold every turn past the active window on every call, bypassing
-   *  the soft/hard char and maxTurns thresholds (continuous always-on inter-turn
-   *  fold). The active window stays the structural floor (full fidelity) and
+  /** When true, fold every detected turn on every call, bypassing the soft/hard
+   *  char and maxTurns thresholds (continuous always-on inter-turn fold).
    *  assistantTextBudget still governs graduated per-turn detail. Default config
-   *  leaves this undefined → existing threshold-gated behavior is unchanged. */
+   *  leaves this undefined -> existing threshold-gated behavior is unchanged. */
   continuous?: boolean;
   /**
    * Budget in chars for the Coordinate Closet appended to the fold block.
@@ -164,25 +163,21 @@ export const DEFAULT_FOLD_CONFIG: FoldConfig = {
  * bypassed (continuous: true → checkFoldTrigger folds all foldable turns every
  * turn), but every signal-preservation rule that made threshold-gated folding
  * safe is unchanged:
- *   - activeWindowTurns (1, rebirth-cadence sized — see the config below) is the
- *     structural floor — the newest turn is NEVER folded and stays at full fidelity
- *     (live working memory is intact). This is the inter-turn analog of the
- *     intra-turn tail buffer. Sized to 1 because swarm agents rebirth every ~2-3
- *     turns; a larger window meant inter-turn fold never engaged at all.
+ *   - continuous folding has no hidden newest-turn floor: when enabled it asks
+ *     foldContext to fold every detected turn. Non-continuous threshold folding
+ *     still uses activeWindowTurns as its trigger hysteresis.
  *   - assistantTextBudget (50K full / 100K essence, allocated newest-first)
- *     governs graduated per-turn detail: turns just past the active window keep
- *     their full assistant text, older turns keep an essence summary, only the
- *     oldest collapse to a pure tool-call skeleton. Reasoning degrades
+ *     governs graduated per-turn detail: newest folded turns keep their full
+ *     assistant text, older turns keep an essence summary, only the oldest
+ *     collapse to a pure tool-call skeleton. Reasoning degrades
  *     gradually, never cliff-edged — the exact machinery added (5/14) to fix the
  *     two layers of reasoning loss that category-gated folding caused.
  *   - the fold is recoverable, not destructive — foldContext returns a new array
  *     and never mutates the raw JSONL, so any folded turn is one self-tap away.
  *
- * Conversations with <= activeWindowTurns still no-op naturally (the active
- * window covers them) — at window=1 that means a brand-new single-turn session.
- * From the second turn onward, inter-turn folding bites every turn, which for a
- * rebirth-heavy cadence is exactly when the prior turn has stopped earning its
- * full-fidelity cost (the rebirth that follows will recompress it anyway).
+ * Continuous mode can fold even a single detected turn; when that folds the whole
+ * view, the newest user text is retained inside the folded block and the output
+ * ends on the folded user message.
  */
 export const ALWAYS_ON_FOLD_CONFIG: FoldConfig = {
   ...DEFAULT_FOLD_CONFIG,
@@ -654,10 +649,7 @@ export function detectTurns(
 //
 // A "turn" only ends at real user TEXT (isUserTurnBoundary). A long agentic rail
 // runs as ONE turn — one kickoff prompt, hundreds of tool steps, no boundary — so
-// inter-turn fold (which only compresses turns BEHIND the 1-turn active window)
-// never engages on it (checkFoldTrigger: turnCount ≤ activeWindowTurns → no-fold),
-// and the single active turn balloons until it hits the provider's hard context
-// ceiling (the MiniMax-M3 400 "context window exceeds limit"). Step segmentation
+// ordinary inter-turn fold can only compress it as one blob. Step segmentation
 // cuts that one oversized turn at agentic-step boundaries (each assistant tool_use
 // + its following tool_result span) so the EXISTING foldContext engine can
 // skeletonize the OLD steps while the last N steps stay full-fidelity. It rides the
@@ -1436,24 +1428,27 @@ export function checkFoldTrigger(
   const turns = detectTurns(messages, syntheticContext);
   const turnCount = turns.length;
 
-  if (turnCount <= config.activeWindowTurns) {
+  if (turnCount === 0) {
+    return { shouldFold: false, turnsToFold: 0, reason: 'no turns' };
+  }
+
+  if (!config.continuous && turnCount <= config.activeWindowTurns) {
     return { shouldFold: false, turnsToFold: 0, reason: `${turnCount} turns ≤ activeWindow(${config.activeWindowTurns})` };
   }
 
-  const foldable = turnCount - config.activeWindowTurns;
+  const foldable = config.continuous ? turnCount : turnCount - config.activeWindowTurns;
 
-  // Continuous always-on: fold every turn past the active window on every call,
-  // bypassing the soft/hard char + maxTurns gates. The active-window early-return
-  // above already protects short conversations (turnCount <= activeWindowTurns
-  // never reaches here), and foldContext's budget pre-pass keeps the freshest
-  // folded turns at full/essence fidelity — so this stays "lean but adequate"
-  // rather than cliff-edged. Default config leaves continuous undefined, so the
-  // threshold-gated behavior below is unchanged for every other caller.
+  // Continuous always-on: fold every detected turn on every call, bypassing the
+  // soft/hard char + maxTurns gates. foldContext's budget pre-pass keeps the
+  // freshest folded turns at full/essence fidelity — so this stays "lean but
+  // adequate" rather than cliff-edged. Default config leaves continuous
+  // undefined, so the threshold-gated behavior below is unchanged for every
+  // other caller.
   if (config.continuous) {
     return {
       shouldFold: true,
       turnsToFold: foldable,
-      reason: `continuous: fold ${foldable} turn(s) past activeWindow(${config.activeWindowTurns})`,
+      reason: `continuous: fold all ${foldable} detected turn(s)`,
     };
   }
 
@@ -1730,7 +1725,7 @@ export function foldContext(
   // segments of one oversized marathon turn) while reusing the entire fold engine
   // below. When omitted, behaviour is byte-identical to detectTurns(messages).
   const turns = precomputedTurns ?? detectTurns(messages, syntheticContext);
-  const actualFoldCount = Math.min(turnsToFold, Math.max(0, turns.length - 1));
+  const actualFoldCount = Math.min(turnsToFold, turns.length);
 
   if (actualFoldCount <= 0) {
     return {
@@ -1755,7 +1750,7 @@ export function foldContext(
       )
     : 0;
 
-  const foldBoundary = turns[actualFoldCount].startIndex;
+  const foldBoundary = actualFoldCount < turns.length ? turns[actualFoldCount].startIndex : messages.length;
 
   // Messages before the first turn (system prompts, preamble) — preserved verbatim
   const prefixEnd = turns.length > 0 ? turns[0].startIndex : 0;
@@ -1857,11 +1852,21 @@ export function foldContext(
     const toolSkeletons = toolCalls.map(tc => skeletonizeTool(tc));
 
     let retained: string | undefined;
+    const shouldRetainNewestUserText =
+      actualFoldCount === turns.length &&
+      turnIdx === turnsToCompress.length - 1 &&
+      userNominationText.trim().length > 0;
+    if (shouldRetainNewestUserText) {
+      retained = `User request:\n${userNominationText.trim()}`;
+    }
+
     if (category === 'action') {
       const editLines = toolCalls
         .filter(tc => tc.name === 'Edit' || tc.name === 'Write')
         .map(tc => skeletonizeTool(tc));
-      if (editLines.length > 0) retained = editLines.join('\n');
+      if (editLines.length > 0) {
+        retained = retained ? `${retained}\n${editLines.join('\n')}` : editLines.join('\n');
+      }
     }
 
     // Budget-based assistant text retention — all categories now retain text.
@@ -2073,17 +2078,17 @@ export function foldContext(
   // USER turn, so the ack correctly sits between them. But a step-segmented active
   // window (marathon fold via precomputedTurns) starts with an ASSISTANT tool_use
   // message — appending it right after the assistant ack would create two consecutive
-  // assistant messages and violate the Anthropic/FC alternation invariant. When the
-  // active window leads with assistant, drop the cosmetic ack so the splice is
-  // user(folded) → assistant(active). Byte-identical for normal fold: detectTurns
-  // turns always start at a user boundary, so this branch is never taken there.
+  // assistant messages and violate the Anthropic/FC alternation invariant. When
+  // folding every turn there is no active window after the synthetic block, so
+  // drop the cosmetic ack and leave the provider-visible tail as user(folded).
   const activeLeadsWithAssistant = activeWindow.length > 0 && (activeWindow[0]?.role === 'assistant' || activeWindow[0]?.role === 'model');
+  const includeAck = activeWindow.length > 0 && !activeLeadsWithAssistant;
 
   const finalMessages: FoldMessage[] = [
     ...prefixMessages,
     ...systemInFoldZone,
     foldedMessage,
-    ...(activeLeadsWithAssistant ? [] : [ackMessage]),
+    ...(includeAck ? [ackMessage] : []),
     ...activeWindow,
   ];
 

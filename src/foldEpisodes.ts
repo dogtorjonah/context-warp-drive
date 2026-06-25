@@ -2193,6 +2193,48 @@ export const EPISODIC_NARRATION_REMINDER =
   '[🗣 above is recovered agent voice — it survived into memory because an agent tagged its messages by register. Open yours with one of 🔍 working · ▶ executing · 🏁 verdict · ⚠️ hazard · ❓ blocked and future agents inherit your conclusions the same way.]';
 
 /**
+ * Compact per-card provenance line for the episodic recall block — the "why this
+ * card surfaced" audit trail that turns opaque recall into something inspectable.
+ * Surfaces the selection signal (term/path/rail/mention match), the matched terms
+ * for term cards, the source episode id(s), and the annotation gate that qualified
+ * it — all from fields the worker already attaches to every card. Path/mention
+ * cards deliberately omit the path here (it leads the card body directly below) so
+ * no bare file path appears outside the synthetic card prefix and the
+ * mention-extraction self-excitation guard stays intact. Pure string formatting;
+ * rides inside the synthetic block so it is never mined as agent voice. Stable per
+ * card (no timestamps/counters) so it never churns the injection cache.
+ */
+export function formatEpisodicCardProvenance(card: EpisodicRecallCardLike): string {
+  const ids = card.chapterIds ?? [];
+  const source = ids.length > 0
+    ? `ep#${ids[0]}${ids.length > 1 ? `+${ids.length - 1}` : ''}`
+    : 'ep#?';
+  const gate = card.debug?.annotationBoostKind
+    ? ` · gate:${card.debug.annotationBoostKind.replace(/^star:/, '')}`
+    : '';
+  let why: string;
+  switch (card.kind) {
+    case 'term': {
+      const colon = card.targetPath.indexOf(':');
+      const terms = colon >= 0
+        ? card.targetPath.slice(colon + 1).split('+').join(', ')
+        : card.targetPath;
+      why = `term-match (${terms})`;
+      break;
+    }
+    case 'rail':
+      why = 'rail-match';
+      break;
+    case 'mention':
+      why = 'mention-match';
+      break;
+    default:
+      why = 'path-match';
+  }
+  return `↞ why: ${why} · ${source}${gate}`;
+}
+
+/**
  * Render the per-boundary episodic block. The header line MUST start with the
  * synthetic episodic prefix (passed in — this module imports nothing) so the
  * fold excludes the block from real-turn detection and signal extraction, and
@@ -2205,8 +2247,8 @@ export function renderEpisodicBoundaryBlock(
   narrationReminder?: string,
 ): string | null {
   if (cards.length === 0) return null;
-  const header = `${syntheticPrefix} ${cards.length} zone card(s) — path-scoped memory; touch a card's target path to unfold its zone]`;
-  const parts = [header, ...cards.map((c) => c.renderedCard)];
+  const header = `${syntheticPrefix} ${cards.length} zone card(s) — trace-derived episodic recall; each card's ↞ why line shows the match (term/path/rail). Touch a path card's target to unfold its zone]`;
+  const parts = [header, ...cards.map((c) => `${formatEpisodicCardProvenance(c)}\n${c.renderedCard}`)];
   if (counterFooter) parts.push(counterFooter);
   // Self-bootstrapping compliance: append the reminder ONLY when the agent is
   // actually benefiting from recovered 🗣 narration voice (value-demo, not a

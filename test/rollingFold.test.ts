@@ -412,6 +412,14 @@ describe('checkFoldTrigger', () => {
     expect(result.shouldFold).toBe(false);
   });
 
+  test('continuous folds every detected turn, including one-turn tails', () => {
+    const messages = [userMsg('tail'), assistantMsg('done')];
+    const result = checkFoldTrigger(messages, ALWAYS_ON_FOLD_CONFIG);
+    expect(result.shouldFold).toBe(true);
+    expect(result.turnsToFold).toBe(1);
+    expect(result.reason).toContain('fold all 1 detected');
+  });
+
   test('triggers on turn count exceeding max', () => {
     const messages: FoldMessage[] = [];
     for (let i = 0; i < 70; i++) {
@@ -516,11 +524,22 @@ describe('foldContext end-to-end', () => {
     expect(categories.some(c => ['research', 'action', 'decision', 'coordination'].includes(c))).toBe(true);
   });
 
-  test('does not fold beyond available turns', () => {
+  test('folds every available turn when requested beyond available turns', () => {
     const messages = buildConversation(5);
     const result = foldContext(messages, 100);
-    // Should fold at most turns.length - 1 (keep at least 1)
-    expect(result.turnsFolded).toBeLessThanOrEqual(4);
+    expect(result.turnsFolded).toBe(5);
+    expect(result.turnsRetained).toBe(0);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe('user');
+  });
+
+  test('all-turn fold retains the newest user-only request text', () => {
+    const messages = [userMsg('REMOVE IT GLOBALLY')];
+    const result = foldContext(messages, 1);
+    expect(result.turnsFolded).toBe(1);
+    expect(result.turnsRetained).toBe(0);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].content as string).toContain('REMOVE IT GLOBALLY');
   });
 
   test('handles empty message array', () => {

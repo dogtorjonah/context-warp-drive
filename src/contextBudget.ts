@@ -12,20 +12,21 @@ import { contextWindowForModel } from './contextWindow.ts';
 //   S = 37K static system/tools prefix reserve (provider-measured floor model)
 //   M = 40K folded memory after full recompute
 //   A = 5K expected appended folded-tail band
-//   T = 45K preferred/default live-tail runway
-//   F = 30K hard minimum append runway
+//   T = 10K preferred/default live-tail runway
+//   F = 10K default append runway floor (explicit overrides can keep a larger floor)
 //   P = 150K normal pressure ceiling
 //   CLI codex = full-recompute-only transport, using the shared trigger by
 //               default while still clamping to message ceiling − F runway
 //
 // Runtime invariant: at a boundary, append a folded tail band only if the
-// post-append prompt can still guarantee F=30K runway before P. The default tail
-// cap still aims for T=45K; F only gates whether append is still viable.
+// post-append prompt can still guarantee F runway before P. The default tail
+// cap now aims for T=10K so tail epochs skeletonize nearly the whole unfrozen
+// tail instead of carrying a 45K raw runway immune to folding.
 // Otherwise do a full recompute and saw the prompt back down to the floor.
 export const DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS = 37_000;
 export const DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS = 40_000;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS = 5_000;
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS = 45_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS = 10_000;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS = 30_000;
 export const DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS =
   DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS;
@@ -47,10 +48,11 @@ export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION = 0.15;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION = 0.25;
 /**
  * Headroom (tokens) kept between S + M + T and the pressure ceiling. For the
- * default 1M-class geometry this is P150 − S37 − M40 − T45 = 28K, which leaves
- * burst/vault tax space before the hard wall.
+ * default 1M-class geometry this is P150 − S37 − M40 − T10 = 63K, which keeps
+ * the append trigger aggressive enough to skeletonize the unfrozen tail instead
+ * of preserving a giant raw runway.
  */
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 28_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 63_000;
 /** Absolute floor for the tail-epoch cap so a tight window never collapses to a ~0 tail (fold-every-turn pathology). */
 export const MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS = 4_000;
 
@@ -436,9 +438,9 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   //   tail = pressureCeiling − S − band − margin
   // By default, margin is derived from the preferred next-runway target:
   //   margin = pressureCeiling − S − band − T
-  // so the raw tail folds at T=45K. At the fold boundary, live runtimes still
+  // so the raw tail folds at T=10K by default. At the fold boundary, live runtimes still
   // gate append eligibility against the stacked append bands: if appending the
-  // next A=5K band would leave less than F=30K runway before P, they
+  // next A=5K band would leave less than F runway before P, they
   // full-recompute instead of extending the staircase.
   // This shrinks automatically under heavy tool load (large S) and grows when there
   // is headroom, unlike the old pressure-blind band×fraction default that ignored S

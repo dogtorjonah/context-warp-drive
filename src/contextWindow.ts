@@ -239,46 +239,6 @@ export function contextWindowForModel(
   return 200_000;
 }
 
-export interface WindowAwareBurstCapInput {
-  engine?: string | null;
-  model?: string | null;
-  legacyFloorChars: number;
-  fraction?: number;
-  charsPerToken?: number;
-}
-
-/**
- * Window-aware cumulative tool-result BURST cap (chars) for a CLI/MCP caller.
- * The relay's MCP tool-proxy (relayToolHost / relayMcpSidecar) guards a rapid burst
- * of tool results from summing past the model window. A flat cap is window-blind and
- * guillotines large-window CLI engines (Gemini CLI's 1M window got ~3% of itself at
- * the legacy 120k). This sizes the batch budget to the caller's context window: a
- * single batch may occupy up to `fraction` of the model's char-capacity
- * (window_tokens × charsPerToken), leaving the rest for the engine's own standing
- * context so the batch can never 400 the provider. Floored at `legacyFloorChars` so
- * small-window engines (mistral 128k) are NEVER capped below the legacy default —
- * the cumulative cap stays intentionally tighter than the single-result cap, since a
- * batch of sub-cap results is exactly what sums past the window. Returns the floor
- * when caller identity is unknown. Pure arithmetic (O(1) map lookup) — safe on any
- * event-loop path (GOD RULE 2). Pass both engine and model/tier when available:
- * Codex API and Codex CLI can share model strings but have different windows.
- */
-export function windowAwareBurstCapChars(input: WindowAwareBurstCapInput): number {
-  const {
-    engine,
-    model,
-    legacyFloorChars,
-    fraction = 0.2,
-    charsPerToken = 4,
-  } = input;
-  const normalizedEngine = engine?.trim() || undefined;
-  const normalizedModel = model?.trim() ?? '';
-  const windowTokens = normalizedEngine || normalizedModel
-    ? contextWindowForModel(normalizedModel, normalizedEngine)
-    : 0;
-  if (!Number.isFinite(windowTokens) || windowTokens <= 0) return legacyFloorChars;
-  return Math.max(legacyFloorChars, Math.round(windowTokens * charsPerToken * fraction));
-}
 
 /**
  * Context utilization thresholds for proactive monitoring.

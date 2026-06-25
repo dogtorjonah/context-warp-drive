@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { resolveContextBudget } from '../src/contextBudget.ts';
 
 describe('resolveContextBudget', () => {
-  it('keeps 1M-class providers on the tuned S37/M40/A5/T45/F30/P150 geometry', () => {
+  it('keeps 1M-class providers on the tuned S37/M40/A5/T10/F10/P150 geometry', () => {
     const budget = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' });
 
     expect(budget.contextWindowTokens).toBe(1_000_000);
@@ -12,13 +12,13 @@ describe('resolveContextBudget', () => {
     expect(budget.systemToolsReserveTokens).toBe(37_000);
     expect(budget.bandTokens).toBe(40_000);
     expect(budget.appendBandTargetTokens).toBe(5_000);
-    expect(budget.tailEpochRunwayTokens).toBe(45_000);
-    expect(budget.tailEpochMinRunwayTokens).toBe(30_000);
+    expect(budget.tailEpochRunwayTokens).toBe(10_000);
+    expect(budget.tailEpochMinRunwayTokens).toBe(10_000);
     expect(budget.foldTriggerTokens).toBe(150_000);
     expect(budget.pressureCeilingTokens).toBe(150_000);
     expect(budget.prefixSaturationTokens).toBe(900_000);
-    expect(budget.tailEpochCapTokens).toBe(45_000);
-    expect(budget.tailEpochPressureMarginTokens).toBe(28_000);
+    expect(budget.tailEpochCapTokens).toBe(10_000);
+    expect(budget.tailEpochPressureMarginTokens).toBe(63_000);
     expect(budget.evictionPolicy).toBe('recompute-on-prefix-saturation');
   });
 
@@ -33,30 +33,29 @@ describe('resolveContextBudget', () => {
     expect(budget.pressureCeilingTokens).toBe(150_000);
     expect(budget.messageCeilingTokens).toBe(176_000);
     expect(budget.prefixSaturationTokens).toBe(176_000);
-    expect(budget.tailEpochCapTokens).toBe(45_000);
+    expect(budget.tailEpochCapTokens).toBe(10_000);
     expect(budget.evictionPolicy).toBe('full-recompute-only');
   });
 
   it('sizes the tail-epoch cap from pressure geometry (pressureCeiling − S − band − margin), not a blind band fraction', () => {
     const oneM = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' });
-    // 1M: S=37k, band=40k, margin=28k, pressure=150k → tail = 150−37−40−28 = 45k.
+    // 1M: S=37k, band=40k, margin=63k, pressure=150k → tail = 150−37−40−63 = 10k.
     expect(oneM.systemToolsReserveTokens).toBe(37_000);
-    expect(oneM.tailEpochPressureMarginTokens).toBe(28_000);
-    expect(oneM.tailEpochRunwayTokens).toBe(45_000);
-    expect(oneM.tailEpochMinRunwayTokens).toBe(30_000);
-    expect(oneM.tailEpochCapTokens).toBe(45_000);
+    expect(oneM.tailEpochPressureMarginTokens).toBe(63_000);
+    expect(oneM.tailEpochRunwayTokens).toBe(10_000);
+    expect(oneM.tailEpochMinRunwayTokens).toBe(10_000);
+    expect(oneM.tailEpochCapTokens).toBe(10_000);
     // Peak occupancy S+band+tail sits UNDER the pressure ceiling by exactly the margin.
     expect(oneM.systemToolsReserveTokens + oneM.bandTokens + oneM.tailEpochCapTokens)
       .toBe(oneM.pressureCeilingTokens! - oneM.tailEpochPressureMarginTokens);
-    expect(oneM.tailEpochCapChars).toBe(45_000 * oneM.charsPerToken);
+    expect(oneM.tailEpochCapChars).toBe(10_000 * oneM.charsPerToken);
   });
 
-  it('shrinks the tail one-for-one as the system+tools reserve (S) grows — the heavy-tool-load fix', () => {
+  it('keeps the default raw-tail cap at 10k under heavier tool load while geometry still fits', () => {
     const base = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', systemToolsReserveTokens: 37_000 });
-    const heavyTools = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', systemToolsReserveTokens: 52_000, tailEpochPressureMarginTokens: 28_000 });
-    expect(base.tailEpochCapTokens).toBe(45_000);
-    // +15k of tool schema removes 15k from the raw-tail cap so S+band+tail never breaches the ceiling.
-    expect(heavyTools.tailEpochCapTokens).toBe(base.tailEpochCapTokens - 15_000);
+    const heavyTools = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', systemToolsReserveTokens: 52_000 });
+    expect(base.tailEpochCapTokens).toBe(10_000);
+    expect(heavyTools.tailEpochCapTokens).toBe(10_000);
     expect(heavyTools.systemToolsReserveTokens + heavyTools.bandTokens + heavyTools.tailEpochCapTokens)
       .toBeLessThanOrEqual(heavyTools.pressureCeilingTokens!);
   });
@@ -73,7 +72,7 @@ describe('resolveContextBudget', () => {
       tailEpochPressureMarginTokens: 28_000,
     });
     expect(tiny.tailEpochCapTokens).toBe(4_000);
-    expect(tiny.tailEpochMinRunwayTokens).toBe(30_000);
+    expect(tiny.tailEpochMinRunwayTokens).toBe(10_000);
     expect(tiny.systemToolsReserveTokens + tiny.bandTokens + tiny.tailEpochCapTokens)
       .toBeGreaterThan(tiny.pressureCeilingTokens!);
   });

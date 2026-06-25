@@ -61,6 +61,11 @@
       "import": "./dist/task-rail.js",
       "require": "./dist/task-rail.cjs"
     },
+    "./raw-rebirth-seed": {
+      "types": "./dist/raw-rebirth-seed.d.ts",
+      "import": "./dist/raw-rebirth-seed.js",
+      "require": "./dist/raw-rebirth-seed.cjs"
+    },
     "./providers/anthropic": {
       "types": "./dist/providers/anthropic.d.ts",
       "import": "./dist/providers/anthropic.js",

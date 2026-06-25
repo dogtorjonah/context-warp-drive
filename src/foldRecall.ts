@@ -116,10 +116,21 @@ export interface FoldRecallConfig {
 
 export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
   enabled: true,
-  maxCards: 2,
+  // Band-coupled: recall card budget grows inversely with the fold band (M).
+  // As M shrinks toward low-band, recall must do MORE paging-in work to keep
+  // the agent unblinded, so the default floor is 3, not 2. Full band-token
+  // coupling (maxCards scales with measured bandTokens) is deferred to the
+  // low-band phase; this raises the safe interim floor.
+  // Override: WARP_FOLD_RECALL_MAX_CARDS.
+  maxCards: 3,
   maxTotalChars: 12_000,
   maxCardChars: 6_000,
-  ttlPasses: 8,
+  // Residency TTL: 4 passes, not 8. With activeWindowTurns=1, content scrolls
+  // out of the visible window after one turn; an 8-pass suppression created a
+  // 7-pass dead zone where the marker was present but the card couldn't
+  // re-show. 4 is the safer interim (tier-0 bypass also mitigates this now).
+  // Override: WARP_FOLD_RECALL_TTL_PASSES.
+  ttlPasses: 4,
   termRecallEnabled: false,
   verbatimRecallEnabled: true,
   highlightsEnabled: true,
@@ -146,10 +157,10 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
  * Resolve config from environment. Default ON (recall is already gated on
  * fold mode 'on' + an active fold-freeze index upstream).
  *   WARP_FOLD_RECALL=0|false|off|no       → disable
- *   WARP_FOLD_RECALL_MAX_CARDS=<n>        → cards per pass (default 2)
+ *   WARP_FOLD_RECALL_MAX_CARDS=<n>        → cards per pass (default 3; band-coupled)
  *   WARP_FOLD_RECALL_MAX_TOTAL_CHARS=<n>  → total chars per pass (default 12000)
  *   WARP_FOLD_RECALL_MAX_CARD_CHARS=<n>   → chars per card body (default 6000)
- *   WARP_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 8)
+ *   WARP_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 4)
  *   WARP_FOLD_RECALL_TERMS=1|true|on|yes  → enable tier-2 term matching (default off)
  *   WARP_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
  *   WARP_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
@@ -632,12 +643,32 @@ function buildToolResultPositions(rawHistory: readonly FoldMessage[]): Map<strin
  * turn and yield zero inter-turn entries), pass that SAME tiling here so each
  * folded step becomes recall-addressable. Omit it on the normal multi-turn path
  * where detectTurns(rawHistory) reproduces the fold segmentation byte-for-byte.
+ *
+ * seedFoldsEntireRaw (BuildFoldIndexOptions): hard-epoch portable-reset case.
+ * The foldedView is a flattened rebirth-package seed that carries NO
+ * "[Conversation Context — N turns folded]" block marker, yet the ENTIRE
+ * pre-reset raw history (minus the trailing live turn) folded into it. Without
+ * a marker the inter-turn gate stays 0 and the page table comes back empty, so
+ * recall would go dormant across portable resets. When this flag is set and no
+ * marker is found, the folded-turn count is taken from the detected raw turns
+ * (clamped to all-but-the-live-turn) so every pre-reset turn becomes
+ * recall-addressable against the retained (push-based) raw backing store.
  */
+export interface BuildFoldIndexOptions {
+  /**
+   * Hard-epoch markerless seed: treat the whole pre-reset raw as folded when the
+   * foldedView carries no fold-block count marker. Default false ⇒ legacy
+   * marker-gated behavior (byte-identical for all existing callers).
+   */
+  seedFoldsEntireRaw?: boolean;
+}
+
 export function buildFoldIndex(
   rawHistory: readonly FoldMessage[],
   foldedView: readonly FoldMessage[],
   precomputedTurns?: readonly Turn[],
   syntheticContext: SyntheticContextOptions = {},
+  options: BuildFoldIndexOptions = {},
 ): FoldRecallIndex {
   const entries: FoldIndexEntry[] = [];
 
@@ -651,9 +682,14 @@ export function buildFoldIndex(
       break;
     }
   }
-  if (interFoldedCount > 0) {
+  // Markerless hard-epoch seed (seedFoldsEntireRaw): the seed folded the whole
+  // pre-reset raw but carries no fold-block count, so derive the folded-turn
+  // count from the detected raw turns. The clamp below keeps the trailing live
+  // turn unfolded, exactly as the marker path does.
+  const seedFullFold = interFoldedCount === 0 && options.seedFoldsEntireRaw === true;
+  if (interFoldedCount > 0 || seedFullFold) {
     const turns = precomputedTurns ?? detectTurns(rawHistory as FoldMessage[], syntheticContext);
-    const count = Math.min(interFoldedCount, Math.max(0, turns.length - 1));
+    const count = Math.min(seedFullFold ? turns.length : interFoldedCount, Math.max(0, turns.length - 1));
     for (let j = 0; j < count; j++) {
       const turn = turns[j];
       const structuredPaths = Array.from(extractToolPathSet(turn.messages));
@@ -1358,12 +1394,16 @@ export function planRecall(
     if (tier === null || matchedPath === null || trigger === null) continue;
 
     // Content-level suppression: this path's content was carded recently
-    // (possibly under a different entry id before a refold). Stay quiet.
+    // (possibly under a different entry id before a refold). Stay quiet —
+    // UNLESS tier 0: an active path-touch (signals.touchedPaths) means the
+    // agent is editing/reading this path THIS turn, the strongest "I need it
+    // now" signal. Suppressing it for ttlPasses creates a dead zone where the
+    // marker is present but the card can't re-show. Tier-0 bypasses residency.
     const pathRecord = residentPaths.get(matchedPath);
     const pathLive = pathRecord !== undefined && passSeq < pathRecord.expiresAtPass;
     const record = resident.get(entry.id);
     const entryLive = record !== undefined && passSeq < record.expiresAtPass;
-    if (pathLive) {
+    if (pathLive && tier !== 0) {
       suppressed++;
       suppressedResidencies.push({
         entryId: entry.id,
@@ -1376,7 +1416,7 @@ export function planRecall(
 
     let escalatedFromHint = false;
     if (entryLive) {
-      if (record!.level === 'card') {
+      if (record!.level === 'card' && tier !== 0) {
         suppressed++;
         suppressedResidencies.push({
           entryId: entry.id,
@@ -1410,8 +1450,16 @@ export function planRecall(
   const items: RecallPlanItem[] = [];
   let cards = 0;
   let hints = 0;
+  // Tier-0 pressure floor: under auto_compact (cardBudget: 0) the budget loop
+  // would downgrade everything to hints, blinding an agent on the path it is
+  // actively editing. Reserve one card for the highest-priority tier-0 item so
+  // a marker never becomes a dead end. matched[] is sorted tier-ascending, so
+  // matched[0] is the top item. Normal/critical/warning paths are unaffected
+  // (cardBudget >= 1 already covers tier-0 naturally).
+  const tier0Floor = budget.cardBudget === 0 && matched.length > 0 && matched[0].tier === 0 ? 1 : 0;
+  const effectiveCardBudget = budget.cardBudget + tier0Floor;
   for (const item of matched) {
-    if (cards < budget.cardBudget) {
+    if (cards < effectiveCardBudget) {
       items.push(item);
       cards++;
     } else if (hints < MAX_HINTS_PER_PASS) {

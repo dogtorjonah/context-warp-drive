@@ -65,7 +65,18 @@
  * target band unless explicitly overridden.
  */
 
-import { countChars, extractToolPathSet, normalizeToolPath, type FoldMessage } from './rollingFold.ts';
+import {
+  countChars,
+  extractToolPathSet,
+  normalizeToolPath,
+  type FoldMessage,
+} from './rollingFold.ts';
+import {
+  buildRawRebirthSeedFromMessages,
+  DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS,
+  DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS,
+  findRawRebirthSeedTraceEnd,
+} from './rawRebirthSeed.ts';
 
 // ══════════════════════════════════════════════════════════════════════
 // Config
@@ -195,12 +206,49 @@ export type FoldFreezeFullRecomputeCause =
   // restored overcap through full recompute + eviction instead.
   | 'restored-overcap'
   | 'pressure-ceiling'
-  | 'prefix-saturation';
+  | 'prefix-saturation'
+  | 'hard-epoch';
 
 export type FoldFreezeTransitionReason =
   | FoldFreezeFullRecomputeCause
   | 'hot-reuse'
   | 'append-tail-epoch';
+
+export type FoldFreezeAppendCommitReason = 'material-shrink';
+
+export type FoldFreezeAppendSkipReason =
+  | 'missing-frozen-view'
+  | 'history-rewound'
+  | 'empty-tail'
+  | 'not-smaller';
+
+export interface FoldFreezeAppendCommit {
+  committed: true;
+  view: FoldMessage[];
+  sealedPrefixMessageCount: number;
+  rawTailChars: number;
+  rawTailMessages: number;
+  bandViewChars: number;
+  savedChars: number;
+  shrinkRatio: number;
+  commitReason: FoldFreezeAppendCommitReason;
+}
+
+export interface FoldFreezeAppendSkip {
+  committed: false;
+  view: FoldMessage[] | null;
+  sealedPrefixMessageCount: number | null;
+  rawTailChars: number;
+  rawTailMessages: number;
+  bandViewChars: number;
+  savedChars: number;
+  shrinkRatio: number | null;
+  skipReason: FoldFreezeAppendSkipReason;
+}
+
+export type FoldFreezeAppendResult = FoldFreezeAppendCommit | FoldFreezeAppendSkip;
+
+const APPEND_TAIL_MIN_SHRINK_RATIO = 0.9;
 
 export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecomputeCause[] = [
   'first-call',
@@ -212,7 +260,135 @@ export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecompute
   'restored-overcap',
   'pressure-ceiling',
   'prefix-saturation',
+  'hard-epoch',
 ];
+
+/** Header that separates the rebirth-package seed body from the merged live turn. */
+export const HARD_EPOCH_LIVE_TURN_HEADER =
+  '--- LIVE TURN (the user message that triggered this completed hard epoch; do not treat it as a fresh unstarted request) ---';
+export const HARD_EPOCH_CONTINUITY_DIRECTIVE =
+  'Continuity refresh: a same-instance hard epoch (context reset) just completed. Treat the seed and merged live turn as already-triggered continuity context, re-evaluate the next action, and do not re-execute work whose boundary/epoch condition is now satisfied. Do not announce, narrate, or apologize for the reset unless the user explicitly asks about the mechanism.';
+
+export const DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS = DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS;
+export const DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS =
+  DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset;
+
+export interface RawHardEpochSeedOptions {
+  /**
+   * Bound the raw trace seed by characters. This is a package budget, not token
+   * telemetry; it keeps the hard epoch from re-sending the full over-cap floor.
+   */
+  readonly maxChars?: number;
+  /**
+   * Budget for the Coordinate Closet band prepended to the raw seed. This is a
+   * character budget for conserved ids/paths/values, not token telemetry.
+   */
+  readonly closetChars?: number;
+  /** Name rendered in the raw rebirth header. */
+  readonly predecessorName?: string;
+  /**
+   * Helper-level API for direct buildRawHardEpochSeed callers that need a complete
+   * raw trace seed without calling buildHardEpochSeedView afterward. FoldSession
+   * leaves this unset because buildHardEpochSeedView appends the live trailing
+   * user turn separately; including it in both places would duplicate the request.
+   */
+  readonly includeTrailingUserTurn?: boolean;
+}
+
+/**
+ * Compute the default raw same-instance hard-epoch seed directly from the local
+ * provider trace. This is the standalone fallback for callers that do not have a
+ * richer host rebirth renderer: no Atlas, no episodic memory, no LLM summary.
+ * Direct helper callers may set includeTrailingUserTurn when they will not later
+ * call buildHardEpochSeedView; FoldSession intentionally keeps it false and uses
+ * buildHardEpochSeedView for the provider-safe single-message live-turn merge.
+ */
+export function buildRawHardEpochSeed(
+  messages: readonly FoldMessage[],
+  options: RawHardEpochSeedOptions = {},
+): string {
+  const maxChars = options.maxChars ?? DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS;
+  const compactSectionMaxChars = maxChars < DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS
+    ? {
+        lastUserAiMessages: Math.max(1_000, Math.floor(maxChars * 0.22)),
+        currentThread: Math.max(1_500, Math.floor(maxChars * 0.35)),
+        rawTraceCoordinateCloset: Math.min(
+          options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS,
+          Math.max(700, Math.floor(maxChars * 0.18)),
+        ),
+        thinkingTrail: Math.max(1_000, Math.floor(maxChars * 0.18)),
+      }
+    : undefined;
+  return buildRawRebirthSeedFromMessages(messages, {
+    predecessorName: options.predecessorName ?? 'predecessor',
+    packageBudget: maxChars,
+    sectionMaxChars: compactSectionMaxChars,
+    rawTraceCoordinateClosetChars: options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS,
+    includeTrailingUserTurn: options.includeTrailingUserTurn === true,
+  });
+}
+
+/**
+ * Build the provider-visible view for a same-instance hard epoch: a SINGLE
+ * `role:'user'` message that is the compact continuity seed with the live user
+ * turn's text merged into its body.
+ *
+ * Returning ONE user message (never `[seed, currentUserMessage]`) is deliberate
+ * and load-bearing — two consecutive `user` turns are rejected by strict
+ * providers (e.g. the Anthropic API). The current question is never dropped:
+ * the trailing user turn's text is appended to the seed body. Non-string
+ * trailing content (e.g. image/attachment parts) cannot be merged into the
+ * string seed and is intentionally omitted here; the seed's own recent-messages
+ * section carries that continuity. The old raw transcript remains as recall
+ * backing, so omitted detail is recoverable.
+ */
+export function buildHardEpochSeedView(
+  messages: readonly FoldMessage[],
+  seedPrompt: string,
+): FoldMessage[] {
+  const traceEnd = findRawHardEpochTraceEnd(messages);
+  const liveTurnText = extractTrailingUserTurnText(messages, traceEnd);
+  const seedBody = ensureHardEpochContinuityDirective(seedPrompt);
+  const content = liveTurnText
+    ? `${seedBody}\n\n${HARD_EPOCH_LIVE_TURN_HEADER}\n${liveTurnText}`
+    : seedBody;
+  return [{ role: 'user', content }];
+}
+
+function ensureHardEpochContinuityDirective(seedPrompt: string): string {
+  return seedPrompt.trimStart().startsWith(HARD_EPOCH_CONTINUITY_DIRECTIVE)
+    ? seedPrompt
+    : `${HARD_EPOCH_CONTINUITY_DIRECTIVE}\n\n${seedPrompt}`;
+}
+
+/**
+ * Collect the text of the trailing contiguous run of `user` messages (the live
+ * turn). At the compaction seam — before the provider call — this is normally
+ * just the single just-pushed user message. Stops at the first non-user message
+ * scanning from the end; skips non-string content parts.
+ */
+function extractTrailingUserTurnText(messages: readonly FoldMessage[], traceEnd: number): string {
+  const parts: string[] = [];
+  const lowerBound = traceEnd < messages.length ? traceEnd : findTrailingUserRunStart(messages);
+  for (let i = messages.length - 1; i >= lowerBound; i--) {
+    const message = messages[i];
+    if (message.role !== 'user') break;
+    if (typeof message.content === 'string' && message.content.trim()) {
+      parts.unshift(message.content);
+    }
+  }
+  return parts.join('\n\n').trim();
+}
+
+function findTrailingUserRunStart(messages: readonly FoldMessage[]): number {
+  let i = messages.length;
+  while (i > 0 && messages[i - 1]?.role === 'user') i -= 1;
+  return i;
+}
+
+function findRawHardEpochTraceEnd(messages: readonly FoldMessage[]): number {
+  return findRawRebirthSeedTraceEnd(messages, false);
+}
 
 export interface FoldFreezeSealedBandMetadata {
   /** View index where the stable prefix ends and this folded tail band begins. */
@@ -225,6 +401,11 @@ export interface FoldFreezeSealedBandMetadata {
   /** Folded message count and char size for the appended band. */
   bandViewCount: number;
   bandViewChars: number;
+  /** Raw tail size before folding, and realized append-band reduction. */
+  rawTailChars?: number;
+  savedChars?: number;
+  shrinkRatio?: number;
+  commitReason?: FoldFreezeAppendCommitReason;
   /** Inclusive start / exclusive end raw-history indices covered by the band. */
   rawStartIndex: number;
   rawEndIndex: number;
@@ -635,13 +816,70 @@ export function appendFoldFreezeTailEpoch(
   tailView: FoldMessage[],
   context: FoldFreezeContext,
   now: number,
-): { view: FoldMessage[]; sealedPrefixMessageCount: number } | null {
-  if (!state.frozenView) return null;
-  if (history.length < state.frozenRawCount) return null;
+): FoldFreezeAppendResult {
+  if (!state.frozenView) {
+    return {
+      committed: false,
+      view: null,
+      sealedPrefixMessageCount: null,
+      rawTailChars: 0,
+      rawTailMessages: 0,
+      bandViewChars: countChars(tailView),
+      savedChars: 0,
+      shrinkRatio: null,
+      skipReason: 'missing-frozen-view',
+    };
+  }
+  if (history.length < state.frozenRawCount) {
+    return {
+      committed: false,
+      view: null,
+      sealedPrefixMessageCount: state.frozenView.length,
+      rawTailChars: 0,
+      rawTailMessages: 0,
+      bandViewChars: countChars(tailView),
+      savedChars: 0,
+      shrinkRatio: null,
+      skipReason: 'history-rewound',
+    };
+  }
 
   const sealedPrefixMessageCount = state.frozenView.length;
   const sealedPrefixChars = state.frozenViewChars;
   const rawStartIndex = state.frozenRawCount;
+  const rawTail = history.slice(rawStartIndex);
+  const rawTailChars = rawTail.length > 0 ? countChars(rawTail) : 0;
+  const rawTailMessages = rawTail.length;
+  const bandViewChars = countChars(tailView);
+  const savedChars = rawTailChars - bandViewChars;
+  const shrinkRatio = rawTailChars > 0 ? bandViewChars / rawTailChars : null;
+  if (rawTailChars <= 0) {
+    return {
+      committed: false,
+      view: state.frozenView.concat(rawTail),
+      sealedPrefixMessageCount,
+      rawTailChars,
+      rawTailMessages,
+      bandViewChars,
+      savedChars,
+      shrinkRatio,
+      skipReason: 'empty-tail',
+    };
+  }
+  if (savedChars <= 0 || shrinkRatio === null || shrinkRatio > APPEND_TAIL_MIN_SHRINK_RATIO) {
+    return {
+      committed: false,
+      view: state.frozenView.concat(rawTail),
+      sealedPrefixMessageCount,
+      rawTailChars,
+      rawTailMessages,
+      bandViewChars,
+      savedChars,
+      shrinkRatio,
+      skipReason: 'not-smaller',
+    };
+  }
+
   const view = state.frozenView.concat(tailView);
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
   const boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
@@ -651,10 +889,14 @@ export function appendFoldFreezeTailEpoch(
     bandStartViewIndex: sealedPrefixMessageCount,
     bandEndViewIndex: view.length,
     bandViewCount: tailView.length,
-    bandViewChars: countChars(tailView),
+    bandViewChars,
+    rawTailChars,
+    savedChars,
+    shrinkRatio,
+    commitReason: 'material-shrink',
     rawStartIndex,
     rawEndIndex: history.length,
-    rawCount: Math.max(0, history.length - rawStartIndex),
+    rawCount: rawTailMessages,
     boundaryRole: boundary?.role ?? '',
     boundaryChars: boundary ? countChars([boundary]) : 0,
     boundaryHash,
@@ -684,5 +926,15 @@ export function appendFoldFreezeTailEpoch(
   state.epochs += 1;
   state.lastTransitionReason = 'append-tail-epoch';
 
-  return { view, sealedPrefixMessageCount };
+  return {
+    committed: true,
+    view,
+    sealedPrefixMessageCount,
+    rawTailChars,
+    rawTailMessages,
+    bandViewChars,
+    savedChars,
+    shrinkRatio,
+    commitReason: 'material-shrink',
+  };
 }

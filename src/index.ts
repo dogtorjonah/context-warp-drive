@@ -23,6 +23,7 @@
  *   `context-warp-drive/fold`, `context-warp-drive/budget`,
  *   `context-warp-drive/episodes`, `context-warp-drive/glyphs`,
  *   `context-warp-drive/overwatch`, `context-warp-drive/task-rail`,
+ *   `context-warp-drive/raw-rebirth-seed`,
  *   `context-warp-drive/providers/anthropic`,
  *   `context-warp-drive/providers/gemini-cli`.
  *
