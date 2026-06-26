@@ -293,6 +293,10 @@ export interface RawHardEpochSeedOptions {
    * user turn separately; including it in both places would duplicate the request.
    */
   readonly includeTrailingUserTurn?: boolean;
+  /** Trace-derived episodic recall text (portable-mode memory section). */
+  readonly episodicCrossRef?: string;
+  /** Lineage glyph log — chronological verdict/hazard register trail (portable-mode memory section). */
+  readonly lineageGlyphLog?: string;
 }
 
 /**
@@ -325,6 +329,8 @@ export function buildRawHardEpochSeed(
     sectionMaxChars: compactSectionMaxChars,
     rawTraceCoordinateClosetChars: options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS,
     includeTrailingUserTurn: options.includeTrailingUserTurn === true,
+    episodicCrossRef: options.episodicCrossRef,
+    lineageGlyphLog: options.lineageGlyphLog,
   });
 }
 

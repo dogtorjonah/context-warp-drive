@@ -703,6 +703,16 @@ export class FoldSession {
       && measuredInputTokens >= this.pressureCeilingTokens;
   }
 
+  /**
+   * Public pressure-ceiling probe. Lets hosts short-circuit expensive
+   * hard-epoch seed preparation (glyph log scans, episode recall) when no
+   * hard epoch is imminent this turn. Mirrors the private check used inside
+   * {@link prepare}.
+   */
+  willTriggerPressureCeiling(measuredInputTokens: number | undefined): boolean {
+    return this.isPressureCeilingTriggered(measuredInputTokens);
+  }
+
 
   private pressureStats(
     pressureCeilingTriggered: boolean,

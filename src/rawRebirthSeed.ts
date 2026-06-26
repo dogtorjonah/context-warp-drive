@@ -12,6 +12,66 @@ import {
   nominateVerbatim,
   type FoldMessage,
 } from './rollingFold.ts';
+import { classifyMessageGlyph } from './foldEpisodes.ts';
+
+/**
+ * Build a portable lineage glyph log from the message trace: scan assistant
+ * messages for declared verdict (🏁) and hazard (⚠️) register glyphs and render
+ * them chronologically, newest-first capped at `maxChars`.
+ *
+ * This is the standalone counterpart to the relay's async `buildLineageGlyphLog`
+ * — same glyph classification and selection logic, but reads from the in-memory
+ * message array instead of loading from a transcript store. Synchronous, no I/O.
+ *
+ * Returns '' if no verdict/hazard entries are found.
+ */
+export function buildLineageGlyphLogFromMessages(
+  messages: readonly FoldMessage[],
+  options: {
+    maxChars?: number;
+    perEntryMaxChars?: number;
+  } = {},
+): string {
+  const maxChars = options.maxChars ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.lineageGlyphLog;
+  const perEntryMaxChars = options.perEntryMaxChars ?? 400;
+  if (maxChars <= 0) return '';
+
+  const entries: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!message) continue;
+    if (message.role !== 'assistant' && message.role !== 'model') continue;
+    const text = messageValueToText(message.content)?.trim();
+    if (!text) continue;
+    const mode = classifyMessageGlyph(text);
+    if (mode !== 'verdict' && mode !== 'hazard') continue;
+    const truncated = truncate(text, perEntryMaxChars);
+    entries.push(`[${messageLabel(message)} msg ${i}] ${truncated}`);
+  }
+
+  if (entries.length === 0) return '';
+
+  // Newest-first fill: greedily keep the most recent entries that fit maxChars.
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const cost = entries[i].length + (kept.length > 0 ? 1 : 0);
+    if (used + cost > maxChars) break;
+    used += cost;
+    kept.unshift(entries[i]);
+  }
+
+  if (kept.length === 0 && entries.length > 0) {
+    kept.push(truncate(entries[entries.length - 1], maxChars));
+  }
+
+  const header = `## Lineage Glyph Log — your own 🏁 verdicts + ⚠️ hazards from the trace; ${kept.length} of ${entries.length} entries, chronological`;
+  const body = kept.join('\n');
+  if (body.length > maxChars) {
+    return `${header}\n${truncate(body, maxChars)}`;
+  }
+  return `${header}\n${body}`;
+}
 
 export type RawRebirthSeedSectionId =
   | 'lastUserAiMessages'
@@ -161,6 +221,10 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly taskRailContext?: string;
   readonly predecessorStatus?: string;
   readonly userMessageTriggered?: boolean;
+  /** Trace-derived episodic recall text (portable-mode memory section). */
+  readonly episodicCrossRef?: string;
+  /** Lineage glyph log text — chronological verdict/hazard register trail (portable-mode memory section). */
+  readonly lineageGlyphLog?: string;
 }
 
 interface BudgetedPromptSection {
@@ -868,6 +932,8 @@ export function buildRawRebirthSeedFromMessages(
     activeEditDelta: options.activeEditDelta,
     taskRailContext: options.taskRailContext,
     workspaceContext: options.workspaceContext,
+    episodicCrossRef: options.episodicCrossRef,
+    lineageGlyphLog: options.lineageGlyphLog,
     thinkingTrail: buildActivityLogFromMessages(
       messages,
       traceEnd,

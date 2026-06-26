@@ -18,6 +18,10 @@
  *   - Overwatch (`./overwatch`) — trace-only context geometry governor.
  *   - Task Rail (`./task-rail`) — portable long-horizon execution state.
  *   - FoldSession — the one-call orchestrator that wires it into any FC loop.
+ *   - Host adapters (`./host`) — MemoryLoop, liveSource, affinity,
+ *     fileMetaProvider — turnkey standalone wiring of the full memory stack.
+ *   - Episode runtime (`./episodes/runtime`) — richer episodic orchestration
+ *     with served-state dedup and chainScore ranking.
  *
  * Sub-path entry points are also published:
  *   `context-warp-drive/fold`, `context-warp-drive/budget`,
@@ -34,9 +38,16 @@
 export * from './fold.ts';
 export * from './contextBudget.ts';
 export * from './episodes.ts';
+export * from './episodes/runtime.ts';
 export * from './glyphs.ts';
 export * from './overwatch.ts';
 export * from './taskRail.ts';
+
+// Host adapters — turnkey standalone wiring of the full memory stack.
+export * from './host/MemoryLoop.ts';
+export * from './host/liveSource.ts';
+export * from './host/affinity.ts';
+export * from './host/fileMetaProvider.ts';
 
 // Provider adapters — re-exported under `providers/` sub-path for consumers
 // who want turnkey cache-breakpoint injection (Anthropic, etc).
