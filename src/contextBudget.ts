@@ -41,6 +41,17 @@ export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 150_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
 export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 150_000;
+// Claude API keeps its model context window denominator, but relief should fire at 180K.
+export const DEFAULT_CONTEXT_BUDGET_CLAUDE_API_PRESSURE_CEILING_TOKENS = 180_000;
+// Claude Code CLI hard-epoch ceiling. The Claude CLI surfaces (claude /
+// claude-cli / claude-interactive) cannot fold in-process
+// (engineSupportsRollingFold=false), so instead of mid-stream folding the relay
+// fires an in-place session-swap rebirth ("hard epoch") once provider-MEASURED
+// context tokens cross this threshold. Same 180K value/intent as the Claude API
+// pressure ceiling above, but kept as a distinct named constant because the two
+// mechanisms (in-process fold relief vs out-of-process session swap) can diverge
+// independently. Consumed by relay handleResultEvent (instanceManager/eventHandlers.ts).
+export const DEFAULT_CONTEXT_BUDGET_CLAUDE_CLI_HARD_EPOCH_TOKENS = 180_000;
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION = 0.9;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_HEADROOM_SAFETY = 0.8;
@@ -310,6 +321,10 @@ function isCodexCliEngine(engine: string): boolean {
   return engine.trim().toLowerCase() === 'codex';
 }
 
+function isClaudeApiEngine(engine: string): boolean {
+  return engine.trim().toLowerCase() === 'claude-api';
+}
+
 function defaultCodexCliReconstructTriggerTokens(
   messageCeilingTokens: number,
   hardWindowTokens: number,
@@ -384,6 +399,9 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
       pressureMaxWindowFraction,
     )
     : null;
+  const claudeApiDefaultPressureCeilingTokens = isClaudeApiEngine(engine)
+    ? DEFAULT_CONTEXT_BUDGET_CLAUDE_API_PRESSURE_CEILING_TOKENS
+    : null;
   let pressureCeilingTokens: number | null;
   if (input.pressureCeilingTokens === null || isDisabled(env.VOXXO_FOLD_PRESSURE_CEILING_TOKENS)) {
     pressureCeilingTokens = null;
@@ -391,6 +409,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     const requestedPressure = positiveInt(input.pressureCeilingTokens)
       ?? parsePositiveInt(env.VOXXO_FOLD_PRESSURE_CEILING_TOKENS)
       ?? codexCliDefaultReconstructTriggerTokens
+      ?? claudeApiDefaultPressureCeilingTokens
       ?? clampPositiveTokensToWindow(
         DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS,
         hardWindowTokens,

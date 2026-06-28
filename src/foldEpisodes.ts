@@ -290,6 +290,12 @@ export interface ChainCardOptions {
   ownLineage?: ReadonlySet<string>;
   /** Caller's friendly display name, used to label own-lineage voice lines. */
   selfName?: string;
+  /**
+   * When true, suppress peer-lineage chapters entirely. This is for own-memory
+   * surfaces such as wake/rebirth packages; live swarm recall can leave it false
+   * to keep cross-lineage coordination signal.
+   */
+  selfLineageOnly?: boolean;
 }
 
 export const DEFAULT_EPISODE_GROUPING = {
@@ -1122,6 +1128,14 @@ function isForeignChapter(episode: Episode, opts: Pick<ChainCardOptions, 'ownLin
   return opts.ownLineage !== undefined && !opts.ownLineage.has(episode.instanceId);
 }
 
+function filterSelfLineageChapters(
+  chapters: readonly Episode[],
+  opts: Pick<ChainCardOptions, 'ownLineage' | 'selfLineageOnly'>,
+): Episode[] {
+  if (opts.selfLineageOnly !== true) return [...chapters];
+  return chapters.filter((chapter) => !isForeignChapter(chapter, opts));
+}
+
 function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   const text = truncateVerbatim(annotation.text, VOICE_TEXT_CAP_CHARS);
   const at = voiceTimeSuffix(annotation);
@@ -1219,12 +1233,14 @@ export function formatChainCard(
   opts: ChainCardOptions = {},
 ): string {
   if (chapters.length === 0) return '';
+  const visibleChapters = filterSelfLineageChapters(chapters, opts);
+  if (visibleChapters.length === 0) return '';
   const budget = opts.charBudget ?? CHAIN_CARD_DEFAULT_BUDGET_CHARS;
   const maxVoice = opts.maxVoiceInlays ?? 2;
   const warmCount = Math.max(0, Math.floor(opts.warmCount ?? 2));
   const fullPreviousCount = Math.max(0, Math.floor(opts.fullPreviousCount ?? 0));
 
-  const ordered = [...chapters].sort((a, b) => (a.endedAt < b.endedAt ? -1 : a.endedAt > b.endedAt ? 1 : 0));
+  const ordered = visibleChapters.sort((a, b) => (a.endedAt < b.endedAt ? -1 : a.endedAt > b.endedAt ? 1 : 0));
   const hot = ordered[ordered.length - 1];
   const fullPreviousStart = Math.max(0, ordered.length - 1 - fullPreviousCount);
   const fullPrevious = ordered.slice(fullPreviousStart, ordered.length - 1).reverse();
@@ -1316,7 +1332,7 @@ export function formatWalkPromotionCard(
   chapter: Episode,
   position: WalkPosition,
   sinceDeltas: readonly string[],
-  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays' | 'ownLineage' | 'selfName'> & {
+  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays' | 'ownLineage' | 'selfName' | 'selfLineageOnly'> & {
     /**
      * Origin-anchored breadcrumb trail (nearest waypoint → … → origin).
      * Optional and additive: absent ⇒ byte-identical pre-breadcrumb grammar.
@@ -1324,6 +1340,7 @@ export function formatWalkPromotionCard(
     spines?: readonly WalkSpineCitation[];
   } = {},
 ): string {
+  if (opts.selfLineageOnly === true && isForeignChapter(chapter, opts)) return '';
   const budget = opts.charBudget ?? CHAIN_CARD_DEFAULT_BUDGET_CHARS;
   const maxVoice = opts.maxVoiceInlays ?? 2;
   const label = episodeAuthorLabel(chapter, opts);

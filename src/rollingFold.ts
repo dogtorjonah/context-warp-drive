@@ -1090,6 +1090,69 @@ export function extractVerbatimContextLabel(sourceText: string, value: string): 
 }
 
 /**
+ * Reject Coordinate Closet candidates that are trace-EXHAUST artifacts rather
+ * than durable coordinate ids/paths. Pure + deterministic (regex only), so it
+ * preserves the fold engine's byte-identical-for-identical-input provider-cache
+ * invariant. Shared by BOTH closet builders — this fold closet's admit() and the
+ * relay rebirth-seed buildRawTraceCoordinateCloset — so one filter cleans both.
+ *
+ * Discriminates by artifact TYPE, not lineage: a tool-result spool / browser
+ * artifact / temp path is noise no matter which instance produced it — and that
+ * is precisely what removes the BULK of cross-lineage closet leakage, since the
+ * foreign refs that leak in are overwhelmingly tool-artifact paths. Real
+ * source-file paths, rail/instance ids, ports, and pids are intentionally KEPT
+ * even when cross-lineage (a fork sibling's file claim is coordination signal).
+ */
+export function isClosetNoiseLiteral(value: string): boolean {
+  const v = value.trim();
+  if (!v) return true;
+  // ── Tool / trace artifact paths (any engine, any lineage) — pure exhaust ──
+  if (v.includes('tool-result-spool/')) return true;
+  // Browser artifact captures (screenshots / DOM dumps).
+  if (v.includes('browser-artifacts/')) return true;
+  if (/(?:^|\/)scr_\d{6,}_[0-9a-f]{6,}/.test(v)) return true;
+  // Scratch / temp paths.
+  if (/(?:^|\/)tmp\//.test(v)) return true;
+  // Wildcard route-manifest entries (hypermath/*, /api/*) — build-dump exhaust,
+  // never a concrete coordinate. Concrete routes (/api/instances/<id>) survive.
+  if (v.includes('/*')) return true;
+  // ── Pure content hashes (sha1/sha256: 40+ hex run, no dashes) ──
+  // Short hex refs / rail / instance ids (≤16) and dashed UUIDs are KEPT.
+  if (/^[0-9a-f]{40,}$/i.test(v)) return true;
+  // ── Numeric / counter / date exhaust ──
+  // N/M progress counters (17/17, 8/17, 0/17), calendar dates (6/20/2026), and
+  // leading-number code ratios (1/zoom, 2/scale).
+  if (/^\d{1,4}\/\d{1,4}$/.test(v)) return true;
+  if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(v)) return true;
+  if (/^\d{1,4}\/[A-Za-z]{2,}$/.test(v)) return true;
+  // ── Tailwind / CSS class fragments ──
+  // Hyphenated utility token with a numeric opacity/size modifier
+  // (ring-blue-400/30, bg-theme-surface/35, shadow-black/40, bg-brand/20).
+  // Requires an interior hyphen AND a pure-digit right side, so real 2-segment
+  // paths (relay/src, app-solid/foo) never match.
+  if (/^[A-Za-z][\w-]*-[\w-]+\/\d{1,3}$/.test(v)) return true;
+  // ── Decontextualized grep/read line fragments ──
+  // Bare basename:line(:col) (PanesView.tsx:2832, foo.ts:84:12). Path-qualified
+  // file:line (relay/src/foo.ts:84) carries a slash and survives; line RANGES
+  // (foo.ts:20-45) survive (dash tail).
+  if (/^[\w.-]+\.[A-Za-z]{1,5}:\d+(?::\d*)?$/.test(v)) return true;
+  // Orphaned stack-frame extension fragment: a stack path like
+  // `…/chunk-artifact.js:2323:10` nominates the path up to the dot, leaving the
+  // bare `js:2323:10` tail as its own literal. Match a short alpha extension +
+  // `:line:col` with BOTH numeric segments present (two colons), so single-colon
+  // key:value coordinates (port:3002, host:8080) are never touched.
+  if (/^[A-Za-z]{1,5}:\d+:\d+$/.test(v)) return true;
+  // Read-output line headers ("Lines: 2417-2486", "Line: 84") — the file/symbol
+  // they referenced sits in a sibling token, so the bare range is decontextualized.
+  if (/^Lines?: ?\d+(?:-\d+)?$/.test(v)) return true;
+  // ── Dictionary slash-bigrams with an interior capital (CPU/GPU, iOS/Android,
+  // Figma/Miro, DOM/GPU, Read/Grep). The capital guard preserves all-lowercase
+  // real 2-segment paths like relay/src or packages/shared. ──
+  if (/^[A-Za-z]{2,}\/[A-Za-z]{2,}$/.test(v) && /[A-Z]/.test(v)) return true;
+  return false;
+}
+
+/**
  * Extract up to `max` carry-worthy verbatim values from a result text (receipts belt).
  * Value-deduped via isConservedIn so `deadbeefcafe` and `id: deadbeefcafe` never
  * spend two slots on one value (nominates a wider pool, then greedy-selects).
@@ -1098,6 +1161,12 @@ function beltVerbatim(text: string, max = 2): string {
   const picked: string[] = [];
   for (const lit of nominateVerbatim(text, max * 4)) {
     if (picked.length >= max) break;
+    // Same artifact-type reject as the Coordinate Closet so a tool-call
+    // skeleton's receipts belt never carries trace exhaust: stack-frame
+    // fragments (js:2323:10), read-output line headers (Lines: 2417-2486),
+    // spool/tmp paths, content hashes, N/M counters. Real ids/paths/ports/pids
+    // still survive — this is the same predicate the closet uses.
+    if (isClosetNoiseLiteral(lit)) continue;
     if (picked.length > 0 && isConservedIn(picked.join(', '), lit)) continue;
     picked.push(lit);
   }
@@ -1945,6 +2014,11 @@ export function foldContext(
       // tight budget never drops the value just to keep its annotation.
       const admit = (lit: string, sourceText: string, ceiling: number): void => {
         if (closetSet.has(lit)) return;
+        // Reject trace-exhaust artifacts (spool/screenshot/tmp paths, N/M
+        // counters, bare file:line fragments, dictionary slash-bigrams) before
+        // they spend closet budget. Artifact-type gate, lineage-blind — see
+        // isClosetNoiseLiteral. Real source paths/rail ids/ports/pids survive.
+        if (isClosetNoiseLiteral(lit)) return;
         if (isConservedIn(bodyCorpus, lit)) return;
         if (closetItems && isConservedIn(closetItems, lit)) return;
         const sep = closetItems ? ' · ' : '';

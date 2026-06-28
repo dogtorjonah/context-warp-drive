@@ -198,6 +198,32 @@ describe('episodic pin idempotency and bookkeeping helpers', () => {
   });
 });
 
+describe('formatChainCard lineage filtering', () => {
+  it('can suppress peer-lineage chapters while preserving own-lineage memory', () => {
+    const own = makeEpisode({
+      endedAt: '2026-06-11T13:00:00.000Z',
+      summary: 'mine',
+      instanceId: 'me',
+    });
+    const peer = makeEpisode({
+      endedAt: '2026-06-11T14:00:00.000Z',
+      summary: 'theirs',
+      instanceId: 'other-lineage',
+    });
+    const opts = { ownLineage: new Set(['me']), fullPreviousCount: 1, charBudget: 4_000 };
+
+    const defaultCard = formatChainCard([own, peer], 'src/shared.ts', [], opts);
+    expect(defaultCard).toContain('theirs');
+    expect(defaultCard).toContain('peer lineage');
+
+    const ownOnlyCard = formatChainCard([own, peer], 'src/shared.ts', [], { ...opts, selfLineageOnly: true });
+    expect(ownOnlyCard).toContain('mine');
+    expect(ownOnlyCard).not.toContain('theirs');
+    expect(ownOnlyCard).not.toContain('peer lineage');
+    expect(formatChainCard([peer], 'src/shared.ts', [], { ...opts, selfLineageOnly: true })).toBe('');
+  });
+});
+
 describe('operator intent (Episode.intent)', () => {
   const identity: EpisodeCaptureIdentity = {
     workspace: 'context-warp-drive',
