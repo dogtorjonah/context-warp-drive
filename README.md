@@ -100,7 +100,7 @@ Then add the provider cache knob:
 
 | Provider | What to do |
 |---|---|
-| Claude / Anthropic | Add top-level `cache_control: { type: 'ephemeral' }` to the request. Use `ttl: '1h'` only when you actually want Anthropic's paid 1-hour cache. Log `usage.cache_read_input_tokens` and `usage.cache_creation_input_tokens`. |
+| Claude / Anthropic | Use `prepareAnthropicCachedRequest()` from `context-warp-drive/providers/anthropic` with `messages`, `sealedBoundary`, `system`, and `tools`. It marks the relay-style breakpoints: tools, stable system head, sealed fold/rebirth boundary, and rolling tail. Default TTL is Anthropic's 5-minute cache shape; pass `ttl: '1h'` only when you want the paid 1-hour cache and merge the returned `requestOptions`/`anthropicBeta` into your SDK or fetch call. Log `usage.cache_read_input_tokens` and `usage.cache_creation_input_tokens`. |
 | OpenAI | No cache marker is required. Keep static tools/system/context first, pass the prepared `messages`, optionally reuse a stable `prompt_cache_key`, and log `usage.prompt_tokens_details.cached_tokens`. |
 | Gemini | Implicit caching is automatic on Gemini 2.5+ when prefixes match. For a large static document/corpus, create an explicit Gemini cache separately and pass it as `cachedContent`; keep the folded conversation after that stable prefix. Log `usage_metadata`. |
 | Gemini CLI | Use `context-warp-drive/providers/gemini-cli` to fold the CLI-owned JSONL view, preserving the metadata header and rewriting with `$set.messages` + `$set.lastUpdated`. |
@@ -140,6 +140,46 @@ console.log(`sent ${messages.length} msgs · cacheHot=${cacheHot} · savings=${s
 That's the whole headline. For continuous always-lean folding, pass `ALWAYS_ON_FOLD_CONFIG`; to match your provider's real cache TTL, set `freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 }`. The measured-token pressure guard defaults to `DEFAULT_FOLD_PRESSURE_CEILING_TOKENS` (240,000); pass `pressureCeiling: false` to disable it or `pressureCeiling: 120_000` to tune it.
 
 See [`examples/anthropic-loop.ts`](./examples/anthropic-loop.ts) and [`examples/openai-loop.ts`](./examples/openai-loop.ts) for full tool loops.
+
+---
+
+### Hard-epoch rebirth seed parity
+
+`FoldSession.prepare()` includes the portable hard-epoch path used by the Voxxo relay: it replaces the provider-visible view with one deterministic rebirth seed message, merges the triggering live user turn exactly once, and reseals that compact seed as the next frozen prefix. It fires automatically when real measured input tokens reach `pressureCeiling`; a harness can also force the same path directly:
+
+```ts
+const outcome = session.prepare(history, {
+  hardEpoch: true,
+  hardEpochSeed: renderMyHostRebirthPackage(), // optional; omitted = raw trace seed
+  measuredInputTokens: previousUsage?.input_tokens,
+});
+```
+
+For Anthropic, feed `outcome.sealedBoundary` to the provider helper every turn:
+
+```ts
+import { prepareAnthropicCachedRequest } from 'context-warp-drive/providers/anthropic';
+
+const cached = prepareAnthropicCachedRequest({
+  messages: outcome.messages as AnthropicMessage[],
+  sealedBoundary: outcome.sealedBoundary,
+  system: SYSTEM_PROMPT,
+  tools: TOOLS,
+});
+
+await client.messages.create(
+  { model, max_tokens: 8192, ...cached.request },
+  cached.requestOptions,
+);
+```
+
+Parity checklist for a custom harness:
+
+- Keep raw history append-only and pass the full raw trace to `prepare()`.
+- Use measured provider token telemetry for `measuredInputTokens`; do not estimate pressure from characters.
+- For intentional same-instance rebirth/reset, pass `hardEpoch: true` plus your rendered host seed, or let the package compute the raw seed from `history`.
+- Persist host-only context such as task rails, file claims, workspace state, chat, and episode cards yourself, then pass those sections into `renderRawRebirthSeed()` when you need relay-like wake text.
+- Keep clone/model-specific identity deltas out of the stable cached prefix. The Anthropic helper splits the system prompt before `## Your Identity` by default; for cheaper clone fanout, put shared seed text before that marker and append per-model deltas after the cached baseline.
 
 ---
 

@@ -45,8 +45,12 @@ The message objects pass through unchanged — Context Warp Drive reads Anthropi
 
 Provider cache setup stays in your SDK call:
 
-- Claude / Anthropic: add top-level `cache_control: { type: 'ephemeral' }`; use
-  `ttl: '1h'` only for Anthropic's paid 1-hour cache.
+- Claude / Anthropic: use `prepareAnthropicCachedRequest()` from
+  `context-warp-drive/providers/anthropic`. Pass `messages`,
+  `sealedBoundary`, stable `system`, and stable `tools`; the adapter marks
+  tools, stable system head, sealed fold/rebirth boundary, and rolling tail.
+  Default 5-minute caching needs no beta header; `ttl: '1h'` returns the
+  extended-cache beta header for human-paced gaps.
 - OpenAI: no cache marker is required; optionally pass a stable
   `prompt_cache_key` for requests that share the same long prefix.
 - Gemini: implicit caching is automatic on Gemini 2.5+; for explicit caching,
@@ -56,6 +60,24 @@ Provider cache setup stays in your SDK call:
 Context Warp Drive's job is to keep the prefix byte-identical. The provider
 knob is deliberately visible at the call site so an integrator can verify cache
 hits in the provider usage fields.
+
+## Hard-epoch rebirth seed parity
+
+`FoldSession.prepare()` exposes the same portable hard-epoch topology as the
+originating relay. When measured pressure reaches `pressureCeiling`, or when a
+host passes `hardEpoch: true`, the outgoing view becomes one deterministic
+rebirth seed user message. `buildHardEpochSeedView()` merges the live triggering
+turn into that message exactly once, `commitFoldFreeze()` seals it as the
+provider baseline, and `sealedBoundary` is available immediately for provider
+cache helpers. On the next append, that same sealed seed stays fixed while the
+rolling tail breakpoint moves forward.
+
+The standalone package cannot gather host-private state by itself. For relay
+parity in another harness, keep raw history as the source of truth, persist your
+own task rail/file-claim/workspace/chat/episode sections, render them through
+`renderRawRebirthSeed()` when needed, and pass that string as
+`hardEpochSeed`. If omitted, FoldSession computes a deterministic trace-local
+seed from the supplied history.
 
 ## Episodic storage adapter
 

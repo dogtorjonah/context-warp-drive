@@ -353,6 +353,41 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body.match(/LIVE_TRIGGER_MARKER/g)).toHaveLength(1);
   });
 
+  test('lets a host explicitly force the hard-epoch rebirth seed path', () => {
+    const session = new FoldSession({
+      foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 111_000,
+      now: () => 1_000,
+    });
+    const raw: FoldMessage[] = [
+      userMsg('old standalone question'),
+      assistantMsg('RAW_PRIOR_TRACE_MARKER standalone answer'),
+      userMsg('LIVE_TRIGGER_MARKER manual reset request'),
+    ];
+
+    const hardEpoch = session.prepare(raw, {
+      hardEpoch: true,
+      hardEpochSeed: 'HOST_SUPPLIED_STANDALONE_REBIRTH_SEED',
+      measuredInputTokens: 10,
+    });
+
+    expect(hardEpoch.stats.epochReason).toBe('hard-epoch');
+    expect(hardEpoch.stats.pressureCeilingTriggered).toBe(false);
+    expect(hardEpoch.messages).toHaveLength(1);
+    expect(hardEpoch.sealedBoundary).toBe(1);
+    const body = vaultJoin(hardEpoch.messages);
+    expect(body).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
+    expect(body).toContain('HOST_SUPPLIED_STANDALONE_REBIRTH_SEED');
+    expect(body).toContain(HARD_EPOCH_LIVE_TURN_HEADER);
+    expect(body).toContain('LIVE_TRIGGER_MARKER manual reset request');
+
+    const appended = session.prepare(appendProfitableTurns(raw, 3), { measuredInputTokens: 10 });
+    expect(appended.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
+    expect(appended.sealedBoundary).toBe(1);
+    expect(appended.messages[0]).toEqual(hardEpoch.messages[0]);
+  });
+
   test('does not duplicate a trailing string user turn when followed by tool-result user content', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },

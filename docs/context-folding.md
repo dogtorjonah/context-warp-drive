@@ -70,12 +70,15 @@ Context Warp Drive owns the deterministic prefix: when `cacheHot` is true, the
 old folded prefix is byte-identical and new raw turns append after it. Provider
 cache controls still live in your provider SDK call:
 
-- **Claude / Anthropic:** add top-level `cache_control: { type: 'ephemeral' }`.
-  Anthropic's default ephemeral cache is 5 minutes; use
-  `{ type: 'ephemeral', ttl: '1h' }` only when you want the paid 1-hour cache.
-  The cached prefix covers `tools` → `system` → `messages` up to the cache
-  breakpoint. Track `usage.cache_read_input_tokens` and
-  `usage.cache_creation_input_tokens`.
+- **Claude / Anthropic:** use `prepareAnthropicCachedRequest()` from
+  `context-warp-drive/providers/anthropic`. Pass `messages`,
+  `sealedBoundary`, stable `system`, and stable `tools`; the adapter marks up
+  to four breakpoints in Anthropic's prefix order (`tools` → `system` →
+  `messages`): last tool definition, stable system head, sealed fold/rebirth
+  boundary, and rolling tail. Anthropic's default ephemeral cache is 5 minutes;
+  pass `ttl: '1h'` only when you want the paid 1-hour cache and merge the
+  returned beta header into your SDK/fetch call. Track
+  `usage.cache_read_input_tokens` and `usage.cache_creation_input_tokens`.
 - **OpenAI:** prompt caching is automatic for eligible prompts. Keep shared
   tools/system/static context at the beginning, put variable user/tool content
   at the end, optionally reuse a stable `prompt_cache_key`, and track

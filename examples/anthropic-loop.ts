@@ -8,19 +8,17 @@
  * Two function calls per turn — that's the whole integration:
  *
  *   1. session.prepare(history) → compacted messages + sealedBoundary
- *   2. applyCacheBreakpoints(messages, { sealedBoundary }) → cached messages
+ *   2. prepareAnthropicCachedRequest(...) → cached request parts
  *
  * In your project:
  *   import { FoldSession } from 'context-warp-drive';
- *   import { applyCacheBreakpoints } from 'context-warp-drive/providers/anthropic';
+ *   import { prepareAnthropicCachedRequest } from 'context-warp-drive/providers/anthropic';
  */
 import { FoldSession, ALWAYS_ON_FOLD_CONFIG, type FoldMessage } from '../src/index.ts';
 import {
-  applyCacheBreakpoints,
-  buildCachedSystem,
-  applyToolsCacheBreakpoint,
-  EXTENDED_CACHE_TTL_BETA,
+  prepareAnthropicCachedRequest,
   type Message,
+  type SystemBlock,
   type ToolSpec,
 } from '../src/providers/anthropic.ts';
 
@@ -35,23 +33,25 @@ interface AnthropicResponse {
   };
 }
 
+interface AnthropicRequest {
+  messages: Message[];
+  system?: string | SystemBlock[];
+  tools?: ToolSpec[];
+}
+
 async function callAnthropic(
-  messages: Message[],
-  system: string | object,
-  tools: ToolSpec[],
+  request: AnthropicRequest,
+  requestOptions?: { headers: { 'anthropic-beta': string } },
 ): Promise<AnthropicResponse> {
   // const client = new Anthropic();
   // const res = await client.messages.create({
   //   model: 'claude-sonnet-4-20250514',
   //   max_tokens: 8192,
-  //   system,
-  //   tools,
-  //   messages,
-  //   betas: { headers: { 'anthropic-beta': EXTENDED_CACHE_TTL_BETA } },
-  // });
+  //   ...request,
+  // }, requestOptions);
   // console.log('cache stats:', res.usage.cache_read_input_tokens, res.usage.cache_creation_input_tokens);
   // return res;
-  void messages; void system; void tools;
+  void request; void requestOptions;
   return { content: [{ type: 'text', text: '(stub)' }] };
 }
 
@@ -79,19 +79,21 @@ async function runAgent(task: string): Promise<void> {
         `sealedBoundary=${sealedBoundary ?? 'none'}`,
     );
 
-    // Step 2: Inject cache breakpoints. This is the only provider-specific call.
-    //   - sealedBoundary breakpoint caches the frozen prefix band
+    // Step 2: Inject cache breakpoints. This is the only provider-specific call:
+    //   - tool + stable-system breakpoints cache static harness material
+    //   - sealedBoundary caches the frozen rebirth/fold band once established
     //   - rolling breakpoint on the last message caches the append-only tail
-    const cachedMessages = applyCacheBreakpoints(messages as Message[], {
+    const cached = prepareAnthropicCachedRequest({
+      messages: messages as Message[],
       sealedBoundary,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
     });
 
-    // Also cache the system prompt and tool definitions (stable per session).
-    const cachedSystem = buildCachedSystem(SYSTEM_PROMPT);
-    const cachedTools = applyToolsCacheBreakpoint(TOOLS);
-
     // Step 3: Send to Anthropic. No beta header needed for default 5m TTL.
-    const response = await callAnthropic(cachedMessages, cachedSystem, cachedTools);
+    // Pass ttl: '1h' to prepareAnthropicCachedRequest only for human-paced gaps;
+    // the returned requestOptions then carries the required anthropic-beta flag.
+    const response = await callAnthropic(cached.request, cached.requestOptions);
 
     // Step 4: Append to raw history (append-only — never mutate past messages).
     history.push({ role: 'assistant', content: response.content } as unknown as FoldMessage);

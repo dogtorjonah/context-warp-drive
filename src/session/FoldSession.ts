@@ -250,6 +250,14 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    */
   readonly measuredInputTokens?: number;
   /**
+   * Force the same raw hard-epoch path that measured pressure would trigger.
+   * Use this when a host harness intentionally resets provider-visible context
+   * (same-instance rebirth, manual compact/reset button, process handoff) and
+   * wants the resulting seed sealed as the next provider-cache baseline without
+   * pretending it has measured pressure telemetry.
+   */
+  readonly hardEpoch?: boolean;
+  /**
    * Quality-driven fidelity override for THIS turn — typically the governor's
    * `decision.fidelity` from {@link governByTrace}. Scales the full/essence
    * retention budget without changing band size. Applied only when this turn
@@ -259,12 +267,13 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    */
   readonly fidelity?: FidelityOverrides | null;
   /**
-   * Optional same-instance hard-epoch seed override. When measured pressure is
-   * RAW-triggered, FoldSession replaces the entire prepared view with a SINGLE
-   * compact continuity message and re-anchors the freeze boundary around it. If
-   * this override is omitted, FoldSession computes the raw seed synchronously from
-   * the supplied provider trace; richer hosts can pass their own already-rendered
-   * raw package string here. The old raw transcript remains recall backing.
+   * Optional same-instance hard-epoch seed override. When measured pressure or
+   * `hardEpoch: true` triggers a hard epoch, FoldSession replaces the entire
+   * prepared view with a SINGLE compact continuity message and re-anchors the
+   * freeze boundary around it. If this override is omitted, FoldSession computes
+   * the raw seed synchronously from the supplied provider trace; richer hosts can
+   * pass their own already-rendered raw package string here. The old raw
+   * transcript remains recall backing.
    */
   readonly hardEpochSeed?: string | null;
 }
@@ -313,8 +322,9 @@ export interface FoldOutcome {
    * prefix band. Pass this to your provider's cache-breakpoint helper (e.g.
    * `applyCacheBreakpoints` from `providers/anthropic`) so the frozen prefix is
    * cached by the provider and reads back at 0.1× on subsequent hot reuses.
-   * `null` when no append-only boundary has been established yet (first epoch
-   * or freeze disabled).
+   * `null` when no cacheable boundary has been established yet (for example a
+   * regular first fold epoch); a hard epoch exposes its single rebirth seed as
+   * boundary `1` immediately when freeze is enabled.
    */
   readonly sealedBoundary?: number | null;
   /**
@@ -768,6 +778,7 @@ export class FoldSession {
     const totalTurns = detectTurns(messages, this.syntheticContext).length;
     const durableCursorIndex = context.durableCursorIndex ?? messages.length;
     const pressureCeilingTriggered = this.isPressureCeilingTriggered(context.measuredInputTokens);
+    const hardEpochTriggered = context.hardEpoch === true || pressureCeilingTriggered;
     // Rewind self-heal. A SHRINK in raw count (turns removed) drops now-stale
     // eviction ordinals before they can mis-tombstone the wrong turns. EDGE
     // (no-freeze path only): this length check cannot see a SAME-LENGTH in-place
@@ -795,12 +806,12 @@ export class FoldSession {
     // boundary around it. A host-supplied seed wins; otherwise the standalone
     // engine computes a raw trace seed from `messages` itself. Fires independent
     // of recompute-suppression because the topology reset lowers the stuck floor.
-    if (pressureCeilingTriggered) {
+    if (hardEpochTriggered) {
       this.activeFidelity = desiredFidelity;
       const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
         maxChars: this.rawHardEpochSeedMaxChars,
       });
-      return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns);
+      return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, pressureCeilingTriggered);
     }
 
     if (!this.freezeEnabled) {
@@ -868,10 +879,10 @@ export class FoldSession {
     const previousActiveFidelity = this.activeFidelity;
     this.activeFidelity = desiredFidelity;
     const runway = this.tailEpochRunwayCheck();
-    const hardEpochBaselineRunwayBypass = recomputeReason === 'tail-epoch'
+    const hardEpochBaselineAppend = recomputeReason === 'tail-epoch'
       && !pressureCeilingTriggered
-      && !runway.ok
       && this.hardEpochCompactBaselineActive;
+    const hardEpochBaselineRunwayBypass = hardEpochBaselineAppend && !runway.ok;
     const upcomingEpoch = this.foldEpochs + 1;
     const appendOnlyTailEpoch = recomputeReason === 'tail-epoch'
       && !pressureCeilingTriggered
@@ -901,7 +912,7 @@ export class FoldSession {
           appliedFidelity: this.activeFidelity,
           stats: {
             ...this.statsFromResult(totalTurns, false, tailResult, false),
-            epochReason: hardEpochBaselineRunwayBypass ? 'tail-epoch-append+hard-epoch-baseline' : 'tail-epoch-append',
+            epochReason: hardEpochBaselineAppend ? 'tail-epoch-append+hard-epoch-baseline' : 'tail-epoch-append',
             appendDecision: 'committed',
             appendRawTailChars: appendCommit.rawTailChars,
             appendBandChars: appendCommit.bandViewChars,
@@ -1007,6 +1018,7 @@ export class FoldSession {
     context: FoldPrepareContext,
     now: number,
     totalTurns: number,
+    pressureCeilingTriggered: boolean,
   ): FoldOutcome {
     const view = buildHardEpochSeedView(messages, seedPrompt);
     const originalChars = countChars(messages);
@@ -1026,6 +1038,7 @@ export class FoldSession {
         claimedPaths: context.claimedPaths ?? EMPTY_CLAIMED,
       };
       commitFoldFreeze(this.freezeState, messages, view, ctx, now, 'hard-epoch');
+      this.freezeState.lastAppendBoundaryViewCount = view.length;
       this.hardEpochCompactBaselineActive = true;
     }
     return {
@@ -1035,7 +1048,7 @@ export class FoldSession {
       result,
       appliedFidelity: this.activeFidelity,
       stats: {
-        ...this.statsFromResult(totalTurns, false, result, true),
+        ...this.statsFromResult(totalTurns, false, result, pressureCeilingTriggered),
         epochReason: 'hard-epoch',
       },
     };

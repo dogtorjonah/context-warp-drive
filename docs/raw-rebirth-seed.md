@@ -40,7 +40,57 @@ const outcome = session.prepare(history, {
 });
 ```
 
+Hosts can also force the exact same hard-epoch machinery for an intentional
+same-instance rebirth/reset. This is the preferred harness hook; do not fake
+token pressure just to reach the seed path.
+
+```ts
+const outcome = session.prepare(history, {
+  hardEpoch: true,
+  hardEpochSeed: seed, // optional; omit to use the deterministic raw trace seed
+  measuredInputTokens: previousUsage?.input_tokens,
+});
+```
+
 You can still pass `hardEpochSeed` when your host has a richer renderer. The package fallback is intentionally deterministic and trace-local.
+
+## Anthropic Prompt Caching
+
+For Claude/Anthropic calls, pass the `sealedBoundary` returned by
+`FoldSession.prepare()` into the provider adapter. A hard epoch starts as one
+compact seed message and exposes that seed as the sealed boundary immediately
+when freeze is enabled. On the seed turn, the rolling breakpoint lands on the
+same message; after the next append, the sealed-boundary breakpoint remains on
+the rebirth baseline while the rolling breakpoint moves to the new tail.
+
+```ts
+import { prepareAnthropicCachedRequest } from 'context-warp-drive/providers/anthropic';
+
+const outcome = session.prepare(history, {
+  hardEpoch: shouldResetProviderContext,
+  hardEpochSeed: hostRenderedSeed,
+  measuredInputTokens: previousUsage?.input_tokens,
+});
+
+const cached = prepareAnthropicCachedRequest({
+  messages: outcome.messages as AnthropicMessage[],
+  sealedBoundary: outcome.sealedBoundary,
+  system: SYSTEM_PROMPT,
+  tools: TOOLS,
+  // ttl: '1h', // opt in only for >5-minute turn gaps
+});
+
+await client.messages.create(
+  { model, max_tokens: 8192, ...cached.request },
+  cached.requestOptions,
+);
+```
+
+The adapter spends at most four Anthropic breakpoints, in request order:
+tools, stable system head, sealed fold/rebirth boundary, and rolling tail. The
+default 5-minute TTL omits the `ttl` field and needs no beta header. `ttl: '1h'`
+adds `ttl: '1h'` and returns the `extended-cache-ttl-2025-04-11` beta header for
+callers that need longer human-paced gaps.
 
 ## Full Renderer
 
