@@ -1,6 +1,6 @@
 # Context Warp Drive
 
-[![npm version](https://img.shields.io/npm/v/context-warp-drive.svg)](https://www.npmjs.com/package/context-warp-drive) [![CI](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![CI](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 **Stop summarizing your agent's memory.** Every compaction call burns a model round-trip, rewrites your prefix so the provider prompt cache goes cold, and quietly drops the exact identifiers your agent needs. Fold it deterministically instead.
 
@@ -65,8 +65,12 @@ Context Warp Drive does neither. It **deterministically folds** old turns into c
 
 ## Install
 
+Not published on npm yet. Install from source today:
+
 ```bash
-npm install context-warp-drive
+git clone https://github.com/dogtorjonah/context-warp-drive.git
+cd context-warp-drive
+npm install        # runs `prepare` -> builds dist/ automatically
 # optional — only for the reference SQLite episode store:
 npm install better-sqlite3
 ```
@@ -74,16 +78,21 @@ npm install better-sqlite3
 The core (`context-warp-drive/fold`) has **zero runtime dependencies**. `better-sqlite3` is an optional peer needed only by the reference episodic store.
 
 <details>
-<summary>Building from source (git clone)</summary>
+<summary>Local tarball / future npm install</summary>
 
-`dist/` is gitignored — it ships only in the npm tarball. After cloning:
+`dist/` is gitignored, so build before consuming the package from another project. For a local package install:
 
 ```bash
-git clone https://github.com/dogtorjonah/context-warp-drive.git
-cd context-warp-drive
-npm install        # runs `prepare` → builds dist/ automatically
-# or if prepare was skipped (e.g. --ignore-scripts):
 npm run build      # explicit fallback
+npm pack
+# from your consuming project:
+npm install /path/to/context-warp-drive/context-warp-drive-*.tgz
+```
+
+After the first npm publish, installation becomes:
+
+```bash
+npm install context-warp-drive
 ```
 
 </details>
@@ -94,7 +103,7 @@ npm run build      # explicit fallback
 
 Paste this:
 
-> Install `context-warp-drive` and wrap our function-calling message history with `FoldSession.prepare()` before each model call. Preserve raw history separately; send only the prepared `messages` view to the provider. Use `cacheHot` and `stats` for logging.
+> Add `context-warp-drive` from the source checkout or local tarball, then wrap our function-calling message history with `FoldSession.prepare()` before each model call. Preserve raw history separately; send only the prepared `messages` view to the provider. Use `cacheHot` and `stats` for logging.
 
 Then add the provider cache knob:
 
