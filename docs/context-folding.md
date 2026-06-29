@@ -221,11 +221,15 @@ starts one) — your visible signal that the frozen view just recomputed and why
 - `WARP_FOLD_FREEZE` — freeze layer on/off. `WARP_FOLD_FREEZE_TTL_MS` —
   cold-gap threshold override (wins over session/provider default and 5m).
 - `WARP_FOLD_RECALL` — recall layer on/off. `WARP_FOLD_RECALL_MAX_CARDS`
-  (default 2), `WARP_FOLD_RECALL_MAX_TOTAL_CHARS` (12000),
-  `WARP_FOLD_RECALL_MAX_CARD_CHARS` (6000), `WARP_FOLD_RECALL_TTL_PASSES` (8).
+  (default 3), `WARP_FOLD_RECALL_MAX_TOTAL_CHARS` (12000),
+  `WARP_FOLD_RECALL_MAX_CARD_CHARS` (6000), `WARP_FOLD_RECALL_TTL_PASSES` (4).
   `WARP_FOLD_RECALL_TERMS` (default off) — tier-2 distinctive-term page-in.
   `WARP_FOLD_RECALL_VERBATIM` (default **ON**; `=0` disables) — tier-2 exact
   verbatim-token page-in (FC engines + Codex CLI).
+- `WARP_FOLD_TARGET_BAND_TOKENS`, `WARP_FOLD_TRIGGER_TOKENS`,
+  `WARP_FOLD_PRESSURE_CEILING_TOKENS`, `WARP_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS`,
+  `WARP_FOLD_OUTPUT_RESERVE_TOKENS` — public budget override aliases. Legacy
+  `VOXXO_FOLD_*` names remain accepted for relay parity and take precedence.
 - `WARP_FOLD_EPISODES_INJECT=0` — episodic boundary injection kill switch.
   `WARP_FOLD_EPISODES_NARRATION=0` — tier-B narration mining kill switch
   (capture-side; stops new narration annotations, existing rows unaffected).

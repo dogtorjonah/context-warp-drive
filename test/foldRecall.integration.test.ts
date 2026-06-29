@@ -8,7 +8,8 @@
  *     → recall card injected at the tool boundary (append-only, rides the tail)
  *     → freeze still evaluates HOT reuse (cache survives recall)
  *     → next epoch refolds the card body away (page-out-again)
- *     → residency suppresses immediate re-recall
+ *     → tier-0 path-touch can page the path back in again; claim residency
+ *       remains the suppression path
  *     → claims interplay: frozen+folded claim epochs AND recalls; tail-only
  *       claim neither epochs nor recalls.
  */
@@ -110,7 +111,7 @@ function buildHistory(): FoldMessage[] {
 // ══════════════════════════════════════════════════════════════════════
 
 describe('fold recall ⇄ fold freeze lifecycle', () => {
-  test('epoch → index → re-touch → card rides tail HOT → next epoch pages it back out → residency suppresses', () => {
+  test('epoch → index → re-touch → card rides tail HOT → next epoch pages it back out → tier-0 can page it again', () => {
     const freeze = createFoldFreezeState();
     const recall = createFoldRecallState();
     const raw = buildHistory();
@@ -156,10 +157,10 @@ describe('fold recall ⇄ fold freeze lifecycle', () => {
     expect(JSON.stringify(third.view)).not.toContain('BIGFILE UNIQUE PAYLOAD');
     expect(JSON.stringify(raw)).toContain('BIGFILE UNIQUE PAYLOAD');
 
-    // ── Residency: immediate re-touch after the refold is suppressed (structured) ──
+    // ── Tier-0 bypass: immediate re-touch after the refold can page it in again ──
     const again = buildFoldRecallContext(recall, raw, signals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
-    expect(again.text).toBeNull();
-    expect(again.suppressed).toBeGreaterThan(0);
+    expect(again.cards).toBeGreaterThan(0);
+    expect(again.text!).toContain('BIGFILE UNIQUE PAYLOAD');
   });
 
   test('claims interplay: frozen+folded claim epochs AND recalls; tail-only claim does neither', () => {
@@ -222,7 +223,7 @@ describe('fold recall ⇄ fold freeze lifecycle', () => {
 // ══════════════════════════════════════════════════════════════════════
 
 describe('fold recall ⇄ fold freeze lifecycle — bash-only session', () => {
-  test('bash-only session: epoch → bash-path index → bash re-touch → card → refold cleans → residency suppresses', () => {
+  test('bash-only session: epoch → bash-path index → bash re-touch → card → refold cleans → tier-0 can page it again', () => {
     const freeze = createFoldFreezeState();
     const recall = createFoldRecallState();
     const t0 = 3_000_000;
@@ -277,9 +278,9 @@ describe('fold recall ⇄ fold freeze lifecycle — bash-only session', () => {
     expect(JSON.stringify(third.view)).not.toContain('BIGFILE UNIQUE PAYLOAD');
     expect(JSON.stringify(raw)).toContain('BIGFILE UNIQUE PAYLOAD');
 
-    // ── Residency: immediate bash re-touch is suppressed ──
+    // ── Tier-0 bypass: immediate bash re-touch can page it in again ──
     const again = buildFoldRecallContext(recall, raw, signals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
-    expect(again.text).toBeNull();
-    expect(again.suppressed).toBeGreaterThan(0);
+    expect(again.cards).toBeGreaterThan(0);
+    expect(again.text!).toContain('BIGFILE UNIQUE PAYLOAD');
   });
 });

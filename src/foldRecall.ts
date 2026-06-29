@@ -689,7 +689,12 @@ export function buildFoldIndex(
   const seedFullFold = interFoldedCount === 0 && options.seedFoldsEntireRaw === true;
   if (interFoldedCount > 0 || seedFullFold) {
     const turns = precomputedTurns ?? detectTurns(rawHistory as FoldMessage[], syntheticContext);
-    const count = Math.min(seedFullFold ? turns.length : interFoldedCount, Math.max(0, turns.length - 1));
+    // Marker-bearing folded views are authoritative: continuous folding can
+    // legitimately fold every detected turn, so indexing must not invent an
+    // unfolded live-tail clamp. Markerless hard-epoch seeds still keep the
+    // trailing live turn outside the page table.
+    const maxFoldedTurns = seedFullFold ? Math.max(0, turns.length - 1) : turns.length;
+    const count = Math.min(seedFullFold ? turns.length : interFoldedCount, maxFoldedTurns);
     for (let j = 0; j < count; j++) {
       const turn = turns[j];
       const structuredPaths = Array.from(extractToolPathSet(turn.messages));

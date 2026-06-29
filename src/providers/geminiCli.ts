@@ -115,21 +115,25 @@ export function resolveGeminiCliFoldMode(
   if (configured === 'on' || configured === 'off' || configured === 'dry-run') {
     return configured;
   }
-  const value = env.VOXXO_GEMINI_CLI_FOLD?.toLowerCase();
+  const value = (env.VOXXO_GEMINI_CLI_FOLD ?? env.WARP_GEMINI_CLI_FOLD)?.toLowerCase();
   if (value === 'off' || value === 'false') return 'off';
   if (value === 'dry-run') return 'dry-run';
   return 'on';
 }
 
 export function getPositiveIntEnv(
-  name: string,
+  name: string | readonly string[],
   fallback: number,
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
 ): number {
-  const value = env[name];
-  if (!value) return fallback;
-  const parsed = parseInt(value, 10);
-  return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
+  const names = Array.isArray(name) ? name : [name];
+  for (const key of names) {
+    const value = env[key];
+    if (!value) continue;
+    const parsed = parseInt(value, 10);
+    return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
+  }
+  return fallback;
 }
 
 export function resolveGeminiCliFoldPolicy(options: {
@@ -143,9 +147,9 @@ export function resolveGeminiCliFoldPolicy(options: {
   const env = options.env ?? process.env;
   const mode = resolveGeminiCliFoldMode(options.configuredMode, env);
   const targetTokens = options.targetTokens
-    ?? getPositiveIntEnv('VOXXO_GEMINI_CLI_FOLD_TARGET_TOKENS', DEFAULT_GEMINI_CLI_FOLD_TARGET_TOKENS, env);
+    ?? getPositiveIntEnv(['VOXXO_GEMINI_CLI_FOLD_TARGET_TOKENS', 'WARP_GEMINI_CLI_FOLD_TARGET_TOKENS'], DEFAULT_GEMINI_CLI_FOLD_TARGET_TOKENS, env);
   const bandTokens = options.bandTokens
-    ?? getPositiveIntEnv('VOXXO_GEMINI_CLI_FOLD_BAND_TOKENS', DEFAULT_GEMINI_CLI_FOLD_BAND_TOKENS, env);
+    ?? getPositiveIntEnv(['VOXXO_GEMINI_CLI_FOLD_BAND_TOKENS', 'WARP_GEMINI_CLI_FOLD_BAND_TOKENS'], DEFAULT_GEMINI_CLI_FOLD_BAND_TOKENS, env);
   const contextWindowTokens = options.contextWindowTokens ?? DEFAULT_GEMINI_CLI_CONTEXT_WINDOW_TOKENS;
   const effectiveTriggerTokens = resolveGeminiCliFoldTriggerTokens(targetTokens, contextWindowTokens);
   const measuredInputTokens = typeof options.measuredInputTokens === 'number'

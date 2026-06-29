@@ -69,10 +69,9 @@ const BIGFILE = 'relay/src/bigfile.ts';
 const BIGFILE_CONTENT = 'BIGFILE CONTENT START ' + 'x'.repeat(3_000) + ' BIGFILE CONTENT END';
 
 /**
- * Two-turn Anthropic history shaped so the real pipeline produces BOTH entry
- * kinds: turn 1 (reads BIGFILE) inter-folds behind the active window; the
- * final turn holds 7 tool results so the intra-fold pages out the oldest two
- * (helper0, helper1) while the tail buffer (5) keeps the rest.
+ * Two-turn Anthropic history shaped so the real pipeline folds both detected
+ * turns under the continuous-fold contract. The intra-only view still pages out
+ * helper0/helper1, which keeps intra-turn recall covered explicitly below.
  */
 function buildAnthropicHistory(): FoldMessage[] {
   const msgs: FoldMessage[] = [];
@@ -101,6 +100,10 @@ function indexFor(raw: FoldMessage[]): FoldRecallIndex {
   return buildFoldIndex(raw, runPipeline(raw));
 }
 
+function intraOnlyIndexFor(raw: FoldMessage[]): FoldRecallIndex {
+  return buildFoldIndex(raw, intraTurnFold(raw, ALWAYS_ON_INTRA_FOLD_CONFIG).messages);
+}
+
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 // ══════════════════════════════════════════════════════════════════════
@@ -108,23 +111,42 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
 // ══════════════════════════════════════════════════════════════════════
 
 describe('buildFoldIndex', () => {
-  test('replays inter-folded turns and scans intra-fold markers from the real pipeline', () => {
+  test('replays every marker-folded turn from the real continuous-fold pipeline', () => {
     const raw = buildAnthropicHistory();
     const index = indexFor(raw);
 
     const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
     const toolEntries = index.entries.filter((e): e is IntraTurnIndexEntry => e.kind === 'tool');
 
-    // Turn 1 folded behind the active window (window=1, 2 turns total).
-    expect(turnEntries).toHaveLength(1);
+    expect(turnEntries).toHaveLength(2);
     expect(turnEntries[0].rawStart).toBe(0);
     expect(turnEntries[0].rawEnd).toBe(4);
     expect(turnEntries[0].category).toBe('research');
     expect(turnEntries[0].paths).toEqual([BIGFILE]);
     expect(turnEntries[0].chars).toBeGreaterThan(3_000);
     expect(turnEntries[0].digest).toContain('bigfile');
+    expect(turnEntries[1].paths).toEqual([
+      'relay/src/helper0.ts',
+      'relay/src/helper1.ts',
+      'relay/src/helper2.ts',
+      'relay/src/helper3.ts',
+      'relay/src/helper4.ts',
+      'relay/src/helper5.ts',
+      'relay/src/helper6.ts',
+    ]);
+    expect(toolEntries).toHaveLength(0);
 
-    // Intra-fold pages out the 2 oldest of 7 results in the live turn.
+    expect(index.rawCount).toBe(raw.length);
+  });
+
+  test('scans intra-fold markers when no inter-turn fold block is present', () => {
+    const raw = buildAnthropicHistory();
+    const index = intraOnlyIndexFor(raw);
+
+    const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
+    const toolEntries = index.entries.filter((e): e is IntraTurnIndexEntry => e.kind === 'tool');
+
+    expect(turnEntries).toHaveLength(0);
     expect(toolEntries).toHaveLength(2);
     expect(toolEntries.map(e => e.toolId).sort()).toEqual(['tu_h0', 'tu_h1']);
     for (const e of toolEntries) {
@@ -152,10 +174,19 @@ describe('buildFoldIndex', () => {
 
     const index = indexFor(msgs);
     const toolEntries = index.entries.filter((e): e is IntraTurnIndexEntry => e.kind === 'tool');
-    expect(toolEntries.map(e => e.toolId).sort()).toEqual(['call_r0', 'call_r1']);
-    expect(toolEntries[0].path).toMatch(/^relay\/src\/rt[01]\.ts$/);
-    const turnEntries = index.entries.filter(e => e.kind === 'turn');
-    expect(turnEntries).toHaveLength(1);
+    expect(toolEntries).toHaveLength(0);
+    const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
+    expect(turnEntries).toHaveLength(2);
+    expect(turnEntries[0].paths).toEqual(['relay/src/config.ts']);
+    expect(turnEntries[1].paths).toEqual([
+      'relay/src/rt0.ts',
+      'relay/src/rt1.ts',
+      'relay/src/rt2.ts',
+      'relay/src/rt3.ts',
+      'relay/src/rt4.ts',
+      'relay/src/rt5.ts',
+      'relay/src/rt6.ts',
+    ]);
   });
 
   test('a fold marker QUOTED inside live tool output does not index (anchored matching)', () => {
@@ -196,7 +227,7 @@ describe('buildFoldIndex', () => {
 
     const index = buildFoldIndex(raw, view);
     const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
-    expect(turnEntries).toHaveLength(1);
+    expect(turnEntries).toHaveLength(2);
     expect(turnEntries[0].paths).toEqual(['relay/src/jobs.ts']);
   });
 
@@ -213,9 +244,9 @@ describe('buildFoldIndex', () => {
     expect(plan).not.toBeNull();
     const view = foldContext(raw, plan!.turnsToFold, ALWAYS_ON_FOLD_CONFIG, undefined, undefined, plan!.turns).messages;
 
-    // Without the tiling, detectTurns collapses to one turn → empty index.
+    // Without the tiling, detectTurns collapses to one coarse folded turn.
     const collapsed = buildFoldIndex(raw, view);
-    expect(collapsed.entries.length).toBe(0);
+    expect(collapsed.entries.length).toBe(1);
 
     // Passing detectTurns(raw) explicitly is byte-identical to omitting it (no FC/normal-path regression).
     expect(buildFoldIndex(raw, view, detectTurns(raw)).entries).toEqual(collapsed.entries);
@@ -461,8 +492,8 @@ describe('planRecall', () => {
     expect(plan.items.map(i => i.tier)).toEqual([0, 0, 1]);
     expect(plan.items[0].trigger).toBe('path-touch relay/src/touched.ts');
     expect(plan.items[2].trigger).toBe('claim relay/src/claimed.ts');
-    // Card budget (2) then hints.
-    expect(plan.items.map(i => i.render)).toEqual(['card', 'card', 'hint']);
+    // Default card budget (3) fits all three.
+    expect(plan.items.map(i => i.render)).toEqual(['card', 'card', 'card']);
   });
 
   test('resident card suppresses; resident hint escalates on a fresh hard trigger', () => {
@@ -471,7 +502,7 @@ describe('planRecall', () => {
       ['tool:a', { level: 'card' as const, expiresAtPass: 10 }],
       ['tool:b', { level: 'hint' as const, expiresAtPass: 10 }],
     ]);
-    const plan = planRecall(index, resident, new Map(), 5, { touchedPaths: ['relay/src/a.ts', 'relay/src/b.ts'], claimedPaths: [] }, 'healthy', config);
+    const plan = planRecall(index, resident, new Map(), 5, { touchedPaths: [], claimedPaths: ['relay/src/a.ts', 'relay/src/b.ts'] }, 'healthy', config);
     expect(plan.suppressed).toBe(1); // a (resident card)
     expect(plan.items).toHaveLength(1);
     expect(plan.items[0].entry.id).toBe('tool:b');
@@ -487,7 +518,7 @@ describe('planRecall', () => {
     expect(plan.items).toHaveLength(1);
   });
 
-  test('pressure ladder: critical allows 1 card; auto_compact allows none', () => {
+  test('pressure ladder: critical allows 1 card; auto_compact keeps a tier-0 floor', () => {
     const index = makeIndex([toolEntry('a', 'relay/src/a.ts', 10), toolEntry('b', 'relay/src/b.ts', 20)]);
     const signals = { touchedPaths: ['relay/src/a.ts', 'relay/src/b.ts'], claimedPaths: [] };
 
@@ -495,7 +526,7 @@ describe('planRecall', () => {
     expect(critical.items.map(i => i.render)).toEqual(['card', 'hint']);
 
     const autoCompact = planRecall(index, new Map(), new Map(), 1, signals, 'auto_compact', config);
-    expect(autoCompact.items.map(i => i.render)).toEqual(['hint', 'hint']);
+    expect(autoCompact.items.map(i => i.render)).toEqual(['card', 'hint']);
   });
 
   test('pure: never mutates the residency map', () => {
@@ -695,7 +726,14 @@ describe('buildFoldRecallContext', () => {
     return state;
   }
 
+  function freshIntraState(raw: FoldMessage[]) {
+    const state = createFoldRecallState();
+    state.index = intraOnlyIndexFor(raw);
+    return state;
+  }
+
   const touchBigfile = () => extractRecallSignals({ file_path: ABS(BIGFILE) }, new Set());
+  const claimBigfile = () => extractRecallSignals(null, new Set([ABS(BIGFILE)]));
 
   test('tier-0 path re-touch pages folded turn content back in as a card', () => {
     const raw = buildAnthropicHistory();
@@ -893,19 +931,19 @@ describe('buildFoldRecallContext', () => {
       raw.length,
     );
 
-    // Pass 1: touch alpha → matches the burst entry. Card injected; residency
+    // Pass 1: claim alpha → matches the burst entry. Card injected; residency
     // keys on matchedPath (alpha), NOT the zone.
-    const out1 = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(alpha) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+    const out1 = buildFoldRecallContext(state, raw, extractRecallSignals(null, new Set([ABS(alpha)])), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out1.cards).toBe(1);
-    expect(out1.text!).toContain('trigger: path-touch relay/src/alpha.ts');
+    expect(out1.text!).toContain('trigger: claim relay/src/alpha.ts');
 
-    // Pass 2: touch beta → the burst entry is entry-resident (suppressed), but
+    // Pass 2: claim beta → the burst entry is entry-resident (suppressed), but
     // the later-beta entry is a different entry and must still produce a card.
     // If residency incorrectly used the zone, beta would be path-resident from
     // pass 1 and the later-beta entry would be suppressed too.
-    const out2 = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(beta) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+    const out2 = buildFoldRecallContext(state, raw, extractRecallSignals(null, new Set([ABS(beta)])), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out2.cards).toBe(1);
-    expect(out2.text!).toContain('trigger: path-touch relay/src/beta.ts');
+    expect(out2.text!).toContain('trigger: claim relay/src/beta.ts');
   });
 
   test('wide burst: enrichment is proximity-ordered and top-K capped, body is not', () => {
@@ -1112,15 +1150,15 @@ describe('buildFoldRecallContext', () => {
     expect(out.text).toContain('pathless demand-paging reel now follows');
   });
 
-  test('residency suppresses immediate re-recall; TTL expiry re-enables', () => {
+  test('claim residency suppresses immediate re-recall; TTL expiry re-enables', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
 
-    const first = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', config);
+    const first = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
     expect(first.cards).toBe(1);
 
-    const second = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', config);
+    const second = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
     expect(second.text).toBeNull();
     expect(second.suppressed).toBe(1);
 
@@ -1129,15 +1167,15 @@ describe('buildFoldRecallContext', () => {
     buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
     buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
 
-    const fourth = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', config);
+    const fourth = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
     expect(fourth.cards).toBe(1); // pass 5 ≥ expiresAtPass 4 → re-recallable
   });
 
-  test('sliding residency keeps repeated matching signals suppressed', () => {
+  test('sliding claim residency keeps repeated matching signals suppressed', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
-    const signals = touchBigfile();
+    const signals = claimBigfile();
 
     let cards = 0;
     let suppressed = 0;
@@ -1156,7 +1194,7 @@ describe('buildFoldRecallContext', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
-    const signals = touchBigfile();
+    const signals = claimBigfile();
     const unrelated = extractRecallSignals({ file_path: ABS('relay/src/unrelated.ts') }, new Set());
 
     expect(buildFoldRecallContext(state, raw, signals, 'healthy', config).cards).toBe(1);
@@ -1167,11 +1205,11 @@ describe('buildFoldRecallContext', () => {
     expect(buildFoldRecallContext(state, raw, signals, 'healthy', config).cards).toBe(1);
   });
 
-  test('sliding path residency survives an index rebuild without re-injecting', () => {
+  test('sliding claim-path residency survives an index rebuild without re-injecting', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
-    const signals = touchBigfile();
+    const signals = claimBigfile();
 
     const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(first.cards).toBe(1);
@@ -1195,17 +1233,17 @@ describe('buildFoldRecallContext', () => {
     expect(state.cardsInjected).toBe(1);
   });
 
-  test('auto_compact injects a hint; the next hard trigger at healthy escalates it to a card', () => {
+  test('claim auto_compact injects a hint; the next hard trigger at healthy escalates it to a card', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
 
-    const hinted = buildFoldRecallContext(state, raw, touchBigfile(), 'auto_compact', DEFAULT_FOLD_RECALL_CONFIG);
+    const hinted = buildFoldRecallContext(state, raw, claimBigfile(), 'auto_compact', DEFAULT_FOLD_RECALL_CONFIG);
     expect(hinted.cards).toBe(0);
     expect(hinted.hints).toBe(1);
     expect(hinted.text!).toContain(RECALL_HINT_PREFIX);
     expect(hinted.text!).not.toContain('BIGFILE CONTENT START');
 
-    const escalated = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+    const escalated = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(escalated.cards).toBe(1);
     expect(escalated.hints).toBe(0);
     expect(escalated.text!).toContain('BIGFILE CONTENT START');
@@ -1235,7 +1273,7 @@ describe('buildFoldRecallContext', () => {
 
     // Measure the natural card size for this trigger, then craft a budget
     // that fits one card plus a hint but not two cards.
-    const probeState = freshState(raw);
+    const probeState = freshIntraState(raw);
     const probe = buildFoldRecallContext(
       probeState,
       raw,
@@ -1246,7 +1284,7 @@ describe('buildFoldRecallContext', () => {
     expect(probe.cards).toBe(2);
 
     const oneCardChars = Math.ceil(probe.chars / 2);
-    const state = freshState(raw);
+    const state = freshIntraState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, maxTotalChars: oneCardChars + 300 };
     const out = buildFoldRecallContext(state, raw, extractRecallSignals({ paths: [ABS('relay/src/helper0.ts'), ABS('relay/src/helper1.ts')] }, new Set()), 'healthy', config);
     expect(out.cards).toBe(1);
@@ -1257,7 +1295,7 @@ describe('buildFoldRecallContext', () => {
 
   test('intra-turn entry recalls the ORIGINAL pre-fold tool result body by tool id', () => {
     const raw = buildAnthropicHistory();
-    const state = freshState(raw);
+    const state = freshIntraState(raw);
     const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS('relay/src/helper0.ts') }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out.cards).toBe(1);
     expect(out.text!).toContain('Read relay/src/helper0.ts');
@@ -1355,7 +1393,7 @@ describe('resolveFoldRecallConfig', () => {
     expect(tuned.termRecallEnabled).toBe(false);
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_TERMS: '1' }).termRecallEnabled).toBe(true);
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_TERMS: 'on' }).termRecallEnabled).toBe(true);
-    expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_MAX_CARDS: 'junk' }).maxCards).toBe(2);
+    expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_MAX_CARDS: 'junk' }).maxCards).toBe(3);
     // Verbatim tier is default ON; only explicit disable values turn it off.
     expect(tuned.verbatimRecallEnabled).toBe(true);
     expect(resolveFoldRecallConfig({}).verbatimRecallEnabled).toBe(true);
@@ -1401,7 +1439,7 @@ describe('recall feedback-loop + rebuild-survival', () => {
     const state = createFoldRecallState();
     state.index = indexFor(raw);
     const config = DEFAULT_FOLD_RECALL_CONFIG;
-    const signals = extractRecallSignals({ file_path: ABS(BIGFILE) }, new Set());
+    const signals = extractRecallSignals(null, new Set([ABS(BIGFILE)]));
 
     // First recall card for the bigfile turn.
     const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
@@ -1416,7 +1454,7 @@ describe('recall feedback-loop + rebuild-survival', () => {
     raw.push(assistantMsg('Working the next item now.'));
     state.index = indexFor(raw);
 
-    // Immediate re-touch: suppressed by PATH residency despite the new entry ids.
+    // Immediate re-claim: suppressed by PATH residency despite the new entry ids.
     const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(second.text).toBeNull();
     expect(second.suppressed).toBeGreaterThan(0);
@@ -1568,16 +1606,16 @@ describe('buildFoldIndex — bash-path participation', () => {
     const raw = buildBashHistory();
     const index = indexFor(raw);
     const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
-    expect(turnEntries).toHaveLength(1);
-    expect(turnEntries[0].paths).toContain(BIGFILE);
+    expect(turnEntries).toHaveLength(2);
+    expect(turnEntries.some(e => e.paths.includes(BIGFILE))).toBe(true);
   });
 
   test('run_bash (OpenAI format) in an inter-folded turn contributes to entry paths', () => {
     const raw = buildOpenAIRunBashHistory();
     const index = indexFor(raw);
     const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
-    expect(turnEntries).toHaveLength(1);
-    expect(turnEntries[0].paths).toContain(BIGFILE);
+    expect(turnEntries).toHaveLength(2);
+    expect(turnEntries.some(e => e.paths.includes(BIGFILE))).toBe(true);
   });
 });
 

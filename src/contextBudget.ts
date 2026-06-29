@@ -94,23 +94,41 @@ export type ContextBudgetEvictionPolicy =
 
 export interface ContextBudgetEnv {
   VOXXO_FOLD_TARGET_BAND_TOKENS?: string;
+  WARP_FOLD_TARGET_BAND_TOKENS?: string;
   VOXXO_FOLD_TRIGGER_TOKENS?: string;
+  WARP_FOLD_TRIGGER_TOKENS?: string;
   VOXXO_FOLD_BAND_MAX_WINDOW_FRACTION?: string;
+  WARP_FOLD_BAND_MAX_WINDOW_FRACTION?: string;
   VOXXO_FOLD_PRESSURE_CEILING_TOKENS?: string;
+  WARP_FOLD_PRESSURE_CEILING_TOKENS?: string;
   VOXXO_FOLD_PRESSURE_MAX_WINDOW_FRACTION?: string;
+  WARP_FOLD_PRESSURE_MAX_WINDOW_FRACTION?: string;
   VOXXO_FOLD_APPEND_ONLY_MAX_WINDOW_FRACTION?: string;
+  WARP_FOLD_APPEND_ONLY_MAX_WINDOW_FRACTION?: string;
   VOXXO_FOLD_PREFIX_SATURATION_FRACTION?: string;
+  WARP_FOLD_PREFIX_SATURATION_FRACTION?: string;
   VOXXO_FOLD_TOOLRESULT_HEADROOM_SAFETY?: string;
+  WARP_FOLD_TOOLRESULT_HEADROOM_SAFETY?: string;
   VOXXO_FOLD_TOOLRESULT_MIN_WINDOW_FRACTION?: string;
+  WARP_FOLD_TOOLRESULT_MIN_WINDOW_FRACTION?: string;
   VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS?: string;
+  WARP_FOLD_APPEND_BAND_TARGET_TOKENS?: string;
   VOXXO_FOLD_TAIL_EPOCH_BAND_FRACTION?: string;
+  WARP_FOLD_TAIL_EPOCH_BAND_FRACTION?: string;
   VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS?: string;
+  WARP_FOLD_TAIL_EPOCH_RUNWAY_TOKENS?: string;
   VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS?: string;
+  WARP_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS?: string;
   VOXXO_FOLD_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS?: string;
+  WARP_FOLD_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS?: string;
   VOXXO_FOLD_OUTPUT_RESERVE_TOKENS?: string;
+  WARP_FOLD_OUTPUT_RESERVE_TOKENS?: string;
   VOXXO_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS?: string;
+  WARP_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS?: string;
   VOXXO_FOLD_EMERGENCY_MARGIN_TOKENS?: string;
+  WARP_FOLD_EMERGENCY_MARGIN_TOKENS?: string;
   VOXXO_FOLD_UNSAFE_DEV_OVERRIDES?: string;
+  WARP_FOLD_UNSAFE_DEV_OVERRIDES?: string;
   [key: string]: string | undefined;
 }
 
@@ -235,6 +253,10 @@ function parseFraction(raw: string | undefined): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 && parsed <= 1 ? parsed : undefined;
 }
 
+function envAlias(env: ContextBudgetEnv, voxxoKey: string, warpKey: string): string | undefined {
+  return env[voxxoKey] ?? env[warpKey];
+}
+
 function resolveFraction(option: number | undefined, envRaw: string | undefined, fallback: number): number {
   const numericOption = positiveNumber(option);
   return numericOption !== undefined && numericOption <= 1
@@ -352,18 +374,18 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   const limitSource = classifyLimitSource(model, engine, explicitWindowTokens !== undefined);
   const budgetTier = classifyTier(contextWindowTokens, limitSource);
   const unsafeDevOverrides = input.unsafeDevOverrides === true
-    || isEnabled(env.VOXXO_FOLD_UNSAFE_DEV_OVERRIDES);
+    || isEnabled(envAlias(env, 'VOXXO_FOLD_UNSAFE_DEV_OVERRIDES', 'WARP_FOLD_UNSAFE_DEV_OVERRIDES'));
   const hardWindowTokens = contextWindowTokens;
   const charsPerToken = positiveNumber(input.charsPerToken) ?? DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN;
 
   const outputReserveTokens = positiveInt(input.outputReserveTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_OUTPUT_RESERVE_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_OUTPUT_RESERVE_TOKENS', 'WARP_FOLD_OUTPUT_RESERVE_TOKENS'))
     ?? defaultOutputReserveTokens(hardWindowTokens);
   const systemToolsReserveTokens = positiveInt(input.systemToolsReserveTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS', 'WARP_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS'))
     ?? defaultSystemToolsReserveTokens(hardWindowTokens);
   const emergencyMarginTokens = positiveInt(input.emergencyMarginTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_EMERGENCY_MARGIN_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_EMERGENCY_MARGIN_TOKENS', 'WARP_FOLD_EMERGENCY_MARGIN_TOKENS'))
     ?? defaultEmergencyMarginTokens(hardWindowTokens);
   const messageCeilingTokens = Math.max(
     1,
@@ -371,11 +393,11 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   );
 
   const requestedBandTokens = positiveInt(input.targetBandTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_TARGET_BAND_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TARGET_BAND_TOKENS', 'WARP_FOLD_TARGET_BAND_TOKENS'))
     ?? DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS;
   const bandMaxWindowFraction = resolveFraction(
     input.bandMaxWindowFraction,
-    env.VOXXO_FOLD_BAND_MAX_WINDOW_FRACTION,
+    envAlias(env, 'VOXXO_FOLD_BAND_MAX_WINDOW_FRACTION', 'WARP_FOLD_BAND_MAX_WINDOW_FRACTION'),
     DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION,
   );
   const bandWindowClamp = unsafeDevOverrides
@@ -389,7 +411,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
 
   const pressureMaxWindowFraction = resolveFraction(
     input.pressureMaxWindowFraction,
-    env.VOXXO_FOLD_PRESSURE_MAX_WINDOW_FRACTION,
+    envAlias(env, 'VOXXO_FOLD_PRESSURE_MAX_WINDOW_FRACTION', 'WARP_FOLD_PRESSURE_MAX_WINDOW_FRACTION'),
     DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION,
   );
   const codexCliDefaultReconstructTriggerTokens = codexCliFullRecomputeOnly
@@ -403,11 +425,12 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     ? DEFAULT_CONTEXT_BUDGET_CLAUDE_API_PRESSURE_CEILING_TOKENS
     : null;
   let pressureCeilingTokens: number | null;
-  if (input.pressureCeilingTokens === null || isDisabled(env.VOXXO_FOLD_PRESSURE_CEILING_TOKENS)) {
+  const pressureCeilingEnv = envAlias(env, 'VOXXO_FOLD_PRESSURE_CEILING_TOKENS', 'WARP_FOLD_PRESSURE_CEILING_TOKENS');
+  if (input.pressureCeilingTokens === null || isDisabled(pressureCeilingEnv)) {
     pressureCeilingTokens = null;
   } else {
     const requestedPressure = positiveInt(input.pressureCeilingTokens)
-      ?? parsePositiveInt(env.VOXXO_FOLD_PRESSURE_CEILING_TOKENS)
+      ?? parsePositiveInt(pressureCeilingEnv)
       ?? codexCliDefaultReconstructTriggerTokens
       ?? claudeApiDefaultPressureCeilingTokens
       ?? clampPositiveTokensToWindow(
@@ -423,7 +446,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   // when measured occupancy crosses this, then crush back toward the band — so M40
   // is the orbit, NOT the trigger. Tiny windows clamp the trigger down to the ceiling.
   const requestedFoldTriggerTokens = positiveInt(input.foldTriggerTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_TRIGGER_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TRIGGER_TOKENS', 'WARP_FOLD_TRIGGER_TOKENS'))
     ?? codexCliDefaultReconstructTriggerTokens
     ?? DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS;
   const foldTriggerUpperBound = Math.min(
@@ -436,7 +459,8 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
 
   const appendOnlyMaxWindowFraction = resolveFraction(
     input.appendOnlyMaxWindowFraction,
-    env.VOXXO_FOLD_APPEND_ONLY_MAX_WINDOW_FRACTION ?? env.VOXXO_FOLD_PREFIX_SATURATION_FRACTION,
+    envAlias(env, 'VOXXO_FOLD_APPEND_ONLY_MAX_WINDOW_FRACTION', 'WARP_FOLD_APPEND_ONLY_MAX_WINDOW_FRACTION')
+      ?? envAlias(env, 'VOXXO_FOLD_PREFIX_SATURATION_FRACTION', 'WARP_FOLD_PREFIX_SATURATION_FRACTION'),
     DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION,
   );
   const rawPrefixSaturationTokens = Number.isFinite(hardWindowTokens) && hardWindowTokens > 0
@@ -468,18 +492,18 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   // overrides and the messageCeiling−band clamp still bound the result.
   const tailEpochBandFraction = resolveFraction(
     input.tailEpochBandFraction,
-    env.VOXXO_FOLD_TAIL_EPOCH_BAND_FRACTION,
+    envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_BAND_FRACTION', 'WARP_FOLD_TAIL_EPOCH_BAND_FRACTION'),
     DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION,
   );
   const appendBandTargetTokens = positiveInt(input.appendBandTargetTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS', 'WARP_FOLD_APPEND_BAND_TARGET_TOKENS'))
     ?? DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS;
   const explicitTailEpochRunwayTokens = positiveInt(input.tailEpochRunwayTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS);
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS', 'WARP_FOLD_TAIL_EPOCH_RUNWAY_TOKENS'));
   const tailEpochRunwayTokens = explicitTailEpochRunwayTokens
     ?? DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
   const tailEpochMinRunwayTokens = positiveInt(input.tailEpochMinRunwayTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS', 'WARP_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS'))
     ?? (explicitTailEpochRunwayTokens === undefined
       ? Math.min(tailEpochRunwayTokens, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
       : tailEpochRunwayTokens);
@@ -487,7 +511,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     ? defaultTailEpochPressureMarginTokens(hardWindowTokens)
     : Math.max(0, pressureCeilingTokens - systemToolsReserveTokens - bandTokens - tailEpochRunwayTokens);
   const tailEpochPressureMarginTokens = positiveInt(input.tailEpochPressureMarginTokens)
-    ?? parsePositiveInt(env.VOXXO_FOLD_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS', 'WARP_FOLD_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS'))
     ?? defaultPressureMarginTokens;
   const bandFractionTailTokens = Math.max(1, Math.round(bandTokens * tailEpochBandFraction));
   const pressureGeometryTailTokens = pressureCeilingTokens === null
@@ -507,12 +531,12 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
 
   const toolResultHeadroomSafety = resolveFraction(
     input.toolResultHeadroomSafety,
-    env.VOXXO_FOLD_TOOLRESULT_HEADROOM_SAFETY,
+    envAlias(env, 'VOXXO_FOLD_TOOLRESULT_HEADROOM_SAFETY', 'WARP_FOLD_TOOLRESULT_HEADROOM_SAFETY'),
     DEFAULT_CONTEXT_BUDGET_TOOLRESULT_HEADROOM_SAFETY,
   );
   const toolResultMinWindowFraction = resolveFraction(
     input.toolResultMinWindowFraction,
-    env.VOXXO_FOLD_TOOLRESULT_MIN_WINDOW_FRACTION,
+    envAlias(env, 'VOXXO_FOLD_TOOLRESULT_MIN_WINDOW_FRACTION', 'WARP_FOLD_TOOLRESULT_MIN_WINDOW_FRACTION'),
     DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION,
   );
 

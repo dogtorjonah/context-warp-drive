@@ -214,6 +214,39 @@ describe('resolveContextBudget', () => {
     expect(overridden.foldTriggerTokens).toBe(120_000);
   });
 
+  it('accepts public WARP_* budget aliases while preserving VOXXO_* precedence', () => {
+    const warp = resolveContextBudget({
+      engine: 'claude',
+      model: 'claude-sonnet-4',
+      env: {
+        WARP_FOLD_TARGET_BAND_TOKENS: '30000',
+        WARP_FOLD_TRIGGER_TOKENS: '120000',
+        WARP_FOLD_PRESSURE_CEILING_TOKENS: '130000',
+        WARP_FOLD_OUTPUT_RESERVE_TOKENS: '17000',
+        WARP_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS: '18000',
+        WARP_FOLD_EMERGENCY_MARGIN_TOKENS: '9000',
+      },
+    });
+
+    expect(warp.requestedBandTokens).toBe(30_000);
+    expect(warp.bandTokens).toBe(30_000);
+    expect(warp.foldTriggerTokens).toBe(120_000);
+    expect(warp.pressureCeilingTokens).toBe(130_000);
+    expect(warp.outputReserveTokens).toBe(17_000);
+    expect(warp.systemToolsReserveTokens).toBe(18_000);
+    expect(warp.emergencyMarginTokens).toBe(9_000);
+
+    const precedence = resolveContextBudget({
+      engine: 'claude',
+      model: 'claude-sonnet-4',
+      env: {
+        VOXXO_FOLD_TARGET_BAND_TOKENS: '31000',
+        WARP_FOLD_TARGET_BAND_TOKENS: '30000',
+      },
+    });
+    expect(precedence.requestedBandTokens).toBe(31_000);
+  });
+
   it('clamps unsafe oversized overrides unless the unsafe dev escape hatch is explicit', () => {
     const safe = resolveContextBudget({
       engine: 'claude',

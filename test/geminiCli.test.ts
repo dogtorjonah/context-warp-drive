@@ -48,6 +48,8 @@ describe('Gemini CLI fold policy', () => {
     expect(resolveGeminiCliFoldMode(undefined, { VOXXO_GEMINI_CLI_FOLD: 'off' })).toBe('off');
     expect(resolveGeminiCliFoldMode(undefined, { VOXXO_GEMINI_CLI_FOLD: 'false' })).toBe('off');
     expect(resolveGeminiCliFoldMode(undefined, { VOXXO_GEMINI_CLI_FOLD: 'dry-run' })).toBe('dry-run');
+    expect(resolveGeminiCliFoldMode(undefined, { WARP_GEMINI_CLI_FOLD: 'off' })).toBe('off');
+    expect(resolveGeminiCliFoldMode(undefined, { VOXXO_GEMINI_CLI_FOLD: 'dry-run', WARP_GEMINI_CLI_FOLD: 'off' })).toBe('dry-run');
     expect(resolveGeminiCliFoldMode('on', { VOXXO_GEMINI_CLI_FOLD: 'off' })).toBe('on');
 
     expect(getPositiveIntEnv('K', 42, {})).toBe(42);
@@ -55,6 +57,17 @@ describe('Gemini CLI fold policy', () => {
     expect(getPositiveIntEnv('K', 42, { K: '-5' })).toBe(42);
     expect(getPositiveIntEnv('K', 42, { K: 'oops' })).toBe(42);
     expect(getPositiveIntEnv('K', 42, { K: '100000' })).toBe(100_000);
+    expect(getPositiveIntEnv(['OLD', 'NEW'], 42, { NEW: '100000' })).toBe(100_000);
+    expect(getPositiveIntEnv(['OLD', 'NEW'], 42, { OLD: '90000', NEW: '100000' })).toBe(90_000);
+
+    const warpPolicy = resolveGeminiCliFoldPolicy({
+      env: {
+        WARP_GEMINI_CLI_FOLD_TARGET_TOKENS: '260000',
+        WARP_GEMINI_CLI_FOLD_BAND_TOKENS: '110000',
+      },
+    });
+    expect(warpPolicy.targetTokens).toBe(260_000);
+    expect(warpPolicy.bandTokens).toBe(110_000);
   });
 });
 
