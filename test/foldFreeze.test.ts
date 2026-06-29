@@ -232,10 +232,12 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     const appended = appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
 
     expect(appended).not.toBeNull();
-    expect(appended?.sealedPrefixMessageCount).toBe(view.length);
-    expect(appended?.view).toHaveLength(view.length + tailFolded.length);
-    for (let i = 0; i < view.length; i++) expect(appended?.view[i]).toBe(view[i]);
-    expect(appended?.view[view.length]).toBe(tailFolded[0]);
+    if (!appended) throw new Error('Expected tail epoch append to produce a frozen view');
+    if (!appended.view) throw new Error('Expected tail epoch append to include a view');
+    expect(appended.sealedPrefixMessageCount).toBe(view.length);
+    expect(appended.view).toHaveLength(view.length + tailFolded.length);
+    for (let i = 0; i < view.length; i++) expect(appended.view[i]).toBe(view[i]);
+    expect(appended.view[view.length]).toBe(tailFolded[0]);
     expect(state.frozenRawCount).toBe(grown.length);
     expect(state.frozenView?.slice(0, view.length)).toEqual(view);
     expect(state.lastAppendBoundaryViewCount).toBe(view.length);

@@ -79,20 +79,20 @@ async function runAgent(task: string): Promise<void> {
         `sealedBoundary=${sealedBoundary ?? 'none'}`,
     );
 
-    // Step 2: Inject cache breakpoints. This is the only provider-specific call:
-    //   - tool + stable-system breakpoints cache static harness material
-    //   - sealedBoundary caches the frozen rebirth/fold band once established
-    //   - rolling breakpoint on the last message caches the append-only tail
+    // Step 2: Inject cache breakpoints with hybrid TTL:
+    //   - prefixTtl '1h': tools, system, sealed fold boundary — stable, survives idle gaps
+    //   - tailTtl '5m': rolling last-message — changes every call, 5m sliding window is enough
     const cached = prepareAnthropicCachedRequest({
       messages: messages as Message[],
       sealedBoundary,
       system: SYSTEM_PROMPT,
       tools: TOOLS,
+      prefixTtl: '1h',   // rebirth seed + system + tools survive long idle gaps
+      tailTtl: '5m',     // rolling tail refreshes every API call
     });
 
-    // Step 3: Send to Anthropic. No beta header needed for default 5m TTL.
-    // Pass ttl: '1h' to prepareAnthropicCachedRequest only for human-paced gaps;
-    // the returned requestOptions then carries the required anthropic-beta flag.
+    // Step 3: Send to Anthropic. When prefixTtl is '1h', requestOptions
+    // automatically carries the required anthropic-beta header.
     const response = await callAnthropic(cached.request, cached.requestOptions);
 
     // Step 4: Append to raw history (append-only — never mutate past messages).

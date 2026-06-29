@@ -8,13 +8,13 @@
 
 import { contextWindowForModel } from './contextWindow.ts';
 
-// Context Warp geometry signposts (Jonah, 2026-06-19):
+// Context Warp geometry signposts (Jonah, 2026-06-19; P bumped to 180K 2026-06-29):
 //   S = 37K static system/tools prefix reserve (provider-measured floor model)
 //   M = 40K folded memory after full recompute
 //   A = 5K expected appended folded-tail band
 //   T = 10K preferred/default live-tail runway
 //   F = 10K default append runway floor (explicit overrides can keep a larger floor)
-//   P = 150K normal pressure ceiling
+//   P = 180K universal pressure ceiling (was 150K; fraction clamp protects small windows)
 //   CLI codex = full-recompute-only transport, using the shared trigger by
 //               default while still clamping to message ceiling − F runway
 //
@@ -33,21 +33,19 @@ export const DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS =
 /**
  * Fold TRIGGER ceiling — peak measured prompt tokens before engines that gate
  * folding on a token threshold should reconstruct. Distinct from the steady-state
- * band (M=40K folded memory) and the pressure ceiling (P=150K hard relief). FC
+ * band (M=40K folded memory) and the pressure ceiling (P=180K hard relief). FC
  * folds continuously and uses the band/tail runway instead; CLI engines read
  * foldTriggerTokens and clamp it under pressureCeilingTokens.
  */
-export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 150_000;
+export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 180_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
 export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
-export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 150_000;
-// Claude API keeps its model context window denominator, but relief should fire at 180K.
-export const DEFAULT_CONTEXT_BUDGET_CLAUDE_API_PRESSURE_CEILING_TOKENS = 180_000;
+export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 180_000;
 // Claude Code CLI hard-epoch ceiling. The Claude CLI surfaces (claude /
 // claude-cli / claude-interactive) cannot fold in-process
 // (engineSupportsRollingFold=false), so instead of mid-stream folding the relay
 // fires an in-place session-swap rebirth ("hard epoch") once provider-MEASURED
-// context tokens cross this threshold. Same 180K value/intent as the Claude API
+// context tokens cross this threshold. Same 180K value/intent as the universal
 // pressure ceiling above, but kept as a distinct named constant because the two
 // mechanisms (in-process fold relief vs out-of-process session swap) can diverge
 // independently. Consumed by relay handleResultEvent (instanceManager/eventHandlers.ts).
@@ -59,11 +57,11 @@ export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION = 0.15;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION = 0.25;
 /**
  * Headroom (tokens) kept between S + M + T and the pressure ceiling. For the
- * default 1M-class geometry this is P150 − S37 − M40 − T10 = 63K, which keeps
+ * default 1M-class geometry this is P180 − S37 − M40 − T10 = 93K, which keeps
  * the append trigger aggressive enough to skeletonize the unfrozen tail instead
  * of preserving a giant raw runway.
  */
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 63_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 93_000;
 /** Absolute floor for the tail-epoch cap so a tight window never collapses to a ~0 tail (fold-every-turn pathology). */
 export const MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS = 4_000;
 
@@ -343,10 +341,6 @@ function isCodexCliEngine(engine: string): boolean {
   return engine.trim().toLowerCase() === 'codex';
 }
 
-function isClaudeApiEngine(engine: string): boolean {
-  return engine.trim().toLowerCase() === 'claude-api';
-}
-
 function defaultCodexCliReconstructTriggerTokens(
   messageCeilingTokens: number,
   hardWindowTokens: number,
@@ -421,9 +415,6 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
       pressureMaxWindowFraction,
     )
     : null;
-  const claudeApiDefaultPressureCeilingTokens = isClaudeApiEngine(engine)
-    ? DEFAULT_CONTEXT_BUDGET_CLAUDE_API_PRESSURE_CEILING_TOKENS
-    : null;
   let pressureCeilingTokens: number | null;
   const pressureCeilingEnv = envAlias(env, 'VOXXO_FOLD_PRESSURE_CEILING_TOKENS', 'WARP_FOLD_PRESSURE_CEILING_TOKENS');
   if (input.pressureCeilingTokens === null || isDisabled(pressureCeilingEnv)) {
@@ -432,7 +423,6 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     const requestedPressure = positiveInt(input.pressureCeilingTokens)
       ?? parsePositiveInt(pressureCeilingEnv)
       ?? codexCliDefaultReconstructTriggerTokens
-      ?? claudeApiDefaultPressureCeilingTokens
       ?? clampPositiveTokensToWindow(
         DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS,
         hardWindowTokens,

@@ -48,13 +48,21 @@
  *
  * ## TTL
  *
- * All breakpoints carry the same TTL. `'5m'` (default) uses the legacy
- * sliding window (1.25× input write). Since agent loops hit every few
- * seconds the cache never expires during continuous work — reads refresh
- * the TTL. `'1h'` uses the extended cache TTL (2× input write, but survives
- * >5-minute turn gaps). Pass `ttl: '1h'` to opt into the extended behavior.
- * The `'1h'` TTL requires the `anthropic-beta: extended-cache-ttl-2025-04-11`
- * header on the request — see {@link EXTENDED_CACHE_TTL_BETA}.
+ * By default all breakpoints carry the same TTL: `'5m'` (legacy sliding
+ * window, 1.25× input write). Agent loops refresh it every few seconds so
+ * the cache stays warm during continuous work.
+ *
+ * **Hybrid TTL** (recommended): pass `prefixTtl: '1h'` for the stable
+ * prefix (tools, system, sealed fold boundary) and `tailTtl: '5m'` for the
+ * rolling last-message breakpoint. The prefix rarely changes — paying 2×
+ * input once keeps it cached across human-paced gaps (>5 min) and rebirth
+ * boundaries. The tail changes every API call, so 5m is sufficient.
+ *
+ * Pass `ttl` alone to apply a single TTL to all breakpoints (backward
+ * compatible). `prefixTtl` and `tailTtl` override `ttl` for their respective
+ * breakpoints. The `'1h'` TTL requires the
+ * `anthropic-beta: extended-cache-ttl-2025-04-11` header — automatically
+ * included when either TTL is `'1h'`. See {@link EXTENDED_CACHE_TTL_BETA}.
  *
  * Max 4 breakpoints per Anthropic request. The `prepareAnthropicCachedRequest`
  * helper spends them in the same order as the request (`tools` → `system` →
@@ -181,18 +189,24 @@ export function applyCacheBreakpoints(
   options?: {
     sealedBoundary?: number | null;
     ttl?: CacheTtl;
+    /** TTL for the sealed fold/rebirth boundary breakpoint. Falls back to `ttl`. */
+    prefixTtl?: CacheTtl;
+    /** TTL for the rolling last-message breakpoint. Falls back to `ttl`. */
+    tailTtl?: CacheTtl;
   },
 ): Message[] {
   if (messages.length === 0) return messages;
-  const ttl = options?.ttl ?? '5m';
+  const baseTtl = options?.ttl ?? '5m';
+  const sealedTtl = options?.prefixTtl ?? baseTtl;
+  const rollingTtl = options?.tailTtl ?? baseTtl;
   let out: Message[] | null = null;
 
-  const markLastBlock = (messageIndex: number): void => {
+  const markLastBlock = (messageIndex: number, blockTtl: CacheTtl): void => {
     const target = (out ?? messages)[messageIndex];
     if (!target || !Array.isArray(target.content) || target.content.length === 0) return;
     const blocks = target.content.slice();
     const blockIdx = blocks.length - 1;
-    blocks[blockIdx] = { ...blocks[blockIdx], cache_control: ephemeralCacheControl(ttl) } as ContentBlock;
+    blocks[blockIdx] = { ...blocks[blockIdx], cache_control: ephemeralCacheControl(blockTtl) } as ContentBlock;
     if (!out) out = messages.slice();
     out[messageIndex] = { ...target, content: blocks } as Message;
   };
@@ -205,11 +219,11 @@ export function applyCacheBreakpoints(
     && sealedBoundary > 0
     && sealedBoundary < messages.length
   ) {
-    markLastBlock(sealedBoundary - 1);
+    markLastBlock(sealedBoundary - 1, sealedTtl);
   }
 
   // Rolling breakpoint (caches the full append-only prefix up to now)
-  markLastBlock(messages.length - 1);
+  markLastBlock(messages.length - 1, rollingTtl);
   return out ?? messages;
 }
 
@@ -321,29 +335,47 @@ export function prepareAnthropicCachedRequest<T extends ToolSpec = ToolSpec>(inp
   readonly sealedBoundary?: number | null;
   readonly system?: string | SystemBlock[];
   readonly tools?: T[];
+  /** Default cache TTL for all breakpoints. Falls back to `'5m'`. */
   readonly ttl?: CacheTtl;
+  /**
+   * TTL for stable prefix content: tools, system prompt, and the sealed
+   * fold/rebirth boundary. Falls back to `ttl`. Set to `'1h'` to keep the
+   * prefix cached across human-paced idle gaps (pays 2× write once, reads at
+   * 0.1× for up to an hour).
+   */
+  readonly prefixTtl?: CacheTtl;
+  /**
+   * TTL for the rolling last-message breakpoint (the append-only tail).
+   * Falls back to `ttl`. `'5m'` is usually sufficient since agent loops
+   * refresh it every few seconds and the tail changes on every API call.
+   */
+  readonly tailTtl?: CacheTtl;
   readonly cacheSystem?: boolean;
   readonly cacheTools?: boolean;
   readonly stableSystemPrefixMarker?: string | null;
 }): PreparedAnthropicCachedRequest<T> {
-  const ttl = input.ttl ?? '5m';
+  const baseTtl = input.ttl ?? '5m';
+  const prefixTtl = input.prefixTtl ?? baseTtl;
+  const tailTtl = input.tailTtl ?? baseTtl;
   const request: MutablePreparedAnthropicRequest<T> = {
     messages: applyCacheBreakpoints(input.messages, {
       sealedBoundary: input.sealedBoundary,
-      ttl,
+      prefixTtl,
+      tailTtl,
     }),
   };
   if (input.system !== undefined) {
     request.system = input.cacheSystem === false
       ? input.system
-      : applySystemCacheBreakpoint(input.system, ttl, {
+      : applySystemCacheBreakpoint(input.system, prefixTtl, {
         stablePrefixMarker: input.stableSystemPrefixMarker,
       });
   }
   if (input.tools !== undefined) {
-    request.tools = input.cacheTools === false ? input.tools : applyToolsCacheBreakpoint(input.tools, ttl);
+    request.tools = input.cacheTools === false ? input.tools : applyToolsCacheBreakpoint(input.tools, prefixTtl);
   }
-  const anthropicBeta = cacheTtlBetaHeader(ttl);
+  // Beta header required if ANY breakpoint uses the extended 1h TTL.
+  const anthropicBeta = (prefixTtl === '1h' || tailTtl === '1h') ? EXTENDED_CACHE_TTL_BETA : null;
   return {
     request,
     anthropicBeta,
