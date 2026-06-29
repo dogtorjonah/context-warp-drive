@@ -299,13 +299,10 @@ Beyond the in-session fold, sealed work **episodes** (the files touched + the ag
 ### 6. Glyph grammar (register tags) — `context-warp-drive/glyphs`
 Every agent message opens with one register glyph — 🔍 in-progress · ▶ executing · 🏁 verdict · ⚠️ hazard · ❓ blocked. `parseRegisterGlyph` classifies it; episodic recall uses it as a trust signal so only **settled** conclusions (🏁/⚠️) get harvested into durable memory while transient work (🔍/▶/❓) self-excludes. See [`docs/glyph-grammar.md`](./docs/glyph-grammar.md).
 
-### 7. Overwatch (trace-driven governor) — `context-warp-drive/overwatch`
-Overwatch is the pure, standalone context-geometry governor. Feed it a recent trace of register-glyph messages and tool ticks plus measured pressure/cache telemetry, and it returns auditable recommendations for retained band size, recall aperture, episodic capture, and cache-safe fold timing. It is deliberately adapter-free: your runtime maps its own message/tool history into `TraceToken[]`.
-
-### 8. Context budget (model-aware mechanical limits) — `context-warp-drive/budget`
+### 7. Context budget (model-aware mechanical limits) — `context-warp-drive/budget`
 The budget resolver turns model/engine/window choices into deterministic fold knobs: active band, message ceiling, pressure ceiling, prefix saturation, tail epoch cap, and compression/eviction profile. Known model tables cover common providers, while explicit `contextWindowTokens` lets any new model opt in without waiting for a package release.
 
-### 9. Task Rail (portable execution state) — `context-warp-drive/task-rail`
+### 8. Task Rail (portable execution state) — `context-warp-drive/task-rail`
 Task Rail is the dependency-free long-horizon execution state machine. It tracks steps, sprint/shoot reservations, ACK status, progress, and JSON serialization so your own tool/UI/storage can preserve “what next?” outside the provider prompt.
 
 ---
@@ -352,9 +349,6 @@ import {
 
 // Glyph grammar — also at "context-warp-drive/glyphs"
 import { parseRegisterGlyph, REGISTER_GLYPHS, classifyAssistantRegister } from 'context-warp-drive';
-
-// Overwatch governor — also at "context-warp-drive/overwatch"
-import { governByTrace, classifyToolClass, glyphFromMessage } from 'context-warp-drive';
 
 // Model-aware fold/pressure knobs — also at "context-warp-drive/budget"
 import { resolveContextBudget } from 'context-warp-drive';

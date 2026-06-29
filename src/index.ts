@@ -15,7 +15,6 @@
  *   - Glyph grammar (`./glyphs`) — register-tagged messages that power episodic
  *     narration harvesting.
  *   - Context budget (`./budget`) — model-aware fold and pressure ceilings.
- *   - Overwatch (`./overwatch`) — trace-only context geometry governor.
  *   - Task Rail (`./task-rail`) — portable long-horizon execution state.
  *   - FoldSession — the one-call orchestrator that wires it into any FC loop.
  *   - Host adapters (`./host`) — MemoryLoop, liveSource, affinity,
@@ -26,7 +25,7 @@
  * Sub-path entry points are also published:
  *   `context-warp-drive/fold`, `context-warp-drive/budget`,
  *   `context-warp-drive/episodes`, `context-warp-drive/glyphs`,
- *   `context-warp-drive/overwatch`, `context-warp-drive/task-rail`,
+ *   `context-warp-drive/task-rail`,
  *   `context-warp-drive/raw-rebirth-seed`,
  *   `context-warp-drive/providers/anthropic`,
  *   `context-warp-drive/providers/gemini-cli`.
@@ -40,7 +39,6 @@ export * from './contextBudget.ts';
 export * from './episodes.ts';
 export * from './episodes/runtime.ts';
 export * from './glyphs.ts';
-export * from './overwatch.ts';
 export * from './taskRail.ts';
 
 // Host adapters — turnkey standalone wiring of the full memory stack.

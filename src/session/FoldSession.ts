@@ -140,9 +140,8 @@ export interface FoldSessionOptions {
   readonly foldConfig?: FoldConfig;
   /**
    * Quality-driven fidelity override (session default). Sets what fraction of
-   * the band stays at full / essence retention, independent of band size. The
-   * governor (governByTrace) can also supply this per-turn via
-   * {@link FoldPrepareContext.fidelity}; a per-turn value takes precedence.
+   * the band stays at full / essence retention, independent of band size.
+   * A per-turn value via {@link FoldPrepareContext.fidelity} takes precedence.
    * Applied only at epoch boundaries (cache-safe).
    */
   readonly fidelity?: FidelityOverrides | null;
@@ -258,8 +257,7 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    */
   readonly hardEpoch?: boolean;
   /**
-   * Quality-driven fidelity override for THIS turn — typically the governor's
-   * `decision.fidelity` from {@link governByTrace}. Scales the full/essence
+   * Quality-driven fidelity override for THIS turn. Scales the full/essence
    * retention budget without changing band size. Applied only when this turn
    * triggers a fold epoch (never mid hot-reuse), mirroring the relay's
    * epoch-gated band/fidelity application. `undefined` keeps the last value;

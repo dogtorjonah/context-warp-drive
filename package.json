@@ -51,11 +51,6 @@
       "import": "./dist/glyphs.js",
       "require": "./dist/glyphs.cjs"
     },
-    "./overwatch": {
-      "types": "./dist/overwatch.d.ts",
-      "import": "./dist/overwatch.js",
-      "require": "./dist/overwatch.cjs"
-    },
     "./task-rail": {
       "types": "./dist/task-rail.d.ts",
       "import": "./dist/task-rail.js",
