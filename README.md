@@ -384,6 +384,4 @@ All optional; sensible defaults. `WARP_FOLD_FREEZE` (freeze on/off) · `WARP_FOL
 npm test   # runs the 380+ test deterministic suite (rolling fold, freeze, recall, task rail)
 ```
 
-## License
-
-MIT © Jonah
+## JonahT © Jonah Tarashansky
