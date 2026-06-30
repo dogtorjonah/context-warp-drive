@@ -40,15 +40,15 @@ Real Claude calls every turn with Anthropic `cache_control` breakpoints, a **rea
 
 ### Offline deterministic demo (no API key, byte-identical every run)
 
-`npx tsx examples/benchmark.ts` — a 16-turn outage-debugging session, exact `o200k_base` BPE token counts (a portable proxy; Claude's tokenizer isn't public), `claude-haiku-4-5` list pricing. This is the CI smoke test; the cache column is a turn-over-turn byte-prefix proxy and the summarizer is a transparent deterministic stand-in (it drops ids buried past its head cutoff — the failure mode the Coordinate Closet exists to avoid).
+`npx tsx examples/benchmark.ts` — a 16-turn outage-debugging session, exact `o200k_base` BPE token counts (a portable proxy; Claude's tokenizer isn't public), `claude-haiku-4-5` list pricing. This is the CI smoke test; the summarizer is a transparent deterministic stand-in (it drops ids buried past its head cutoff — the failure mode the Coordinate Closet exists to avoid).
 
-| Strategy | Input Cost | Cache Hit (prefix proxy) | Extra LLM Calls | Fact Retention |
-| :--- | :---: | :---: | :---: | :---: |
-| Truncation (rolling window) | $0.0172 | 28% | 0 | 44% (7/16) |
-| LLM Summarization (stand-in) | $0.0228 | 43% | 6 | 44% (7/16) |
-| **Context Warp Drive** | **$0.0066** | 60% | 0 | **94% (15/16)** |
+| Strategy | Input Cost | Extra LLM Calls | Fact Retention |
+| :--- | :---: | :---: | :---: |
+| Truncation (rolling window) | $0.0172 | 0 | 44% (7/16) |
+| LLM Summarization (stand-in) | $0.0228 | 6 | 44% (7/16) |
+| **Context Warp Drive** | **$0.0069** | 0 | **94% (15/16)** |
 
-CWD is cheapest (**−71% vs summarization, −62% vs truncation** at Claude-haiku rates), makes zero extra model calls, and beats truncation decisively on retention. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + a hot cache.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI.
+CWD is cheapest (**−70% vs summarization, −60% vs truncation** at Claude-haiku rates), makes zero extra model calls, and beats truncation decisively on retention. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + a hot cache.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI.
 
 ---
 
