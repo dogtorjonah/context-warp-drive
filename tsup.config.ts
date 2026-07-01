@@ -20,6 +20,8 @@ export default defineConfig({
     'providers/geminiCli': 'src/providers/geminiCli.ts',
     'providers/codexCli': 'src/providers/codexCli.ts',
     'providers/claudeCli': 'src/providers/claudeCli.ts',
+    'host/claudeCliLoop': 'src/host/claudeCliLoop.ts',
+    'host/claudeTmuxLoop': 'src/host/claudeTmuxLoop.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

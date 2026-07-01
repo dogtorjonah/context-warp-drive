@@ -30,7 +30,9 @@
  *   `context-warp-drive/providers/anthropic`,
  *   `context-warp-drive/providers/gemini-cli`,
  *   `context-warp-drive/providers/codex-cli`,
- *   `context-warp-drive/providers/claude-cli`.
+ *   `context-warp-drive/providers/claude-cli`,
+ *   `context-warp-drive/host/claude-cli-loop`,
+ *   `context-warp-drive/host/claude-tmux-loop`.
  *
  * Pure CPU, zero I/O, zero LLM calls (the episodic SQLite store is the only
  * optional native dependency). Byte-identical output for identical inputs is the
@@ -48,6 +50,8 @@ export * from './host/MemoryLoop.ts';
 export * from './host/liveSource.ts';
 export * from './host/affinity.ts';
 export * from './host/fileMetaProvider.ts';
+export * from './host/claudeCliLoop.ts';
+export * from './host/claudeTmuxLoop.ts';
 
 // Provider adapters — re-exported under `providers/` sub-path for consumers
 // who want turnkey cache-breakpoint injection (Anthropic, etc).
@@ -56,3 +60,5 @@ export * from './host/fileMetaProvider.ts';
 //   import { buildGeminiCliFoldView } from 'context-warp-drive/providers/gemini-cli';
 //   import { buildCodexFoldItems } from 'context-warp-drive/providers/codex-cli';
 //   import { buildClaudeCliFold } from 'context-warp-drive/providers/claude-cli';
+//   import { ClaudeCliFoldLoop } from 'context-warp-drive/host/claude-cli-loop';
+//   import { ClaudeTmuxFoldLoop } from 'context-warp-drive/host/claude-tmux-loop';

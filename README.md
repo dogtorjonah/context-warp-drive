@@ -335,6 +335,30 @@ CLI fold packs mirror the Voxxo relay seams for owned-history runtimes:
 `thread/inject_items`, and `context-warp-drive/providers/claude-cli` builds and
 writes a uuid-linked Claude Code JSONL chain for `claude --resume`.
 
+For Claude Code, the runnable setup layer is
+`context-warp-drive/host/claude-cli-loop`. It spawns
+`claude --print --input-format stream-json --output-format stream-json`, learns
+the session id from the stream, tracks Anthropic-reported usage tokens, computes
+tail vs hard-epoch folds, atomically rewrites the Claude Code project JSONL, and
+respawns with `--resume <session-id>`. Use `mode: 'dry-run'` to write a
+`<session>.jsonl.dryrun` sidecar before letting it touch the live file.
+
+```bash
+npx tsx examples/claude-cli-loop.ts /path/to/project
+WARP_CLAUDE_CLI_FOLD=dry-run npx tsx examples/claude-cli-loop.ts
+```
+
+If you want the normal Claude Code terminal UI instead of `--print`, use
+`context-warp-drive/host/claude-tmux-loop`. It starts plain interactive
+`claude` inside tmux, gives you an attach command, tails
+`~/.claude/projects/.../<session>.jsonl`, folds from provider-measured usage,
+rewrites the JSONL, and restarts the tmux session with `--resume`.
+
+```bash
+npx tsx examples/claude-tmux-loop.ts /path/to/project
+WARP_CLAUDE_TMUX_FOLD=dry-run npx tsx examples/claude-tmux-loop.ts
+```
+
 ---
 
 ## API surface
@@ -382,7 +406,58 @@ import {
   buildClaudeCliFold,
   writeFoldedClaudeCliJsonl,
 } from 'context-warp-drive/providers/claude-cli';
+
+// Claude Code CLI setup loop: spawn, monitor measured usage, fold, rewrite, resume
+import { ClaudeCliFoldLoop } from 'context-warp-drive/host/claude-cli-loop';
+
+// Claude Code interactive tmux loop: normal terminal UI, JSONL tail, fold, resume
+import { ClaudeTmuxFoldLoop } from 'context-warp-drive/host/claude-tmux-loop';
 ```
+
+### Claude Code CLI setup loop
+
+```ts
+import { ClaudeCliFoldLoop } from 'context-warp-drive/host/claude-cli-loop';
+
+const loop = new ClaudeCliFoldLoop({
+  cwd: process.cwd(),
+  sessionId: process.env.CLAUDE_SESSION_ID, // optional; learned from stream-json when omitted
+  model: process.env.CLAUDE_MODEL ?? 'claude-sonnet-4-6',
+  mode: process.env.WARP_CLAUDE_CLI_FOLD === 'dry-run' ? 'dry-run' : 'on',
+  authMode: process.env.CLAUDE_CODE_OAUTH_TOKEN ? 'oauth' : 'inherit',
+  onEpoch: (epoch) => console.error(epoch.reason),
+});
+
+await loop.start();
+await loop.sendUserText('Continue the current task.');
+```
+
+The loop only folds from provider-measured usage telemetry. If you already keep
+your own canonical transcript, pass `transcript: async () => rows` and
+`captureTranscript: false`; otherwise the loop captures user text, assistant text,
+tool calls, and tool results from Claude Code's stream-json events.
+
+### Claude Code interactive tmux loop
+
+```ts
+import { ClaudeTmuxFoldLoop } from 'context-warp-drive/host/claude-tmux-loop';
+
+const loop = new ClaudeTmuxFoldLoop({
+  cwd: process.cwd(),
+  sessionId: process.env.CLAUDE_SESSION_ID, // optional; otherwise discovered from JSONL
+  model: process.env.CLAUDE_MODEL ?? 'claude-sonnet-4-6',
+  mode: process.env.WARP_CLAUDE_TMUX_FOLD === 'dry-run' ? 'dry-run' : 'on',
+  authMode: process.env.CLAUDE_CODE_OAUTH_TOKEN ? 'oauth' : 'inherit',
+  onSpawn: (info) => console.error(info.attachCommand),
+});
+
+await loop.start();
+```
+
+This loop does not pass `--print`; the user attaches to tmux and uses Claude Code
+normally. Context Warp observes the on-disk JSONL transcript, so an unwrapped
+Claude process can still be observed by your own code, but automatic kill/rewrite
+resume requires the wrapper to own the tmux session.
 
 ---
 

@@ -80,6 +80,16 @@
       "types": "./dist/providers/claudeCli.d.ts",
       "import": "./dist/providers/claudeCli.js",
       "require": "./dist/providers/claudeCli.cjs"
+    },
+    "./host/claude-cli-loop": {
+      "types": "./dist/host/claudeCliLoop.d.ts",
+      "import": "./dist/host/claudeCliLoop.js",
+      "require": "./dist/host/claudeCliLoop.cjs"
+    },
+    "./host/claude-tmux-loop": {
+      "types": "./dist/host/claudeTmuxLoop.d.ts",
+      "import": "./dist/host/claudeTmuxLoop.js",
+      "require": "./dist/host/claudeTmuxLoop.cjs"
     }
   },
   "main": "./dist/index.cjs",

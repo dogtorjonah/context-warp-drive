@@ -530,16 +530,20 @@ export function buildClaudeCliHardEpochChain(
 // Claude Code JSONL writer helpers
 // ════════════════════════════════════════════════════════════════════════
 
-/** Encode an absolute cwd into Claude Code's project-dir naming convention. */
+/**
+ * Encode an absolute cwd into Claude Code's project-dir naming convention.
+ * Claude Code replaces every non-alphanumeric path character with `-`.
+ */
 export function encodeCwdForClaudeCode(cwd: string): string {
-  return cwd.replace(/\//g, '-');
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
 /**
  * Resolve a Claude Code session's on-disk JSONL path:
  *   <root>/<encoded-cwd>/<session-id>.jsonl
- * where <root> defaults to ~/.claude/projects and <encoded-cwd> replaces `/`
- * with `-`. Pass `root` (the projects-base dir) in tests to target a tmp dir.
+ * where <root> defaults to ~/.claude/projects and <encoded-cwd> replaces every
+ * non-alphanumeric cwd character with `-`. Pass `root` (the projects-base dir)
+ * in tests to target a tmp dir.
  */
 export function resolveClaudeCliSessionJsonlPath(
   sessionId: string,
