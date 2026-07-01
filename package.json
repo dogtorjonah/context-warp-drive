@@ -70,6 +70,16 @@
       "types": "./dist/providers/geminiCli.d.ts",
       "import": "./dist/providers/geminiCli.js",
       "require": "./dist/providers/geminiCli.cjs"
+    },
+    "./providers/codex-cli": {
+      "types": "./dist/providers/codexCli.d.ts",
+      "import": "./dist/providers/codexCli.js",
+      "require": "./dist/providers/codexCli.cjs"
+    },
+    "./providers/claude-cli": {
+      "types": "./dist/providers/claudeCli.d.ts",
+      "import": "./dist/providers/claudeCli.js",
+      "require": "./dist/providers/claudeCli.cjs"
     }
   },
   "main": "./dist/index.cjs",

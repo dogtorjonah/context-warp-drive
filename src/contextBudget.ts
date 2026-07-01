@@ -8,13 +8,20 @@
 
 import { contextWindowForModel } from './contextWindow.ts';
 
-// Context Warp geometry signposts (Jonah, 2026-06-19; P bumped to 180K 2026-06-29):
+// Context Warp geometry signposts (Jonah, 2026-06-19; P bumped to 180K 2026-06-29;
+// P split 120K/180K 2026-07-01):
 //   S = 37K static system/tools prefix reserve (provider-measured floor model)
 //   M = 40K folded memory after full recompute
 //   A = 5K expected appended folded-tail band
 //   T = 10K preferred/default live-tail runway
 //   F = 10K default append runway floor (explicit overrides can keep a larger floor)
-//   P = 180K universal pressure ceiling (was 150K; fraction clamp protects small windows)
+//   P = 120K universal pressure ceiling default (was 180K; fraction clamp protects
+//       small windows). Opus 4.8 max-context sessions keep P=180K, but ONLY on the
+//       two surfaces that carry a real 1M-class window end-to-end: the Claude API
+//       (engine='claude-api', in-process FC fold) and the interactive tmux CLI
+//       (engine='claude-interactive', hard-epoch session swap). See
+//       DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS /
+//       defaultPressureCeilingTokensForModelEngine below.
 //   CLI codex = full-recompute-only transport, using the shared trigger by
 //               default while still clamping to message ceiling − F runway
 //
@@ -33,22 +40,37 @@ export const DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS =
 /**
  * Fold TRIGGER ceiling — peak measured prompt tokens before engines that gate
  * folding on a token threshold should reconstruct. Distinct from the steady-state
- * band (M=40K folded memory) and the pressure ceiling (P=180K hard relief). FC
- * folds continuously and uses the band/tail runway instead; CLI engines read
- * foldTriggerTokens and clamp it under pressureCeilingTokens.
+ * band (M=40K folded memory) and the pressure ceiling (P=120K default / 180K
+ * opus-4.8-max hard relief). FC folds continuously and uses the band/tail runway
+ * instead; CLI engines read foldTriggerTokens and clamp it under
+ * pressureCeilingTokens, so this raw default is always clamped down to whatever
+ * pressure ceiling the model/engine actually resolves to.
  */
 export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 180_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
 export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
-export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 180_000;
-// Claude Code CLI hard-epoch ceiling. The Claude CLI surfaces (claude /
+/**
+ * Universal pressure ceiling default (Jonah, 2026-07-01: dropped from 180K to
+ * 120K). Applies to every model/engine EXCEPT the opus-4.8-max exception below —
+ * see defaultPressureCeilingTokensForModelEngine.
+ */
+export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 120_000;
+/**
+ * Elevated pressure ceiling kept ONLY for Opus 4.8 max-context sessions on the
+ * Claude API (engine='claude-api') and the interactive tmux CLI
+ * (engine='claude-interactive') — the two surfaces that run a real 1M-class
+ * window end-to-end. Every other model/engine combination (plain claude /
+ * claude-cli, Codex, Gemini, GLM, etc.) uses the 120K universal default above.
+ */
+export const DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS = 180_000;
+// Claude Code CLI hard-epoch fallback ceiling. The Claude CLI surfaces (claude /
 // claude-cli / claude-interactive) cannot fold in-process
 // (engineSupportsRollingFold=false), so instead of mid-stream folding the relay
-// fires an in-place session-swap rebirth ("hard epoch") once provider-MEASURED
-// context tokens cross this threshold. Same 180K value/intent as the universal
-// pressure ceiling above, but kept as a distinct named constant because the two
-// mechanisms (in-process fold relief vs out-of-process session swap) can diverge
-// independently. Consumed by relay handleResultEvent (instanceManager/eventHandlers.ts).
+// can fire an in-place session-swap rebirth ("hard epoch") once provider-MEASURED
+// context tokens cross a hard ceiling. Kept distinct from the 120K/180K pressure
+// ceiling split because fold pressure and out-of-process session-swap saturation
+// can diverge independently. Consumed by relay handleResultEvent
+// (instanceManager/eventHandlers.ts).
 export const DEFAULT_CONTEXT_BUDGET_CLAUDE_CLI_HARD_EPOCH_TOKENS = 180_000;
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION = 0.9;
@@ -56,10 +78,9 @@ export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_HEADROOM_SAFETY = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION = 0.15;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION = 0.25;
 /**
- * Headroom (tokens) kept between S + M + T and the pressure ceiling. For the
- * default 1M-class geometry this is P180 − S37 − M40 − T10 = 93K, which keeps
- * the append trigger aggressive enough to skeletonize the unfrozen tail instead
- * of preserving a giant raw runway.
+ * Fallback headroom (tokens) kept between S + M + T and the pressure ceiling
+ * when no pressure ceiling is configured. For the elevated Opus max P180
+ * geometry this is P180 − S37 − M40 − T10 = 93K.
  */
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 93_000;
 /** Absolute floor for the tail-epoch cap so a tight window never collapses to a ~0 tail (fold-every-turn pathology). */
@@ -341,6 +362,33 @@ function isCodexCliEngine(engine: string): boolean {
   return engine.trim().toLowerCase() === 'codex';
 }
 
+// Engines that keep the elevated Opus-4.8-max pressure ceiling (Jonah, 2026-07-01):
+// the Claude API (in-process FC fold) and the interactive tmux CLI (hard-epoch
+// session swap) — the two surfaces that carry a real 1M-class window end-to-end.
+// Plain 'claude' / 'claude-cli' (non-tmux CLI) deliberately stay OFF this set and
+// fall through to the 120K universal default even for opus-4.8.
+const OPUS_MAX_PRESSURE_CEILING_ENGINES: ReadonlySet<string> = new Set(['claude-api', 'claude-interactive']);
+
+function isOpusFourEightModel(model: string): boolean {
+  const modelLower = model.trim().toLowerCase();
+  return modelLower.includes('opus-4-8') || modelLower.includes('opus-4.8') || modelLower.includes('opus 4.8');
+}
+
+/**
+ * Default pressure ceiling for a given model/engine pair. 120K universal default;
+ * 180K ONLY for opus-4.8 on the Claude API or interactive tmux CLI surfaces (see
+ * OPUS_MAX_PRESSURE_CEILING_ENGINES above). Explicit input.pressureCeilingTokens
+ * and the VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env override both still take
+ * precedence over this default in resolveContextBudget.
+ */
+function defaultPressureCeilingTokensForModelEngine(model: string, engine: string): number {
+  const engineLower = engine.trim().toLowerCase();
+  if (OPUS_MAX_PRESSURE_CEILING_ENGINES.has(engineLower) && isOpusFourEightModel(model)) {
+    return DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS;
+  }
+  return DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
+}
+
 function defaultCodexCliReconstructTriggerTokens(
   messageCeilingTokens: number,
   hardWindowTokens: number,
@@ -422,9 +470,8 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   } else {
     const requestedPressure = positiveInt(input.pressureCeilingTokens)
       ?? parsePositiveInt(pressureCeilingEnv)
-      ?? codexCliDefaultReconstructTriggerTokens
       ?? clampPositiveTokensToWindow(
-        DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS,
+        defaultPressureCeilingTokensForModelEngine(model, engine),
         hardWindowTokens,
         pressureMaxWindowFraction,
       );

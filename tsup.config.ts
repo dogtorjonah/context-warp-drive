@@ -5,8 +5,8 @@ import { defineConfig } from 'tsup';
 // (`context-warp-drive/episodes`, optional better-sqlite3 peer), the glyph
 // grammar (`context-warp-drive/glyphs`), the portable task rail
 // (`context-warp-drive/task-rail`), raw rebirth seed rendering
-// (`context-warp-drive/raw-rebirth-seed`), and provider adapters can each be
-// imported in isolation.
+// (`context-warp-drive/raw-rebirth-seed`), and provider/CLI adapters can each
+// be imported in isolation.
 export default defineConfig({
   entry: {
     index: 'src/index.ts',
@@ -18,6 +18,8 @@ export default defineConfig({
     'raw-rebirth-seed': 'src/rawRebirthSeed.ts',
     'providers/anthropic': 'src/providers/anthropic.ts',
     'providers/geminiCli': 'src/providers/geminiCli.ts',
+    'providers/codexCli': 'src/providers/codexCli.ts',
+    'providers/claudeCli': 'src/providers/claudeCli.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

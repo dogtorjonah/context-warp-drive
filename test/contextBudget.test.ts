@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { resolveContextBudget } from '../src/contextBudget.ts';
 
 describe('resolveContextBudget', () => {
-  it('keeps 1M-class providers on the tuned S37/M40/A5/T10/F10/P180 geometry', () => {
-    const budget = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' });
+  it('keeps opus-4.8-max Claude API sessions on the tuned S37/M40/A5/T10/F10/P180 geometry', () => {
+    const budget = resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' });
 
     expect(budget.contextWindowTokens).toBe(1_000_000);
     expect(budget.budgetTier).toBe('large-1m');
@@ -22,15 +22,22 @@ describe('resolveContextBudget', () => {
     expect(budget.evictionPolicy).toBe('recompute-on-prefix-saturation');
   });
 
-  it('puts 200k Claude models in survival mode with a window-clamped band', () => {
+  it('keeps 180K only for opus-4.8 on Claude API and interactive tmux surfaces', () => {
+    expect(resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(120_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(180_000);
+    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(180_000);
+    expect(resolveContextBudget({ engine: 'codex-api', model: 'gpt-5.5' }).pressureCeilingTokens).toBe(120_000);
+  });
+
+  it('puts 200k Claude models in survival mode with the 120K default pressure ceiling', () => {
     const budget = resolveContextBudget({ engine: 'claude', model: 'claude-sonnet-4' });
 
     expect(budget.contextWindowTokens).toBe(200_000);
     expect(budget.budgetTier).toBe('small-200k');
     expect(budget.compressionProfile).toBe('survival');
     expect(budget.bandTokens).toBe(40_000);
-    expect(budget.foldTriggerTokens).toBe(160_000);
-    expect(budget.pressureCeilingTokens).toBe(160_000);
+    expect(budget.foldTriggerTokens).toBe(120_000);
+    expect(budget.pressureCeilingTokens).toBe(120_000);
     expect(budget.messageCeilingTokens).toBe(176_000);
     expect(budget.prefixSaturationTokens).toBe(176_000);
     expect(budget.tailEpochCapTokens).toBe(10_000);
@@ -39,9 +46,11 @@ describe('resolveContextBudget', () => {
 
   it('sizes the tail-epoch cap from pressure geometry (pressureCeiling − S − band − margin), not a blind band fraction', () => {
     const oneM = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' });
-    // 1M: S=37k, band=40k, margin=93k, pressure=180k → tail = 180−37−40−93 = 10k.
+    // Plain Claude CLI/API defaults to P120: S=37k, band=40k, margin=33k,
+    // pressure=120k → tail = 120−37−40−33 = 10k.
     expect(oneM.systemToolsReserveTokens).toBe(37_000);
-    expect(oneM.tailEpochPressureMarginTokens).toBe(93_000);
+    expect(oneM.pressureCeilingTokens).toBe(120_000);
+    expect(oneM.tailEpochPressureMarginTokens).toBe(33_000);
     expect(oneM.tailEpochRunwayTokens).toBe(10_000);
     expect(oneM.tailEpochMinRunwayTokens).toBe(10_000);
     expect(oneM.tailEpochCapTokens).toBe(10_000);
@@ -62,7 +71,7 @@ describe('resolveContextBudget', () => {
 
   it('honors a tail pressure-margin override and floors impossible geometry instead of folding to ~0', () => {
     const widerMargin = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', tailEpochPressureMarginTokens: 40_000 });
-    expect(widerMargin.tailEpochCapTokens).toBe(180_000 - 37_000 - 40_000 - 40_000);
+    expect(widerMargin.tailEpochCapTokens).toBe(4_000);
     // glm-5 80k with oversized S: geometry collapses, so the raw-tail cap floors at MIN (4k).
     // The runtime runway gate must full-recompute instead of appending in this impossible geometry.
     const tiny = resolveContextBudget({
@@ -145,12 +154,13 @@ describe('resolveContextBudget', () => {
     expect(cli.compressionProfile).toBe('survival');
     expect(cli.bandTokens).toBe(40_000);
     expect(cli.messageCeilingTokens).toBe(231_680);
-    expect(cli.pressureCeilingTokens).toBe(180_000);
-    expect(cli.foldTriggerTokens).toBe(180_000);
+    expect(cli.pressureCeilingTokens).toBe(120_000);
+    expect(cli.foldTriggerTokens).toBe(120_000);
     expect(api.contextWindowTokens).toBe(1_048_576);
     expect(api.compressionProfile).toBe('cache-economic');
     expect(api.bandTokens).toBe(40_000);
-    expect(api.foldTriggerTokens).toBe(180_000);
+    expect(api.pressureCeilingTokens).toBe(120_000);
+    expect(api.foldTriggerTokens).toBe(120_000);
   });
 
   it('treats GLM 5.2 as a 1M flagship window instead of the older GLM fallback', () => {
@@ -160,7 +170,7 @@ describe('resolveContextBudget', () => {
     expect(budget.budgetTier).toBe('large-1m');
     expect(budget.compressionProfile).toBe('cache-economic');
     expect(budget.bandTokens).toBe(40_000);
-    expect(budget.pressureCeilingTokens).toBe(180_000);
+    expect(budget.pressureCeilingTokens).toBe(120_000);
   });
 
   it('supports arbitrary new models through an explicit context window override', () => {
@@ -177,24 +187,26 @@ describe('resolveContextBudget', () => {
     expect(budget.contextWindowTokens).toBe(1_000_000);
     expect(budget.budgetTier).toBe('large-1m');
     expect(budget.bandTokens).toBe(150_000);
-    expect(budget.pressureCeilingTokens).toBe(180_000);
+    expect(budget.pressureCeilingTokens).toBe(120_000);
   });
 
   it('resolves Codex CLI under the 200k danger line while preserving runway clamps and overrides', () => {
     const codex = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5' });
     // 40k is the steady-state orbit, NOT the trigger: CLI fold reconstruction
-    // uses the shared 180k trigger unless a smaller window needs more runway.
+    // uses the shared trigger clamped under the resolved 120k pressure ceiling.
     expect(codex.bandTokens).toBe(40_000);
-    expect(codex.foldTriggerTokens).toBe(180_000);
+    expect(codex.pressureCeilingTokens).toBe(120_000);
+    expect(codex.foldTriggerTokens).toBe(120_000);
     expect(codex.foldTriggerTokens).toBeLessThan(200_000);
     expect(codex.foldTriggerTokens).toBeGreaterThan(codex.bandTokens);
     expect(codex.foldTriggerTokens).toBeLessThanOrEqual(codex.pressureCeilingTokens ?? Number.POSITIVE_INFINITY);
 
-    // A 200k explicit window keeps the hard F=30k runway, so it clamps below
-    // the default trigger instead of waiting near the wall.
+    // A 200k explicit window still stays under the global 120K pressure ceiling
+    // instead of using the old runway-derived 146K trigger.
     const twoHundredK = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5', contextWindowTokens: 200_000 });
     expect(twoHundredK.messageCeilingTokens).toBe(176_000);
-    expect(twoHundredK.foldTriggerTokens).toBe(146_000);
+    expect(twoHundredK.pressureCeilingTokens).toBe(120_000);
+    expect(twoHundredK.foldTriggerTokens).toBe(120_000);
 
     // Lowering the band must NOT drag the trigger down — the regression that made Codex thrash at band size.
     const lowBand = resolveContextBudget({
@@ -203,7 +215,7 @@ describe('resolveContextBudget', () => {
       env: { VOXXO_FOLD_TARGET_BAND_TOKENS: '30000' },
     });
     expect(lowBand.bandTokens).toBe(30_000);
-    expect(lowBand.foldTriggerTokens).toBe(180_000);
+    expect(lowBand.foldTriggerTokens).toBe(120_000);
 
     // Explicit trigger override is honored, clamped between band and pressure ceiling.
     const overridden = resolveContextBudget({
@@ -294,7 +306,7 @@ describe('resolveContextBudget', () => {
 
     expect(budget.requestedBandTokens).toBe(40_000);
     expect(budget.bandTokens).toBe(40_000);
-    expect(budget.pressureCeilingTokens).toBe(160_000);
+    expect(budget.pressureCeilingTokens).toBe(120_000);
     expect(budget.outputReserveTokens).toBe(16_000);
     expect(budget.systemToolsReserveTokens).toBe(16_000);
     expect(budget.emergencyMarginTokens).toBe(8_000);
@@ -357,6 +369,6 @@ describe('resolveContextBudget', () => {
     expect(budget.conservativeFallback).toBe(true);
     expect(budget.budgetTier).toBe('unknown-conservative');
     expect(budget.compressionProfile).toBe('survival');
-    expect(budget.pressureCeilingTokens).toBe(160_000);
+    expect(budget.pressureCeilingTokens).toBe(120_000);
   });
 });

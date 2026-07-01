@@ -15,6 +15,7 @@ This repo (`/home/jonah/context-warp-drive/`) is the **standalone public copy** 
 | `src/foldEpisodes.ts` | Episodic memory engine |
 | `src/foldRecall.ts` | Ambient page-in for folded context |
 | `src/foldFreeze.ts` | Cache-hot freeze / snapshot |
+| `src/foldBirthHydration.ts` | CLI transcript hydration for birth-fold reconstruction |
 | `src/rollingFold.ts` | Core rolling-fold compaction |
 | `src/foldPathCanon.ts` | Path canonicalization |
 | `src/contextBudget.ts` | Model-aware budget resolver |

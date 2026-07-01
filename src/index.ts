@@ -28,7 +28,9 @@
  *   `context-warp-drive/task-rail`,
  *   `context-warp-drive/raw-rebirth-seed`,
  *   `context-warp-drive/providers/anthropic`,
- *   `context-warp-drive/providers/gemini-cli`.
+ *   `context-warp-drive/providers/gemini-cli`,
+ *   `context-warp-drive/providers/codex-cli`,
+ *   `context-warp-drive/providers/claude-cli`.
  *
  * Pure CPU, zero I/O, zero LLM calls (the episodic SQLite store is the only
  * optional native dependency). Byte-identical output for identical inputs is the
@@ -52,3 +54,5 @@ export * from './host/fileMetaProvider.ts';
 //
 //   import { applyCacheBreakpoints } from 'context-warp-drive/providers/anthropic';
 //   import { buildGeminiCliFoldView } from 'context-warp-drive/providers/gemini-cli';
+//   import { buildCodexFoldItems } from 'context-warp-drive/providers/codex-cli';
+//   import { buildClaudeCliFold } from 'context-warp-drive/providers/claude-cli';

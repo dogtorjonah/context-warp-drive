@@ -78,8 +78,12 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
   'gpt-4.1-nano': { inputPerM: 0.1, cachedPerM: 0.025, cacheWritePerM: 0.1, outputPerM: 0.4, source: 'OpenAI list price, 2026 (cached = 75% off)' },
 };
 
-/** Default benchmark model: Claude (the engine's primary target). */
-export const DEFAULT_MODEL = process.env.WARP_BENCH_MODEL ?? 'claude-haiku-4-5';
+/**
+ * Default benchmark model: Claude Sonnet — the workhorse tier that matches the
+ * production telemetry table in the README (Opus/Sonnet agents), not the cheap
+ * haiku tier. Override with WARP_BENCH_MODEL for any other listed or custom model.
+ */
+export const DEFAULT_MODEL = process.env.WARP_BENCH_MODEL ?? 'claude-sonnet-4-6';
 
 /** Resolve pricing for a model: env override > table > null (unknown). */
 export function resolvePricing(model: string): ModelPricing | null {

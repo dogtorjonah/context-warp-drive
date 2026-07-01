@@ -10,8 +10,9 @@
  *     every identifier — a fair shot). Whether it keeps them is measured.
  *   • Real token counts and real dollar cost (incl. the cache-write premium) from usage.
  *
- * Requires ANTHROPIC_API_KEY. Spends real tokens. Default model claude-haiku-4-5
- * (cheap); set WARP_BENCH_MODEL=claude-sonnet-4-6 for the workhorse.
+ * Requires ANTHROPIC_API_KEY. Spends real tokens. Default model claude-sonnet-4-6
+ * (matches the production telemetry table); set WARP_BENCH_MODEL=claude-haiku-4-5
+ * for a cheaper smoke run, or any other listed/custom model.
  *   ANTHROPIC_API_KEY=sk-ant-... npx tsx examples/benchmark-live.ts
  *
  * Anthropic caching is EXPLICIT: a `cache_control: {type:'ephemeral'}` breakpoint marks

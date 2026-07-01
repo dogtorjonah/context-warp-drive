@@ -30,25 +30,27 @@ The numbers that matter are from the production multi-agent system this engine p
 
 **~90% of all input tokens are served from cache** across these high-turn Claude workloads — that is the byte-identical frozen-fold prefix doing its job, turn after turn, at $0.30/MTok cache reads instead of $3.00/MTok fresh input (Sonnet rates). A re-summarizing compactor rewrites the prefix and can never sustain this; truncation slides the window and breaks it. This is the entire economic argument, measured live.
 
+**Note on scope:** the table above is live single-deployment production telemetry, not a controlled A/B study — there is no held-out arm running truncation or summarization against the same real workload for a head-to-head comparison. The offline/live benchmarks below fill that gap deterministically on a small session; a larger-scale controlled long-horizon comparison across strategies is future work, gated on compute budget, not on the mechanism being unproven.
+
 ### Reproduce it yourself — live, against Claude
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... npx tsx examples/benchmark-live.ts   # default claude-haiku-4-5
+ANTHROPIC_API_KEY=sk-ant-... npx tsx examples/benchmark-live.ts   # default claude-sonnet-4-6
 ```
 
 Real Claude calls every turn with Anthropic `cache_control` breakpoints, a **real Claude summarizer** (told to preserve every identifier — a fair fight), and the provider's own `cache_read_input_tokens` / `cache_creation_input_tokens`. A short 16-turn demo *understates* the production cache rate (caching needs a ≥1024-token prefix and CWD's advantage compounds over long sessions) — but it shows the mechanism on real telemetry, with CWD reading from cache while truncation and summarization rebuild their prefix.
 
 ### Offline deterministic demo (no API key, byte-identical every run)
 
-`npx tsx examples/benchmark.ts` — a 16-turn outage-debugging session, exact `o200k_base` BPE token counts (a portable proxy; Claude's tokenizer isn't public), `claude-haiku-4-5` list pricing. This is the CI smoke test; the summarizer is a transparent deterministic stand-in (it drops ids buried past its head cutoff — the failure mode the Coordinate Closet exists to avoid).
+`npx tsx examples/benchmark.ts` — a 16-turn outage-debugging session, exact `o200k_base` BPE token counts (a portable proxy; Claude's tokenizer isn't public), `claude-sonnet-4-6` list pricing — the same workhorse tier as the production table above, not a cheap demo tier. This is the CI smoke test; the summarizer is a transparent deterministic stand-in (it drops ids buried past its head cutoff — the failure mode the Coordinate Closet exists to avoid).
 
 | Strategy | Input Cost | Extra LLM Calls | Fact Retention |
 | :--- | :---: | :---: | :---: |
-| Truncation (rolling window) | $0.0172 | 0 | 44% (7/16) |
-| LLM Summarization (stand-in) | $0.0228 | 6 | 44% (7/16) |
-| **Context Warp Drive** | **$0.0069** | 0 | **94% (15/16)** |
+| Truncation (rolling window) | $0.0516 | 0 | 44% (7/16) |
+| LLM Summarization (stand-in) | $0.0685 | 6 | 44% (7/16) |
+| **Context Warp Drive** | **$0.0208** | 0 | **94% (15/16)** |
 
-CWD is cheapest (**−70% vs summarization, −60% vs truncation** at Claude-haiku rates), makes zero extra model calls, and beats truncation decisively on retention. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + a hot cache.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI.
+CWD is cheapest (**−70% vs summarization, −60% vs truncation** at Claude-sonnet rates — the ratio holds across tiers since Anthropic's cache discount is model-invariant), makes zero extra model calls, and beats truncation decisively on retention. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + a hot cache.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI or a cheaper Claude tier.
 
 ---
 
@@ -113,6 +115,8 @@ Then add the provider cache knob:
 | OpenAI | No cache marker is required. Keep static tools/system/context first, pass the prepared `messages`, optionally reuse a stable `prompt_cache_key`, and log `usage.prompt_tokens_details.cached_tokens`. |
 | Gemini | Implicit caching is automatic on Gemini 2.5+ when prefixes match. For a large static document/corpus, create an explicit Gemini cache separately and pass it as `cachedContent`; keep the folded conversation after that stable prefix. Log `usage_metadata`. |
 | Gemini CLI | Use `context-warp-drive/providers/gemini-cli` to fold the CLI-owned JSONL view, preserving the metadata header and rewriting with `$set.messages` + `$set.lastUpdated`. |
+| Codex CLI | Use `context-warp-drive/providers/codex-cli` to rebuild a folded Responses item seed for `thread/inject_items` from canonical transcript rows. |
+| Claude Code CLI | Use `context-warp-drive/providers/claude-cli` to build a folded Claude Code JSONL chain and atomically rewrite `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` before `claude --resume`. |
 
 Context Warp Drive keeps the prefix byte-identical. The provider SDK call still owns provider-specific cache settings.
 
@@ -181,6 +185,8 @@ await client.messages.create(
   cached.requestOptions,
 );
 ```
+
+**Bounded is what makes it boundless.** A hard epoch collapses the *provider-visible* view to one compact seed message — it does not discard anything. The raw transcript remains recall backing: fold recall (§4 below) keeps paging folded/pre-epoch content back in the moment the agent re-touches a path, a claim, or a prior identifier, exactly as it does for an ordinary rolling fold. That's the actual mechanism behind "long-horizon": the window itself never grows past its ceiling, so it stays cheap and cache-friendly turn after turn, while forward momentum — what the agent was doing, what it touched, what it decided — survives the reset because recall and episodic memory read from the untouched raw trace, not from the collapsed view. The engine is deliberately bounded; that boundedness is what lets a session run indefinitely instead of eventually blowing the context window.
 
 Parity checklist for a custom harness:
 
@@ -284,6 +290,8 @@ const seed = buildRawRebirthSeedFromMessages(history, {
 ### 1. Rolling fold (page-out) — `foldContext`
 From the active window backward, every prior turn skeletonizes into one line per tool call (`$ cmd → ok`, `read path`, …) plus budgeted retained reasoning. Only the newest turns stay at full fidelity. The fold is a synthetic user+assistant pair with a self-documenting preamble; it never mutates your raw history (it returns a *view*).
 
+**"Turn" is looser than it sounds — long agentic work folds per step, not per user message.** A conversational turn only ends at real user text (`isUserTurnBoundary`); a long single-prompt agentic rail — one kickoff, hundreds of tool-call steps, no further user text — is structurally ONE turn. `planActiveTurnStepFold` detects that marathon pattern and re-segments the oversized active turn at agentic-step boundaries (each assistant tool-call + its result), so `foldContext` can skeletonize the OLD steps of a still-open turn while the newest N steps stay full-fidelity. This is what keeps a long-horizon single-turn agent session bounded without waiting for a user message that may never come.
+
 ### 2. Coordinate Closet — exact-value conservation
 Folded turns are skeletonized, **but their exact identifiers are not paraphrased**. `nominateVerbatim` extracts UUIDs, long hashes, absolute paths, digit-bearing key/values (`port=3002`), and issue refs, and conserves them in a `Coordinate Closet (conserved from folded turns): …` block. Opaque ids carry a deterministic context label (`7fd5835b ⟦changelog_id⟧`). A separate capped lane conserves identifiers from operator-pasted user text too.
 
@@ -317,12 +325,15 @@ The engine reads three message shapes natively — pass your history through unc
 | OpenAI (+ DeepSeek, Kimi, GLM, Mistral, Grok, MiniMax) | `{ role, content, tool_calls }` + `{ role: 'tool', tool_call_id }` |
 | Gemini | `{ role: 'model', parts: [...] }` with `functionCall` / `functionResponse` |
 
-> **FC (function-calling) APIs only.** Context Warp Drive folds the *conversational message array* you control. CLI/agent runtimes that own their own context (and don't expose the message array) can't be folded this way.
+> **FC APIs and supported CLI transports.** Context Warp Drive folds the
+> *conversational message array* you control directly. For CLI/agent runtimes
+> that own their own context, use the dedicated provider packs below.
 
-Gemini CLI is the special case: `context-warp-drive/providers/gemini-cli` mirrors
-the Voxxo relay's JSONL fold seam for CLI-owned history, including the 250k
-measured-token trigger, 100k band fold config, recent token high-water scan, and
-dry-run/atomic rewrite helpers.
+CLI fold packs mirror the Voxxo relay seams for owned-history runtimes:
+`context-warp-drive/providers/gemini-cli` rewrites Gemini CLI JSONL `$set.messages`,
+`context-warp-drive/providers/codex-cli` emits folded Responses items for
+`thread/inject_items`, and `context-warp-drive/providers/claude-cli` builds and
+writes a uuid-linked Claude Code JSONL chain for `claude --resume`.
 
 ---
 
@@ -362,6 +373,15 @@ import {
   readLatestGeminiCliMeasuredTokens,
   writeFoldedGeminiCliJsonl,
 } from 'context-warp-drive/providers/gemini-cli';
+
+// Codex CLI fold seed for thread/inject_items
+import { buildCodexFoldItems } from 'context-warp-drive/providers/codex-cli';
+
+// Claude Code CLI JSONL folding adapter
+import {
+  buildClaudeCliFold,
+  writeFoldedClaudeCliJsonl,
+} from 'context-warp-drive/providers/claude-cli';
 ```
 
 ---

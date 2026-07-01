@@ -29,6 +29,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'claude-sonnet-4-20250514': 200_000,
   'claude-sonnet-4': 200_000,
   'claude-sonnet-4-6': 1_000_000, // Sonnet 4.6 ships a 1M Claude API window; /200k gauges were stale rollout metadata
+  'claude-sonnet-5': 1_000_000, // Sonnet 5 (2026-06-30 launch): 1M Claude API window, provider-documented (platform.claude.com); same modern Claude family exception as Sonnet 4.6
   'claude-opus-4-8': 1_000_000, // Opus 4.x ships a 1M window — operator-directed (Jonah, 2026-06-13); mirrors the fable-5 exception (see invariant doc above)
   'claude-opus-4-7': 1_000_000, // same Opus 4.x family window
   'claude-opus-4-6': 1_000_000, // same Opus 4.x family window
