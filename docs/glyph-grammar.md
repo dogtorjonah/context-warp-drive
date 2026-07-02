@@ -36,3 +36,13 @@ Episodic capture mines an agent's burst-final prose into durable memory. Without
 - Untagged prose stays a priority-last backstop — behavior is byte-identical at 0% glyph compliance and strictly less noisy above it.
 
 In short: the grammar is what makes the high-frequency commentary channel a *primary* memory source instead of a noisy fallback. It costs one character per message and zero model calls.
+
+## Emitting — the host's half of the contract
+
+Parsing is only half the grammar: a host that never *instructs* its model to open messages with a register glyph gets 0% compliance and the entire trust ladder runs on the untagged backstop. The engine therefore exports the emit contract alongside the parser:
+
+- **`REGISTER_GLYPH_PROMPT_SNIPPET`** — a canonical one-paragraph system-prompt instruction, derived at module load from `REGISTER_GLYPHS` + `REGISTER_DESCRIPTIONS` so the emit wording can never drift from what `parseRegisterGlyph` accepts. Inject it into any system prompt that drives a model through this engine.
+- **`buildRegisterGlyphPromptSnippet(descriptions?)`** — same derivation with a replaceable description table (localization / house-style wording); the glyph set always comes from `REGISTER_GLYPHS`.
+- **`CARD_GLYPHS`** — the quoted-memory glyphs (✎ ⭐ 💬 🗣 ⌖ Δ ↞ ↠) that must never open fresh speech; the snippet names them as forbidden openers to prevent echo contamination (replayed memory re-harvested as a fresh verdict).
+
+Rule of thumb: if your host calls `parseRegisterGlyph` anywhere, it should be injecting `REGISTER_GLYPH_PROMPT_SNIPPET` somewhere.

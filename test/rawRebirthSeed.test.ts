@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  buildOpenQuestionsFromMessages,
   buildRawRebirthSeedFromMessages,
   buildRawTraceCoordinateCloset,
   buildRawTraceCoordinateClosetFromMessages,
@@ -273,5 +274,48 @@ describe('raw rebirth seed renderer', () => {
 
     expect(findRawRebirthSeedTraceEnd(messages, false)).toBe(messages.length);
     expect(buildRawTraceCoordinateClosetFromMessages(messages, { includeTrailingUserTurn: false })).toContain('toolu_1');
+  });
+});
+
+describe('open questions ledger (buildOpenQuestionsFromMessages)', () => {
+  const messages: FoldMessage[] = [
+    { role: 'user', content: 'please fix the relay' },
+    { role: 'assistant', content: '🔍 investigating the relay handler' },
+    { role: 'assistant', content: '❓ blocked: cannot reach the PC sidecar /health endpoint' },
+    { role: 'assistant', content: '🏁 relay handler fixed and verified' },
+    { role: 'assistant', content: '❓ blocked on missing GLM API quota' },
+  ];
+
+  test('collects only blocked-register entries chronologically', () => {
+    const ledger = buildOpenQuestionsFromMessages(messages);
+    expect(ledger).toContain('Open Questions');
+    expect(ledger).toContain('PC sidecar /health');
+    expect(ledger).toContain('GLM API quota');
+    expect(ledger).not.toContain('relay handler fixed');
+    expect(ledger).not.toContain('investigating the relay');
+    expect(ledger.indexOf('PC sidecar')).toBeLessThan(ledger.indexOf('GLM API quota'));
+  });
+
+  test('returns empty string when no blocked entries exist', () => {
+    expect(buildOpenQuestionsFromMessages([
+      { role: 'assistant', content: '🏁 all done' },
+    ])).toBe('');
+  });
+
+  test('keeps newest entries under a tight budget', () => {
+    const ledger = buildOpenQuestionsFromMessages(messages, { maxChars: 80 });
+    expect(ledger).toContain('GLM API quota');
+    expect(ledger).not.toContain('PC sidecar');
+  });
+
+  test('seed auto-builds the openQuestions section from the trace', () => {
+    const seed = buildRawRebirthSeedFromMessages(messages);
+    expect(seed).toContain('── Open Questions');
+    expect(seed).toContain('GLM API quota');
+  });
+
+  test('passing empty string suppresses the section', () => {
+    const seed = buildRawRebirthSeedFromMessages(messages, { openQuestions: '' });
+    expect(seed).not.toContain('── Open Questions');
   });
 });

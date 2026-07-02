@@ -219,3 +219,62 @@ function failed(reason: AssistantRegisterParseFailureReason, body: string): Assi
     classification: classifyAssistantRegister(null),
   };
 }
+
+// ─── Emit contract ──────────────────────────────────────────────────────────
+// The parse side above defines what the runtime ACCEPTS; the constants below
+// define what hosts should INSTRUCT models to EMIT. They are derived from
+// REGISTER_GLYPHS so the emit instruction can never drift from the parse
+// contract. Any host that drives a model through this engine should inject
+// REGISTER_GLYPH_PROMPT_SNIPPET (or buildRegisterGlyphPromptSnippet()) into
+// its system prompt; without it the model emits 0% glyph compliance and the
+// entire harvest/recall trust ladder runs on the untagged backstop.
+
+/** One-line meaning per register, keyed to the same registers as REGISTER_GLYPHS. */
+export const REGISTER_DESCRIPTIONS: Readonly<Record<AssistantRegister, string>> = {
+  in_progress: 'investigating, building, partial findings, hypotheses',
+  executing: 'tool, edit, test, or batch execution actively underway',
+  verdict: 'a verified outcome or settled conclusion',
+  hazard: 'a trap, gotcha, or invariant others must know',
+  blocked: 'needs a decision or input to proceed',
+} as const;
+
+/**
+ * Card glyphs mark QUOTED folded memory (recall cards, starred moments,
+ * coordinate-closet rows). They must never open fresh assistant speech:
+ * a card-opened message would let replayed memory masquerade as a new
+ * verdict and re-enter the episodic harvest (echo contamination).
+ */
+export const CARD_GLYPHS = ['✎', '⭐', '💬', '🗣', '⌖', 'Δ', '↞', '↠'] as const;
+
+const REGISTER_EMIT_ORDER: readonly AssistantRegister[] = [
+  'in_progress',
+  'executing',
+  'verdict',
+  'hazard',
+  'blocked',
+];
+
+/**
+ * Build the canonical emit instruction from the parse-side constants.
+ * Hosts may pass a replacement description table (same keys) to localize
+ * wording, but the glyph set itself always comes from REGISTER_GLYPHS.
+ */
+export function buildRegisterGlyphPromptSnippet(
+  descriptions: Readonly<Record<AssistantRegister, string>> = REGISTER_DESCRIPTIONS,
+): string {
+  const registers = REGISTER_EMIT_ORDER.map(
+    (register) => `${REGISTER_GLYPHS[register]} ${descriptions[register]}`,
+  ).join(' · ');
+  return (
+    `Open every message with exactly one register glyph as the first character: ${registers}. ` +
+    'When in doubt, use 🔍 — tag what the message IS, not what you hope it becomes. ' +
+    'Glyphs drive episodic memory harvest: 🏁/⚠️ are durable and get harvested; 🔍/▶/❓ self-exclude. ' +
+    `Never open fresh speech with card glyphs ${CARD_GLYPHS.join(' ')} — those mark quoted memory only.`
+  );
+}
+
+/**
+ * Canonical host-injectable emit instruction. Keep SOP / system-prompt
+ * wording aligned with this constant (sop/master.md P23 in the relay).
+ */
+export const REGISTER_GLYPH_PROMPT_SNIPPET = buildRegisterGlyphPromptSnippet();

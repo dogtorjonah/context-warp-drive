@@ -70,6 +70,13 @@ export interface PortableEpisode {
   readonly annotations: readonly EpisodeAnnotation[];
   readonly members: readonly EpisodeMember[];
   readonly trace: readonly string[];
+  /**
+   * Episode ids this episode explicitly retires — harvested from durable
+   * (🏁/⚠️) annotation bodies carrying the `↺ episode-<id>` /
+   * `supersedes episode-<id>` marker. Recorded into `episode_supersessions`
+   * by `recordEpisodes`; superseded episodes stop surfacing in recall.
+   */
+  readonly supersedes?: readonly string[];
 }
 
 export interface DeriveEpisodesOptions {
@@ -112,6 +119,26 @@ export interface EpisodeRecallStateResult {
   readonly cards: readonly EpisodeRecallCard[];
 }
 
+/**
+ * Verdict supersession — the grammar's retraction path. A 🏁 that later proves
+ * wrong should not stay harvested as durable truth forever: a newer durable
+ * message can retire it by carrying `↺ episode-<id>` (or the ASCII form
+ * `supersedes episode-<id>`) in its body. Retired episodes are excluded from
+ * `recallEpisodeCards`. Storage is an additive sidecar table
+ * (`episode_supersessions`) so legacy stores open cleanly — no ALTER needed.
+ */
+export const SUPERSEDES_MARKER = '↺';
+
+export interface EpisodeSupersession {
+  /** Episode being retired. */
+  readonly episodeId: string;
+  /** Episode (or free-form id) that replaces it, when known. */
+  readonly supersededBy?: string;
+  readonly reason?: string;
+  /** ISO timestamp; defaults to now. */
+  readonly at?: string;
+}
+
 interface MutableBurst {
   startedAt: string;
   endedAt: string;
@@ -122,6 +149,15 @@ interface MutableBurst {
 }
 
 const DEFAULT_SESSION_ID = 'default';
+const SUPERSEDES_REF_RE = /(?:↺|\bsupersedes\b)[:\s]+(episode-[0-9a-f]{8,64})/giu;
+const SUPERSESSION_TABLE_DDL = `
+  CREATE TABLE IF NOT EXISTS episode_supersessions (
+    episode_id TEXT PRIMARY KEY,
+    superseded_by TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL
+  )
+`;
 const PATH_LIKE_RE = /(?:^|[\s"'`(])((?:\.{1,2}\/|\/|[A-Za-z0-9_.-]+\/)[A-Za-z0-9_./:@+-]+\.[A-Za-z0-9]+(?::\d+)?)/gu;
 const BARE_FILENAME_RE = /(?:^|[\s"'`(])([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?=$|[\s"'`),.])/gu;
 const TOOL_TOUCH_KEYS = new Set(['path', 'paths', 'file', 'files', 'file_path', 'filePath', 'cwd', 'workdir']);
@@ -241,6 +277,9 @@ export function recordEpisodes(db: EpisodeDatabase, episodes: readonly PortableE
           rebirthEpochId: episode.rebirthEpochId,
           closedBy: episode.closedBy,
           annotations: episode.annotations,
+          ...(episode.supersedes && episode.supersedes.length > 0
+            ? { supersedes: episode.supersedes }
+            : {}),
         }),
       ) as { changes?: number };
 
@@ -254,7 +293,80 @@ export function recordEpisodes(db: EpisodeDatabase, episodes: readonly PortableE
     return { inserted, skipped };
   });
 
-  return insertMany(episodes);
+  const result = insertMany(episodes);
+
+  // Apply glyph-harvested supersessions after the insert batch so a verdict
+  // recorded in this window can retire an older episode in the same call.
+  const supersessions = episodes.flatMap((episode) =>
+    (episode.supersedes ?? [])
+      .filter((episodeId) => episodeId !== episode.id)
+      .map((episodeId) => ({
+        episodeId,
+        supersededBy: episode.id,
+        reason: 'glyph_marker',
+      })),
+  );
+  if (supersessions.length > 0) supersedeEpisodes(db, supersessions);
+
+  return result;
+}
+
+/**
+ * Extract explicit supersession targets from a durable message body:
+ * `↺ episode-<id>`, `↺: episode-<id>`, or `supersedes episode-<id>`.
+ * Pure text parse — deduplicated, order-preserving.
+ */
+export function extractSupersededEpisodeIds(text: string): readonly string[] {
+  const found = new Set<string>();
+  for (const match of text.matchAll(SUPERSEDES_REF_RE)) {
+    const id = match[1];
+    if (id) found.add(id);
+  }
+  return [...found];
+}
+
+/**
+ * Record supersessions: retire the named episodes from future recall. Creates
+ * the additive `episode_supersessions` sidecar table on demand, so it works
+ * against legacy stores opened before the table existed. Idempotent
+ * (INSERT OR IGNORE — first retirement wins). Returns rows newly recorded.
+ */
+export function supersedeEpisodes(
+  db: EpisodeDatabase,
+  entries: readonly EpisodeSupersession[],
+): number {
+  if (entries.length === 0) return 0;
+  db.prepare(SUPERSESSION_TABLE_DDL).run();
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO episode_supersessions (episode_id, superseded_by, reason, created_at)
+    VALUES (?, ?, ?, ?)
+  `);
+  let recorded = 0;
+  const applyAll = db.transaction((items: readonly EpisodeSupersession[]) => {
+    for (const entry of items) {
+      const result = insert.run(
+        entry.episodeId,
+        entry.supersededBy ?? null,
+        entry.reason ?? null,
+        entry.at ?? new Date().toISOString(),
+      );
+      if ((result.changes ?? 0) > 0) recorded += 1;
+    }
+  });
+  applyAll(entries);
+  return recorded;
+}
+
+/** True when the store has the supersession sidecar table. */
+export function hasSupersessionTable(db: EpisodeDatabase): boolean {
+  try {
+    const row = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'episode_supersessions'`)
+      .get();
+    return row !== undefined && row !== null;
+  } catch {
+    return false;
+  }
 }
 
 export function recallEpisodeCards(
@@ -269,6 +381,9 @@ export function recallEpisodeCards(
   const excludeClause = excludedIds.length > 0
     ? `AND e.id NOT IN (${excludedIds.map(() => '?').join(', ')})`
     : '';
+  const supersededClause = hasSupersessionTable(db)
+    ? 'AND e.id NOT IN (SELECT episode_id FROM episode_supersessions)'
+    : '';
   const rows = db.prepare(`
     SELECT
       e.id,
@@ -280,6 +395,7 @@ export function recallEpisodeCards(
     JOIN episode_members em ON em.episode_id = e.id
     WHERE em.path IN (${pathPlaceholders})
       ${excludeClause}
+      ${supersededClause}
     GROUP BY e.id
     ORDER BY e.ended_at DESC
     LIMIT ?
@@ -422,8 +538,16 @@ function sealBurst(
   const register = representative?.register ?? null;
   const trust = representative?.classification.trust ?? 'low_trust';
   const id = stableEpisodeId(sessionId, burst.startedAt, burst.endedAt, summary, members);
+  const supersedes = [
+    ...new Set(
+      burst.annotations
+        .filter((annotation) => annotation.classification.durable)
+        .flatMap((annotation) => extractSupersededEpisodeIds(annotation.body)),
+    ),
+  ].filter((episodeId) => episodeId !== id);
 
   return {
+    ...(supersedes.length > 0 ? { supersedes } : {}),
     id,
     sessionId,
     runId,

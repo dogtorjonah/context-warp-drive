@@ -58,6 +58,13 @@ export const EPISODE_SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_episode_members_path ON episode_members(path);
   CREATE INDEX IF NOT EXISTS idx_episodes_ended_at ON episodes(ended_at);
+
+  CREATE TABLE IF NOT EXISTS episode_supersessions (
+    episode_id TEXT PRIMARY KEY,
+    superseded_by TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL
+  );
 `;
 
 export interface CreateEpisodeStoreOptions {

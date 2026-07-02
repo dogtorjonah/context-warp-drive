@@ -77,6 +77,30 @@ describe('scoreTurnFidelityValue — intrinsic trace value', () => {
     expect(scores[1]).toBe(0);
   });
 
+  test('a transient-glyph turn superseded by a later durable verdict on the same path is discounted', () => {
+    const messages = [
+      ...toolTurn(0, 'Read', '/repo/case.ts', '🔍 investigating the failure'), // transient, superseded below
+      ...toolTurn(1, 'Read', '/repo/other.ts', '🔍 unrelated investigation'), // transient, never superseded
+      ...toolTurn(2, 'Read', '/repo/case.ts', '🏁 root cause confirmed'), // durable conclusion on case.ts
+    ];
+    const scores = scoreTurnFidelityValue(detectTurns(messages), 2); // fold 0,1; turn 2 = active window
+    const w = DEFAULT_FIDELITY_VALUE_WEIGHTS;
+    // Turn 0 earns the downstream-read credit but loses the transient discount:
+    expect(scores[0]).toBe(w.read * w.activeWindowMultiplier - w.glyphTransientDiscount);
+    // Turn 1 has no downstream durable supersession — no discount applies.
+    expect(scores[1]).toBe(0);
+  });
+
+  test('an untagged turn superseded by a durable verdict is NOT discounted (0% compliance unchanged)', () => {
+    const messages = [
+      ...toolTurn(0, 'Read', '/repo/case.ts', 'plain untagged note'), // no glyph
+      ...toolTurn(1, 'Read', '/repo/case.ts', '🏁 conclusion'), // active window durable
+    ];
+    const scores = scoreTurnFidelityValue(detectTurns(messages), 1);
+    const w = DEFAULT_FIDELITY_VALUE_WEIGHTS;
+    expect(scores[0]).toBe(w.read * w.activeWindowMultiplier); // credit only, no discount
+  });
+
   test('a path the operator names in prose (no tool call) survives fidelity decay it previously would not have', () => {
     const messages = [
       ...toolTurn(0, 'Read', '/repo/named.ts', 'note0'), // turn 0 reads named.ts; no tool call ever re-touches it
@@ -109,6 +133,37 @@ describe('scoreTurnFidelityValue — intrinsic trace value', () => {
     const scores = scoreTurnFidelityValue(turns, 2); // fold turns 0,1; turn 2 = active window
     // No active-window multiplier here since the reference is inside the fold zone, not the active window.
     expect(scores[0]).toBe(DEFAULT_FIDELITY_VALUE_WEIGHTS.userNamed);
+  });
+
+  test('fold output keeps the terminal durable verdict over the superseded transient chain', () => {
+    const TRANSIENT = '🔍 transient investigation distinctive token';
+    const VERDICT = '🏁 terminal verdict distinctive token';
+    const NEWER = 'newer unrelated filler distinctive token';
+    const messages = [
+      ...toolTurn(0, 'Read', '/repo/case.ts', TRANSIENT),
+      ...toolTurn(1, 'Read', '/repo/case.ts', VERDICT),
+      ...toolTurn(2, 'Read', '/repo/noise.ts', NEWER),
+      ...toolTurn(3, 'Read', '/repo/active.ts', 'active window note'),
+    ];
+    const cfg: FoldConfig = {
+      ...ALWAYS_ON_FOLD_CONFIG,
+      activeWindowTurns: 1,
+      assistantTextBudget: { fullRetentionChars: VERDICT.length + 5, essenceRetentionChars: 0 },
+    };
+    const folded = foldContext(
+      messages,
+      3,
+      cfg,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { recencyFloorTurns: 0 },
+    );
+    const block = foldBlock(folded.messages);
+    expect(block).toContain(VERDICT);
+    expect(block).not.toContain(TRANSIENT);
+    expect(block).not.toContain(NEWER);
   });
 });
 

@@ -284,6 +284,19 @@ export interface FidelityValueWeights {
   activeWindowMultiplier: number;
   /** Additive bonus when the folded turn's assistant text opens with a durable register glyph (🏁 verdict / ⚠️ hazard). */
   glyphDurableBonus: number;
+  /**
+   * Register-shaped folding (rail-d70d3388 s7): additive PENALTY subtracted
+   * from a folded turn that opens with a transient register glyph (🔍 in
+   * progress / ▶ executing) when a LATER turn that touches at least one of
+   * the same paths opens with a durable glyph (🏁 / ⚠️). The chain
+   * 🔍🔍🔍🏁 marks which turn carried the conclusion — the superseded
+   * investigation folds harder while the verdict keeps its bonus. Scores are
+   * ranking-only (sorted desc before budget allocation), so a resulting
+   * negative score is safe: it just folds hardest. Transient turns with no
+   * later same-path durable conclusion are untouched, and untagged prose is
+   * never penalized — behavior remains byte-identical at 0% glyph compliance.
+   */
+  glyphTransientDiscount: number;
 }
 
 export const DEFAULT_FIDELITY_VALUE_WEIGHTS: FidelityValueWeights = {
@@ -293,6 +306,7 @@ export const DEFAULT_FIDELITY_VALUE_WEIGHTS: FidelityValueWeights = {
   userNamed: 5,
   activeWindowMultiplier: 2,
   glyphDurableBonus: 2,
+  glyphTransientDiscount: 1,
 };
 
 /** Newest folded turns always allocated before value ranking — the working-set recency floor. */
@@ -1855,6 +1869,16 @@ function turnOpensWithDurableGlyph(assistantText: string): boolean {
   return DURABLE_GLYPH_PREFIXES.some(g => assistantText.startsWith(g));
 }
 
+const TRANSIENT_GLYPH_PREFIXES = ['🔍', '▶'] as const;
+/**
+ * 🔍 in-progress / ▶ executing are the investigation-chain registers: the
+ * agent itself declared the turn as connective work, not a conclusion. Same
+ * inlined zero-import heuristic as the durable test above.
+ */
+function turnOpensWithTransientGlyph(assistantText: string): boolean {
+  return TRANSIENT_GLYPH_PREFIXES.some(g => assistantText.startsWith(g));
+}
+
 export function resolveFidelityValueWeights(
   overrides?: Partial<FidelityValueWeights>,
 ): FidelityValueWeights {
@@ -1932,9 +1956,18 @@ export function scoreTurnFidelityValue(
     : kind === 'edit' ? weights.edit
     : kind === 'claim' ? weights.claim
     : weights.read;
+  // Register shape per turn (all n turns, so the active window can supersede):
+  // computed once so the per-turn loop stays O(refs), not O(n·text).
+  const assistantTexts: string[] = new Array(n);
+  const opensDurable: boolean[] = new Array(n);
+  for (let g = 0; g < n; g++) {
+    assistantTexts[g] = extractAssistantText(turns[g].messages);
+    opensDurable[g] = turnOpensWithDurableGlyph(assistantTexts[g]);
+  }
   const scores: number[] = new Array(fold).fill(0);
   for (let i = 0; i < fold; i++) {
     let score = 0;
+    let supersededByDurable = false;
     const seen = new Set<string>();
     for (const { key } of turnPaths[i]) {
       if (seen.has(key)) continue; // dedupe a turn's own repeated path
@@ -1944,10 +1977,17 @@ export function scoreTurnFidelityValue(
       for (const ref of refs) {
         if (ref.g <= i) continue; // downstream references only
         score += kindWeight(ref.kind) * (ref.g >= fold ? weights.activeWindowMultiplier : 1);
+        if (opensDurable[ref.g]) supersededByDurable = true;
       }
     }
-    if (turnOpensWithDurableGlyph(extractAssistantText(turns[i].messages))) {
+    if (opensDurable[i]) {
       score += weights.glyphDurableBonus;
+    } else if (supersededByDurable && turnOpensWithTransientGlyph(assistantTexts[i])) {
+      // Register-shaped folding: a 🔍/▶-declared turn whose paths a LATER
+      // 🏁/⚠️-declared turn re-touched is a superseded investigation — the
+      // chain's conclusion carries the value, so the connective step folds
+      // first. Ranking-only (sorted below); negatives are safe.
+      score -= weights.glyphTransientDiscount;
     }
     scores[i] = score;
   }

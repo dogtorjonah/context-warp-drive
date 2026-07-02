@@ -75,6 +75,66 @@ export function buildLineageGlyphLogFromMessages(
   return `${header}\n${body}`;
 }
 
+/**
+ * Build a portable open-questions ledger from the message trace: scan assistant
+ * messages for declared blocked (❓) register glyphs and render them
+ * chronologically, newest-first capped at `maxChars`.
+ *
+ * This gives the ❓ register a downstream consumer: blockers tagged honestly at
+ * write-time resurface at rebirth as an agenda of possibly-unresolved
+ * questions. Entries are NOT filtered by later verdicts — resolution is the
+ * successor's call to verify, so the header says so explicitly.
+ *
+ * Synchronous, no I/O. Returns '' if no blocked entries are found.
+ */
+export function buildOpenQuestionsFromMessages(
+  messages: readonly FoldMessage[],
+  options: {
+    maxChars?: number;
+    perEntryMaxChars?: number;
+  } = {},
+): string {
+  const maxChars = options.maxChars ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.openQuestions;
+  const perEntryMaxChars = options.perEntryMaxChars ?? 400;
+  if (maxChars <= 0) return '';
+
+  const entries: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!message) continue;
+    if (message.role !== 'assistant' && message.role !== 'model') continue;
+    const text = messageValueToText(message.content)?.trim();
+    if (!text) continue;
+    const mode = classifyMessageGlyph(text);
+    if (mode !== 'blocked') continue;
+    const truncated = truncate(text, perEntryMaxChars);
+    entries.push(`[${messageLabel(message)} msg ${i}] ${truncated}`);
+  }
+
+  if (entries.length === 0) return '';
+
+  // Newest-first fill: greedily keep the most recent entries that fit maxChars.
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const cost = entries[i].length + (kept.length > 0 ? 1 : 0);
+    if (used + cost > maxChars) break;
+    used += cost;
+    kept.unshift(entries[i]);
+  }
+
+  if (kept.length === 0 && entries.length > 0) {
+    kept.push(truncate(entries[entries.length - 1], maxChars));
+  }
+
+  const header = `## Open Questions — your own ❓ blocked-register trail; ${kept.length} of ${entries.length} entries, chronological. Each was a live blocker when written — verify it was resolved before assuming it is gone.`;
+  const body = kept.join('\n');
+  if (body.length > maxChars) {
+    return `${header}\n${truncate(body, maxChars)}`;
+  }
+  return `${header}\n${body}`;
+}
+
 export type RawRebirthSeedSectionId =
   | 'lastUserAiMessages'
   | 'currentThread'
@@ -83,6 +143,7 @@ export type RawRebirthSeedSectionId =
   | 'taskRailContext'
   | 'episodicCrossRef'
   | 'lineageGlyphLog'
+  | 'openQuestions'
   | 'atlasCrossRef'
   | 'workspaceContext'
   | 'starredMoments'
@@ -150,6 +211,12 @@ export interface RawRebirthMergedLineage {
   readonly source?: 'live' | 'archived';
   readonly essence?: string;
   readonly recentThread?: string;
+  /** Donor's FIRST user ask — what it was FOR. Only set when not visible in recentThread. */
+  readonly mission?: string;
+  /** Persisted user+assistant row count at absorption — lifecycle size anchor. */
+  readonly messageCount?: number;
+  /** True when the donor had NO persisted conversation at absorption. Failed load leaves unset. */
+  readonly emptyTranscript?: boolean;
 }
 
 export interface RawRebirthDurableMergedLineage {
@@ -192,6 +259,7 @@ export interface RawRebirthSeedInput {
   readonly taskRailContext?: string;
   readonly episodicCrossRef?: string;
   readonly lineageGlyphLog?: string;
+  readonly openQuestions?: string;
   readonly atlasCrossRef?: string;
   readonly workspaceContext?: RawRebirthWorkspaceContext | string;
   readonly starredMoments?: string;
@@ -227,6 +295,12 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly episodicCrossRef?: string;
   /** Lineage glyph log text — chronological verdict/hazard register trail (portable-mode memory section). */
   readonly lineageGlyphLog?: string;
+  /**
+   * Open-questions ledger — chronological ❓ blocked-register trail. When
+   * omitted, buildRawRebirthSeedFromMessages auto-builds it from the message
+   * trace via buildOpenQuestionsFromMessages; pass '' to suppress.
+   */
+  readonly openQuestions?: string;
 }
 
 interface BudgetedPromptSection {
@@ -251,6 +325,7 @@ export const DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS: Record<RawRebirthSeedSe
   taskRailContext: 12_000,
   episodicCrossRef: 12_000,
   lineageGlyphLog: 4_000,
+  openQuestions: 2_500,
   atlasCrossRef: 25_000,
   workspaceContext: 1_500,
   starredMoments: 50_500,
@@ -270,8 +345,9 @@ export const DEFAULT_RAW_REBIRTH_SEED_SECTION_PRIORITY: Record<RawRebirthSeedSec
   taskRailContext: 4,
   episodicCrossRef: 5,
   lineageGlyphLog: 6,
-  atlasCrossRef: 7,
-  workspaceContext: 8,
+  openQuestions: 7,
+  atlasCrossRef: 8,
+  workspaceContext: 9,
   starredMoments: 10,
   thinkingTrail: 11,
   lifetimeChangelogArc: 12,
@@ -289,6 +365,7 @@ export const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSecti
   'taskRailContext',
   'episodicCrossRef',
   'lineageGlyphLog',
+  'openQuestions',
   'atlasCrossRef',
   'workspaceContext',
   'starredMoments',
@@ -570,13 +647,23 @@ function formatMergedLineageProvenance(input: RawRebirthSeedInput): string {
   const mindWord = donors.length === 1 ? 'mind' : 'minds';
   const donorCapsules = donors.map((entry) => {
     const sourceTag = entry.source === 'archived' ? ', archived' : '';
+    const lifeTag = typeof entry.messageCount === 'number' && entry.messageCount > 0
+      ? `, ${entry.messageCount} msgs`
+      : '';
     const essence = entry.essence?.trim();
-    const head = `  ⊕ ${entry.instanceName} (${entry.instanceId}${sourceTag})`;
+    const head = `  ⊕ ${entry.instanceName} (${entry.instanceId}${sourceTag}${lifeTag})`;
     const capsuleLine = essence ? `${head} — ${essence}` : head;
+    if (entry.emptyTranscript) {
+      return `${capsuleLine}\n    Empty donor — no persisted transcript at absorption (spawned, never worked); nothing to synthesize beyond this marker.`;
+    }
+    const block = [capsuleLine];
+    const mission = entry.mission?.trim();
+    if (mission) block.push(`    Mission (first user ask): ${mission}`);
     const thread = entry.recentThread?.trim();
-    return thread
-      ? `${capsuleLine}\n    Recent reasoning (last messages before absorption):\n${thread.split('\n').map((line) => `      ${line}`).join('\n')}`
-      : capsuleLine;
+    if (thread) {
+      block.push(`    Recent reasoning (last messages before absorption):\n${thread.split('\n').map((line) => `      ${line}`).join('\n')}`);
+    }
+    return block.join('\n');
   });
   return [
     '── 🧠 Brain Merge — Synthesis Mandate ──',
@@ -716,6 +803,14 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     'lineageGlyphLog',
     input.lineageGlyphLog?.trim()
       ? `\n── Lineage Glyph Log (chronological verdicts + hazards from your own glyph trail) ──\n${input.lineageGlyphLog.trim()}`
+      : undefined,
+  );
+  pushSection(
+    budgetedSections,
+    input,
+    'openQuestions',
+    input.openQuestions?.trim()
+      ? `\n── Open Questions (❓ blocked-register trail — verify each was resolved before assuming it is gone) ──\n${input.openQuestions.trim()}`
       : undefined,
   );
   pushSection(
@@ -1051,6 +1146,7 @@ export function buildRawRebirthSeedFromMessages(
     workspaceContext: options.workspaceContext,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
+    openQuestions: options.openQuestions ?? buildOpenQuestionsFromMessages(messages),
     thinkingTrail: buildActivityLogFromMessages(
       messages,
       traceEnd,
