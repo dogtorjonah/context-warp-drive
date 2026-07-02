@@ -187,12 +187,20 @@ export class MemoryLoop {
     // let FoldSession compute its own lightweight fallback seed if one is ever
     // needed (it won't be — the seed path only runs on pressure trigger).
     const needsPortableSeed = context.hardEpochSeed == null
-      && session.willTriggerPressureCeiling(context.measuredInputTokens);
+      && (context.hardEpoch === true
+        || session.willTriggerPressureCeiling(context.measuredInputTokens));
 
     const foldOutcome = session.prepare(rawHistory, {
       measuredInputTokens: context.measuredInputTokens,
       fidelity: context.fidelity,
       durableCursorIndex: context.durableCursorIndex,
+      // Host-forced hard epochs (manual compact/reset, process handoff) and the
+      // freeze layer's pin-aware context ride through here — previously these
+      // were silently dropped, so `hardEpoch: true` never reached FoldSession
+      // and claimed paths never protected frozen turns from eviction.
+      hardEpoch: context.hardEpoch,
+      thinningMode: context.thinningMode,
+      claimedPaths: context.claimedPaths,
       hardEpochSeed: needsPortableSeed
         ? this.buildPortableHardEpochSeed(rawHistory, this.episodeRuntime, this.recallState.index, context)
         : context.hardEpochSeed,
@@ -205,11 +213,21 @@ export class MemoryLoop {
       // Rebuild the fold recall index from the new view.
       const foldedView = foldOutcome.messages;
 
+      // Hard epochs replace the view with a markerless rebirth-package seed —
+      // no "[Conversation Context — N turns folded]" block exists, so the
+      // marker-gated index would come back empty and fold recall would go
+      // dormant across the reset. seedFoldsEntireRaw derives the folded-turn
+      // count from the detected raw turns instead, making every pre-reset turn
+      // recall-addressable against the retained raw backing store. Parity with
+      // the relay portable-reset commit (fcBaseSession) and the CLI engines'
+      // isHardEpoch branches.
+      const isHardEpoch = foldOutcome.stats.epochReason === 'hard-epoch';
       recallState.index = buildFoldIndex(
         rawHistory,
         foldedView,
         undefined,
         syntheticContext,
+        isHardEpoch ? { seedFoldsEntireRaw: true } : {},
       );
       this.lastFoldedView = foldedView;
       this.lastFoldedRawCount = recallState.index?.rawCount ?? rawHistory.length;

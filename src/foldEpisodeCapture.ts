@@ -954,7 +954,8 @@ export function computeValueFloorPaths(
     }
   }
 
-  // Weight per path: read=1, claim=3, edit=4 (matches FidelityValueWeights).
+  // Tool-call weights align with FidelityValueWeights; rollingFold's userNamed
+  // weight applies only to free-form user text, not episode value-floor scans.
   const weights = new Map<string, number>();
   for (const [path, firstIdx] of firstTouchIdx) {
     weights.set(path, 0);

@@ -14,6 +14,9 @@ import {
   extractRecallSignals,
   findToolResultText,
   planRecall,
+  repeatCardBudgetRatio,
+  REPEAT_CARD_MIN_RATIO,
+  REPEAT_CARD_SHRINK_RATIO,
   resolveFoldRecallConfig,
   stripRecallBlocks,
   type FoldRecallConfig,
@@ -770,6 +773,23 @@ describe('buildFoldRecallContext', () => {
     expect(state.cardsInjected).toBe(1);
   });
 
+  test('missing index signature is treated as first pass for legacy recall state objects', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
+    const signals = touchBigfile();
+
+    const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(first.cards).toBe(1);
+    delete state.lastIndexSignature;
+
+    const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(second.text).toBeNull();
+    expect(second.cards).toBe(0);
+    expect(second.suppressed).toBe(1);
+    expect(state.cardsInjected).toBe(1);
+  });
+
   test('live source delta: changed current source becomes the card body + delta notifier', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
@@ -1343,6 +1363,97 @@ describe('buildFoldRecallContext', () => {
     const b = buildFoldRecallContext(freshState(raw), raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(a.text).toBe(b.text);
     expect(a.chars).toBe(b.chars);
+  });
+
+  // ── Repeat-recall card shrink (rail-c63e326e s6) ──
+
+  test('repeat-recall shrink: unchanged content shrinks card body chars on each same-session repeat', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    // Force truncation to become visible: BIGFILE_CONTENT is ~3,044 chars, so a
+    // maxCardChars small enough to truncate on pass 1 makes each shrink step
+    // observable in out.chars instead of hiding under an already-full budget.
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 1, maxCardChars: 3_000 };
+    const signals = touchBigfile();
+
+    const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(first.cards).toBe(1);
+    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(1);
+
+    // ttlPasses: 1 expires residency every pass, so the same path re-cards.
+    const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(second.cards).toBe(1);
+    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(2);
+    expect(second.chars).toBeLessThan(first.chars);
+
+    const third = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(third.cards).toBe(1);
+    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(3);
+    expect(third.chars).toBeLessThan(second.chars);
+  });
+
+  test('repeat-recall shrink: ratio floors at REPEAT_CARD_MIN_RATIO instead of vanishing', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 1, maxCardChars: 3_000 };
+    const signals = touchBigfile();
+
+    let last = Infinity;
+    for (let i = 0; i < 8; i++) {
+      const out = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+      // Every repeat either downgrades to hint (still non-empty) or shrinks a
+      // strictly smaller-or-equal card once the floor ratio is reached — it
+      // never grows back and never disappears while still matched.
+      expect(out.text).not.toBeNull();
+      expect(out.chars).toBeLessThanOrEqual(last);
+      last = out.chars;
+    }
+    // Never shrinks a card below the floor: maxCardChars * REPEAT_CARD_MIN_RATIO.
+    expect(repeatCardBudgetRatio(50)).toBe(REPEAT_CARD_MIN_RATIO);
+  });
+
+  test('repeat-recall shrink: no loss of correctness — a genuine live-source change resets to full body budget', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 1, maxCardChars: 3_000 };
+    const signals = touchBigfile();
+
+    // Warm up two unchanged repeats so the shrink has visibly taken hold.
+    const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(second.chars).toBeLessThan(first.chars);
+    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(2);
+
+    // Relay signals a genuine live-source change since the prior pass — this
+    // is the correctness guard: shrink must NOT apply to genuinely changed
+    // content, even though priorShowCount is already 2.
+    state.pathSourceDeltas.set(BIGFILE, {
+      path: BIGFILE,
+      liveHash: 'changed-hash',
+      liveSource: 'COMPLETELY DIFFERENT CONTENT ON DISK NOW '.repeat(120),
+      stableSincePrior: false,
+    });
+    const third = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(third.cards).toBe(1);
+    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(3);
+    expect(third.text!).toContain('Δ Source changed since fold');
+    // Full (unshrunk) body budget used again despite priorShowCount=2.
+    expect(third.chars).toBeGreaterThan(second.chars);
+  });
+
+  test('repeatCardBudgetRatio: pure arithmetic matches the documented shrink/floor contract', () => {
+    expect(repeatCardBudgetRatio(0)).toBe(1);
+    expect(repeatCardBudgetRatio(-1)).toBe(1);
+    expect(repeatCardBudgetRatio(1)).toBe(REPEAT_CARD_SHRINK_RATIO);
+    expect(repeatCardBudgetRatio(2)).toBeCloseTo(REPEAT_CARD_SHRINK_RATIO ** 2, 10);
+    expect(repeatCardBudgetRatio(10)).toBe(REPEAT_CARD_MIN_RATIO);
+    // Monotonically non-increasing as priorShowCount grows.
+    let prev = repeatCardBudgetRatio(0);
+    for (let n = 1; n <= 12; n++) {
+      const cur = repeatCardBudgetRatio(n);
+      expect(cur).toBeLessThanOrEqual(prev);
+      prev = cur;
+    }
   });
 });
 

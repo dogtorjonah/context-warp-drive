@@ -11,6 +11,7 @@
  *   - Rolling fold (`foldContext`) + Coordinate Closet — deterministic page-out.
  *   - Fold freeze (`evaluateFoldFreeze`) — byte-identical cache-hot reuse.
  *   - Fold recall (`buildFoldRecallContext`) — ambient page-in.
+ *   - Boundary auction (`runBoundaryAuction`) — opt-in shared recall budget.
  *   - Episodic recall (`./episodes`) — durable cross-session blast-radius memory.
  *   - Glyph grammar (`./glyphs`) — register-tagged messages that power episodic
  *     narration harvesting.
@@ -40,7 +41,10 @@
  */
 export * from './fold.ts';
 export * from './contextBudget.ts';
+export * from './boundaryAuction.ts';
 export * from './episodes.ts';
+export * from './foldRecallUsage.ts';
+export * from './foldRailPrefetch.ts';
 export * from './episodes/runtime.ts';
 export * from './glyphs.ts';
 export * from './taskRail.ts';

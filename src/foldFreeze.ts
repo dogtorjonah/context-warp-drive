@@ -253,6 +253,45 @@ export type FoldFreezeAppendResult = FoldFreezeAppendCommit | FoldFreezeAppendSk
 
 const APPEND_TAIL_MIN_SHRINK_RATIO = 0.9;
 
+/**
+ * Tail-epoch efficiency ALARM threshold (rail-c63e326e s4). A tail-epoch
+ * attempt can pass the `APPEND_TAIL_MIN_SHRINK_RATIO` commit gate (shrinkRatio
+ * <= 0.9, i.e. "saved at least something") yet still land far outside the
+ * ~5K append-band target the runway model assumes — e.g. dense tool-result /
+ * code / JSON content that resists turn-based compaction. This SEPARATE,
+ * stricter threshold flags that "barely helped" case for operator visibility:
+ * 0.9 asks "did folding help AT ALL"; 0.6 asks "did it help ENOUGH to matter"
+ * (>=40% saved). A shrink ratio worse than this escalates the emitted
+ * epoch/skip log line from console.log to console.warn and appends an
+ * ` ⚠ ALARM: …` suffix into the epochCause string — visible through the
+ * EXISTING aa-ledger fold_events `epoch_cause` field with no schema change,
+ * since EPOCH_RE captures the full cause text lazily up to `) — frozen`.
+ *
+ * Live case that validates this threshold (2026-07-01, stealth-dragon/glm,
+ * epoch #2, ts 1782921627686): a single append-only tail-epoch attempt folded
+ * 123 raw tail messages (287,211 raw chars -> 258,454 folded chars) for only
+ * 10% savings — shrinkRatio ≈ 0.8999, i.e. it JUST barely squeaked under the
+ * 0.9 commit gate. Root cause: this tail accumulated across many tool calls
+ * inside one long turn before any tail-epoch trigger fired (only 1 prior
+ * cached msg was sealed, so essentially the whole early session landed in one
+ * shot), and the bulk of those 123 messages were large tool-result payloads
+ * (dense code/JSON/log dumps) that are already low-redundancy prose-wise —
+ * turn-based fold summarization has little to compress out of structured,
+ * already-terse content. This threshold exists so that class of "technically
+ * committed, functionally useless" tail epoch is surfaced instead of silently
+ * passing as a normal EPOCH line.
+ */
+export const TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO = 0.6;
+
+/**
+ * Pure check: does this tail-epoch attempt's shrink ratio breach the
+ * efficiency alarm threshold? `null` (no raw tail chars to measure) never
+ * alarms — there is nothing to judge efficiency against.
+ */
+export function isTailEpochEfficiencyAlarm(shrinkRatio: number | null): boolean {
+  return shrinkRatio !== null && shrinkRatio > TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO;
+}
+
 export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecomputeCause[] = [
   'first-call',
   'cold-gap',

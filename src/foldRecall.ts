@@ -39,8 +39,10 @@
  */
 
 import {
+  ALWAYS_ON_FOLD_CONFIG,
   classifyTurn,
   countChars,
+  DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS,
   detectTurns,
   extractAssistantText,
   extractPath,
@@ -142,16 +144,182 @@ export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
 /** Hints injected per pass never exceed this, regardless of pressure. */
 const MAX_HINTS_PER_PASS = 4;
 /** Minimum remaining char budget worth spending on a card; below this, downgrade to hint. */
-const MIN_USEFUL_CARD_CHARS = 400;
+export const MIN_USEFUL_CARD_CHARS = 400;
 /** Bounded lowercased per-turn digest length (reserved for deferred tier-2 term matching). */
 const TURN_DIGEST_MAX_CHARS = 400;
 const TERM_RECALL_MIN_DISTINCTIVE_COUNT = 2;
+/**
+ * Reserved gap subtracted from the remaining pass budget before sizing a card
+ * body (see the bodyBudget computation in renderRecallPlan), so a rendered
+ * card's trailing punctuation/metadata never exactly exhausts the pass
+ * budget. Named + exported so validateFoldGeometry() shares the same source
+ * of truth as the render path instead of duplicating the literal.
+ */
+export const RECALL_BODY_RESERVED_GAP_CHARS = 200;
+
+/**
+ * Repeat-recall card shrink (rail-c63e326e s6). A path that has already been
+ * carded once or more this session and has NOT changed content since (see
+ * `RecallSourceDelta.stableSincePrior`, or no live-source info at all — the
+ * folded historical entry itself is fixed regardless of live source
+ * tracking) does not need the full body budget again: the agent has already
+ * seen it. Each repeat multiplies the available body budget by this ratio,
+ * floored at REPEAT_CARD_MIN_RATIO so a card never shrinks to uselessness —
+ * MIN_USEFUL_CARD_CHARS still governs the eventual card→hint downgrade.
+ */
+export const REPEAT_CARD_SHRINK_RATIO = 0.6;
+/** Floor on the cumulative shrink multiplier — never shrink a repeat card below 35% of its unshrunk budget. */
+export const REPEAT_CARD_MIN_RATIO = 0.35;
+
+/**
+ * Pure arithmetic: the body-budget multiplier for the (priorShowCount+1)-th
+ * card injection of the same path this session. priorShowCount=0 (first-ever
+ * card for this path) → 1 (no shrink). Deterministic, no I/O.
+ */
+export function repeatCardBudgetRatio(priorShowCount: number): number {
+  if (priorShowCount <= 0) return 1;
+  return Math.max(REPEAT_CARD_MIN_RATIO, REPEAT_CARD_SHRINK_RATIO ** priorShowCount);
+}
 
 function parsePositiveInt(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const n = Number.parseInt(raw.trim(), 10);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Fold geometry invariant checker (rail-c63e326e s2)
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Historical bug: ttlPasses=8 vs activeWindowTurns=1 (buffer=7) created a
+ * 7-pass recall dead zone where a folded marker was present but the card
+ * could not re-show (rail-ed5588b5, fixed 2026-06-24; refined further by
+ * rail-dccaa1a1 on 2026-07-02). The fix landed at ttlPasses=4 (buffer=3).
+ * Ceiling is set with headroom above the fixed value for legitimate tuning,
+ * while still catching a regression back toward the old buggy shape.
+ */
+export const MAX_TTL_DEADZONE_BUFFER_PASSES = 5;
+
+export interface FoldGeometryInputs {
+  /** Recall residency TTL in passes (FoldRecallConfig.ttlPasses). */
+  ttlPasses: number;
+  /** Inter-turn fold's guaranteed-verbatim window in turns (FoldConfig.activeWindowTurns). */
+  activeWindowTurns: number;
+  /** Fidelity-value eviction floor in turns (DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS or override). */
+  recencyFloorTurns: number;
+  /** FoldRecallConfig.maxTotalChars. */
+  maxTotalChars: number;
+  /** FoldRecallConfig.maxCardChars. */
+  maxCardChars: number;
+}
+
+export interface FoldGeometryViolation {
+  rule: 'ttl-deadzone' | 'recency-floor-below-window' | 'auto-compact-card-too-small';
+  message: string;
+}
+
+/**
+ * Pure cross-knob invariant checker for fold/recall geometry. Each rule
+ * encodes a specific interaction class that has previously shipped as a live
+ * dogfood regression (see file history for rail-ed5588b5 / rail-dccaa1a1)
+ * before being caught and fixed by hand. This does not prove the geometry is
+ * "correct" — it only catches a regression back toward a known-bad shape, or
+ * flags a genuinely new bad combination in the same families. Violations are
+ * data for the caller to log/assert on in dev/test; this function itself
+ * never throws or logs, keeping it pure and safe to call from any context.
+ */
+export function validateFoldGeometry(inputs: FoldGeometryInputs): FoldGeometryViolation[] {
+  const violations: FoldGeometryViolation[] = [];
+
+  const ttlDeadZoneBuffer = inputs.ttlPasses - inputs.activeWindowTurns;
+  if (ttlDeadZoneBuffer > MAX_TTL_DEADZONE_BUFFER_PASSES) {
+    violations.push({
+      rule: 'ttl-deadzone',
+      message:
+        `ttlPasses (${inputs.ttlPasses}) exceeds activeWindowTurns (${inputs.activeWindowTurns}) by ` +
+        `${ttlDeadZoneBuffer} passes, beyond the ${MAX_TTL_DEADZONE_BUFFER_PASSES}-pass ceiling. This is the ` +
+        `rail-ed5588b5 dead-zone bug class: content scrolls out of the visible window after activeWindowTurns ` +
+        `but recall residency keeps suppressing re-injection for the rest of ttlPasses. Tier-0 path-touch bypass ` +
+        `(rail-dccaa1a1) only mitigates active-file cases; other tiers stay blinded for the full buffer.`,
+    });
+  }
+
+  if (inputs.recencyFloorTurns < inputs.activeWindowTurns) {
+    violations.push({
+      rule: 'recency-floor-below-window',
+      message:
+        `recencyFloorTurns (${inputs.recencyFloorTurns}) is below activeWindowTurns (${inputs.activeWindowTurns}) ` +
+        `— the fidelity-value eviction floor would let turns evict before they even leave the ` +
+        `guaranteed-verbatim active window.`,
+    });
+  }
+
+  const autoCompactCharBudget = Math.min(800, inputs.maxTotalChars);
+  const tier0EffectiveBodyChars = Math.min(inputs.maxCardChars, autoCompactCharBudget - RECALL_BODY_RESERVED_GAP_CHARS);
+  if (tier0EffectiveBodyChars < MIN_USEFUL_CARD_CHARS) {
+    violations.push({
+      rule: 'auto-compact-card-too-small',
+      message:
+        `Under auto_compact pressure, the tier-0 floor's effective per-card body budget ` +
+        `(min(maxCardChars=${inputs.maxCardChars}, autoCompactCharBudget=${autoCompactCharBudget} - ` +
+        `${RECALL_BODY_RESERVED_GAP_CHARS}) = ${tier0EffectiveBodyChars}) falls below MIN_USEFUL_CARD_CHARS ` +
+        `(${MIN_USEFUL_CARD_CHARS}). The one card recall reserves for the actively-edited path under maximum ` +
+        `pressure would downgrade to an unhelpfully small stub exactly when the agent needs it most.`,
+    });
+  }
+
+  return violations;
+}
+
+function foldGeometryInputsForRecallConfig(
+  config: Pick<FoldRecallConfig, 'ttlPasses' | 'maxTotalChars' | 'maxCardChars'>,
+): FoldGeometryInputs {
+  return {
+    ttlPasses: config.ttlPasses,
+    activeWindowTurns: ALWAYS_ON_FOLD_CONFIG.activeWindowTurns,
+    recencyFloorTurns: DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS,
+    maxTotalChars: config.maxTotalChars,
+    maxCardChars: config.maxCardChars,
+  };
+}
+
+function foldGeometryEnv(env?: Record<string, string | undefined>): Record<string, string | undefined> | undefined {
+  return env ?? (typeof process !== 'undefined' ? process.env : undefined);
+}
+
+function shouldWarnFoldGeometry(env?: Record<string, string | undefined>): boolean {
+  return (foldGeometryEnv(env)?.NODE_ENV ?? '') !== 'production';
+}
+
+const warnedFoldGeometryKeys = new Set<string>();
+
+function warnFoldGeometryViolations(
+  violations: readonly FoldGeometryViolation[],
+  env: Record<string, string | undefined> | undefined,
+  source: 'defaults' | 'resolveFoldRecallConfig',
+): void {
+  if (violations.length === 0 || !shouldWarnFoldGeometry(env)) return;
+  for (const violation of violations) {
+    const key = `${source}:${violation.rule}:${violation.message}`;
+    if (warnedFoldGeometryKeys.has(key)) continue;
+    warnedFoldGeometryKeys.add(key);
+    // eslint-disable-next-line no-console
+    console.warn(`[fold-geometry:${source}] ${violation.rule}: ${violation.message}`);
+  }
+}
+
+/**
+ * Dev/test-only self-check of shipped defaults. Env-resolved config is checked
+ * inside resolveFoldRecallConfig(), so operator overrides cannot silently
+ * recreate a known-bad geometry. Both paths warn instead of throwing and are
+ * skipped in production.
+ */
+warnFoldGeometryViolations(
+  validateFoldGeometry(foldGeometryInputsForRecallConfig(DEFAULT_FOLD_RECALL_CONFIG)),
+  foldGeometryEnv(),
+  'defaults',
+);
 
 /**
  * Resolve config from environment. Default ON (recall is already gated on
@@ -179,7 +347,7 @@ export function resolveFoldRecallConfig(
   const hazardsRaw = (env.WARP_FOLD_RECALL_HAZARDS ?? '').trim().toLowerCase();
   const episodesRaw = (env.WARP_FOLD_RECALL_EPISODES ?? '').trim().toLowerCase();
   const atlasMetaRaw = (env.WARP_FOLD_RECALL_ATLAS_META ?? '').trim().toLowerCase();
-  return {
+  const config: FoldRecallConfig = {
     enabled,
     maxCards: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARDS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
     maxTotalChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_TOTAL_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
@@ -202,6 +370,12 @@ export function resolveFoldRecallConfig(
     atlasMetaEnabled:
       atlasMetaRaw === '' || (atlasMetaRaw !== '0' && atlasMetaRaw !== 'false' && atlasMetaRaw !== 'off' && atlasMetaRaw !== 'no'),
   };
+  warnFoldGeometryViolations(
+    validateFoldGeometry(foldGeometryInputsForRecallConfig(config)),
+    env,
+    'resolveFoldRecallConfig',
+  );
+  return config;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -884,6 +1058,14 @@ export interface FoldRecallState {
   /** entryId → residency. Map iteration order is never observable in output. */
   resident: Map<string, ResidencyRecord>;
   /**
+   * Normalized path → lifetime count of CARD-level injections this session
+   * (rail-c63e326e s6). Unlike `residentPaths`, this NEVER expires or gets
+   * cleared on index rebuild — it is a pure session-lifetime counter used
+   * only to shrink same-content repeat cards, never to suppress them
+   * (suppression stays entirely owned by `resident`/`residentPaths` TTL).
+   */
+  pathCardShowCounts: Map<string, number>;
+  /**
    * Normalized path → CARD residency. Content-level suppression that survives
    * index rebuilds: after a refold the same logical content can reappear
    * under a NEW entry id (e.g. the turn that received a recall card folds and
@@ -928,6 +1110,16 @@ export interface FoldRecallState {
   pathAtlasMeta?: Map<string, AtlasFileMeta>;
   /** Recall pass counter — one pass per tool boundary that carried signals. */
   passSeq: number;
+  /**
+   * Signature of the index seen on the previous pass (rawCount|firstId|lastId).
+   * When the index is rebuilt by a freeze epoch (refold), the entry ids change
+   * identity even though path residency stays content-keyed — so entry-id
+   * residency must be cleared on index change to avoid suppressing a genuinely
+   * fresh refolded entry that legitimately re-cards. Path residency survives
+   * (content-keyed, intentionally post-refold-stable). null/undefined =
+   * first pass (undefined preserves compatibility with older state objects).
+   */
+  lastIndexSignature?: string | null;
   // ── Lifetime telemetry counters ──
   cardsInjected: number;
   hintsInjected: number;
@@ -939,6 +1131,7 @@ export function createFoldRecallState(): FoldRecallState {
   return {
     index: null,
     resident: new Map(),
+    pathCardShowCounts: new Map(),
     residentPaths: new Map(),
     pathHighlights: new Map(),
     pathHazards: new Map(),
@@ -947,6 +1140,7 @@ export function createFoldRecallState(): FoldRecallState {
     pathEpisodes: new Map(),
     pathAtlasMeta: new Map(),
     passSeq: 0,
+    lastIndexSignature: null,
     cardsInjected: 0,
     hintsInjected: 0,
     recallChars: 0,
@@ -2050,6 +2244,19 @@ function swapPathToCurrentSource(
   };
 }
 
+/**
+ * True unless the relay has explicitly signaled a live-source change for this
+ * path (`stableSincePrior === false`). Absence of any source-delta signal is
+ * treated as "unchanged" because the folded historical entry itself is fixed
+ * content from rawHistory — it never changes on its own between recalls;
+ * only a live file diverging from that historical snapshot is a genuine
+ * change worth paying full card budget for again.
+ */
+function isPathContentUnchanged(matchedPath: string, state: FoldRecallState): boolean {
+  const delta = state.pathSourceDeltas.get(matchedPath);
+  return !delta || delta.stableSincePrior !== false;
+}
+
 function resolveItemSourceDeltaMap(item: RecallPlanItem, state: FoldRecallState): Map<string, RecallSourceDelta> {
   const map = new Map<string, RecallSourceDelta>();
   for (const key of recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS)) {
@@ -2161,6 +2368,20 @@ export function buildFoldRecallContext(
   // Staleness guard: a rewound history invalidates raw ranges; the next
   // freeze epoch (history-rewound) rebuilds the index from current truth.
   if (rawHistory.length < state.index.rawCount) return EMPTY_OUTCOME;
+
+  // Index-change detection: a freeze epoch rebuilds the index, and entry ids
+  // (turn:<startIndex>) can collide across rebuilds even though the refolded
+  // entry is fresh. Clear entry-id residency on rebuild so the new entry can
+  // legitimately re-card. Path residency is content-keyed and intentionally
+  // survives refolds, so it is NOT cleared here.
+  const entries = state.index.entries;
+  const currentIndexSignature =
+    `${state.index.rawCount}|${entries[0]?.id ?? ''}|${entries[entries.length - 1]?.id ?? ''}`;
+  if (state.lastIndexSignature != null && state.lastIndexSignature !== currentIndexSignature) {
+    state.resident.clear();
+  }
+  state.lastIndexSignature = currentIndexSignature;
+
   const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
   const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
   if (
@@ -2214,7 +2435,15 @@ export function buildFoldRecallContext(
     let rendered: string | null = null;
 
     if (level === 'card') {
-      const bodyBudget = Math.min(config.maxCardChars, remaining - 200);
+      const uncappedBodyBudget = Math.min(config.maxCardChars, remaining - RECALL_BODY_RESERVED_GAP_CHARS);
+      // Repeat-recall shrink (rail-c63e326e s6): a path already carded earlier
+      // this session, with no signaled live-source change, needs less budget
+      // on each repeat — the agent has already seen it once.
+      const priorShowCount = state.pathCardShowCounts.get(item.matchedPath) ?? 0;
+      const shrinkRatio = isPathContentUnchanged(item.matchedPath, state)
+        ? repeatCardBudgetRatio(priorShowCount)
+        : 1;
+      const bodyBudget = shrinkRatio < 1 ? Math.floor(uncappedBodyBudget * shrinkRatio) : uncappedBodyBudget;
       if (bodyBudget < MIN_USEFUL_CARD_CHARS) {
         level = 'hint'; // measured budget overflow → card degrades to hint
       } else {
@@ -2254,6 +2483,8 @@ export function buildFoldRecallContext(
     if (level === 'card') {
       // Content-level residency: keep this path quiet across index rebuilds.
       state.residentPaths.set(item.matchedPath, { level: 'card', expiresAtPass: passSeq + config.ttlPasses });
+      // Lifetime repeat counter (rail-c63e326e s6) — never expires/clears, unlike residency.
+      state.pathCardShowCounts.set(item.matchedPath, (state.pathCardShowCounts.get(item.matchedPath) ?? 0) + 1);
     }
     charsUsed += rendered.length;
     if (level === 'card') cards++;

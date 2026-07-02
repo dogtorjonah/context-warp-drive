@@ -135,6 +135,37 @@ export interface Episode {
    * for tier-2 pathless recall. Optional before persistence and on legacy rows.
    */
   terms?: string[];
+  /**
+   * EMA of terminal recall outcomes in [0,1]. Absent for unmeasured legacy rows
+   * and the -1 sentinel; used only by opt-in ranking experiments.
+   */
+  recallUtility?: number;
+}
+
+export const RECALL_UTILITY_MIN_MULTIPLIER = 0.75;
+export const RECALL_UTILITY_MAX_MULTIPLIER = 1.25;
+
+export interface RecallUtilityDebugFields {
+  recallUtility: number;
+  recallUtilityMultiplier: number;
+}
+
+export function normalizeRecallUtility(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.min(1, Math.max(0, value));
+}
+
+export function recallUtilityMultiplier(value: unknown): number {
+  const utility = normalizeRecallUtility(value);
+  if (utility === undefined) return 1;
+  return RECALL_UTILITY_MIN_MULTIPLIER
+    + utility * (RECALL_UTILITY_MAX_MULTIPLIER - RECALL_UTILITY_MIN_MULTIPLIER);
+}
+
+export function recallUtilityDebugFields(value: unknown): RecallUtilityDebugFields | undefined {
+  const utility = normalizeRecallUtility(value);
+  if (utility === undefined) return undefined;
+  return { recallUtility: utility, recallUtilityMultiplier: recallUtilityMultiplier(utility) };
 }
 
 export interface EpisodeTouch {
@@ -1490,6 +1521,8 @@ export interface EpisodicRecallCardDebugLike {
   annotationBoost: number;
   annotationBoostKind?: EpisodeAnnotationKind;
   score?: number;
+  recallUtility?: number;
+  recallUtilityMultiplier?: number;
 }
 
 export interface EpisodicRecallCardLike {

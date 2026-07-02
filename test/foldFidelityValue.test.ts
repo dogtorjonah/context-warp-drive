@@ -4,6 +4,7 @@ import {
   foldContext,
   detectTurns,
   scoreTurnFidelityValue,
+  extractUserNamedPaths,
   DEFAULT_FIDELITY_VALUE_WEIGHTS,
   ALWAYS_ON_FOLD_CONFIG,
   type FoldMessage,
@@ -74,6 +75,58 @@ describe('scoreTurnFidelityValue — intrinsic trace value', () => {
     // Neither path is re-referenced downstream, so the only signal is the glyph.
     expect(scores[0]).toBe(DEFAULT_FIDELITY_VALUE_WEIGHTS.glyphDurableBonus);
     expect(scores[1]).toBe(0);
+  });
+
+  test('a path the operator names in prose (no tool call) survives fidelity decay it previously would not have', () => {
+    const messages = [
+      ...toolTurn(0, 'Read', '/repo/named.ts', 'note0'), // turn 0 reads named.ts; no tool call ever re-touches it
+      userMsg('before we ship, please double check /repo/named.ts one more time'), // ACTIVE window: prose-only mention
+      assistantMsg('ok, will do'),
+    ];
+    const turns = detectTurns(messages);
+    const scores = scoreTurnFidelityValue(turns, 1); // fold turn 0; turn 1 (prose mention) is the active window
+
+    // Prior to userNamed extraction this is byte-identical to the abandoned-cold.ts
+    // case above: no downstream TOOL CALL ever references named.ts, so turn 0 would
+    // score 0 and lose the fold budget to any turn with a real downstream tool touch.
+    // The operator naming the path by hand must be enough on its own to avoid that.
+    expect(scores[0]).toBeGreaterThan(0);
+    expect(scores[0]).toBe(
+      DEFAULT_FIDELITY_VALUE_WEIGHTS.userNamed * DEFAULT_FIDELITY_VALUE_WEIGHTS.activeWindowMultiplier,
+    );
+    // And it is weighted at least as high as a downstream edit would be (rail-c63e326e s5 acceptance).
+    expect(DEFAULT_FIDELITY_VALUE_WEIGHTS.userNamed).toBeGreaterThanOrEqual(DEFAULT_FIDELITY_VALUE_WEIGHTS.edit);
+  });
+
+  test('a user-named mention in the FOLD zone (not just active window) also registers as a downstream ref', () => {
+    const messages = [
+      ...toolTurn(0, 'Read', '/repo/named2.ts', 'note0'),
+      userMsg('circle back to /repo/named2.ts before the next step'), // still inside the fold zone
+      assistantMsg('noted'),
+      ...toolTurn(2, 'Read', '/repo/unrelated.ts', 'note2'), // ACTIVE window, unrelated
+    ];
+    const turns = detectTurns(messages);
+    const scores = scoreTurnFidelityValue(turns, 2); // fold turns 0,1; turn 2 = active window
+    // No active-window multiplier here since the reference is inside the fold zone, not the active window.
+    expect(scores[0]).toBe(DEFAULT_FIDELITY_VALUE_WEIGHTS.userNamed);
+  });
+});
+
+describe('extractUserNamedPaths — pure path-mention extraction', () => {
+  test('matches absolute and relative path shapes, strips line ranges, dedupes', () => {
+    const text =
+      'dive into relay/src/fcBaseSession.ts:200-210 and also /repo/context-warp/src/rollingFold.ts, ' +
+      'then relay/src/fcBaseSession.ts again';
+    const paths = extractUserNamedPaths(text);
+    expect(paths).toContain('relay/src/fcBaseSession.ts');
+    expect(paths).toContain('/repo/context-warp/src/rollingFold.ts');
+    // deduped: the second mention of fcBaseSession.ts (with no range) collapses onto the first.
+    expect(paths.filter((p) => p === 'relay/src/fcBaseSession.ts')).toHaveLength(1);
+  });
+
+  test('does not match ordinary slash-separated prose', () => {
+    const paths = extractUserNamedPaths('this fixes either/both cases and/or the edge case');
+    expect(paths).toHaveLength(0);
   });
 });
 

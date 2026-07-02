@@ -19,6 +19,8 @@ import {
   getFoldFreezeMetadata,
   resolveFoldFreezeConfig,
   DEFAULT_FOLD_FREEZE_CONFIG,
+  isTailEpochEfficiencyAlarm,
+  TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO,
   type FoldFreezeConfig,
   type FoldFreezeContext,
   type FoldFreezeState,
@@ -235,12 +237,13 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
 
     const appended = appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
 
-    expect(appended).not.toBeNull();
-    expect(appended?.sealedPrefixMessageCount).toBe(view.length);
-    expect(appended?.view).toHaveLength(view.length + tailFolded.length);
-    for (let i = 0; i < view.length; i++) expect(appended?.view[i]).toBe(view[i]);
-    expect(JSON.stringify(appended?.view.slice(0, view.length))).toBe(sealedPrefixBytes);
-    expect(appended?.view[view.length]).toBe(tailFolded[0]);
+    expect(appended.committed).toBe(true);
+    if (!appended.committed) return;
+    expect(appended.sealedPrefixMessageCount).toBe(view.length);
+    expect(appended.view).toHaveLength(view.length + tailFolded.length);
+    for (let i = 0; i < view.length; i++) expect(appended.view[i]).toBe(view[i]);
+    expect(JSON.stringify(appended.view.slice(0, view.length))).toBe(sealedPrefixBytes);
+    expect(appended.view[view.length]).toBe(tailFolded[0]);
     expect(state.frozenRawCount).toBe(grown.length);
     expect(state.frozenView?.slice(0, view.length)).toEqual(view);
     expect(JSON.stringify(state.frozenView?.slice(0, view.length))).toBe(sealedPrefixBytes);
@@ -557,5 +560,39 @@ describe('resolveFoldFreezeConfig — env parsing', () => {
     expect(cfg.enabled).toBe(true);
     expect(cfg.ttlMs).toBe(60_000);
     expect(cfg.maxTailChars).toBe(50_000);
+  });
+});
+
+describe('isTailEpochEfficiencyAlarm — tail-epoch efficiency ALARM threshold (rail-c63e326e s4)', () => {
+  it('never alarms when there is no raw tail to measure (null shrinkRatio)', () => {
+    expect(isTailEpochEfficiencyAlarm(null)).toBe(false);
+  });
+
+  it('does not alarm at or below the documented threshold (>= 40% saved)', () => {
+    expect(TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO).toBe(0.6);
+    expect(isTailEpochEfficiencyAlarm(0.6)).toBe(false);
+    expect(isTailEpochEfficiencyAlarm(0.1)).toBe(false);
+    expect(isTailEpochEfficiencyAlarm(0)).toBe(false);
+  });
+
+  it('alarms once shrinkRatio breaches the threshold (< 40% saved)', () => {
+    expect(isTailEpochEfficiencyAlarm(0.6001)).toBe(true);
+    // Live stealth-dragon regression case (2026-07-01): 287,211 -> 258,454 chars.
+    expect(isTailEpochEfficiencyAlarm(258_454 / 287_211)).toBe(true);
+  });
+
+  it('surfaces the same shrinkRatio the append-only commit path reports', () => {
+    const { state, history, view } = frozenFixture();
+    // A tail that shrinks enough to pass the 0.9 commit gate but not enough
+    // to clear the stricter 0.6 ALARM threshold (shrinkRatio 1400/2000 = 0.7).
+    const rawTail = [msg('user', 'x'.repeat(1000)), msg('assistant', 'y'.repeat(1000))];
+    const tailFolded = [msg('user', 'x'.repeat(1000)), msg('assistant', 'y'.repeat(400))];
+    const grown = [...history, ...rawTail];
+    const result = appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
+    expect(result.committed).toBe(true);
+    if (result.committed) {
+      expect(result.shrinkRatio).toBeCloseTo(0.7, 5);
+      expect(isTailEpochEfficiencyAlarm(result.shrinkRatio)).toBe(true);
+    }
   });
 });

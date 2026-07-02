@@ -31,6 +31,17 @@ describe('resolveContextBudget', () => {
     expect(resolveContextBudget({ engine: 'codex-api', model: 'gpt-5.5' }).pressureCeilingTokens).toBe(120_000);
   });
 
+  it('mirrors the opus-4.8 180K exception for fable-5 on Claude API and interactive tmux surfaces (Jonah, 2026-07-02)', () => {
+    expect(resolveContextBudget({ engine: 'claude', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(120_000);
+    expect(resolveContextBudget({ engine: 'claude', model: 'claude-fable-5' }).foldTriggerTokens).toBe(120_000);
+    expect(resolveContextBudget({ engine: 'claude-cli', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(120_000);
+    expect(resolveContextBudget({ engine: 'claude-cli', model: 'claude-fable-5' }).foldTriggerTokens).toBe(120_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(180_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5' }).foldTriggerTokens).toBe(180_000);
+    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(180_000);
+    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-fable-5' }).foldTriggerTokens).toBe(180_000);
+  });
+
   it('puts 200k Claude models in survival mode with the 120K default pressure ceiling', () => {
     const budget = resolveContextBudget({ engine: 'claude', model: 'claude-sonnet-4' });
 

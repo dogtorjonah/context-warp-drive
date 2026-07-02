@@ -362,11 +362,12 @@ function isCodexCliEngine(engine: string): boolean {
   return engine.trim().toLowerCase() === 'codex';
 }
 
-// Engines that keep the elevated Opus-4.8-max pressure ceiling (Jonah, 2026-07-01):
-// the Claude API (in-process FC fold) and the interactive tmux CLI (hard-epoch
-// session swap) — the two surfaces that carry a real 1M-class window end-to-end.
-// Plain 'claude' / 'claude-cli' (non-tmux CLI) deliberately stay OFF this set and
-// fall through to the 120K universal default even for opus-4.8.
+// Engines that keep the elevated Opus-4.8-max pressure ceiling (Jonah, 2026-07-01;
+// fable-5 added Jonah 2026-07-02): the Claude API (in-process FC fold) and the
+// interactive tmux CLI (hard-epoch session swap) — the two surfaces that carry a
+// real 1M-class window end-to-end. Plain 'claude' / 'claude-cli' (non-tmux CLI)
+// deliberately stay OFF this set and fall through to the 120K universal default
+// even for opus-4.8 or fable-5.
 const OPUS_MAX_PRESSURE_CEILING_ENGINES: ReadonlySet<string> = new Set(['claude-api', 'claude-interactive']);
 
 function isOpusFourEightModel(model: string): boolean {
@@ -374,16 +375,21 @@ function isOpusFourEightModel(model: string): boolean {
   return modelLower.includes('opus-4-8') || modelLower.includes('opus-4.8') || modelLower.includes('opus 4.8');
 }
 
+function isFableFiveModel(model: string): boolean {
+  const modelLower = model.trim().toLowerCase();
+  return modelLower.includes('fable-5') || modelLower.includes('fable.5') || modelLower.includes('fable 5');
+}
+
 /**
  * Default pressure ceiling for a given model/engine pair. 120K universal default;
- * 180K ONLY for opus-4.8 on the Claude API or interactive tmux CLI surfaces (see
- * OPUS_MAX_PRESSURE_CEILING_ENGINES above). Explicit input.pressureCeilingTokens
- * and the VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env override both still take
- * precedence over this default in resolveContextBudget.
+ * 180K ONLY for opus-4.8 or fable-5 on the Claude API or interactive tmux CLI
+ * surfaces (see OPUS_MAX_PRESSURE_CEILING_ENGINES above). Explicit
+ * input.pressureCeilingTokens and the VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env
+ * override both still take precedence over this default in resolveContextBudget.
  */
 function defaultPressureCeilingTokensForModelEngine(model: string, engine: string): number {
   const engineLower = engine.trim().toLowerCase();
-  if (OPUS_MAX_PRESSURE_CEILING_ENGINES.has(engineLower) && isOpusFourEightModel(model)) {
+  if (OPUS_MAX_PRESSURE_CEILING_ENGINES.has(engineLower) && (isOpusFourEightModel(model) || isFableFiveModel(model))) {
     return DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS;
   }
   return DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;

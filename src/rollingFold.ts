@@ -201,20 +201,25 @@ export const ALWAYS_ON_FOLD_CONFIG: FoldConfig = {
 // Today's base fold budgets are absolute char constants calibrated against a
 // 100K-token band (400K chars at the fold's 4 chars/token estimate). The band
 // resolver keeps that base reproducible while making the public default band
-// explicit and tunable: 160K tokens by default, independent of model context
-// window size. Every ratio below is calibrated so an explicit 100K-token band
-// reproduces the existing constants EXACTLY (base-equivalence, locked by tests).
+// explicit and tunable: 100K tokens by default (DEFAULT_FOLD_BAND_TOKENS
+// below), independent of model context window size. Callers such as
+// fcBaseSession pass their own live-resolved bandTokens (e.g. the M40
+// steady-state fold-band geometry in contextBudget.ts); 100K only applies
+// when no band is supplied. Every ratio below is calibrated so an explicit
+// 100K-token band reproduces the existing constants EXACTLY
+// (base-equivalence, locked by tests).
 // The remainder of the band (~56.5%) is working-set + skeleton headroom.
 // ══════════════════════════════════════════════════════════════════════
 
 /**
  * Default chars-per-token assumption for converting a token-denominated band
  * target into a char budget. Claude-calibrated (~4). Denser-tokenizing engines
- * (code/JSON/path-heavy transcripts) can pass a lower ratio so the default
- * 160K-token band target yields a correspondingly smaller char budget — i.e.
- * the band stays pinned to real tokens, not chars. Passing 100K explicitly
- * reproduces every existing fold constant EXACTLY (base-equivalence, locked by
- * tests).
+ * (code/JSON/path-heavy transcripts) can pass a lower ratio so a given
+ * token-denominated band target (100K by default; callers may pass their own
+ * live-resolved band, e.g. M40) yields a correspondingly smaller char budget
+ * — i.e. the band stays pinned to real tokens, not chars. Passing 100K
+ * explicitly reproduces every existing fold constant EXACTLY
+ * (base-equivalence, locked by tests).
  */
 export const BAND_CHARS_PER_TOKEN = 4;
 
@@ -264,6 +269,17 @@ export interface FidelityValueWeights {
   claim: number;
   /** Downstream reference where a later turn EDITS the same path. */
   edit: number;
+  /**
+   * Downstream reference where a later turn NAMES the same path in the
+   * user's own words (rail-c63e326e s5) — a file path Jonah explicitly
+   * mentions in a user message, extracted via `extractUserNamedPaths`.
+   * Deliberately weighted at least as high as `edit`: an operator naming a
+   * path is the strongest relevance signal available (stronger than the
+   * agent's own downstream tool-call behavior), so a turn an operator later
+   * calls back to by name should not decay just because no tool call
+   * happened to touch it.
+   */
+  userNamed: number;
   /** Multiplier when the downstream reference is in the live active window, not just a later folded turn. */
   activeWindowMultiplier: number;
   /** Additive bonus when the folded turn's assistant text opens with a durable register glyph (🏁 verdict / ⚠️ hazard). */
@@ -274,6 +290,7 @@ export const DEFAULT_FIDELITY_VALUE_WEIGHTS: FidelityValueWeights = {
   read: 1,
   claim: 3,
   edit: 4,
+  userNamed: 5,
   activeWindowMultiplier: 2,
   glyphDurableBonus: 2,
 };
@@ -322,9 +339,9 @@ export function resolveFoldBandBudgets(
 
 /**
  * Band-aware ALWAYS_ON fold config. `undefined` (env knob unset) uses the
- * public 160K default band. A band returns a copy with the assistant-text
- * budget scaled by the documented ratios; explicit 100K deep-equals the
- * unscaled base config.
+ * public 100K default band (DEFAULT_FOLD_BAND_TOKENS). A band returns a copy
+ * with the assistant-text budget scaled by the documented ratios; explicit
+ * 100K deep-equals the unscaled base config.
  *
  * When `fidelity` is provided, the retention fractions are overridden —
  * enabling quality-driven ratio adjustment.
@@ -930,6 +947,43 @@ export function normalizeToolPath(p: string): string {
 export function extractPath(input: Record<string, unknown>): string {
   const p = String(input.file_path ?? input.path ?? input.filePath ?? input.file ?? '');
   return normalizeToolPath(p);
+}
+
+/** Absolute path token: reuses the closet's absolute-path shape (VERBATIM_ABS_PATH_RE),
+ *  with an optional trailing ":line" / ":line-line" range so it matches a
+ *  claim/edit arg's shape before `fidelityPathKey` strips the range. */
+const USER_NAMED_ABS_PATH_RE = /(?:^|[\s"'`(])(\/(?:[\w.@-]+\/)+[\w.@-]+(?::\d+(?:-\d+)?)?)/g;
+/** Relative path token: at least one '/' and a recognizable file extension —
+ *  distinguishes a real repo path ("relay/src/foldFreeze.ts") from ordinary
+ *  slash-separated prose ("and/or", "either/both"). */
+const USER_NAMED_REL_PATH_RE = /(?:^|[\s"'`(])((?:[\w][\w.@-]*\/)+[\w.@-]+\.[A-Za-z0-9]{1,10}(?::\d+(?:-\d+)?)?)/g;
+
+/**
+ * Extract file-path-shaped tokens from free-form user text (rail-c63e326e
+ * s5): an operator naming a path in their own words ("dive into
+ * foldFreeze.ts" / "look at relay/src/fcBaseSession.ts:200") is the
+ * strongest relevance signal available, stronger than the agent's own
+ * downstream tool-call behavior — see `FidelityValueWeights.userNamed`. Pure
+ * and deterministic: no I/O, no Date.now, same normalization
+ * (`normalizeToolPath` + `fidelityPathKey`) as tool-call path extraction so
+ * a user-named mention of a path collapses onto the SAME forward-index key
+ * a claim/edit of that path would use.
+ */
+export function extractUserNamedPaths(text: string): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const re of [USER_NAMED_ABS_PATH_RE, USER_NAMED_REL_PATH_RE]) {
+    const r = new RegExp(re.source, re.flags);
+    let m: RegExpExecArray | null;
+    while ((m = r.exec(text)) !== null) {
+      const key = fidelityPathKey(normalizeToolPath(m[1]));
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        result.push(key);
+      }
+    }
+  }
+  return result;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1807,7 +1861,7 @@ export function resolveFidelityValueWeights(
   return overrides ? { ...DEFAULT_FIDELITY_VALUE_WEIGHTS, ...overrides } : DEFAULT_FIDELITY_VALUE_WEIGHTS;
 }
 
-type FidelityRefKind = 'read' | 'claim' | 'edit';
+type FidelityRefKind = 'read' | 'claim' | 'edit' | 'userNamed';
 
 /** Strip a trailing line-range suffix (":20-45" / ":20") so a claim/edit of a
  *  range matches a read of the whole file. */
@@ -1826,17 +1880,25 @@ function fidelityRefKind(toolName: string): FidelityRefKind {
  * fidelity). Value = downstream relevance measured from the TRACE ITSELF (no
  * episodic store, no I/O, deterministic): for each folded turn, sum the
  * weighted downstream references — later folded turns + the live active window —
- * to the paths it touched (claim/edit weighted over read; active-window refs
- * multiplied), plus an additive bonus for a durable register glyph (🏁/⚠️).
+ * to the paths it touched (claim/edit weighted over read; a path the OPERATOR
+ * later names by hand in a user message weighted at least as high as edit —
+ * see `extractUserNamedPaths` / `FidelityValueWeights.userNamed`, rail-c63e326e
+ * s5), plus an additive bonus for a durable register glyph (🏁/⚠️).
  *
  * `turns` is the full detected turn list; the first `foldCount` are the folded
  * turns being scored. Returns one score per folded turn (aligned to
  * turns[0..foldCount)); active-window turns are turns[foldCount..].
+ *
+ * `syntheticContext` is forwarded to `extractUserText` so synthetic
+ * user-context blocks (rebirth seeds, etc.) are stripped before path
+ * extraction, matching the same stripping `foldContext`'s caller already
+ * applies for turn detection.
  */
 export function scoreTurnFidelityValue(
   turns: readonly Turn[],
   foldCount: number,
   weights: FidelityValueWeights = DEFAULT_FIDELITY_VALUE_WEIGHTS,
+  syntheticContext: SyntheticContextOptions = EMPTY_SYNTHETIC_CONTEXT_OPTIONS,
 ): number[] {
   const n = turns.length;
   const fold = Math.max(0, Math.min(Math.floor(foldCount), n));
@@ -1847,6 +1909,12 @@ export function scoreTurnFidelityValue(
       const path = extractPath(tc.input);
       if (!path) continue;
       refs.push({ key: fidelityPathKey(path), kind: fidelityRefKind(tc.name) });
+    }
+    const userText = extractUserText(turns[g].messages, syntheticContext);
+    if (userText) {
+      for (const key of extractUserNamedPaths(userText)) {
+        refs.push({ key, kind: 'userNamed' });
+      }
     }
     turnPaths[g] = refs;
   }
@@ -1860,7 +1928,10 @@ export function scoreTurnFidelityValue(
     }
   }
   const kindWeight = (kind: FidelityRefKind): number =>
-    kind === 'edit' ? weights.edit : kind === 'claim' ? weights.claim : weights.read;
+    kind === 'userNamed' ? weights.userNamed
+    : kind === 'edit' ? weights.edit
+    : kind === 'claim' ? weights.claim
+    : weights.read;
   const scores: number[] = new Array(fold).fill(0);
   for (let i = 0; i < fold; i++) {
     let score = 0;
@@ -1992,7 +2063,7 @@ export function foldContext(
       0,
       Math.floor(fidelityValue.recencyFloorTurns ?? DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS),
     );
-    const values = scoreTurnFidelityValue(turns, turnsToCompress.length, valueWeights);
+    const values = scoreTurnFidelityValue(turns, turnsToCompress.length, valueWeights, syntheticContext);
     const floorStart = Math.max(initialEvictedThrough, turnsToCompress.length - recencyFloor);
     const order: number[] = [];
     for (let j = turnsToCompress.length - 1; j >= floorStart; j--) order.push(j); // recency floor, newest-first
