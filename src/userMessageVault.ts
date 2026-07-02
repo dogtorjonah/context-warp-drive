@@ -48,6 +48,17 @@ export interface UserMessageVaultRenderOptions {
   assistantEntries?: readonly AssistantGlyphVaultEntry[];
   /** Visible assistant texts (in the send view) to dedupe against, like visibleUserTexts. */
   visibleAssistantTexts?: readonly string[];
+  /**
+   * When true, the newest surviving operator row is flagged live: it arrived
+   * after the agent's last completed assistant turn and is still UNANSWERED, so
+   * its render carries USER_MESSAGE_VAULT_LIVE_MARKER. Transient send-view
+   * renders only — bake/seal paths must pass this too but then exclude live
+   * rows via selectSealableVaultRows (cache safety: a LIVE marker must never
+   * seal into a frozen band, where it would read as unanswered forever, and an
+   * unmarked seal would make the row "visible" and dedupe the transient marker
+   * away).
+   */
+  newestOperatorUnanswered?: boolean;
 }
 
 interface VisibleUserMessage {
@@ -434,8 +445,24 @@ function renderOperatorOnlyVault(
     .filter((entry) => entry.text.length > 0 && !isVisibleVaultEntry(entry.text, visibleTexts))
     .slice(-maxMessages);
 
+  // Only the row that IS the newest operator message may carry the LIVE
+  // marker; if the newest was deduped out as still-visible, nothing is live
+  // (the message itself is in view, which is stronger than any marker).
+  const newestText = entries.length > 0 ? normalizeEntryText(entries[entries.length - 1].text) : '';
+
   while (retained.length > 0) {
-    const body = retained.map((entry, index) => renderEntry(entry, index, retained.length)).join('\n\n');
+    const liveNewest =
+      options?.newestOperatorUnanswered === true
+      && newestText.length > 0
+      && retained[retained.length - 1].text === newestText;
+    const body = retained
+      .map((entry, index) => {
+        const rendered = renderEntry(entry, index, retained.length);
+        return liveNewest && index === retained.length - 1
+          ? `${rendered}\n${USER_MESSAGE_VAULT_LIVE_MARKER}`
+          : rendered;
+      })
+      .join('\n\n');
     const block = `${HEADER}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
     if (block.length <= maxChars) return block;
     retained = retained.slice(1);
@@ -457,6 +484,15 @@ const GLYPH_DISPLAY: Record<MessageGlyphMode, string> = {
   blocked: '❓',
 };
 
+/**
+ * Rendered directly under the newest operator row when it is still unanswered
+ * (arrived after the agent's last completed reply). Transient send views only:
+ * live rows are deferred from band sealing via selectSealableVaultRows, so this
+ * marker is never baked into a byte-frozen prefix where it would go stale.
+ */
+export const USER_MESSAGE_VAULT_LIVE_MARKER =
+  '⌖ LIVE — this operator message arrived after your last completed reply and is UNANSWERED; your current work must resolve it or it remains open.';
+
 export interface VaultRenderRow {
   role: 'user' | 'assistant';
   text: string;
@@ -464,6 +500,13 @@ export interface VaultRenderRow {
   glyph?: MessageGlyphMode;
   /** Eviction priority — operator rows are Infinity (protected floor). */
   priority: number;
+  /**
+   * Newest operator row still unanswered at render time. Rendered with
+   * USER_MESSAGE_VAULT_LIVE_MARKER on transient views; excluded from band
+   * sealing (selectSealableVaultRows) until answered. Never part of the row
+   * fingerprint — once answered, the same row seals under the same identity.
+   */
+  live?: boolean;
 }
 
 function entryMs(createdAt: string | undefined): number {
@@ -477,7 +520,8 @@ function renderVaultRow(row: VaultRenderRow, isNewest: boolean): string {
   if (row.role === 'user') {
     const surface: VaultSurface = isNewest ? 'fold_vault_newest' : 'fold_vault_older';
     const title = timestamp ? `[operator message @ ${timestamp}]` : '[operator message]';
-    return `${title}\n${excerptForSurface(row.text, surface)}`;
+    const rendered = `${title}\n${excerptForSurface(row.text, surface)}`;
+    return row.live ? `${rendered}\n${USER_MESSAGE_VAULT_LIVE_MARKER}` : rendered;
   }
   const surface: VaultSurface = isNewest ? 'fold_vault_assistant_newest' : 'fold_vault_assistant_older';
   const glyphTag = row.glyph ? `${GLYPH_DISPLAY[row.glyph]} ` : '';
@@ -557,6 +601,14 @@ export function selectVaultRows(
       createdAt: entry.createdAt,
       priority: Number.POSITIVE_INFINITY,
     }));
+  if (options?.newestOperatorUnanswered && userRows.length > 0 && userEntries.length > 0) {
+    // Only flag the row that IS the newest operator message; if the newest was
+    // deduped out as still-visible, no vault row is live (the message itself is
+    // in view, which is stronger than any marker).
+    const newestText = normalizeEntryText(userEntries[userEntries.length - 1].text);
+    const last = userRows[userRows.length - 1];
+    if (last.text === newestText) userRows[userRows.length - 1] = { ...last, live: true };
+  }
 
   const normalizedAssistant = assistantEntries
     .map((entry) => ({ ...entry, text: normalizeEntryText(entry.text) }))
@@ -608,6 +660,17 @@ export function selectVaultDeltaRows(
   sealedFingerprints: ReadonlySet<string>,
 ): VaultRenderRow[] {
   return allRows.filter((row) => !sealedFingerprints.has(vaultRowFingerprint(row)));
+}
+
+/**
+ * Rows eligible for band sealing: live (unanswered-newest) rows are deferred so
+ * a frozen prefix never contains the LIVE marker (stale the moment the message
+ * is answered) nor an unmarked copy of the unanswered row (whose visibility
+ * would dedupe the transient live render away). Once answered the row loses its
+ * live flag and seals normally under the unchanged fingerprint.
+ */
+export function selectSealableVaultRows(rows: readonly VaultRenderRow[]): VaultRenderRow[] {
+  return rows.filter((row) => row.live !== true);
 }
 
 function renderInterleavedGlyphVault(

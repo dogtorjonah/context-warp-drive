@@ -74,6 +74,7 @@ import {
   appendUserMessageVaultToView,
   selectVaultRows,
   selectVaultDeltaRows,
+  selectSealableVaultRows,
   renderVaultRowsBlock,
   vaultRowFingerprint,
   type UserMessageVaultEntry,
@@ -375,6 +376,12 @@ export class FoldSession {
   private readonly vaultTailWindow: number | undefined;
   private readonly userMessageVaultEntries: UserMessageVaultEntry[] = [];
   private readonly assistantGlyphVaultEntries: AssistantGlyphVaultEntry[] = [];
+  /**
+   * True while the newest recorded operator message has no completed assistant
+   * reply after it (record-call ordering). Drives the vault live/unanswered
+   * marker: transient renders flag the row; bake paths defer it from sealing.
+   */
+  private newestOperatorUnanswered = false;
   private foldEpochs = 0;
   private foldEvictedSpans: FoldEvictionSpan[] = [];
   private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
@@ -469,6 +476,7 @@ export class FoldSession {
   recordOperatorMessage(text: string, createdAt?: string): void {
     if (!this.vaultEnabled) return;
     recordUserMessageVaultEntry(this.userMessageVaultEntries, text, createdAt);
+    this.newestOperatorUnanswered = true;
   }
 
   /**
@@ -479,6 +487,7 @@ export class FoldSession {
   recordAssistantMessage(text: string, createdAt?: string): void {
     if (!this.vaultEnabled) return;
     recordAssistantGlyphVaultEntry(this.assistantGlyphVaultEntries, text, createdAt);
+    this.newestOperatorUnanswered = false;
   }
 
   /**
@@ -492,11 +501,34 @@ export class FoldSession {
     const vault = renderUserMessageVault(this.userMessageVaultEntries, {
       visibleUserMessages: outcome.messages,
       assistantEntries: this.assistantGlyphVaultEntries,
+      newestOperatorUnanswered: this.newestOperatorUnanswered,
     });
     if (!vault) return outcome;
     const messages = appendUserMessageVaultToView(outcome.messages, vault, this.vaultTailWindow);
     if (messages === outcome.messages) return { ...outcome, vault };
     return { ...outcome, messages, vault };
+  }
+
+  /**
+   * Freeze-path transient overlay: render ONLY the deferred live
+   * (unanswered-newest) rows onto the outgoing view. Sealed rows already ride
+   * the cached frozen prefix — re-rendering the full vault here would duplicate
+   * them (band text does not dedupe row-for-row) — so this appends nothing
+   * unless a live row is currently deferred from sealing (rail-c5d53b27).
+   * Cache-safe: touches only the uncached tail, never frozen bytes.
+   */
+  private applyLiveVaultOverlay(outcome: FoldOutcome): FoldOutcome {
+    if (!this.vaultEnabled || !this.newestOperatorUnanswered) return outcome;
+    const liveRows = selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
+      visibleUserMessages: outcome.messages,
+      newestOperatorUnanswered: true,
+    }).filter((row) => row.live === true);
+    if (liveRows.length === 0) return outcome;
+    const block = renderVaultRowsBlock(liveRows, 'full');
+    if (!block) return outcome;
+    const messages = appendUserMessageVaultToView(outcome.messages, block, this.vaultTailWindow);
+    if (messages === outcome.messages) return { ...outcome, vault: block };
+    return { ...outcome, messages, vault: block };
   }
 
   /**
@@ -512,9 +544,16 @@ export class FoldSession {
    */
   private bakeVault(view: FoldMessage[], mode: 'full' | 'delta'): FoldMessage[] {
     if (!this.vaultEnabled) return view;
-    const rows = selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
-      visibleUserMessages: view,
-    });
+    // Live (unanswered-newest) rows are deferred from sealing: they ride the
+    // transient applyVault path with the LIVE marker until answered, then seal
+    // normally under the unchanged fingerprint. Cache-safe by construction —
+    // frozen bytes never contain the marker or the unanswered row.
+    const rows = selectSealableVaultRows(
+      selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
+        visibleUserMessages: view,
+        newestOperatorUnanswered: this.newestOperatorUnanswered,
+      }),
+    );
     if (mode === 'full') this.freezeState.sealedVaultFingerprints.clear();
     const bakeRows = mode === 'full' ? rows : selectVaultDeltaRows(rows, this.freezeState.sealedVaultFingerprints);
     if (bakeRows.length === 0) return view;
@@ -882,10 +921,14 @@ export class FoldSession {
 
     if (decision.action === 'reuse' && !pressureCeilingTriggered) {
       touchFoldFreeze(this.freezeState, now);
-      // Vault already lives in the cached frozen prefix (baked at the last
-      // epoch) — hot reuse re-sends it for free, with no per-send re-render or
-      // tail append. The byte-frozen prefix stays identical across reuses.
-      return {
+      // Sealed vault rows live in the cached frozen prefix (baked at the last
+      // epoch) — hot reuse re-sends them for free. The transient overlay exists
+      // for rows NOT in the prefix: the deferred live (unanswered-newest)
+      // operator row renders with its LIVE marker on the uncached tail, so
+      // liveness survives reuse sends without touching frozen bytes
+      // (rail-c5d53b27). NOT applyVault: a full render would duplicate the
+      // already-sealed band rows (dedupe is row-vs-visible-text, not band bytes).
+      return this.applyLiveVaultOverlay({
         messages: decision.view,
         cacheHot: true,
         sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -897,7 +940,7 @@ export class FoldSession {
           epochs: this.freezeState.epochs,
           ...this.pressureStats(false),
         },
-      };
+      });
     }
 
     const recomputeReason = decision.action === 'recompute' ? decision.reason : undefined;
@@ -934,7 +977,9 @@ export class FoldSession {
       const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, sealedTail, ctx, now);
       if (appendCommit.committed) {
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
-        return {
+        // Live overlay: deferred live row (excluded from the sealed band by
+        // selectSealableVaultRows) still renders transiently (rail-c5d53b27).
+        return this.applyLiveVaultOverlay({
           messages: appendCommit.view,
           cacheHot: false,
           sealedBoundary: appendCommit.sealedPrefixMessageCount,
@@ -949,12 +994,14 @@ export class FoldSession {
             appendSavedChars: appendCommit.savedChars,
             appendShrinkRatio: appendCommit.shrinkRatio,
           },
-        };
+        });
       }
       if (appendCommit.view) {
         this.activeFidelity = previousActiveFidelity;
         touchFoldFreeze(this.freezeState, now);
-        return {
+        // Live overlay: same live-row transient render on the skipped-append
+        // (hot view) path (rail-c5d53b27).
+        return this.applyLiveVaultOverlay({
           messages: appendCommit.view,
           cacheHot: true,
           sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -972,7 +1019,7 @@ export class FoldSession {
             ...(appendCommit.shrinkRatio === null ? {} : { appendShrinkRatio: appendCommit.shrinkRatio }),
             ...this.pressureStats(false),
           },
-        };
+        });
       }
     }
     const foldConfig = this.effectiveFoldConfig(desiredFidelity);
@@ -1003,7 +1050,10 @@ export class FoldSession {
       : recomputeReason === 'tail-epoch' && !runway.ok
         ? `tail-runway-gate+${recomputeReason}`
         : recomputeReason;
-    return {
+    // Live overlay: the full bake seals everything EXCEPT the deferred live
+    // row; render it transiently on the outgoing view so the unanswered ask is
+    // never dropped at an epoch boundary (rail-c5d53b27).
+    return this.applyLiveVaultOverlay({
       messages: sealedView,
       cacheHot: false,
       sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -1013,7 +1063,7 @@ export class FoldSession {
         ...this.statsFromResult(totalTurns, false, bookkeepingResult, pressureCeilingTriggered),
         ...(epochReason ? { epochReason } : {}),
       },
-    };
+    });
   }
 
   /** Freeze-layer telemetry: hot reuses since last epoch, lifetime epochs, frozen size. */

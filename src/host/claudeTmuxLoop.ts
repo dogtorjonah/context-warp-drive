@@ -102,6 +102,16 @@ export interface ClaudeTmuxFoldLoopOptions {
   readonly captureTranscript?: boolean;
   readonly projectsRoot?: string;
   readonly extraArgs?: readonly string[];
+  /**
+   * Path to a `--system-prompt-file` for the spawned Claude process. CACHE
+   * CONTRACT: the file's BYTES must stay stable for the lifetime of this loop —
+   * fold/crash respawns pass the same path, and Claude re-reads it at spawn, so
+   * rewriting the contents between respawns changes the rendered system prompt
+   * and misses the provider prompt cache at the tools/system boundary (~178K
+   * wasted cache-write tokens per fold, measured on the voxxo relay before it
+   * froze its per-session render — rail-9cf61211). Re-render only when
+   * constructing a NEW loop (true rebirth/fork), never mid-session.
+   */
   readonly systemPromptFile?: string;
   readonly mcpConfigFile?: string;
   readonly settingsFile?: string;
