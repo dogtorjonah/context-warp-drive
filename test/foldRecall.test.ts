@@ -259,6 +259,65 @@ describe('buildFoldIndex', () => {
     expect(tiled.entries.length).toBe(plan!.turnsToFold);
     expect(tiled.entries.every(e => e.kind === 'turn')).toBe(true);
   });
+
+  test('multi-band tail-epoch view: fold-block counts accumulate across ALL bands (first-block-wins regression)', () => {
+    // FC append-only tail epochs seal one fold block per band, so the view can
+    // carry several "[Conversation Context — N turns folded, …]" headers in
+    // chronological band order. The page table must cover the SUM of the band
+    // counts — reading only the FIRST block pinned the index to the oldest band
+    // and left every later-folded turn unrecallable (measured as permanent
+    // cards:0 recall on multi-band FC sessions).
+    const raw: FoldMessage[] = [];
+    for (let i = 0; i < 4; i++) {
+      raw.push(userMsg(`work on task ${i}`));
+      raw.push(anthropicToolUse(`tu_band_${i}`, 'Read', { file_path: ABS(`relay/src/band${i}.ts`) }));
+      raw.push(anthropicToolResult(`tu_band_${i}`, `contents of band file ${i}`));
+      raw.push(assistantMsg(`finished task ${i}`));
+    }
+    raw.push(userMsg('live tail turn'));
+    raw.push(assistantMsg('working on it'));
+
+    // Two sealed bands: band 1 folded turns 0-1, band 2 folded turns 2-3.
+    const view: FoldMessage[] = [
+      userMsg('[Conversation Context — 2 turns folded, 10K → 1K chars]\n(band 1 summary)'),
+      userMsg('[Conversation Context — 2 turns folded, 8K → 1K chars]\n(band 2 summary)'),
+      userMsg('live tail turn'),
+      assistantMsg('working on it'),
+    ];
+
+    const index = buildFoldIndex(raw, view);
+    const turnEntries = index.entries.filter((e): e is InterTurnIndexEntry => e.kind === 'turn');
+    // All four folded turns are recall-addressable, not just the first band's two.
+    expect(turnEntries).toHaveLength(4);
+    const allPaths = turnEntries.flatMap(e => e.paths);
+    expect(allPaths).toContain('relay/src/band0.ts');
+    expect(allPaths).toContain('relay/src/band3.ts');
+
+    // Single-block views keep byte-identical prior behavior: one marker, same count.
+    const singleBlockView: FoldMessage[] = [
+      userMsg('[Conversation Context — 2 turns folded, 10K → 1K chars]\n(band 1 summary)'),
+      userMsg('live tail turn'),
+      assistantMsg('working on it'),
+    ];
+    const singleIndex = buildFoldIndex(raw, singleBlockView);
+    expect(singleIndex.entries.filter(e => e.kind === 'turn')).toHaveLength(2);
+  });
+
+  test('records exact visible recall card blocks from the built view', () => {
+    const raw: FoldMessage[] = [userMsg('hi'), assistantMsg('hello')];
+    const card = [
+      `${RECALL_CARD_PREFIX} Read relay/src/visible.ts | trigger: claim relay/src/visible.ts | 5,000 chars folded]`,
+      'visible recalled body',
+      '[End fold recall]',
+    ].join('\n');
+    const view: FoldMessage[] = [
+      userMsg(`before\n${card}\nafter`),
+      anthropicToolResult('tu_visible', `fresh tool output\n\n${card}\n\ntrailing text`),
+    ];
+
+    const index = buildFoldIndex(raw, view);
+    expect(index.visibleRecallCards).toEqual([card]);
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1206,7 +1265,7 @@ describe('buildFoldRecallContext', () => {
     expect(out.text).toContain('pathless demand-paging reel now follows');
   });
 
-  test('claim residency suppresses immediate re-recall; TTL expiry re-enables', () => {
+  test('claim residency suppresses while the exact prior card is visible; view absence re-enables', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
@@ -1214,17 +1273,27 @@ describe('buildFoldRecallContext', () => {
     const first = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
     expect(first.cards).toBe(1);
 
-    const second = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
-    expect(second.text).toBeNull();
-    expect(second.suppressed).toBe(1);
+    raw.push(anthropicToolUse('tu_visible_bigfile', 'Read', { file_path: ABS(BIGFILE) }));
+    raw.push(anthropicToolResult('tu_visible_bigfile', `fresh read output\n\n${first.text}`));
+    state.index = { ...indexFor(raw), visibleRecallCards: [first.text!] };
 
-    // Burn passes with non-matching (but non-empty) signals until the TTL lapses.
+    const visible = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
+    expect(visible.text).toBeNull();
+    expect(visible.suppressed).toBeGreaterThan(0);
+
+    // Burn passes with non-matching (but non-empty) signals past the old TTL.
     const unrelated = extractRecallSignals({ file_path: ABS('relay/src/unrelated.ts') }, new Set());
-    buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
-    buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
+    for (let i = 0; i < config.ttlPasses + 1; i++) {
+      buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
+    }
 
-    const fourth = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
-    expect(fourth.cards).toBe(1); // pass 5 ≥ expiresAtPass 4 → re-recallable
+    const stillVisible = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
+    expect(stillVisible.text).toBeNull();
+    expect(stillVisible.suppressed).toBeGreaterThan(0);
+
+    state.index = { ...indexFor(raw), visibleRecallCards: [] };
+    const absent = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
+    expect(absent.cards).toBeGreaterThan(0);
   });
 
   test('sliding claim residency keeps repeated matching signals suppressed', () => {
@@ -1261,7 +1330,7 @@ describe('buildFoldRecallContext', () => {
     expect(buildFoldRecallContext(state, raw, signals, 'healthy', config).cards).toBe(1);
   });
 
-  test('sliding claim-path residency survives an index rebuild without re-injecting', () => {
+  test('sliding claim-path residency survives rebuild only while the exact card remains visible', () => {
     const raw = buildAnthropicHistory();
     const state = freshState(raw);
     const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
@@ -1274,7 +1343,7 @@ describe('buildFoldRecallContext', () => {
     raw.push(anthropicToolResult('tu_touch_path', `fresh read output\n\n${first.text}`));
     raw.push(userMsg('continue'));
     raw.push(assistantMsg('Continuing.'));
-    state.index = indexFor(raw);
+    state.index = { ...indexFor(raw), visibleRecallCards: [first.text!] };
 
     let cardsAfterRebuild = 0;
     let suppressedAfterRebuild = 0;
@@ -1287,6 +1356,10 @@ describe('buildFoldRecallContext', () => {
     expect(cardsAfterRebuild).toBe(0);
     expect(suppressedAfterRebuild).toBeGreaterThanOrEqual(30);
     expect(state.cardsInjected).toBe(1);
+
+    state.index = { ...indexFor(raw), visibleRecallCards: [] };
+    const absent = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(absent.cards).toBeGreaterThan(0);
   });
 
   test('claim auto_compact injects a hint; the next hard trigger at healthy escalates it to a card', () => {
@@ -1601,19 +1674,25 @@ describe('recall feedback-loop + rebuild-survival', () => {
     raw.push(anthropicToolResult('tu_touch', `fresh read output\n\n${first.text}`));
     raw.push(userMsg('next item of work please'));
     raw.push(assistantMsg('Working the next item now.'));
-    state.index = indexFor(raw);
+    state.index = { ...indexFor(raw), visibleRecallCards: [first.text!] };
 
     // Immediate re-claim: suppressed by PATH residency despite the new entry ids.
     const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(second.text).toBeNull();
     expect(second.suppressed).toBeGreaterThan(0);
 
-    // After the TTL lapses, recall returns — and the re-recalled body must
-    // contain the original payload but never a nested card.
+    // After the TTL lapses, the still-visible prior card continues suppressing.
     const unrelated = extractRecallSignals({ file_path: ABS('relay/src/other.ts') }, new Set());
     for (let i = 0; i < config.ttlPasses; i++) {
       buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
     }
+    const stillVisible = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(stillVisible.text).toBeNull();
+    expect(stillVisible.suppressed).toBeGreaterThan(0);
+
+    // Once the rebuilt view no longer contains the exact card, recall returns —
+    // and the re-recalled body must contain the original payload but never a nested card.
+    state.index = { ...indexFor(raw), visibleRecallCards: [] };
     const third = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(third.cards).toBeGreaterThan(0);
     const occurrences = third.text!.split(RECALL_CARD_PREFIX).length - 1;

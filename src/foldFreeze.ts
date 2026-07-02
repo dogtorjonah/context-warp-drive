@@ -354,14 +354,23 @@ export function buildRawHardEpochSeed(
   options: RawHardEpochSeedOptions = {},
 ): string {
   const maxChars = options.maxChars ?? DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS;
-  const compactSectionMaxChars = maxChars < DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS
+  const isCompact = maxChars < DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS;
+  // The closet's build-stage budget (used to decide which lines fit) and the
+  // render-stage section budget (used by allocateSectionBlocks' final char-cap)
+  // must be the SAME number. Otherwise the content gets assembled to a larger
+  // budget than it is later truncated to, and the final truncate() cuts the
+  // block mid-line/mid-literal instead of at a clean line boundary.
+  const closetBudget = isCompact
+    ? Math.min(
+        options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS,
+        Math.max(700, Math.floor(maxChars * 0.18)),
+      )
+    : (options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS);
+  const compactSectionMaxChars = isCompact
     ? {
         lastUserAiMessages: Math.max(1_000, Math.floor(maxChars * 0.22)),
         currentThread: Math.max(1_500, Math.floor(maxChars * 0.35)),
-        rawTraceCoordinateCloset: Math.min(
-          options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS,
-          Math.max(700, Math.floor(maxChars * 0.18)),
-        ),
+        rawTraceCoordinateCloset: closetBudget,
         thinkingTrail: Math.max(1_000, Math.floor(maxChars * 0.18)),
       }
     : undefined;
@@ -369,7 +378,7 @@ export function buildRawHardEpochSeed(
     predecessorName: options.predecessorName ?? 'predecessor',
     packageBudget: maxChars,
     sectionMaxChars: compactSectionMaxChars,
-    rawTraceCoordinateClosetChars: options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS,
+    rawTraceCoordinateClosetChars: closetBudget,
     includeTrailingUserTurn: options.includeTrailingUserTurn === true,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,

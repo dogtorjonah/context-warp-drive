@@ -384,6 +384,32 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, limit - marker.length)}${marker}`;
 }
 
+/**
+ * Truncate a newline-delimited list block at whole-line boundaries. Used for
+ * sections whose lines are exact conserved literals (the Coordinate Closet):
+ * cutting a literal mid-string corrupts the identifier it exists to preserve,
+ * so trailing lines are dropped whole and replaced with an elision marker.
+ * Falls back to plain char truncation only when not even one line + marker fit.
+ */
+function truncateWholeLines(text: string, max: number): string {
+  const limit = Math.floor(max);
+  if (!Number.isFinite(limit) || limit <= 0) return '';
+  if (text.length <= limit) return text;
+  const marker = '- … [closet truncated to fit the package budget — recover elided coordinates via fold recall or self-tap]';
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    const next = used + line.length + (kept.length > 0 ? 1 : 0);
+    if (next + marker.length + 1 > limit) break;
+    kept.push(line);
+    used = next;
+  }
+  if (kept.length === 0) return truncate(text, limit);
+  kept.push(marker);
+  return kept.join('\n');
+}
+
 function truncateMiddle(text: string, max: number): string {
   if (!Number.isFinite(max) || max <= 0 || text.length <= max) return text;
   const marker = `\n... [${text.length - max} chars omitted] ...\n`;
@@ -413,7 +439,13 @@ function allocateSectionBlocks(
     if (!section.block.trim() || remainingChars <= 0) continue;
     const limit = Math.min(section.maxChars, remainingChars);
     if (limit < 48) continue;
-    const rendered = truncate(section.block, limit);
+    // The Coordinate Closet is a list of exact literals (paths/ids/values);
+    // a mid-line cut corrupts the very identifier the closet exists to
+    // conserve, so it truncates at whole-line boundaries. Other sections are
+    // prose/log blocks where a mid-line char cut is acceptable.
+    const rendered = section.key === 'rawTraceCoordinateCloset'
+      ? truncateWholeLines(section.block, limit)
+      : truncate(section.block, limit);
     allocations.set(section.key, rendered);
     remainingChars -= rendered.length;
   }

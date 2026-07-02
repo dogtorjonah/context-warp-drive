@@ -11,7 +11,8 @@
  * - The fold INDEX is the page table. It is rebuilt ONLY at fold-freeze epoch
  *   commits (the only moments the folded view changes): inter-turn entries by
  *   replaying the deterministic turn detection over raw history and reading
- *   the folded-view fold block's exact "N turns folded" count; intra-turn
+ *   the folded-view fold blocks' "N turns folded" counts (summed in view order —
+ *   FC append-only tail epochs seal one fold block per band); intra-turn
  *   entries by scanning the folded view for the fold's own
  *   "[Folded: tool path — n,nnn chars | self-tap to recover]" markers, keyed
  *   by provider tool ids (tool_use_id / tool_call_id) as recovery handles.
@@ -585,6 +586,12 @@ export interface FoldRecallIndex {
   rawCount: number;
   /** Entries in deterministic build order (turns by rawStart asc, then tools by raw position asc). */
   entries: FoldIndexEntry[];
+  /**
+   * Exact fold-recall card blocks still literally present in the built view.
+   * Undefined means a legacy/manually-built index that cannot answer residency
+   * by view presence; buildFoldIndex always supplies a bounded array.
+   */
+  visibleRecallCards?: readonly string[];
 }
 
 /** Matches the folded view's fold-block header: "[Conversation Context — N turns folded, …". */
@@ -629,6 +636,61 @@ function parseIntraMarker(content: string): ParsedIntraMarker | null {
     return { tool: atlas[1], path: normalizeToolPath(atlas[2] ?? ''), chars: parseMarkerChars(atlas[3]) };
   }
   return null;
+}
+
+function collectRecallCardsFromText(text: string): string[] {
+  if (!text.includes(RECALL_CARD_PREFIX)) return [];
+  const cards: string[] = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith(RECALL_CARD_PREFIX)) continue;
+    const block = [lines[i]];
+    i++;
+    while (i < lines.length && lines[i] !== '[End fold recall]') {
+      block.push(lines[i]);
+      i++;
+    }
+    if (i < lines.length && lines[i] === '[End fold recall]') {
+      block.push(lines[i]);
+      cards.push(block.join('\n'));
+    }
+  }
+  return cards;
+}
+
+function collectMessageTextFragments(msg: FoldMessage): string[] {
+  const out: string[] = [];
+  const content = (msg as any).content;
+  if (typeof content === 'string') {
+    out.push(content);
+  } else if (Array.isArray(content)) {
+    for (const block of content as any[]) {
+      if (typeof block === 'string') out.push(block);
+      else if (block?.type === 'text' && typeof block.text === 'string') out.push(block.text);
+      else if (block?.type === 'tool_result') out.push(blockContentText(block.content));
+    }
+  }
+  if (Array.isArray((msg as any).parts)) {
+    for (const part of (msg as any).parts as any[]) {
+      if (typeof part?.text === 'string') out.push(part.text);
+    }
+  }
+  return out;
+}
+
+function collectVisibleRecallCards(messages: readonly FoldMessage[]): string[] {
+  const cards: string[] = [];
+  const seen = new Set<string>();
+  for (const msg of messages) {
+    for (const text of collectMessageTextFragments(msg)) {
+      for (const card of collectRecallCardsFromText(text)) {
+        if (seen.has(card)) continue;
+        seen.add(card);
+        cards.push(card);
+      }
+    }
+  }
+  return cards;
 }
 
 function buildTurnDigest(
@@ -828,9 +890,10 @@ function buildToolResultPositions(rawHistory: readonly FoldMessage[]): Map<strin
 /**
  * Build the fold index (page table) from the raw history and the freshly
  * recomputed folded view. Call ONLY at fold-freeze epoch commits — the fold
- * is deterministic, so replaying detectTurns over raw plus reading the view's
- * own fold-block count reproduces exactly which turns folded, with zero extra
- * fold passes and zero I/O.
+ * is deterministic, so replaying detectTurns over raw plus summing the view's
+ * fold-block counts (one block per sealed band on FC append-only tail epochs;
+ * a single cumulative block on full recomputes) reproduces exactly which turns
+ * folded, with zero extra fold passes and zero I/O.
  *
  * Caveat: turn replay assumes upstream pipeline stages preserve user-text
  * message structure (they replace/truncate content; they don't add or remove
@@ -872,15 +935,21 @@ export function buildFoldIndex(
   options: BuildFoldIndexOptions = {},
 ): FoldRecallIndex {
   const entries: FoldIndexEntry[] = [];
+  const visibleRecallCards = collectVisibleRecallCards(foldedView);
 
-  // ── Inter-turn entries: replay turn detection over raw, count from the view's fold block ──
+  // ── Inter-turn entries: replay turn detection over raw, count from the view's fold blocks ──
+  // FC append-only tail epochs seal one fold block PER BAND, so a folded view
+  // may carry several "[Conversation Context — N turns folded, …]" markers in
+  // chronological band order; the folded raw prefix is their SUM. First-match-
+  // wins pinned the page table to the oldest band forever (measured: permanent
+  // cards:0 recall on multi-band FC sessions while newer folded spans stayed
+  // unindexed). Single-block full-recompute views are unchanged by summing.
   let interFoldedCount = 0;
   for (const msg of foldedView) {
     if (msg.role !== 'user' || typeof msg.content !== 'string') continue;
     const match = FOLD_BLOCK_COUNT_RE.exec(msg.content);
     if (match) {
-      interFoldedCount = Number.parseInt(match[1], 10) || 0;
-      break;
+      interFoldedCount += Number.parseInt(match[1], 10) || 0;
     }
   }
   // Markerless hard-epoch seed (seedFoldsEntireRaw): the seed folded the whole
@@ -962,7 +1031,7 @@ export function buildFoldIndex(
     }
   }
 
-  return { rawCount: rawHistory.length, entries };
+  return { rawCount: rawHistory.length, entries, visibleRecallCards };
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1052,8 +1121,16 @@ export interface AtlasFileMeta {
 
 export interface ResidencyRecord {
   level: 'card' | 'hint';
-  /** Pass number at which this residency expires (suppression while passSeq < expiresAtPass). */
+  /** Pass number at which TTL fallback expires (suppression while passSeq < expiresAtPass). */
   expiresAtPass: number;
+  /**
+   * Exact rendered card text that created CARD path residency. When present and
+   * the index has moved since injection, suppression follows literal view
+   * presence instead of this pass-count fallback.
+   */
+  renderedCard?: string;
+  /** Fold-index signature in force when `renderedCard` was injected. */
+  indexSignature?: string;
 }
 
 export interface FoldRecallState {
@@ -1064,16 +1141,14 @@ export interface FoldRecallState {
    * Normalized path → lifetime count of CARD-level injections this session
    * (rail-c63e326e s6). Unlike `residentPaths`, this NEVER expires or gets
    * cleared on index rebuild — it is a pure session-lifetime counter used
-   * only to shrink same-content repeat cards, never to suppress them
-   * (suppression stays entirely owned by `resident`/`residentPaths` TTL).
+   * only to shrink same-content repeat cards, never to suppress them.
    */
   pathCardShowCounts: Map<string, number>;
   /**
    * Normalized path → CARD residency. Content-level suppression that survives
-   * index rebuilds: after a refold the same logical content can reappear
-   * under a NEW entry id (e.g. the turn that received a recall card folds and
-   * itself becomes an entry for the same path) — path residency keeps recently
-   * shown content quiet regardless of which entry would carry it.
+   * index rebuilds only while the exact rendered card is still literally present
+   * in the rebuilt view. TTL remains a bounded cleanup fallback for legacy/manual
+   * indexes and same-index immediate repeats.
    */
   residentPaths: Map<string, ResidencyRecord>;
   /**
@@ -2352,6 +2427,24 @@ export interface FoldRecallOutcome {
 
 const EMPTY_OUTCOME: FoldRecallOutcome = { text: null, cards: 0, hints: 0, chars: 0, suppressed: 0, triggers: [] };
 
+function hashVisibleCard(text: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function foldIndexSignature(index: FoldRecallIndex): string {
+  const entries = index.entries;
+  const cards = index.visibleRecallCards;
+  const cardSig = cards === undefined
+    ? 'legacy'
+    : `${cards.length}:${cards.map(hashVisibleCard).join(',')}`;
+  return `${index.rawCount}|${entries[0]?.id ?? ''}|${entries[entries.length - 1]?.id ?? ''}|${cardSig}`;
+}
+
 function refreshResidency(
   map: Map<string, ResidencyRecord>,
   key: string,
@@ -2359,6 +2452,59 @@ function refreshResidency(
 ): void {
   const existing = map.get(key);
   if (existing) map.set(key, { ...existing, expiresAtPass });
+}
+
+function sweepPathResidencyByView(
+  residentPaths: Map<string, ResidencyRecord>,
+  index: FoldRecallIndex,
+  rawHistory: readonly FoldMessage[],
+  currentIndexSignature: string,
+  passSeq: number,
+  refreshedExpiresAtPass: number,
+): void {
+  const visibleCards = index.visibleRecallCards === undefined ? null : new Set(index.visibleRecallCards);
+  if (visibleCards !== null) {
+    const tailStart = Math.max(0, Math.min(index.rawCount, rawHistory.length));
+    for (const card of collectVisibleRecallCards(rawHistory.slice(tailStart))) {
+      visibleCards.add(card);
+    }
+  }
+  for (const [path, record] of residentPaths) {
+    const renderedCardVisible = record.renderedCard !== undefined && visibleCards?.has(record.renderedCard) === true;
+    const canCheckView =
+      visibleCards !== null &&
+      record.level === 'card' &&
+      record.renderedCard !== undefined &&
+      record.indexSignature !== undefined &&
+      (record.indexSignature !== currentIndexSignature || renderedCardVisible);
+
+    if (canCheckView) {
+      if (renderedCardVisible) {
+        if (passSeq >= record.expiresAtPass) {
+          residentPaths.set(path, { ...record, expiresAtPass: refreshedExpiresAtPass });
+        }
+      } else {
+        residentPaths.delete(path);
+      }
+      continue;
+    }
+
+    if (passSeq >= record.expiresAtPass) residentPaths.delete(path);
+  }
+}
+
+function makeResidencyRecord(
+  level: 'card' | 'hint',
+  expiresAtPass: number,
+  renderedCard?: string,
+  indexSignature?: string,
+): ResidencyRecord {
+  return {
+    level,
+    expiresAtPass,
+    ...(renderedCard !== undefined ? { renderedCard } : {}),
+    ...(indexSignature !== undefined ? { indexSignature } : {}),
+  };
 }
 
 /**
@@ -2388,9 +2534,7 @@ export function buildFoldRecallContext(
   // entry is fresh. Clear entry-id residency on rebuild so the new entry can
   // legitimately re-card. Path residency is content-keyed and intentionally
   // survives refolds, so it is NOT cleared here.
-  const entries = state.index.entries;
-  const currentIndexSignature =
-    `${state.index.rawCount}|${entries[0]?.id ?? ''}|${entries[entries.length - 1]?.id ?? ''}`;
+  const currentIndexSignature = foldIndexSignature(state.index);
   if (state.lastIndexSignature != null && state.lastIndexSignature !== currentIndexSignature) {
     state.resident.clear();
   }
@@ -2409,18 +2553,16 @@ export function buildFoldRecallContext(
 
   state.passSeq += 1;
   const passSeq = state.passSeq;
+  const refreshedExpiresAtPass = passSeq + config.ttlPasses;
 
-  // Deterministic sweep of expired residency (bounds both maps).
+  // Deterministic sweep of expired/view-absent residency (bounds both maps).
   for (const [id, record] of state.resident) {
     if (passSeq >= record.expiresAtPass) state.resident.delete(id);
   }
-  for (const [path, record] of state.residentPaths) {
-    if (passSeq >= record.expiresAtPass) state.residentPaths.delete(path);
-  }
+  sweepPathResidencyByView(state.residentPaths, state.index, rawHistory, currentIndexSignature, passSeq, refreshedExpiresAtPass);
 
   const plan = planRecall(state.index, state.resident, state.residentPaths, passSeq, signals, utilization, config);
   let suppressed = plan.suppressed;
-  const refreshedExpiresAtPass = passSeq + config.ttlPasses;
   for (const residency of plan.suppressedResidencies) {
     if (residency.refreshEntry) refreshResidency(state.resident, residency.entryId, refreshedExpiresAtPass);
     if (residency.refreshPath) refreshResidency(state.residentPaths, residency.matchedPath, refreshedExpiresAtPass);
@@ -2496,7 +2638,10 @@ export function buildFoldRecallContext(
     injected.push({ id: item.entry.id, level });
     if (level === 'card') {
       // Content-level residency: keep this path quiet across index rebuilds.
-      state.residentPaths.set(item.matchedPath, { level: 'card', expiresAtPass: passSeq + config.ttlPasses });
+      state.residentPaths.set(
+        item.matchedPath,
+        makeResidencyRecord('card', passSeq + config.ttlPasses, rendered, currentIndexSignature),
+      );
       // Lifetime repeat counter (rail-c63e326e s6) — never expires/clears, unlike residency.
       state.pathCardShowCounts.set(item.matchedPath, (state.pathCardShowCounts.get(item.matchedPath) ?? 0) + 1);
     }
@@ -2506,7 +2651,7 @@ export function buildFoldRecallContext(
   }
 
   for (const { id, level } of injected) {
-    state.resident.set(id, { level, expiresAtPass: passSeq + config.ttlPasses });
+    state.resident.set(id, makeResidencyRecord(level, passSeq + config.ttlPasses));
   }
   state.cardsInjected += cards;
   state.hintsInjected += hints;

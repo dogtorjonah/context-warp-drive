@@ -197,7 +197,19 @@ describe('FoldSession E10 sawtooth eviction', () => {
     expect(preparedText.length).toBeLessThan(12_000);
     expect(preparedText).toContain('[CONTEXT REBIRTH] You are the continuation of "predecessor".');
     expect(preparedText).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
-    expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_12.ts');
+    // Stable closet properties, not a brittle exact deep-history literal:
+    // nomination is newest-first, so the NEWEST touched path must always fit
+    // the compact closet budget, and every admitted path line must be a
+    // complete literal (the build-stage and render-stage closet budgets are
+    // the same number, so lines are fitted whole — never cut mid-literal).
+    expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_27.ts');
+    const closetPathLines = preparedText
+      .split('\n')
+      .filter((line) => line.startsWith('- /home/jonah/context-warp-drive/src/file_'));
+    expect(closetPathLines.length).toBeGreaterThan(0);
+    for (const line of closetPathLines) {
+      expect(line).toMatch(/^- \/home\/jonah\/context-warp-drive\/src\/file_\d+\.ts$/);
+    }
     expect(preparedText).toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
   });
 
