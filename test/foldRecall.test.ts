@@ -450,16 +450,9 @@ describe('deriveBoundaryRecallSignals (live fold-recall GET-path wiring seam)', 
     ); // rawCount=6 → active tail = raw.slice(6)
   }
 
-  test('default-off: a pathless boundary does not proceed and carries no term signals (byte-identical)', () => {
-    const { signals, proceed } = deriveBoundaryRecallSignals(null, new Set(), wiringRaw(), 6, DEFAULT_FOLD_RECALL_CONFIG);
-    expect(proceed).toBe(false);
-    expect(signals.terms).toBeUndefined();
-  });
-
-  test('flag-on: pathless active window sharing >=2 distinctive terms proceeds and pages a tier-2 card through the real sequence', () => {
+  test('default-on: pathless active window sharing >=2 distinctive terms proceeds and pages a tier-2 card', () => {
     const raw = wiringRaw();
-    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, termRecallEnabled: true };
-    const { signals, proceed } = deriveBoundaryRecallSignals(null, new Set(), raw, 6, config);
+    const { signals, proceed } = deriveBoundaryRecallSignals(null, new Set(), raw, 6, DEFAULT_FOLD_RECALL_CONFIG);
     expect(proceed).toBe(true);
     expect(signals.touchedPaths).toHaveLength(0);
     expect(signals.claimedPaths).toHaveLength(0);
@@ -467,14 +460,22 @@ describe('deriveBoundaryRecallSignals (live fold-recall GET-path wiring seam)', 
 
     const state = createFoldRecallState();
     state.index = wiringIndex();
-    const out = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    const out = buildFoldRecallContext(state, raw, signals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
     expect(out.cards).toBe(1);
     expect(out.triggers[0]).toContain('term-overlap');
     expect(out.text).toContain('pathless demand-paging reel now follows');
   });
 
+  test('explicit-off: a pathless boundary does not proceed and carries no term signals', () => {
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, termRecallEnabled: false };
+    const { signals, proceed } = deriveBoundaryRecallSignals(null, new Set(), wiringRaw(), 6, config);
+    expect(proceed).toBe(false);
+    expect(signals.terms).toBeUndefined();
+  });
+
   test('path-touch still proceeds with term recall OFF (tier-0 wiring unaffected by the seam)', () => {
-    const { signals, proceed } = deriveBoundaryRecallSignals({ file_path: ABS('relay/src/x.ts') }, new Set(), wiringRaw(), 6, DEFAULT_FOLD_RECALL_CONFIG);
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, termRecallEnabled: false };
+    const { signals, proceed } = deriveBoundaryRecallSignals({ file_path: ABS('relay/src/x.ts') }, new Set(), wiringRaw(), 6, config);
     expect(proceed).toBe(true);
     expect(signals.touchedPaths).toEqual(['relay/src/x.ts']);
     expect(signals.terms).toBeUndefined();
@@ -539,7 +540,7 @@ describe('planRecall', () => {
     expect(resident.size).toBe(0);
   });
 
-  test('tier 2 term matching is default-off, then faults the distinctive-overlap turn when enabled', () => {
+  test('tier 2 term matching is default-on, with explicit opt-out for legacy no-term behavior', () => {
     const index = makeIndex([
       turnEntry('target', 'pathless demand-paging reel adaptation solved the stale cache', 30),
       turnEntry('common-a', 'context fold system routing continued normally', 90),
@@ -547,10 +548,10 @@ describe('planRecall', () => {
     ]);
     const signals = extractRecallSignals(null, new Set(), 'pathless demand-paging reel should revive');
 
-    const off = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', config);
+    const off = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', { ...config, termRecallEnabled: false });
     expect(off.items).toHaveLength(0);
 
-    const on = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', { ...config, termRecallEnabled: true });
+    const on = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', config);
     expect(on.items).toHaveLength(1);
     expect(on.items[0].entry.id).toBe('turn:target');
     expect(on.items[0].tier).toBe(2);
@@ -562,6 +563,19 @@ describe('planRecall', () => {
     const signals = extractRecallSignals(null, new Set(), 'context fold system');
     const plan = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', { ...config, termRecallEnabled: true });
     expect(plan.items).toHaveLength(0);
+  });
+
+  test('tier 2 orders fuzzy term matches by relevance before recency', () => {
+    const index = makeIndex([
+      turnEntry('target', 'pathless demand-paging reel adaptation solved the stale cache', 10),
+      turnEntry('recent-noisy', 'pathless demand-paging filler stayed recent', 99),
+      turnEntry('filler-a', 'context fold system routing continued normally', 80),
+      turnEntry('filler-b', 'context fold system telemetry stayed quiet', 70),
+      turnEntry('filler-c', 'ordinary workspace note with no matching vocabulary', 60),
+    ]);
+    const signals = extractRecallSignals(null, new Set(), 'pathless demand-paging reel cache should revive');
+    const plan = planRecall(index, new Map(), new Map(), 1, signals, 'healthy', config);
+    expect(plan.items.map(i => i.entry.id)).toEqual(['turn:target', 'turn:recent-noisy']);
   });
 
   test('path tiers still outrank term tier when both match', () => {
@@ -692,8 +706,13 @@ describe('verbatim-token recall — buildFoldIndex + end-to-end (Tier-2 integrat
     expect(on.cards).toBeGreaterThanOrEqual(1);
     expect(on.triggers.some(t => t.includes(`verbatim-token ${HASH}`))).toBe(true);
 
-    // Disabled (WARP_FOLD_RECALL_VERBATIM=0): no active-window derivation, no token signal, no recall.
-    const offCfg: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, verbatimRecallEnabled: false };
+    // Disabled (WARP_FOLD_RECALL_VERBATIM=0 plus term opt-out): no active-window
+    // derivation, no token/term signal, no recall.
+    const offCfg: FoldRecallConfig = {
+      ...DEFAULT_FOLD_RECALL_CONFIG,
+      verbatimRecallEnabled: false,
+      termRecallEnabled: false,
+    };
     const offSig = deriveBoundaryRecallSignals(null, new Set(), raw, foldedRawCount, offCfg);
     expect(offSig.proceed).toBe(false);
     const offState = createFoldRecallState();
@@ -1518,7 +1537,9 @@ describe('resolveFoldRecallConfig', () => {
     expect(tuned.maxTotalChars).toBe(20_000);
     expect(tuned.maxCardChars).toBe(9_000);
     expect(tuned.ttlPasses).toBe(12);
-    expect(tuned.termRecallEnabled).toBe(false);
+    expect(tuned.termRecallEnabled).toBe(true);
+    expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_TERMS: '0' }).termRecallEnabled).toBe(false);
+    expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_TERMS: 'off' }).termRecallEnabled).toBe(false);
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_TERMS: '1' }).termRecallEnabled).toBe(true);
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_TERMS: 'on' }).termRecallEnabled).toBe(true);
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_MAX_CARDS: 'junk' }).maxCards).toBe(3);

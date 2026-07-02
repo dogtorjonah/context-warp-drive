@@ -17,7 +17,8 @@
  *   by provider tool ids (tool_use_id / tool_call_id) as recovery handles.
  * - TRIGGERS (tool-boundary only): tier 0 = a tool call re-touches a folded
  *   path; tier 1 = a file claim lands on a folded path. Tier 2 distinctive-term
- *   overlap is available behind WARP_FOLD_RECALL_TERMS (default OFF).
+ *   overlap is default ON after rail-c63e326e A/B; disable with
+ *   WARP_FOLD_RECALL_TERMS=0|false|off|no.
  * - INJECTION: the session appends rendered cards/hints to the tool result's
  *   post-dispatch context (the same channel as tool-boundary mesh digest
  *   deltas; payloads are body-only strings). Cards land durably in raw
@@ -32,7 +33,7 @@
  * Pure CPU, zero I/O, zero LLM calls, no clock reads. Deterministic by
  * construction: identical inputs produce byte-identical output, and no
  * Set/Map iteration order is observable in any rendered string (entries are
- * explicitly ordered: tier asc, recency desc, id asc).
+ * explicitly ordered: tier asc, tier-2 relevance desc, recency desc, id asc).
  *
  * Kill switch: WARP_FOLD_RECALL=0. Recall only ever runs when fold mode is
  * 'on' and the fold freeze is active — no fold, no index, no recall.
@@ -76,7 +77,7 @@ export interface FoldRecallConfig {
   maxCardChars: number;
   /** Residency TTL in recall passes — an injected entry is suppressed for this many subsequent passes. */
   ttlPasses: number;
-  /** Tier-2 distinctive-term matching. Default OFF; path tiers stay unchanged. */
+  /** Tier-2 distinctive-term matching. Default ON after A/B; path tiers stay unchanged. */
   termRecallEnabled: boolean;
   /**
    * Exact verbatim-token page-in (WARP_FOLD_RECALL_VERBATIM). When a kept
@@ -133,7 +134,7 @@ export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
   // re-show. 4 is the safer interim (tier-0 bypass also mitigates this now).
   // Override: WARP_FOLD_RECALL_TTL_PASSES.
   ttlPasses: 4,
-  termRecallEnabled: false,
+  termRecallEnabled: true,
   verbatimRecallEnabled: true,
   highlightsEnabled: true,
   hazardsEnabled: true,
@@ -329,7 +330,7 @@ warnFoldGeometryViolations(
  *   WARP_FOLD_RECALL_MAX_TOTAL_CHARS=<n>  → total chars per pass (default 12000)
  *   WARP_FOLD_RECALL_MAX_CARD_CHARS=<n>   → chars per card body (default 6000)
  *   WARP_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 4)
- *   WARP_FOLD_RECALL_TERMS=1|true|on|yes  → enable tier-2 term matching (default off)
+ *   WARP_FOLD_RECALL_TERMS=0|false|off|no → disable tier-2 term matching (default ON)
  *   WARP_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
  *   WARP_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
  *   WARP_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
@@ -353,7 +354,10 @@ export function resolveFoldRecallConfig(
     maxTotalChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_TOTAL_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
     maxCardChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARD_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCardChars,
     ttlPasses: parsePositiveInt(env.WARP_FOLD_RECALL_TTL_PASSES) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
-    termRecallEnabled: termRaw === '1' || termRaw === 'true' || termRaw === 'on' || termRaw === 'yes',
+    // Tier-2 term recall passed rail-c63e326e A/B: default ON; only explicit
+    // disable values turn it off. Same default-on idiom as verbatim recall.
+    termRecallEnabled:
+      termRaw === '' || (termRaw !== '0' && termRaw !== 'false' && termRaw !== 'off' && termRaw !== 'no'),
     // Default ON (operator-blessed); only explicit disable values turn it off.
     verbatimRecallEnabled:
       verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
@@ -679,9 +683,8 @@ const ACTIVE_WINDOW_MAX_CHARS = 1600;
  * buildTurnDigest's surface (first real user text + assistant text; tool results
  * and synthetic recall/fold blocks excluded) so the query terms and the index's
  * per-turn digest terms are drawn from the same vocabulary. Recency-favored cap
- * keeps extraction cheap and focused on current cognition. Pure; returns '' when
- * the unfolded tail is empty. The live caller passes activeText only when term
- * recall is flag-enabled, so default-off behavior is unaffected.
+ * keeps extraction cheap and focused on current cognition. Pure; returns ''
+ * when the unfolded tail is empty or when term recall is explicitly disabled.
  */
 export function extractActiveWindowText(
   rawHistory: readonly FoldMessage[],
@@ -1307,11 +1310,11 @@ export function extractRecallSignals(
 
 /**
  * Compose the tool-boundary recall query exactly as the live GET path consumes
- * it: derive active-window terms (flag-gated; '' when term recall is off so the
- * default path stays byte-identical), build signals, and decide whether recall
- * should proceed. `proceed` mirrors buildFoldRecallContext's internal admit
- * guard — path-touch OR claim OR (only when flag-on) distinctive term signals —
- * so pathless cognition is no longer short-circuited before terms are weighed.
+ * it: derive active-window terms ('' when term recall is explicitly off), build
+ * signals, and decide whether recall should proceed. `proceed` mirrors
+ * buildFoldRecallContext's internal admit guard — path-touch OR claim OR
+ * distinctive term signals — so pathless cognition is no longer short-circuited
+ * before terms are weighed.
  * Pure; the single seam shared by the live caller and its wiring tests.
  */
 export function deriveBoundaryRecallSignals(
@@ -1354,6 +1357,8 @@ export interface RecallPlanItem {
   /** Matched path for tiers 0/1; a deterministic term-residency key for tier 2. */
   matchedPath: string;
   trigger: string;
+  /** Tier-2 relevance only; path tiers continue to sort by recency. */
+  relevanceScore?: number;
   /** Planned render level before measured char budgeting. */
   render: 'card' | 'hint';
   /** True when a resident HINT is being escalated by a fresh hard trigger. */
@@ -1562,11 +1567,13 @@ function idfForTurnDigests(
 
 /**
  * Plan which folded entries to page back in this pass. Pure — reads residency,
- * never mutates. Ordering is fully deterministic: tier asc, recency desc,
- * id asc. Residency: resident cards suppress (by entry id AND by content
- * path — path residency survives index rebuilds); resident hints escalate to
- * card-eligible on a fresh hard trigger (tiers 0-1 are both hard in v1) and
- * suppress otherwise.
+ * never mutates. Ordering is fully deterministic: tier asc, tier-2 relevance
+ * desc, recency desc, id asc. Path tiers keep their recency ordering; only
+ * fuzzy/exact tier-2 matches spend card budget by relevance before falling
+ * back to recency. Residency: resident cards suppress (by entry id AND by
+ * content path — path residency survives index rebuilds); resident hints
+ * escalate to card-eligible on a fresh hard trigger (tiers 0-1 are both hard
+ * in v1) and suppress otherwise.
  */
 export function planRecall(
   index: FoldRecallIndex,
@@ -1614,6 +1621,7 @@ export function planRecall(
     let tier: RecallTier | null = null;
     let matchedPath: string | null = null;
     let trigger: string | null = null;
+    let relevanceScore = 0;
     const touch = firstIntersection(paths, signals.touchedPaths);
     if (touch !== null) {
       tier = 0;
@@ -1629,6 +1637,7 @@ export function planRecall(
         tier = 2;
         matchedPath = `verbatim:${tokenHit}`;
         trigger = `verbatim-token ${tokenHit}`;
+        relevanceScore = Number.POSITIVE_INFINITY;
       } else if (termIdf !== null && entry.kind === 'turn') {
         const overlap = scoreTermOverlap(queryTerms, getTurnTerms(entry), termIdf);
         if (overlap.distinctiveCount >= TERM_RECALL_MIN_DISTINCTIVE_COUNT) {
@@ -1636,6 +1645,7 @@ export function planRecall(
           const matchedTerms = overlap.matched.map((m) => m.term);
           matchedPath = `term:${matchedTerms.join('+')}`;
           trigger = `term-overlap ${matchedTerms.join(', ')}`;
+          relevanceScore = overlap.score;
         }
       }
     }
@@ -1698,6 +1708,7 @@ export function planRecall(
       tier,
       matchedPath,
       trigger,
+      relevanceScore,
       render: 'card',
       escalatedFromHint,
     });
@@ -1705,6 +1716,9 @@ export function planRecall(
 
   matched.sort((a, b) => {
     if (a.tier !== b.tier) return a.tier - b.tier;
+    if (a.tier === 2 && b.tier === 2 && a.relevanceScore !== b.relevanceScore) {
+      return (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0);
+    }
     if (a.entry.recency !== b.entry.recency) return b.entry.recency - a.entry.recency;
     return a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
   });

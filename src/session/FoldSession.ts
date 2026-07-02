@@ -89,9 +89,9 @@ const EMPTY_CLAIMED: ReadonlySet<string> = new Set<string>();
 //   F = hard minimum append runway
 //   P = measured pressure ceiling
 //
-// Runtime invariant: append a folded tail band only when
-//   P - (S + M + stacked A bands) >= F.
-// Otherwise the tail-epoch boundary becomes a full recompute and saws back down.
+// Runtime invariant: when measured provider tokens are available, append a
+// folded tail band only when P - measuredInputTokens >= F. The S/M/A projection
+// is a telemetryless fallback, not the live runway gate.
 export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
 export const DEFAULT_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS = DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS;
 export const DEFAULT_FOLD_TARGET_BAND_TOKENS = DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS;
@@ -120,11 +120,11 @@ export interface FoldPressureCeilingConfig {
 }
 
 export interface FoldTailEpochRunwayConfig {
-  /** S: modeled system/tools prefix reserve tokens. */
+  /** S: fallback modeled system/tools prefix reserve tokens. */
   readonly systemToolsReserveTokens?: number;
-  /** M: modeled folded memory band after a full recompute. */
+  /** M: fallback modeled folded memory band after a full recompute. */
   readonly targetBandTokens?: number;
-  /** A: modeled size of one appended folded-tail band. */
+  /** A: fallback modeled size of one appended folded-tail band. */
   readonly appendBandTargetTokens?: number;
   /** T: preferred/default next raw-tail runway used for geometry signposts. */
   readonly runwayTokens?: number;
@@ -172,9 +172,10 @@ export interface FoldSessionOptions {
    */
   readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
   /**
-   * Standalone S/M/A/T/F runway geometry for append-only tail epochs. Defaults
-   * to effective S37/M40/A5/T10/F10; pass false to disable the runway gate while keeping
-   * ordinary pressure-ceiling recomputes.
+   * Standalone S/M/A/T/F fallback runway geometry for append-only tail epochs
+   * when measuredInputTokens is absent. Defaults to effective S37/M40/A5/T10/F10;
+   * pass false to disable the runway gate while keeping ordinary pressure-ceiling
+   * recomputes.
    */
   readonly tailEpochRunway?: false | FoldTailEpochRunwayConfig;
   /**
@@ -740,8 +741,10 @@ export class FoldSession {
     };
   }
 
-  private tailEpochRunwayCheck(): {
+  private tailEpochRunwayCheck(measuredInputTokens: number | undefined): {
     readonly ok: boolean;
+    readonly basis: 'measured' | 'modeled' | 'disabled';
+    readonly measuredInputTokens: number | null;
     readonly sealedAppendBandCount: number;
     readonly postAppendModeledTokens: number | null;
     readonly postAppendRunwayTokens: number | null;
@@ -751,9 +754,26 @@ export class FoldSession {
     if (this.pressureCeilingTokens === null || this.tailEpochMinRunwayTokens === null) {
       return {
         ok: true,
+        basis: 'disabled',
+        measuredInputTokens: null,
         sealedAppendBandCount,
         postAppendModeledTokens: null,
         postAppendRunwayTokens: null,
+        requiredRunwayTokens: this.tailEpochMinRunwayTokens,
+      };
+    }
+    const measuredTokens = typeof measuredInputTokens === 'number' && Number.isFinite(measuredInputTokens) && measuredInputTokens > 0
+      ? Math.floor(measuredInputTokens)
+      : null;
+    if (measuredTokens !== null) {
+      const postAppendRunwayTokens = this.pressureCeilingTokens - measuredTokens;
+      return {
+        ok: postAppendRunwayTokens >= this.tailEpochMinRunwayTokens,
+        basis: 'measured',
+        measuredInputTokens: measuredTokens,
+        sealedAppendBandCount,
+        postAppendModeledTokens: null,
+        postAppendRunwayTokens,
         requiredRunwayTokens: this.tailEpochMinRunwayTokens,
       };
     }
@@ -764,6 +784,8 @@ export class FoldSession {
     const postAppendRunwayTokens = this.pressureCeilingTokens - postAppendModeledTokens;
     return {
       ok: postAppendRunwayTokens >= this.tailEpochMinRunwayTokens,
+      basis: 'modeled',
+      measuredInputTokens: null,
       sealedAppendBandCount,
       postAppendModeledTokens,
       postAppendRunwayTokens,
@@ -884,11 +906,13 @@ export class FoldSession {
     }
     const previousActiveFidelity = this.activeFidelity;
     this.activeFidelity = desiredFidelity;
-    const runway = this.tailEpochRunwayCheck();
+    const runway = this.tailEpochRunwayCheck(context.measuredInputTokens);
     const hardEpochBaselineAppend = recomputeReason === 'tail-epoch'
       && !pressureCeilingTriggered
       && this.hardEpochCompactBaselineActive;
-    const hardEpochBaselineRunwayBypass = hardEpochBaselineAppend && !runway.ok;
+    const hardEpochBaselineRunwayBypass = hardEpochBaselineAppend
+      && runway.basis === 'modeled'
+      && !runway.ok;
     const upcomingEpoch = this.foldEpochs + 1;
     const appendOnlyTailEpoch = recomputeReason === 'tail-epoch'
       && !pressureCeilingTriggered
@@ -918,7 +942,7 @@ export class FoldSession {
           appliedFidelity: this.activeFidelity,
           stats: {
             ...this.statsFromResult(totalTurns, false, tailResult, false),
-            epochReason: hardEpochBaselineAppend ? 'tail-epoch-append+hard-epoch-baseline' : 'tail-epoch-append',
+            epochReason: hardEpochBaselineRunwayBypass ? 'tail-epoch-append+hard-epoch-baseline' : 'tail-epoch-append',
             appendDecision: 'committed',
             appendRawTailChars: appendCommit.rawTailChars,
             appendBandChars: appendCommit.bandViewChars,

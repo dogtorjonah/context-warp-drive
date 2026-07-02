@@ -260,7 +260,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
 });
 
 describe('FoldSession tail-epoch runway gate', () => {
-  test('appends a folded tail epoch when the modeled runway satisfies the 10k default floor', () => {
+  test('appends a folded tail epoch when the fallback modeled runway satisfies the 10k default floor', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -307,7 +307,39 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(session.telemetry.epochs).toBe(1);
   });
 
-  test('full-recomputes a tail epoch when appending would leave less than the 10k default floor', () => {
+  test('appends a folded tail epoch when measured runway holds even if fallback modeling would fail', () => {
+    const session = new FoldSession({
+      foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 91_000,
+      now: () => 1_000,
+    });
+    const first = turn(0);
+    session.prepare(first);
+    const appended = session.prepare(appendProfitableTurns(first, 1), { measuredInputTokens: 70_000 });
+
+    expect(appended.cacheHot).toBe(false);
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(appended.stats.appendDecision).toBe('committed');
+    expect(session.telemetry.epochs).toBe(2);
+  });
+
+  test('accepts an append when measured runway lands exactly on the 10k floor', () => {
+    const session = new FoldSession({
+      foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 91_000,
+      now: () => 1_000,
+    });
+    const first = turn(0);
+    session.prepare(first);
+    const appended = session.prepare(appendProfitableTurns(first, 1), { measuredInputTokens: 81_000 });
+
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(appended.stats.appendDecision).toBe('committed');
+  });
+
+  test('full-recomputes a telemetryless tail epoch when fallback modeling leaves less than the 10k floor', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -383,7 +415,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body).toContain('LIVE_TRIGGER_MARKER manual reset request');
 
     const appended = session.prepare(appendProfitableTurns(raw, 3), { measuredInputTokens: 10 });
-    expect(appended.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(appended.sealedBoundary).toBe(1);
     expect(appended.messages[0]).toEqual(hardEpoch.messages[0]);
   });
@@ -443,7 +475,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body).toContain('LIVE_TRIGGER_MARKER current request');
   });
 
-  test('keeps appending on the compact seed baseline after a hard epoch despite generic runway pessimism', () => {
+  test('appends on the compact seed baseline after a hard epoch when measured runway holds', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -455,19 +487,19 @@ describe('FoldSession tail-epoch runway gate', () => {
       measuredInputTokens: 111_000,
       hardEpochSeed: 'STANDALONE_HARD_EPOCH_SEED',
     });
-    const appended = session.prepare(appendProfitableTurns(raw, 3), { measuredInputTokens: 90_000 });
+    const appended = session.prepare(appendProfitableTurns(raw, 3), { measuredInputTokens: 70_000 });
 
     expect(hardEpoch.stats.epochReason).toBe('hard-epoch');
     expect(hardEpoch.messages).toHaveLength(1);
     expect(appended.cacheHot).toBe(false);
-    expect(appended.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(appended.sealedBoundary).toBe(hardEpoch.messages.length);
     expect(appended.messages[0]).toEqual(hardEpoch.messages[0]);
     expect(JSON.stringify(appended.messages)).not.toContain(bodyToken(0));
     expect(session.telemetry.epochs).toBe(2);
   });
 
-  test('a later pressure ceiling hard-epoch re-arms the compact baseline for appends', () => {
+  test('keeps the hard-epoch baseline bypass only for telemetryless fallback routing', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -481,18 +513,19 @@ describe('FoldSession tail-epoch runway gate', () => {
       hardEpochSeed: 'STANDALONE_RESET_HARD_EPOCH_SEED',
     });
     expect(hardEpoch.stats.epochReason).toBe('hard-epoch');
-    // 2) While armed, a sub-ceiling tail epoch with failing runway bypasses the gate and appends.
+    // 2) Without measured telemetry, the fallback modeled runway is pessimistic
+    // after the tiny seed. The legacy baseline bypass remains scoped here only.
     const bypassHistory = appendProfitableTurns(raw, 3);
     const ceilingHistory = appendProfitableTurns(bypassHistory, 6);
     const resumedHistory = appendProfitableTurns(ceilingHistory, 9);
-    const bypassed = session.prepare(bypassHistory, { measuredInputTokens: 90_000 });
+    const bypassed = session.prepare(bypassHistory);
     expect(bypassed.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
     // 3) A later pressure ceiling hard-epochs again and re-arms the compact baseline.
     const ceiling = session.prepare(ceilingHistory, { measuredInputTokens: 200_000 });
     expect(ceiling.stats.pressureCeilingTriggered).toBe(true);
     expect(ceiling.stats.epochReason).toBe('hard-epoch');
-    // 4) The re-armed compact baseline can append despite the generic runway gate.
-    const resumed = session.prepare(resumedHistory, { measuredInputTokens: 90_000 });
+    // 4) The re-armed compact baseline can append through the fallback bypass.
+    const resumed = session.prepare(resumedHistory);
     expect(resumed.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
     expect(resumed.sealedBoundary).toBe(ceiling.messages.length);
   });
