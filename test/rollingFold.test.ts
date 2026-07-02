@@ -1,10 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Authoritative test-runner note (rail-ed4a7878 step-9)
 //
-// In the my-monorepo monorepo this file is NOT executed by the relay's vitest:
-// that runner's `include` is scoped to relay/src/__tests__, and context-warp is
-// not a monorepo npm workspace, so its devDeps (vitest ^2.1.0) are not installed
-// in-tree and `vitest/config` does not resolve from here.
+// When copied inside the voxxo-swarm monorepo, this file is NOT executed by the
+// relay's vitest: that runner's `include` is scoped to relay/src/__tests__, and
+// context-warp is not a monorepo npm workspace, so its devDeps (vitest ^2.1.0)
+// are not installed in-tree and `vitest/config` does not resolve from there.
 //
 // The canonical fold engine IS covered in-tree by relay/src/__tests__/rollingFold.test.ts
 // (currently 169 tests, green): relay/src/rollingFold.ts is a zero-logic
@@ -15,7 +15,7 @@
 //
 // To run THIS standalone copy directly (e.g. published-package CI), provision the
 // package's own devDeps first:
-//   cd packages/context-warp && npm install && npm test
+//   npm install && npm test
 // ─────────────────────────────────────────────────────────────────────────────
 import { describe, expect, test } from 'vitest';
 
@@ -64,7 +64,7 @@ import {
   type IntraTurnFoldConfig,
   type FoldEvictionInput,
   type FoldEvictionSpan,
-} from '../src/rollingFold.js';
+} from '../src/rollingFold.ts';
 
 // ── Helpers ──
 

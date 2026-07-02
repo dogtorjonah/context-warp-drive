@@ -207,6 +207,9 @@ export type FoldFreezeFullRecomputeCause =
   | 'restored-overcap'
   | 'pressure-ceiling'
   | 'prefix-saturation'
+  // Same-instance rebirth-package hard epoch: provider-visible history was
+  // replaced with a compact continuity seed. Distinct from pressure-ceiling
+  // because the topology reset is the primary action, not just a recompute.
   | 'hard-epoch';
 
 export type FoldFreezeTransitionReason =

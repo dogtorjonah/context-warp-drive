@@ -4,8 +4,8 @@ import {
   computeOpenBurst,
   deriveEpisodesFromMessages,
   type EpisodeCaptureIdentity,
-} from '../src/foldEpisodeCapture.js';
-import type { FoldMessage } from '../src/fold.js';
+} from '../src/foldEpisodeCapture.ts';
+import type { FoldMessage } from '../src/fold.ts';
 
 function userMsg(text: string): FoldMessage {
   return { role: 'user', content: text };

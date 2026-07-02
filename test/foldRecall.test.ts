@@ -20,7 +20,7 @@ import {
   type FoldRecallIndex,
   type IntraTurnIndexEntry,
   type InterTurnIndexEntry,
-} from '../src/foldRecall.js';
+} from '../src/foldRecall.ts';
 import {
   ALWAYS_ON_FOLD_CONFIG,
   ALWAYS_ON_INTRA_FOLD_CONFIG,
@@ -32,7 +32,7 @@ import {
   RECALL_CARD_PREFIX,
   RECALL_HINT_PREFIX,
   type FoldMessage,
-} from '../src/rollingFold.js';
+} from '../src/rollingFold.ts';
 
 // ── Helpers ──
 
@@ -751,6 +751,23 @@ describe('buildFoldRecallContext', () => {
     expect(out.triggers).toEqual(['path-touch relay/src/bigfile.ts']);
     expect(state.cardsInjected).toBe(1);
     expect(state.recallChars).toBe(out.chars);
+  });
+
+  test('tier-0 path re-touch suppresses the identical entry on consecutive passes', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 3 };
+    const signals = touchBigfile();
+
+    const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(first.cards).toBe(1);
+    expect(first.text!).toContain('BIGFILE CONTENT START');
+
+    const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(second.text).toBeNull();
+    expect(second.cards).toBe(0);
+    expect(second.suppressed).toBe(1);
+    expect(state.cardsInjected).toBe(1);
   });
 
   test('live source delta: changed current source becomes the card body + delta notifier', () => {

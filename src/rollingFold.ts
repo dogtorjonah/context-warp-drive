@@ -967,6 +967,8 @@ const VERBATIM_REF_RE = /(?:^|\s)(#\d{2,8})\b/g;
  * then short hex, paths, KVs, refs — source order within each pattern. Under a
  * budget this priority order is the carry policy: id-shaped values win over
  * KV pairs. Truncates each value to 200 chars, dedupes exactly, stops at cap.
+ *
+ * @param cap Max ENTRY COUNT, not characters.
  */
 export function nominateVerbatim(text: string, cap = 40): string[] {
   const seen = new Set<string>();
@@ -1033,6 +1035,51 @@ export function isConservedIn(haystack: string, value: string): boolean {
   return false;
 }
 
+/** Canonical comparison key for Coordinate Closet literals. */
+export function canonicalizeClosetLiteral(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
+}
+
+function preferredClosetLiteral(left: string, right: string): string {
+  if (left.startsWith('/') !== right.startsWith('/')) return left.startsWith('/') ? left : right;
+  return left.length >= right.length ? left : right;
+}
+
+function pathSuffixContains(container: string, contained: string): boolean {
+  if (container === contained) return true;
+  return container.endsWith(`/${contained}`);
+}
+
+/**
+ * Mutating admission helper for closet literal lists. It dedupes slash/no-slash
+ * twins and replaces shorter path suffixes with fuller path spellings.
+ */
+export function admitClosetLiteral(admitted: string[], candidate: string): boolean {
+  const literal = candidate.trim();
+  if (!literal) return false;
+  const key = canonicalizeClosetLiteral(literal);
+  for (let i = 0; i < admitted.length; i += 1) {
+    const existing = admitted[i];
+    const existingKey = canonicalizeClosetLiteral(existing);
+    if (existingKey === key) {
+      const preferred = preferredClosetLiteral(existing, literal);
+      if (preferred !== existing) {
+        admitted[i] = preferred;
+        return true;
+      }
+      return false;
+    }
+    if (pathSuffixContains(key, existingKey)) {
+      admitted[i] = literal;
+      return true;
+    }
+    if (pathSuffixContains(existingKey, key)) return false;
+  }
+  admitted.push(literal);
+  return true;
+}
+
 /** Max chars for a Coordinate Closet context label (Tier-1 annotated keep). */
 export const LABEL_MAX_CHARS = 24;
 
@@ -1089,6 +1136,74 @@ export function extractVerbatimContextLabel(sourceText: string, value: string): 
   return label.slice(0, LABEL_MAX_CHARS);
 }
 
+/** Reject opaque values only when no source-derived label or explicit key exists. */
+export function isUnlabeledOpaqueClosetLiteral(value: string): boolean {
+  const v = value.trim();
+  if (!v) return true;
+  if (/\s\([^)]+\)$/.test(v)) return false;
+  if (/^[A-Za-z_][\w.-]{0,40}[=:]/.test(v)) return false;
+  if (/^[0-9a-f]{6,}$/i.test(v)) return true;
+  if (/^\d+$/.test(v)) return true;
+  return false;
+}
+
+const CLOSET_CODE_ROOT_SEGMENTS = new Set([
+  'src',
+  'test',
+  'tests',
+  'dist',
+  'lib',
+  'app',
+  'relay',
+  'packages',
+  'shared',
+  'docs',
+  'sop',
+  'data',
+  'logs',
+  'scripts',
+  'node_modules',
+  'components',
+  'stores',
+  'routes',
+  'crossinstancetools',
+  '__tests__',
+  'home',
+  'tmp',
+  'var',
+  'usr',
+  'etc',
+  'mnt',
+  'opt',
+]);
+
+function slashWordSegments(value: string): string[] {
+  if (!value.includes('/')) return [];
+  const segments = value.split('/');
+  if (segments.some((segment) => segment.length === 0)) return [];
+  return segments;
+}
+
+function hasCodeRootSegment(segments: readonly string[]): boolean {
+  return segments.some((segment) => CLOSET_CODE_ROOT_SEGMENTS.has(segment.toLowerCase()));
+}
+
+function isLowSignalSlashChain(value: string): boolean {
+  const segments = slashWordSegments(value);
+  if (segments.length < 2 || segments.length > 4) return false;
+  if (hasCodeRootSegment(segments)) return false;
+  if (segments.some((segment) => /[.\d]/.test(segment))) return false;
+  return segments.every((segment) => /^[A-Za-z_-]+$/.test(segment));
+}
+
+function hasSingleCharNoiseSegment(value: string): boolean {
+  const segments = slashWordSegments(value);
+  if (segments.length < 2) return false;
+  if (hasCodeRootSegment(segments)) return false;
+  if (segments.some((segment) => /[.\d]/.test(segment))) return false;
+  return segments.some((segment) => segment.length === 1);
+}
+
 /**
  * Reject Coordinate Closet candidates that are trace-EXHAUST artifacts rather
  * than durable coordinate ids/paths. Pure + deterministic (regex only), so it
@@ -1123,8 +1238,12 @@ export function isClosetNoiseLiteral(value: string): boolean {
   // N/M progress counters (17/17, 8/17, 0/17), calendar dates (6/20/2026), and
   // leading-number code ratios (1/zoom, 2/scale).
   if (/^\d{1,4}\/\d{1,4}$/.test(v)) return true;
+  if (/^[A-Za-z_][\w.-]{0,40}[=:][ ]?\d{1,4}\/\d{1,4}$/.test(v)) return true;
   if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(v)) return true;
   if (/^\d{1,4}\/[A-Za-z]{2,}$/.test(v)) return true;
+  // Capitalized prose label fragments ("So: fable-5-specific") are summary
+  // shards; lowercase operational keys like "model: codex-5.5" stay accepted.
+  if (/^[A-Z][A-Za-z0-9_.-]{0,40}:[ ]?/.test(v)) return true;
   // ── Tailwind / CSS class fragments ──
   // Hyphenated utility token with a numeric opacity/size modifier
   // (ring-blue-400/30, bg-theme-surface/35, shadow-black/40, bg-brand/20).
@@ -1149,6 +1268,8 @@ export function isClosetNoiseLiteral(value: string): boolean {
   // Figma/Miro, DOM/GPU, Read/Grep). The capital guard preserves all-lowercase
   // real 2-segment paths like relay/src or packages/shared. ──
   if (/^[A-Za-z]{2,}\/[A-Za-z]{2,}$/.test(v) && /[A-Z]/.test(v)) return true;
+  if (isLowSignalSlashChain(v)) return true;
+  if (hasSingleCharNoiseSegment(v)) return true;
   return false;
 }
 

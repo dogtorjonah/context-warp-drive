@@ -4,6 +4,8 @@ import { resolveContextBudget } from '../src/contextBudget.ts';
 
 describe('resolveContextBudget', () => {
   it('keeps opus-4.8-max Claude API sessions on the tuned S37/M40/A5/T10/F10/P180 geometry', () => {
+    // engine='claude-api' + opus-4.8 is the elevated-ceiling exception (Jonah, 2026-07-01):
+    // see DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS.
     const budget = resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' });
 
     expect(budget.contextWindowTokens).toBe(1_000_000);

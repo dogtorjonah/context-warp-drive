@@ -22,7 +22,7 @@ import {
   DEFAULT_FOLD_RECALL_CONFIG,
   extractRecallSignals,
   type FoldRecallState,
-} from '../src/foldRecall.js';
+} from '../src/foldRecall.ts';
 import {
   commitFoldFreeze,
   createFoldFreezeState,
@@ -30,7 +30,7 @@ import {
   type FoldFreezeConfig,
   type FoldFreezeContext,
   type FoldFreezeState,
-} from '../src/foldFreeze.js';
+} from '../src/foldFreeze.ts';
 import {
   ALWAYS_ON_FOLD_CONFIG,
   ALWAYS_ON_INTRA_FOLD_CONFIG,
@@ -39,7 +39,7 @@ import {
   intraTurnFold,
   RECALL_CARD_PREFIX,
   type FoldMessage,
-} from '../src/rollingFold.js';
+} from '../src/rollingFold.ts';
 
 // ── Session-shaped harness (mirrors fcBaseSession.applyCompaction, fold 'on') ──
 

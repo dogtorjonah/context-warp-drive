@@ -279,34 +279,35 @@ describe('shouldReconstructCodexEpoch — epoch predicate', () => {
     expect(shouldReconstructCodexEpoch(170_000, window)).toBe(true);
   });
 
-  it('resolves CodexSession fold TRIGGERS through the shared CLI budget below the 200k danger line', () => {
+  it('resolves CodexSession fold TRIGGERS through the shared CLI budget below the danger line', () => {
     // The live helper returns foldTriggerTokens, NOT bandTokens. Distinct from
     // the pure-predicate default test above: this path applies message-ceiling
-    // runway and pressure clamps around the shared live trigger.
-    // 200k window: message ceiling 176k minus 30k runway.
+    // and pressure clamps around the shared live trigger.
+    // 200k window: current shared Codex CLI trigger wins over the old
+    // message-ceiling-minus-runway fallback.
     expect(resolveCodexFoldTargetTokens({
       model: 'codex-5.5',
       contextWindowTokens: 200_000,
       env: {},
-    })).toBe(146_000);
-    // 258k (real codex-5.5): shared 180K trigger stays below the 200k danger line.
+    })).toBe(120_000);
+    // 258k (real codex-5.5): shared trigger stays below the 200k danger line.
     expect(resolveCodexFoldTargetTokens({
       model: 'codex-5.5',
       contextWindowTokens: 258_000,
       env: {},
-    })).toBe(180_000);
+    })).toBe(120_000);
     expect(resolveCodexFoldTargetTokens({
       model: 'codex-5.5',
       contextWindowTokens: 1_050_000,
       env: {},
-    })).toBe(180_000);
+    })).toBe(120_000);
     // Setting the BAND must not move the TRIGGER — guards the thrash regression where
     // wiring the helper to bandTokens collapsed the Codex trigger to 100k.
     expect(resolveCodexFoldTargetTokens({
       model: 'codex-5.5',
       contextWindowTokens: 1_050_000,
       env: { VOXXO_FOLD_TARGET_BAND_TOKENS: '100000' },
-    })).toBe(180_000);
+    })).toBe(120_000);
   });
 
   it('honors a custom fold band fraction', () => {

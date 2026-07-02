@@ -7,8 +7,10 @@
  * orientation footer. It performs no I/O and does not gather relay-only memory.
  */
 import {
+  admitClosetLiteral,
   extractVerbatimContextLabel,
-  isConservedIn,
+  isClosetNoiseLiteral,
+  isUnlabeledOpaqueClosetLiteral,
   nominateVerbatim,
   type FoldMessage,
 } from './rollingFold.ts';
@@ -298,11 +300,76 @@ export const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSecti
   'squadThoughts',
 ];
 
-const PATH_MENTION_RE = /\b(?:[\w.-]+\/)+[\w./@+-]+\b/g;
-const RAW_TRACE_CLOSET_USER_BUDGET_RATIO = 0.25;
+const PATH_MENTION_RE = /(?<![\w./-])\/?(?:[\w.-]+\/)+[\w./@+-]+\b/g;
 const RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE = 24_000;
 const RAW_TRACE_CLOSET_ID_MENTION_RE =
   /\b(?:toolu[-_][A-Za-z0-9_.:-]{1,}|(?:rail|sig|msg|inst|task|thread|summon|fork|group|epoch|tool|call)[-_][A-Za-z0-9][A-Za-z0-9_.:-]{5,})\b/g;
+
+interface EphemeralCoordinationBlock {
+  readonly start: string;
+  readonly end?: string;
+}
+
+const EPHEMERAL_COORDINATION_BLOCKS: readonly EphemeralCoordinationBlock[] = Object.freeze([
+  { start: '[DIGEST DELTA', end: '[END DIGEST DELTA]' },
+  { start: '[RELAY DIGEST DELTA]', end: '[END RELAY DIGEST DELTA]' },
+  { start: '[CHATROOM SIGNALS]', end: '[END CHATROOM SIGNALS]' },
+  { start: '[Ambient Atlas]', end: '[END Ambient Atlas]' },
+  { start: '[🌱 FORK LINEAGE', end: '[END FORK LINEAGE]' },
+  { start: '[👑 BOSS PRESENCE', end: '[END BOSS PRESENCE]' },
+  { start: '[Control Signals — persistent non-interrupting reminders]' },
+]);
+
+function isLineLeading(text: string, idx: number): boolean {
+  return idx === 0 || text[idx - 1] === '\n';
+}
+
+function removeEphemeralBlockOccurrences(text: string, block: EphemeralCoordinationBlock): string {
+  let result = '';
+  let cursor = 0;
+  for (;;) {
+    const startIdx = text.indexOf(block.start, cursor);
+    if (startIdx === -1) {
+      result += text.slice(cursor);
+      return result;
+    }
+    const afterStart = startIdx + block.start.length;
+    if (!isLineLeading(text, startIdx)) {
+      result += text.slice(cursor, afterStart);
+      cursor = afterStart;
+      continue;
+    }
+    if (block.end) {
+      const endIdx = text.indexOf(block.end, afterStart);
+      if (endIdx === -1) {
+        result += text.slice(cursor, afterStart);
+        cursor = afterStart;
+        continue;
+      }
+      result += text.slice(cursor, startIdx);
+      cursor = endIdx + block.end.length;
+    } else {
+      result += text.slice(cursor, startIdx);
+      const boundary = text.slice(afterStart).search(/\n\n\[[^\n]+\]/);
+      cursor = boundary === -1 ? text.length : afterStart + boundary;
+    }
+  }
+}
+
+function stripEphemeralCoordinationBlocks(text: string | null | undefined): string {
+  if (!text) return '';
+  let out = text;
+  let removedAny = false;
+  for (const block of EPHEMERAL_COORDINATION_BLOCKS) {
+    if (out.indexOf(block.start) === -1) continue;
+    const next = removeEphemeralBlockOccurrences(out, block);
+    if (next !== out) {
+      out = next;
+      removedAny = true;
+    }
+  }
+  return removedAny ? out.replace(/\n{3,}/g, '\n\n').trim() : out.trim();
+}
 
 function countStringChars(value: string): number {
   return Array.from(value).length;
@@ -699,56 +766,74 @@ export function buildRawTraceCoordinateCloset(
   const sourceTexts = visibleMessages.flatMap((message) => {
     const text = message.text?.trim();
     if (!text) return [];
+    const scrubbed = stripEphemeralCoordinationBlocks(text).trim();
+    if (!scrubbed) return [];
     const role = message.type === 'user' ? 'user' : message.type === 'assistant_text' ? 'assistant' : message.type;
-    const bounded = text.length > RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE
-      ? `${text.slice(0, RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE)}\n... [message source truncated for closet nomination]`
-      : text;
+    const bounded = scrubbed.length > RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE
+      ? `${scrubbed.slice(0, RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE)}\n... [message source truncated for closet nomination]`
+      : scrubbed;
     return [`${role}:\n${bounded}`];
   });
   if (sourceTexts.length === 0) return '';
 
   const fullText = sourceTexts.join('\n\n');
-  const nominationBudget = Math.max(0, Math.floor(maxChars * RAW_TRACE_CLOSET_USER_BUDGET_RATIO));
   const candidates = [
-    ...nominateVerbatim(fullText, nominationBudget).map((literal) => ({
+    ...nominateVerbatim(fullText, 40).map((literal) => ({ // cap = max entries, not chars
       literal,
       index: Math.max(0, fullText.lastIndexOf(literal)),
     })),
-    ...Array.from(fullText.matchAll(PATH_MENTION_RE), (match) => {
-      const index = match.index ?? 0;
-      const hasLeadingSlash = index > 0 && fullText[index - 1] === '/';
-      return {
-        literal: hasLeadingSlash ? `/${match[0]}` : match[0],
-        index: hasLeadingSlash ? index - 1 : index,
-      };
-    }),
+    ...Array.from(fullText.matchAll(PATH_MENTION_RE), (match) => ({
+      literal: match[0],
+      index: match.index ?? 0,
+    })),
     ...Array.from(fullText.matchAll(RAW_TRACE_CLOSET_ID_MENTION_RE), (match) => ({
       literal: match[0],
       index: match.index ?? 0,
     })),
   ].sort((left, right) => right.index - left.index);
 
-  const header = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact ids/paths/values when the raw package body omits the middle.';
-  const lines: string[] = [];
-  let usedChars = countStringChars(header);
-  const seen = new Set<string>();
+  const header = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact identifiers, file paths, and values when the raw package body omits the middle.';
+  const admitted: string[] = [];
   for (const candidate of candidates) {
-    const literal = candidate.literal.trim();
-    const seenKey = literal.startsWith('/') ? literal.slice(1) : literal;
-    if (!literal || seen.has(seenKey)) continue;
-    const closetSoFar = lines.join('\n');
-    if (closetSoFar && isConservedIn(closetSoFar, literal)) continue;
-    const label = extractVerbatimContextLabel(fullText, literal);
-    const line = label ? `- ${literal} (${label})` : `- ${literal}`;
-    const nextChars = usedChars + countStringChars(line) + 1;
-    if (nextChars > maxChars) break;
-    seen.add(seenKey);
-    lines.push(line);
-    usedChars = nextChars;
+    const rawLiteral = candidate.literal.trim();
+    const literal = rawLiteral.includes('/') ? rawLiteral.replace(/[.,;]+$/u, '') : rawLiteral;
+    if (!literal || isClosetNoiseLiteral(literal)) continue;
+    if (!admitClosetLiteral(admitted, literal)) continue;
   }
 
-  if (lines.length === 0) return '';
-  return [header, ...lines].join('\n');
+  const lines = admitted.flatMap((literal) => {
+    const label = extractVerbatimContextLabel(fullText, literal);
+    if (label === 'bare' && /^[0-9a-f]{6,}$/i.test(literal)) return [];
+    const labelled = label ? `${literal} (${label})` : literal;
+    if (isUnlabeledOpaqueClosetLiteral(labelled)) return [];
+    return [`- ${labelled}`];
+  });
+
+  const fittedLines: string[] = [];
+  let usedChars = countStringChars(header);
+  for (const line of lines) {
+    const nextChars = usedChars + countStringChars(line) + 1;
+    if (fittedLines.length === 0 || nextChars <= maxChars) {
+      fittedLines.push(line);
+      usedChars = nextChars;
+    }
+  }
+  let elided = lines.length - fittedLines.length;
+  if (elided > 0) {
+    let tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
+    while (fittedLines.length > 1 && usedChars + countStringChars(tail) + 1 > maxChars) {
+      const removed = fittedLines.pop();
+      if (removed) {
+        usedChars -= countStringChars(removed) + 1;
+        elided += 1;
+        tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
+      }
+    }
+    fittedLines.push(tail);
+  }
+
+  if (fittedLines.length === 0) return '';
+  return [header, ...fittedLines].join('\n');
 }
 
 function messageValueToText(value: unknown): string {

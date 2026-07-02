@@ -168,7 +168,9 @@ function parsePositiveInt(raw: string | undefined): number | undefined {
  *   WARP_FOLD_RECALL_EPISODES=0|false|off|no → disable episodic voice (default ON)
  *   WARP_FOLD_RECALL_ATLAS_META=0|false|off|no → disable Atlas identity meta (default ON)
  */
-export function resolveFoldRecallConfig(env: Record<string, string | undefined> = process.env): FoldRecallConfig {
+export function resolveFoldRecallConfig(
+  env: Record<string, string | undefined> = process.env,
+): FoldRecallConfig {
   const raw = (env.WARP_FOLD_RECALL ?? '').trim().toLowerCase();
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
   const termRaw = (env.WARP_FOLD_RECALL_TERMS ?? '').trim().toLowerCase();
@@ -185,15 +187,20 @@ export function resolveFoldRecallConfig(env: Record<string, string | undefined> 
     ttlPasses: parsePositiveInt(env.WARP_FOLD_RECALL_TTL_PASSES) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
     termRecallEnabled: termRaw === '1' || termRaw === 'true' || termRaw === 'on' || termRaw === 'yes',
     // Default ON (operator-blessed); only explicit disable values turn it off.
-    verbatimRecallEnabled: verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
+    verbatimRecallEnabled:
+      verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
     // Curated Code Radar (operator-blessed, Jonah 2026-06-17): both default ON;
     // only explicit 0/false/off/no disable. Same idiom as verbatimRecallEnabled.
-    highlightsEnabled: highlightsRaw === '' || (highlightsRaw !== '0' && highlightsRaw !== 'false' && highlightsRaw !== 'off' && highlightsRaw !== 'no'),
-    hazardsEnabled: hazardsRaw === '' || (hazardsRaw !== '0' && hazardsRaw !== 'false' && hazardsRaw !== 'off' && hazardsRaw !== 'no'),
+    highlightsEnabled:
+      highlightsRaw === '' || (highlightsRaw !== '0' && highlightsRaw !== 'false' && highlightsRaw !== 'off' && highlightsRaw !== 'no'),
+    hazardsEnabled:
+      hazardsRaw === '' || (hazardsRaw !== '0' && hazardsRaw !== 'false' && hazardsRaw !== 'off' && hazardsRaw !== 'no'),
     // Episodic voice: default ON; only explicit 0/false/off/no disable.
-    episodesEnabled: episodesRaw === '' || (episodesRaw !== '0' && episodesRaw !== 'false' && episodesRaw !== 'off' && episodesRaw !== 'no'),
+    episodesEnabled:
+      episodesRaw === '' || (episodesRaw !== '0' && episodesRaw !== 'false' && episodesRaw !== 'off' && episodesRaw !== 'no'),
     // Atlas identity meta: default ON; only explicit 0/false/off/no disable.
-    atlasMetaEnabled: atlasMetaRaw === '' || (atlasMetaRaw !== '0' && atlasMetaRaw !== 'false' && atlasMetaRaw !== 'off' && atlasMetaRaw !== 'no'),
+    atlasMetaEnabled:
+      atlasMetaRaw === '' || (atlasMetaRaw !== '0' && atlasMetaRaw !== 'false' && atlasMetaRaw !== 'off' && atlasMetaRaw !== 'no'),
   };
 }
 
@@ -288,11 +295,7 @@ function extractBashPathsFromMessages(messages: readonly FoldMessage[]): string[
       for (const tc of (msg as any).tool_calls as any[]) {
         if (tc?.id && tc?.function?.name && BASH_TOOL_NAME_RE.test(tc.function.name)) {
           let args: Record<string, unknown> = {};
-          try {
-            args = JSON.parse(tc.function.arguments ?? '{}');
-          } catch {
-            /* skip */
-          }
+          try { args = JSON.parse(tc.function.arguments ?? '{}'); } catch { /* skip */ }
           const cmd = args.command;
           if (typeof cmd === 'string') {
             for (const p of extractPathsFromBashCommand(cmd)) paths.add(p);
@@ -422,7 +425,7 @@ function parseMarkerChars(raw: string): number {
 function blockContentText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    return content.map((b: any) => (typeof b === 'string' ? b : (b?.text ?? JSON.stringify(b)))).join('\n');
+    return content.map((b: any) => (typeof b === 'string' ? b : b?.text ?? JSON.stringify(b))).join('\n');
   }
   return JSON.stringify(content ?? '');
 }
@@ -450,7 +453,10 @@ function parseIntraMarker(content: string): ParsedIntraMarker | null {
   return null;
 }
 
-function buildTurnDigest(turnMessages: FoldMessage[], syntheticContext: SyntheticContextOptions = {}): string {
+function buildTurnDigest(
+  turnMessages: FoldMessage[],
+  syntheticContext: SyntheticContextOptions = {},
+): string {
   const parts: string[] = [];
   const user = extractFirstUserText(turnMessages, syntheticContext);
   if (user) parts.push(user);
@@ -460,7 +466,10 @@ function buildTurnDigest(turnMessages: FoldMessage[], syntheticContext: Syntheti
 }
 
 /** First REAL user text in a slice (synthetic fold/recall blocks excluded). */
-function extractFirstUserText(messages: readonly FoldMessage[], syntheticContext: SyntheticContextOptions = {}): string {
+function extractFirstUserText(
+  messages: readonly FoldMessage[],
+  syntheticContext: SyntheticContextOptions = {},
+): string {
   for (const msg of messages) {
     if (msg.role !== 'user') continue;
     if (typeof msg.content === 'string') {
@@ -500,13 +509,19 @@ const ACTIVE_WINDOW_MAX_CHARS = 1600;
  * the unfolded tail is empty. The live caller passes activeText only when term
  * recall is flag-enabled, so default-off behavior is unaffected.
  */
-export function extractActiveWindowText(rawHistory: readonly FoldMessage[], foldedRawCount: number, syntheticContext: SyntheticContextOptions = {}): string {
+export function extractActiveWindowText(
+  rawHistory: readonly FoldMessage[],
+  foldedRawCount: number,
+  syntheticContext: SyntheticContextOptions = {},
+): string {
   if (foldedRawCount < 0 || foldedRawCount >= rawHistory.length) return '';
   const tail = rawHistory.slice(foldedRawCount);
   const user = extractFirstUserText(tail, syntheticContext);
   const assistant = extractAssistantText(tail);
-  const combined = [user, assistant].filter(s => s.length > 0).join(' ');
-  return combined.length > ACTIVE_WINDOW_MAX_CHARS ? combined.slice(combined.length - ACTIVE_WINDOW_MAX_CHARS) : combined;
+  const combined = [user, assistant].filter((s) => s.length > 0).join(' ');
+  return combined.length > ACTIVE_WINDOW_MAX_CHARS
+    ? combined.slice(combined.length - ACTIVE_WINDOW_MAX_CHARS)
+    : combined;
 }
 
 /**
@@ -516,7 +531,10 @@ export function extractActiveWindowText(rawHistory: readonly FoldMessage[], fold
  * Feeds nominateVerbatim so the indexed tokens are the same family the Verbatim
  * Keep conserves.
  */
-function extractTurnVerbatimText(turnMessages: readonly FoldMessage[], syntheticContext: SyntheticContextOptions = {}): string {
+function extractTurnVerbatimText(
+  turnMessages: readonly FoldMessage[],
+  syntheticContext: SyntheticContextOptions = {},
+): string {
   const parts: string[] = [];
   const pushText = (text: string, role: string | undefined): void => {
     if (!text) return;
@@ -572,7 +590,13 @@ function extractTurnVerbatimText(turnMessages: readonly FoldMessage[], synthetic
  * state.pathEpisodes safely; returns '' when empty, disabled, or missing.
  * Does NOT parse annotation kinds — the worker already rendered/attribution.
  */
-function buildEpisodeVoiceBlock(item: RecallPlanItem, state: FoldRecallState, config: FoldRecallConfig, charBudget: number, suppressPaths: ReadonlySet<string>): string {
+function buildEpisodeVoiceBlock(
+  item: RecallPlanItem,
+  state: FoldRecallState,
+  config: FoldRecallConfig,
+  charBudget: number,
+  suppressPaths: ReadonlySet<string>,
+): string {
   if (charBudget <= 0 || !config.episodesEnabled) return '';
   const path = item.matchedPath;
   if (suppressPaths.has(path)) return '';
@@ -949,7 +973,7 @@ export interface RecallSignals {
    * that file's full source_highlights+hazards live, so the compressed radar
    * would just parrot the tool output. Omitted unless the relay supplies it; the
    * folded card BODY still pages in, and tier matching is unaffected.
-   */
+  */
   atlasReadPaths?: string[];
 }
 
@@ -965,11 +989,7 @@ function normalizeAtlasReadToolLeaf(toolName: string | null | undefined): string
   if (!raw) return '';
   const doubleUnderscoreLeaf = raw.split('__').at(-1) ?? raw;
   const dottedLeaf = doubleUnderscoreLeaf.split('.').at(-1) ?? doubleUnderscoreLeaf;
-  return dottedLeaf
-    .replace(/^mcp_to_/, '')
-    .replace(/^mcp_/, '')
-    .trim()
-    .toLowerCase();
+  return dottedLeaf.replace(/^mcp_to_/, '').replace(/^mcp_/, '').trim().toLowerCase();
 }
 
 /**
@@ -983,7 +1003,10 @@ function normalizeAtlasReadToolLeaf(toolName: string | null | undefined): string
  * and provider-prefixed forms match — not only bare names. search/history/graph/
  * diff do NOT match: they do not render the curated per-file record.
  */
-export function radarDuplicatesActiveAtlasRead(toolName: string | null | undefined, action: unknown): boolean {
+export function radarDuplicatesActiveAtlasRead(
+  toolName: string | null | undefined,
+  action: unknown,
+): boolean {
   const leaf = normalizeAtlasReadToolLeaf(toolName);
   if (leaf === 'atlas_lookup' || leaf === 'atlas_brief' || leaf === 'atlas_snippet') return true;
   if (leaf === 'atlas_query') return action === 'lookup' || action === 'brief' || action === 'snippet';
@@ -1026,7 +1049,12 @@ const ATLAS_RESULT_PATH_RE = /^`?((?:\/?[A-Za-z0-9_.@+\-=]+\/)+[^\s`]+?)`?(?:\s+
  * trigger source. Bounded by construction: at most the first 200 lines are
  * scanned and at most maxPaths anchors are returned.
  */
-export function extractAtlasSearchResultPaths(toolName: string | null | undefined, action: unknown, output: string | null | undefined, maxPaths = 12): string[] {
+export function extractAtlasSearchResultPaths(
+  toolName: string | null | undefined,
+  action: unknown,
+  output: string | null | undefined,
+  maxPaths = 12,
+): string[] {
   if (!output || !isAtlasDiscoveryResultTool(toolName, action)) return [];
   const seen = new Set<string>();
   const paths: string[] = [];
@@ -1052,7 +1080,11 @@ export function extractAtlasSearchResultPaths(toolName: string | null | undefine
  * the current global claims set, and optional active-window text for tier-2
  * distinctive-term matching. The term tier is config-gated default OFF.
  */
-export function extractRecallSignals(toolInput: Record<string, unknown> | null, claimedPaths: ReadonlySet<string>, activeText: string | readonly string[] = ''): RecallSignals {
+export function extractRecallSignals(
+  toolInput: Record<string, unknown> | null,
+  claimedPaths: ReadonlySet<string>,
+  activeText: string | readonly string[] = '',
+): RecallSignals {
   const touched = new Set<string>();
   if (toolInput) {
     const primary = extractPath(toolInput);
@@ -1111,7 +1143,8 @@ export function deriveBoundaryRecallSignals(
   }
   const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
   const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
-  const proceed = signals.touchedPaths.length > 0 || signals.claimedPaths.length > 0 || hasTermSignals || hasVerbatimSignals;
+  const proceed =
+    signals.touchedPaths.length > 0 || signals.claimedPaths.length > 0 || hasTermSignals || hasVerbatimSignals;
   return { signals, proceed };
 }
 
@@ -1219,20 +1252,26 @@ function affinityKey(anchor: string, zonePath: string): string {
  * even when the carrier is non-empty for some OTHER anchor. An empty carrier
  * short-circuits straight to proximity (byte-identical standalone behavior).
  */
-function orderZoneByRelevance(anchor: string, paths: readonly string[], affinity: ReadonlyMap<string, number>): string[] {
+function orderZoneByRelevance(
+  anchor: string,
+  paths: readonly string[],
+  affinity: ReadonlyMap<string, number>,
+): string[] {
   if (affinity.size === 0) return orderZoneByProximity(anchor, paths);
   // Proximity rank is the fallback ordering: it tie-breaks equal affinity scores
   // and fully orders a zone whose anchor has no affinity keys (all score -1),
   // preserving tier-0 proximity rather than collapsing to insertion order.
-  const proximityRank = new Map(orderZoneByProximity(anchor, paths).map((p, rank) => [p, rank] as const));
+  const proximityRank = new Map(
+    orderZoneByProximity(anchor, paths).map((p, rank) => [p, rank] as const),
+  );
   return paths
-    .map(p => ({
+    .map((p) => ({
       p,
       rank: proximityRank.get(p) ?? Number.MAX_SAFE_INTEGER,
       score: p === anchor ? Infinity : (affinity.get(affinityKey(anchor, p)) ?? -1),
     }))
     .sort((x, y) => y.score - x.score || x.rank - y.rank)
-    .map(z => z.p);
+    .map((z) => z.p);
 }
 
 // ── Tier-1b booster math (BENCHED) ──────────────────────────────────────────
@@ -1286,7 +1325,9 @@ function recallZonePaths(item: RecallPlanItem, state?: FoldRecallState): readonl
   if (item.entry.kind === 'turn' || isSyntheticRecallKey(item.matchedPath)) {
     if (isSyntheticRecallKey(item.matchedPath)) return entryPaths(item.entry);
     const affinity = state?.pathAffinity;
-    return affinity ? orderZoneByRelevance(item.matchedPath, entryPaths(item.entry), affinity) : orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
+    return affinity
+      ? orderZoneByRelevance(item.matchedPath, entryPaths(item.entry), affinity)
+      : orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
   }
   return [item.matchedPath];
 }
@@ -1307,7 +1348,10 @@ function turnTerms(entry: FoldIndexEntry): string[] {
   return entry.kind === 'turn' ? extractDistinctiveTerms(entry.digest) : [];
 }
 
-function idfForTurnDigests(entries: readonly FoldIndexEntry[], getTerms: (entry: FoldIndexEntry) => string[] = turnTerms): Map<string, number> {
+function idfForTurnDigests(
+  entries: readonly FoldIndexEntry[],
+  getTerms: (entry: FoldIndexEntry) => string[] = turnTerms,
+): Map<string, number> {
   const df = new Map<string, number>();
   let total = 0;
   for (const entry of entries) {
@@ -1357,7 +1401,9 @@ export function planRecall(
     }
     return terms;
   };
-  const termIdf = queryTerms.length >= TERM_RECALL_MIN_DISTINCTIVE_COUNT ? idfForTurnDigests(index.entries, getTurnTerms) : null;
+  const termIdf = queryTerms.length >= TERM_RECALL_MIN_DISTINCTIVE_COUNT
+    ? idfForTurnDigests(index.entries, getTurnTerms)
+    : null;
   let suppressed = 0;
 
   for (const entry of index.entries) {
@@ -1365,8 +1411,11 @@ export function planRecall(
     // Exact verbatim-token re-surface: a single kept hash/id matching the active
     // window pages this turn in. Stronger than fuzzy term overlap (evaluated
     // first within tier 2), but path-touch/claim still outrank.
-    const tokenEligible = queryTokens.length > 0 && entry.kind === 'turn' && (entry.verbatimTokens?.length ?? 0) > 0;
-    const tokenHit = tokenEligible ? firstIntersection(entry.verbatimTokens ?? [], queryTokens) : null;
+    const tokenEligible =
+      queryTokens.length > 0 && entry.kind === 'turn' && (entry.verbatimTokens?.length ?? 0) > 0;
+    const tokenHit = tokenEligible
+      ? firstIntersection(entry.verbatimTokens ?? [], queryTokens)
+      : null;
     if (paths.length === 0 && (termIdf === null || entry.kind !== 'turn') && tokenHit === null) continue;
     let tier: RecallTier | null = null;
     let matchedPath: string | null = null;
@@ -1390,7 +1439,7 @@ export function planRecall(
         const overlap = scoreTermOverlap(queryTerms, getTurnTerms(entry), termIdf);
         if (overlap.distinctiveCount >= TERM_RECALL_MIN_DISTINCTIVE_COUNT) {
           tier = 2;
-          const matchedTerms = overlap.matched.map(m => m.term);
+          const matchedTerms = overlap.matched.map((m) => m.term);
           matchedPath = `term:${matchedTerms.join('+')}`;
           trigger = `term-overlap ${matchedTerms.join(', ')}`;
         }
@@ -1398,12 +1447,22 @@ export function planRecall(
     }
     if (tier === null || matchedPath === null || trigger === null) continue;
 
-    // Content-level suppression: this path's content was carded recently
-    // (possibly under a different entry id before a refold). Stay quiet —
-    // UNLESS tier 0: an active path-touch (signals.touchedPaths) means the
-    // agent is editing/reading this path THIS turn, the strongest "I need it
-    // now" signal. Suppressing it for ttlPasses creates a dead zone where the
-    // marker is present but the card can't re-show. Tier-0 bypasses residency.
+    // Content-level suppression operates on TWO independent residency maps:
+    //
+    // 1. PATH residency (residentPaths): coarse — "this path's content was
+    //    carded recently, possibly under a DIFFERENT entry id after a refold."
+    //    Tier-0 (active path-touch) BYPASSES this: post-refold the same logical
+    //    content reappears under a new entry id, and suppressing it would create
+    //    a dead zone where the marker is present but recall can't re-show it
+    //    (rail recall-derisk, 2026-06-24). This bypass MUST stay.
+    //
+    // 2. ENTRY-ID residency (resident): fine-grained — "this EXACT folded entry
+    //    was carded recently." Entry id is turn:<startIndex>, stable within an
+    //    index. A tier-0 path-touch that matches the SAME entry id is re-carding
+    //    byte-identical content shown one tool-boundary ago — pure repetition
+    //    tax. Tier-0 now RESPECTS entry-id card residency (rail-dccaa1a1): the
+    //    identical entry is suppressed for ttlPasses, while a genuinely different
+    //    entry for the same path (new content or post-refold new id) still cards.
     const pathRecord = residentPaths.get(matchedPath);
     const pathLive = pathRecord !== undefined && passSeq < pathRecord.expiresAtPass;
     const record = resident.get(entry.id);
@@ -1421,7 +1480,12 @@ export function planRecall(
 
     let escalatedFromHint = false;
     if (entryLive) {
-      if (record!.level === 'card' && tier !== 0) {
+      if (record!.level === 'card') {
+        // Exact-entry dedup: this identical entry was carded within ttlPasses.
+        // Applies to ALL tiers including tier-0 — an active path-touch does not
+        // justify re-injecting byte-identical content the agent saw one tool
+        // boundary ago. Path residency (above) still bypasses for tier-0 so a
+        // different/new entry for the same path can card.
         suppressed++;
         suppressedResidencies.push({
           entryId: entry.id,
@@ -1563,7 +1627,10 @@ export function findToolResultText(rawHistory: readonly FoldMessage[], toolId: s
  * that ignore the path produce byte-identical output; the path lets a caller
  * substitute current box source for an individually-changed path.
  */
-function collectToolResultEntriesForPaths(slice: readonly FoldMessage[], paths: readonly string[]): Array<{ path: string; text: string }> {
+function collectToolResultEntriesForPaths(
+  slice: readonly FoldMessage[],
+  paths: readonly string[],
+): Array<{ path: string; text: string }> {
   if (paths.length === 0) return [];
   const wanted = new Set(paths);
   const ids: string[] = [];
@@ -1599,11 +1666,7 @@ function collectToolResultEntriesForPaths(slice: readonly FoldMessage[], paths: 
       for (const tc of (msg as any).tool_calls) {
         if (tc?.id && tc?.function?.name) {
           let args: Record<string, unknown> = {};
-          try {
-            args = JSON.parse(tc.function.arguments ?? '{}');
-          } catch {
-            /* skip */
-          }
+          try { args = JSON.parse(tc.function.arguments ?? '{}'); } catch { /* skip */ }
           const path = extractPath(args);
           if (path && wanted.has(path)) {
             pushId(tc.id, path);
@@ -1766,7 +1829,11 @@ export function formatHazardRadar(hazards: readonly RecallHazard[], charBudget: 
  * matched a real file path; tier 2 (verbatim/term) keys are synthetic, so fall
  * back to the entry's own paths. Deduped across paths.
  */
-function resolveItemEnrichment(item: RecallPlanItem, state: FoldRecallState, suppressPaths: ReadonlySet<string>): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
+function resolveItemEnrichment(
+  item: RecallPlanItem,
+  state: FoldRecallState,
+  suppressPaths: ReadonlySet<string>,
+): { highlights: RecallSourceHighlight[]; hazards: RecallHazard[] } {
   const keys = recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
   const highlights: RecallSourceHighlight[] = [];
   const hazards: RecallHazard[] = [];
@@ -1797,24 +1864,24 @@ function resolveItemEnrichment(item: RecallPlanItem, state: FoldRecallState, sup
  * urgency), then highlight radar — each flag-gated, the two sharing charBudget.
  * Returns '' when both flags are off, nothing is resident, or nothing fits.
  */
-function buildRadar(item: RecallPlanItem, state: FoldRecallState, config: FoldRecallConfig, charBudget: number, suppressPaths: ReadonlySet<string>): string {
+function buildRadar(
+  item: RecallPlanItem,
+  state: FoldRecallState,
+  config: FoldRecallConfig,
+  charBudget: number,
+  suppressPaths: ReadonlySet<string>,
+): string {
   if (charBudget <= 0 || (!config.highlightsEnabled && !config.hazardsEnabled)) return '';
   const { highlights, hazards } = resolveItemEnrichment(item, state, suppressPaths);
   const parts: string[] = [];
   let used = 0;
   if (config.hazardsEnabled && hazards.length > 0) {
     const block = formatHazardRadar(hazards, charBudget - used);
-    if (block) {
-      parts.push(block);
-      used += block.length + 1;
-    }
+    if (block) { parts.push(block); used += block.length + 1; }
   }
   if (config.highlightsEnabled && highlights.length > 0) {
     const block = formatHighlightsRadar(highlights, charBudget - used);
-    if (block) {
-      parts.push(block);
-      used += block.length + 1;
-    }
+    if (block) { parts.push(block); used += block.length + 1; }
   }
   return parts.join('\n');
 }
@@ -1828,7 +1895,13 @@ function buildRadar(item: RecallPlanItem, state: FoldRecallState, config: FoldRe
  * (purpose is the longer timeless description; blurb is the tweet-length
  * fallback used when purpose is absent). Tags are always rendered separately.
  */
-function buildAtlasMetaBlock(item: RecallPlanItem, state: FoldRecallState, config: FoldRecallConfig, charBudget: number, _suppressPaths: ReadonlySet<string>): string {
+function buildAtlasMetaBlock(
+  item: RecallPlanItem,
+  state: FoldRecallState,
+  config: FoldRecallConfig,
+  charBudget: number,
+  _suppressPaths: ReadonlySet<string>,
+): string {
   if (!config.atlasMetaEnabled) return '';
   if (charBudget <= 0) return '';
   const meta = state.pathAtlasMeta?.get(item.matchedPath);
@@ -1868,20 +1941,17 @@ const SOURCE_GUTTER_RE = /^\s*\d+\t/;
  */
 function stripSourceGutter(text: string): string {
   if (!text.includes('\t')) return text;
-  return text
-    .split('\n')
-    .map(line => line.replace(SOURCE_GUTTER_RE, ''))
-    .join('\n');
+  return text.split('\n').map(line => line.replace(SOURCE_GUTTER_RE, '')).join('\n');
 }
 
 function splitNormalizedLines(text: string): string[] {
-  return text
-    .replace(/\r\n/g, '\n')
-    .split('\n')
-    .map(line => line.replace(/[ \t]+$/, ''));
+  return text.replace(/\r\n/g, '\n').split('\n').map(line => line.replace(/[ \t]+$/, ''));
 }
 
-type SourceDeltaResult = { kind: 'changed'; diff: string } | { kind: 'beyond' } | null;
+type SourceDeltaResult =
+  | { kind: 'changed'; diff: string }
+  | { kind: 'beyond' }
+  | null;
 
 /**
  * Bounded, deterministic line delta between a historical folded body and the
@@ -1929,16 +1999,10 @@ function computeSourceDelta(historicalBody: string, liveSource: string, truncate
   let shown = 0;
   let omitted = 0;
   const push = (marker: string, text: string): void => {
-    if (shown >= DELTA_MAX_LINES) {
-      omitted++;
-      return;
-    }
+    if (shown >= DELTA_MAX_LINES) { omitted++; return; }
     const clipped = text.length > DELTA_LINE_MAX_CHARS ? `${charSafeSlice(text, 0, DELTA_LINE_MAX_CHARS - 1)}…` : text;
     const line = `${marker} ${clipped}`;
-    if (used + line.length + 1 > budget) {
-      omitted++;
-      return;
-    }
+    if (used + line.length + 1 > budget) { omitted++; return; }
     out.push(line);
     used += line.length + 1;
     shown++;
@@ -1950,7 +2014,9 @@ function computeSourceDelta(historicalBody: string, liveSource: string, truncate
 }
 
 function currentSourceLabel(path: string, truncated: boolean): string {
-  return truncated ? `↻ CURRENT box source — ${path} (snapshot truncated; fresh-read for full file):` : `↻ CURRENT box source — ${path}:`;
+  return truncated
+    ? `↻ CURRENT box source — ${path} (snapshot truncated; fresh-read for full file):`
+    : `↻ CURRENT box source — ${path}:`;
 }
 
 /**
@@ -2005,9 +2071,9 @@ function formatDeltaNotifier(applied: readonly AppliedSourceDelta[], budget: num
   if (applied.length === 0 || budget < 80) return '';
   const allChanged = applied.every(a => !a.beyond);
   const heading = allChanged
-    ? applied.length === 1
-      ? 'Δ Source changed since fold — body below is CURRENT box source; what changed:'
-      : `Δ ${applied.length} sources changed since fold — bodies below are CURRENT box source; what changed:`
+    ? (applied.length === 1
+        ? 'Δ Source changed since fold — body below is CURRENT box source; what changed:'
+        : `Δ ${applied.length} sources changed since fold — bodies below are CURRENT box source; what changed:`)
     : 'Δ Fold-recall live-source check:';
   const out: string[] = [heading];
   let used = heading.length + 1;
@@ -2065,7 +2131,11 @@ export interface FoldRecallOutcome {
 
 const EMPTY_OUTCOME: FoldRecallOutcome = { text: null, cards: 0, hints: 0, chars: 0, suppressed: 0, triggers: [] };
 
-function refreshResidency(map: Map<string, ResidencyRecord>, key: string, expiresAtPass: number): void {
+function refreshResidency(
+  map: Map<string, ResidencyRecord>,
+  key: string,
+  expiresAtPass: number,
+): void {
   const existing = map.get(key);
   if (existing) map.set(key, { ...existing, expiresAtPass });
 }
@@ -2093,7 +2163,12 @@ export function buildFoldRecallContext(
   if (rawHistory.length < state.index.rawCount) return EMPTY_OUTCOME;
   const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
   const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
-  if (signals.touchedPaths.length === 0 && signals.claimedPaths.length === 0 && !hasTermSignals && !hasVerbatimSignals) {
+  if (
+    signals.touchedPaths.length === 0 &&
+    signals.claimedPaths.length === 0 &&
+    !hasTermSignals &&
+    !hasVerbatimSignals
+  ) {
     return EMPTY_OUTCOME;
   }
 

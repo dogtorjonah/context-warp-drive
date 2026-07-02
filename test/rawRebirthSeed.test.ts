@@ -8,10 +8,15 @@ import {
   DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS,
   findRawRebirthSeedTraceEnd,
   renderRawRebirthSeed,
-} from '../src/rawRebirthSeed.js';
-import type { FoldMessage } from '../src/fold.js';
+} from '../src/rawRebirthSeed.ts';
+import type { FoldMessage } from '../src/fold.ts';
 
 describe('raw rebirth seed renderer', () => {
+  const closetEntries = (closet: string): string[] => closet
+    .split('\n')
+    .filter((line) => line.startsWith('- '))
+    .map((line) => line.slice(2));
+
   test('renders relay-style raw sections in the default priority and display order', () => {
     const seed = renderRawRebirthSeed({
       predecessorName: 'source-agent',
@@ -106,6 +111,104 @@ describe('raw rebirth seed renderer', () => {
     expect(closet).toContain('Conserved high-value literals nominated newest-first');
     expect(closet.indexOf('/repo/src/new.ts')).toBeLessThan(closet.indexOf('/repo/src/old.ts'));
     expect(closet.indexOf('rail-new-abcdef')).toBeLessThan(closet.indexOf('rail-old-123456'));
+  });
+
+  test('collapses slash/no-slash duplicate path candidates and keeps the leading slash spelling', () => {
+    const absolutePath = '/home/jonah/voxxo-swarm/relay/src/instanceManagerImpl.ts';
+    const closet = buildRawTraceCoordinateCloset([
+      { type: 'assistant_text', text: `The active file is ${absolutePath}.` },
+    ], 1_000);
+
+    expect(closetEntries(closet).filter((entry) => entry.includes('home/jonah/voxxo-swarm/relay/src/instanceManagerImpl.ts')))
+      .toEqual([absolutePath]);
+  });
+
+  test('rejects closet noise fixtures while keeping durable coordinate fixtures', () => {
+    const noise = [
+      'n/g',
+      'b/g',
+      'word/word',
+      'withheld/invisible',
+      'check/kill',
+      'create/refine',
+      'live/contended',
+      'coordination/presence',
+      'digest-delta/coordination',
+      'ids/paths/values',
+      'paths/ids/hashes',
+      'slash/no-slash',
+      'absolute/repo-relative',
+      'hex/numerics/counters',
+      'recall/self-tap',
+      'block/text/token/stop_reason',
+      'manager/session/callback',
+      'limit/i',
+      'all=10/10',
+      'all=4/10',
+      'S-A/S-B',
+      'I/O',
+      'So: fable-5-specific',
+    ];
+    const gold = [
+      'relay/logs/relay-out.log',
+      'sop/system/fable-5.md',
+      'relay/src/crossInstanceTools/rebirthPackageBuilder.ts',
+      'packages/context-warp/src/rollingFold.ts',
+      '/home/jonah/voxxo-swarm/relay/data/rebirth-spool/rebirth-SduJbsZv-1782943793927.txt',
+      'supabase/migrations/20260701221500_clinical_soul_drain_observability.sql',
+      'rail-49b60f62',
+      '285cab02 (rail)',
+      '51d936e4 (claude-SduJbsZv)',
+      'unit=voxxo-per-agent-claude-SduJbsZv-51d936e4',
+      'turn=turn-1782943730486-jqvT78',
+      'contextInputTokens=64696',
+      'model: codex-5.5',
+      'restarted: 2026-07-01T19:27:07.234Z',
+    ];
+    const goldSource = [
+      'relay/logs/relay-out.log',
+      'sop/system/fable-5.md',
+      'relay/src/crossInstanceTools/rebirthPackageBuilder.ts',
+      'packages/context-warp/src/rollingFold.ts',
+      '/home/jonah/voxxo-swarm/relay/data/rebirth-spool/rebirth-SduJbsZv-1782943793927.txt',
+      'supabase/migrations/20260701221500_clinical_soul_drain_observability.sql',
+      'rail-49b60f62',
+      'rail 285cab02',
+      'claude-SduJbsZv 51d936e4',
+      'unit=voxxo-per-agent-claude-SduJbsZv-51d936e4',
+      'turn=turn-1782943730486-jqvT78',
+      'contextInputTokens=64696',
+      'model: codex-5.5',
+      'restarted: 2026-07-01T19:27:07.234Z',
+    ];
+
+    const closet = buildRawTraceCoordinateCloset([
+      { type: 'assistant_text', text: [...noise, ...goldSource].join('\n') },
+    ], 20_000);
+
+    for (const literal of noise) expect(closet).not.toContain(literal);
+    for (const literal of gold) expect(closet).toContain(literal);
+  });
+
+  test('drops unlabeled opaque hex and N/M counters while keeping labeled or self-describing values', () => {
+    const closet = buildRawTraceCoordinateCloset([
+      {
+        type: 'assistant_text',
+        text: [
+          'bare d9678796',
+          'rail 285cab02',
+          'unit=voxxo-per-agent-claude-SduJbsZv-51d936e4',
+          'turn=turn-1782943730486-jqvT78',
+          'all=10/10',
+        ].join('\n'),
+      },
+    ], 2_000);
+
+    expect(closet).not.toContain('d9678796');
+    expect(closet).toContain('285cab02 (rail)');
+    expect(closet).toContain('unit=voxxo-per-agent-claude-SduJbsZv-51d936e4');
+    expect(closet).toContain('turn=turn-1782943730486-jqvT78');
+    expect(closet).not.toContain('all=10/10');
   });
 
   test('builds a complete raw seed from provider-shaped messages', () => {

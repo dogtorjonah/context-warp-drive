@@ -5,7 +5,7 @@ import {
   DEFAULT_FOLD_PRESSURE_CEILING_TOKENS,
   FoldSession,
   type FoldMessage,
-} from '../src/fold.js';
+} from '../src/fold.ts';
 
 function userMsg(text: string): FoldMessage {
   return { role: 'user', content: text };

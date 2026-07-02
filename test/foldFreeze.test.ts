@@ -14,13 +14,16 @@ import {
   commitFoldFreeze,
   appendFoldFreezeTailEpoch,
   touchFoldFreeze,
+  serializeFoldFreezeState,
+  restoreFoldFreezeState,
+  getFoldFreezeMetadata,
   resolveFoldFreezeConfig,
   DEFAULT_FOLD_FREEZE_CONFIG,
   type FoldFreezeConfig,
   type FoldFreezeContext,
   type FoldFreezeState,
-} from '../src/foldFreeze.js';
-import type { FoldMessage } from '../src/rollingFold.js';
+} from '../src/foldFreeze.ts';
+import type { FoldMessage } from '../src/rollingFold.ts';
 
 const msg = (role: string, content: string): FoldMessage => ({ role, content });
 
@@ -222,6 +225,7 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
 
   it('append tail epoch preserves the old frozen view as a byte-identical prefix', () => {
     const { state, history, view } = frozenFixture();
+    const sealedPrefixBytes = JSON.stringify(view);
     const tailRaw = [
       msg('user', 'new whale '.repeat(80)),
       msg('assistant', 'folded whale summary'),
@@ -232,16 +236,99 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     const appended = appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
 
     expect(appended).not.toBeNull();
-    if (!appended) throw new Error('Expected tail epoch append to produce a frozen view');
-    if (!appended.view) throw new Error('Expected tail epoch append to include a view');
-    expect(appended.sealedPrefixMessageCount).toBe(view.length);
-    expect(appended.view).toHaveLength(view.length + tailFolded.length);
-    for (let i = 0; i < view.length; i++) expect(appended.view[i]).toBe(view[i]);
-    expect(appended.view[view.length]).toBe(tailFolded[0]);
+    expect(appended?.sealedPrefixMessageCount).toBe(view.length);
+    expect(appended?.view).toHaveLength(view.length + tailFolded.length);
+    for (let i = 0; i < view.length; i++) expect(appended?.view[i]).toBe(view[i]);
+    expect(JSON.stringify(appended?.view.slice(0, view.length))).toBe(sealedPrefixBytes);
+    expect(appended?.view[view.length]).toBe(tailFolded[0]);
     expect(state.frozenRawCount).toBe(grown.length);
     expect(state.frozenView?.slice(0, view.length)).toEqual(view);
+    expect(JSON.stringify(state.frozenView?.slice(0, view.length))).toBe(sealedPrefixBytes);
     expect(state.lastAppendBoundaryViewCount).toBe(view.length);
     expect(state.epochs).toBe(2);
+  });
+
+  it('serializes append-only sealed-band metadata and restores byte-stable reuse', () => {
+    const { state, history, view } = frozenFixture();
+    const sealedPrefixChars = state.frozenViewChars;
+    const tailRaw = [
+      msg('user', 'new whale '.repeat(80)),
+      msg('assistant', 'folded whale summary'),
+    ];
+    const tailFolded = [msg('user', '[folded tail band]'), tailRaw[1]];
+    const grown = [...history, ...tailRaw];
+
+    appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
+
+    const metadata = getFoldFreezeMetadata(state);
+    expect(metadata.sealedBoundaryViewCount).toBe(view.length);
+    expect(metadata.rawFrontierIndex).toBe(grown.length);
+    expect(metadata.cache.lastTransitionReason).toBe('append-tail-epoch');
+    expect(metadata.cache.lastFullRecomputeReason).toBe('first-call');
+    expect(metadata.fullRecomputeCauses).toContain('cold-gap');
+    expect(metadata.fullRecomputeCauses).toContain('boundary-mismatch');
+    expect(metadata.fullRecomputeCauses).toContain('restored-overcap');
+    expect(metadata.fullRecomputeCauses).toContain('prefix-saturation');
+    expect(metadata.sealedBands).toHaveLength(1);
+    expect(metadata.sealedBands[0]).toMatchObject({
+      sealedPrefixMessageCount: view.length,
+      sealedPrefixChars,
+      bandStartViewIndex: view.length,
+      bandEndViewIndex: view.length + tailFolded.length,
+      bandViewCount: tailFolded.length,
+      rawStartIndex: history.length,
+      rawEndIndex: grown.length,
+      rawCount: tailRaw.length,
+      boundaryRole: 'assistant',
+      createdAt: T0 + 4_000,
+    });
+    expect(metadata.sealedBands[0]?.bandViewChars).toBeGreaterThan(0);
+    expect(metadata.sealedBands[0]?.boundaryHash).toBeDefined();
+
+    const snapshot = serializeFoldFreezeState(state);
+    expect(snapshot.frozenView).toHaveLength(view.length + tailFolded.length);
+    expect(snapshot.sealedBands).toEqual(metadata.sealedBands);
+    expect(snapshot.frozenRawCount).toBe(metadata.rawFrontierIndex);
+    expect(snapshot.frozenToolPaths).toEqual([]);
+    expect(snapshot.frozenRelevantClaims).toEqual([]);
+
+    const restored = restoreFoldFreezeState(JSON.parse(JSON.stringify(snapshot)) as typeof snapshot);
+    expect(restored.sealedBands).toEqual(snapshot.sealedBands);
+    expect(restored.lastAppendBoundaryViewCount).toBe(view.length);
+
+    const hot = evaluateFoldFreeze(restored, grown, ctx(), T0 + 5_000, CFG);
+    expect(hot.action).toBe('reuse');
+    if (hot.action !== 'reuse') return;
+    expect(restored.frozenView).not.toBeNull();
+    for (let i = 0; i < restored.frozenView!.length; i++) {
+      expect(hot.view[i]).toBe(restored.frozenView![i]);
+      expect(hot.view[i]).toEqual(state.frozenView![i]);
+    }
+
+    const cold = evaluateFoldFreeze(restored, grown, ctx(), T0 + 4_000 + CFG.ttlMs + 1, CFG);
+    expect(cold).toMatchObject({ action: 'recompute', reason: 'cold-gap' });
+  });
+
+  it('restored one-shot reuse still honors the raw tail cap', () => {
+    const { state, history } = frozenFixture();
+    const snapshot = serializeFoldFreezeState(state);
+    const restored = restoreFoldFreezeState({
+      ...snapshot,
+      forceAcceptRestoredView: true,
+    });
+    const whale = msg('user', 'x'.repeat(CFG.maxTailChars + 500));
+
+    const decision = evaluateFoldFreeze(restored, [...history, whale], ctx(), T0 + 5_000, CFG);
+
+    // Distinct from generic 'tail-epoch' so both the relay and standalone
+    // callers force full recompute + eviction instead of appending a folded
+    // tail band onto the oversized restored prefix.
+    expect(decision).toMatchObject({
+      action: 'recompute',
+      reason: 'restored-overcap',
+      detail: 'restored-tail-overcap',
+    });
+    expect(restored.forceAcceptRestoredView).toBe(false);
   });
 
   it('touch bumps hotReuses and slides lastCallAt; commit resets hotReuses and bumps epochs', () => {
@@ -250,10 +337,22 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     touchFoldFreeze(state, T0 + 2_000);
     expect(state.hotReuses).toBe(2);
     expect(state.lastCallAt).toBe(T0 + 2_000);
-    commitFoldFreeze(state, history, [msg('user', 'refolded')], ctx(), T0 + 3_000);
+    commitFoldFreeze(state, history, [msg('user', 'refolded')], ctx(), T0 + 3_000, 'cold-gap');
     expect(state.hotReuses).toBe(0);
     expect(state.epochs).toBe(2);
     expect(state.lastCallAt).toBe(T0 + 3_000);
+    expect(state.lastTransitionReason).toBe('cold-gap');
+    expect(state.lastFullRecomputeReason).toBe('cold-gap');
+  });
+
+  it('records prefix saturation as a caller-supplied full recompute cause', () => {
+    const { state, history } = frozenFixture();
+    commitFoldFreeze(state, history, [msg('user', 'prefix refreshed')], ctx(), T0 + 3_000, 'prefix-saturation');
+
+    expect(state.lastTransitionReason).toBe('prefix-saturation');
+    expect(state.lastFullRecomputeReason).toBe('prefix-saturation');
+    expect(getFoldFreezeMetadata(state).cache.lastFullRecomputeReason).toBe('prefix-saturation');
+    expect(serializeFoldFreezeState(state).lastFullRecomputeReason).toBe('prefix-saturation');
   });
 
   it('empty-history commit is safe and reuse returns the pure tail', () => {
@@ -377,18 +476,40 @@ describe('resolveFoldFreezeConfig — env parsing', () => {
     expect(cfg.maxTailChars).toBe(DEFAULT_FOLD_FREEZE_CONFIG.maxTailChars);
   });
 
-  it.each(['0', 'false', 'off', 'no', ' OFF ', 'False'])('disables on WARP_FOLD_FREEZE=%s', (raw) => {
-    expect(resolveFoldFreezeConfig({ WARP_FOLD_FREEZE: raw }).enabled).toBe(false);
+  it.each([
+    ['VOXXO_FOLD_FREEZE', '0'],
+    ['VOXXO_FOLD_FREEZE', 'false'],
+    ['VOXXO_FOLD_FREEZE', 'off'],
+    ['VOXXO_FOLD_FREEZE', 'no'],
+    ['VOXXO_FOLD_FREEZE', ' OFF '],
+    ['VOXXO_FOLD_FREEZE', 'False'],
+    ['WARP_FOLD_FREEZE', '0'],
+    ['WARP_FOLD_FREEZE', 'false'],
+    ['WARP_FOLD_FREEZE', 'off'],
+    ['WARP_FOLD_FREEZE', 'no'],
+    ['WARP_FOLD_FREEZE', ' OFF '],
+    ['WARP_FOLD_FREEZE', 'False'],
+  ])('disables on %s=%s', (key: string, raw: string) => {
+    expect(resolveFoldFreezeConfig({ [key]: raw }).enabled).toBe(false);
   });
 
-  it.each(['1', 'true', 'on', ''])('stays enabled on WARP_FOLD_FREEZE=%s', (raw) => {
-    expect(resolveFoldFreezeConfig({ WARP_FOLD_FREEZE: raw }).enabled).toBe(true);
+  it.each([
+    ['VOXXO_FOLD_FREEZE', '1'],
+    ['VOXXO_FOLD_FREEZE', 'true'],
+    ['VOXXO_FOLD_FREEZE', 'on'],
+    ['VOXXO_FOLD_FREEZE', ''],
+    ['WARP_FOLD_FREEZE', '1'],
+    ['WARP_FOLD_FREEZE', 'true'],
+    ['WARP_FOLD_FREEZE', 'on'],
+    ['WARP_FOLD_FREEZE', ''],
+  ])('stays enabled on %s=%s', (key: string, raw: string) => {
+    expect(resolveFoldFreezeConfig({ [key]: raw }).enabled).toBe(true);
   });
 
-  it('honors numeric TTL and tail-cap overrides', () => {
+  it.each(['VOXXO', 'WARP'])('honors numeric TTL and tail-cap overrides for %s_', (prefix: string) => {
     const cfg = resolveFoldFreezeConfig({
-      WARP_FOLD_FREEZE_TTL_MS: '60000',
-      WARP_FOLD_FREEZE_MAX_TAIL_CHARS: '50000',
+      [`${prefix}_FOLD_FREEZE_TTL_MS`]: '60000',
+      [`${prefix}_FOLD_FREEZE_MAX_TAIL_CHARS`]: '50000',
     });
     expect(cfg.ttlMs).toBe(60_000);
     expect(cfg.maxTailChars).toBe(50_000);
@@ -403,8 +524,10 @@ describe('resolveFoldFreezeConfig — env parsing', () => {
   it('keeps explicit env overrides ahead of caller defaults', () => {
     const cfg = resolveFoldFreezeConfig(
       {
-        WARP_FOLD_FREEZE_TTL_MS: '60000',
-        WARP_FOLD_FREEZE_MAX_TAIL_CHARS: '50000',
+        WARP_FOLD_FREEZE_TTL_MS: '70000',
+        WARP_FOLD_FREEZE_MAX_TAIL_CHARS: '60000',
+        VOXXO_FOLD_FREEZE_TTL_MS: '60000',
+        VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS: '50000',
       },
       { ttlMs: 3_600_000, maxTailChars: 100_000 },
     );
@@ -414,10 +537,25 @@ describe('resolveFoldFreezeConfig — env parsing', () => {
 
   it('ignores invalid numeric overrides (garbage, zero, negative)', () => {
     const cfg = resolveFoldFreezeConfig({
-      WARP_FOLD_FREEZE_TTL_MS: 'abc',
+      VOXXO_FOLD_FREEZE_TTL_MS: 'abc',
       WARP_FOLD_FREEZE_MAX_TAIL_CHARS: '-5',
     });
     expect(cfg.ttlMs).toBe(DEFAULT_FOLD_FREEZE_CONFIG.ttlMs);
     expect(cfg.maxTailChars).toBe(DEFAULT_FOLD_FREEZE_CONFIG.maxTailChars);
+  });
+
+  it('prefers VOXXO_ flags over WARP_ aliases', () => {
+    const cfg = resolveFoldFreezeConfig({
+      VOXXO_FOLD_FREEZE: 'true',
+      WARP_FOLD_FREEZE: 'false',
+      VOXXO_FOLD_FREEZE_TTL_MS: '60000',
+      WARP_FOLD_FREEZE_TTL_MS: '70000',
+      VOXXO_FOLD_FREEZE_MAX_TAIL_CHARS: '50000',
+      WARP_FOLD_FREEZE_MAX_TAIL_CHARS: '60000',
+    });
+
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.ttlMs).toBe(60_000);
+    expect(cfg.maxTailChars).toBe(50_000);
   });
 });

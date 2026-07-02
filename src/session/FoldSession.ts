@@ -35,6 +35,7 @@ import {
   type FoldConfig,
   type FoldResult,
   type FoldEvictionInput,
+  type FoldEvictionOutcome,
   type FoldEvictionSpan,
   type StepFoldPlan,
   type FidelityOverrides,
@@ -140,8 +141,9 @@ export interface FoldSessionOptions {
   readonly foldConfig?: FoldConfig;
   /**
    * Quality-driven fidelity override (session default). Sets what fraction of
-   * the band stays at full / essence retention, independent of band size.
-   * A per-turn value via {@link FoldPrepareContext.fidelity} takes precedence.
+   * the band stays at full / essence retention, independent of band size. The
+   * governor (governByTrace) can also supply this per-turn via
+   * {@link FoldPrepareContext.fidelity}; a per-turn value takes precedence.
    * Applied only at epoch boundaries (cache-safe).
    */
   readonly fidelity?: FidelityOverrides | null;
@@ -156,14 +158,17 @@ export interface FoldSessionOptions {
    * E10 sawtooth eviction for the standing fold block. Enabled by default for
    * prepare(), because FoldSession's contract is full raw append-only history:
    * hosts can compose foldRecall with that raw history to page tombstoned
-   * detail back in. Pass false to keep the fold block monotonic, or tune the
-   * threshold.
+   * detail back in. Full recompute epochs can target the oldest safe frontier
+   * when the pressure ceiling reopens all raw history for tombstoning; pass
+   * false to keep the fold block monotonic, or tune the threshold.
    */
   readonly eviction?: boolean | { readonly thresholdChars?: number };
   /**
    * Absolute pressure guard for large-window models. Enabled by default at
-   * 150k measured input tokens; pass false to disable or a number/config to
-   * tune. The host must pass measuredInputTokens to prepare() for it to fire.
+   * 120k measured input tokens (the shared
+   * DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS); pass false to disable or
+   * a number/config to tune. The host must pass measuredInputTokens to
+   * prepare() for it to fire.
    */
   readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
   /**
@@ -257,7 +262,8 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    */
   readonly hardEpoch?: boolean;
   /**
-   * Quality-driven fidelity override for THIS turn. Scales the full/essence
+   * Quality-driven fidelity override for THIS turn — typically the governor's
+   * `decision.fidelity` from {@link governByTrace}. Scales the full/essence
    * retention budget without changing band size. Applied only when this turn
    * triggers a fold epoch (never mid hot-reuse), mirroring the relay's
    * epoch-gated band/fidelity application. `undefined` keeps the last value;
@@ -295,6 +301,7 @@ export interface FoldStats {
   /** E10 sawtooth telemetry, present on fresh folds when eviction is enabled. */
   readonly newlyEvictedTurns?: number;
   readonly evictedSpanCount?: number;
+  readonly evictionOutcome?: FoldEvictionOutcome;
   /** Absolute measured-token ceiling telemetry when the pressure guard is enabled. */
   readonly pressureCeilingTokens?: number;
   readonly pressureCeilingTriggered?: boolean;
@@ -715,12 +722,13 @@ export class FoldSession {
    * Public pressure-ceiling probe. Lets hosts short-circuit expensive
    * hard-epoch seed preparation (glyph log scans, episode recall) when no
    * hard epoch is imminent this turn. Mirrors the private check used inside
-   * {@link prepare}.
+   * {@link prepare}. Standalone parity: context-warp-drive FoldSession exposes
+   * the same probe, so the published library and the relay engine stay in sync
+   * even though the relay host builds hard-epoch seeds lazily and may not call it.
    */
   willTriggerPressureCeiling(measuredInputTokens: number | undefined): boolean {
     return this.isPressureCeilingTriggered(measuredInputTokens);
   }
-
 
   private pressureStats(
     pressureCeilingTriggered: boolean,
@@ -1069,6 +1077,7 @@ export class FoldSession {
       epochs: this.freezeState.epochs,
       newlyEvictedTurns: result.newlyEvictedTurns,
       evictedSpanCount: result.evictedSpans?.length,
+      evictionOutcome: result.evictionOutcome,
       ...this.pressureStats(pressureCeilingTriggered),
     };
   }

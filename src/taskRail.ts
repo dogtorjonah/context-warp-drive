@@ -6,6 +6,8 @@
  * transport, NO squad permissions, NO chat/Atlas/file-claim coupling, and NO
  * relay I/O. Consumers can wrap these pure lifecycle/execution helpers in their
  * own CLI, MCP tool, UI, local JSON file, SQLite store, or agent runtime.
+ * The `complete_review` operation is enum-only here because review finalization
+ * remains an adapter workflow, not a pure state-machine helper.
  */
 
 
@@ -880,6 +882,365 @@ export function resetStepToPending(
 }
 
 // ══════════════════════════════════════════════════════════════════════
+//  Source: @voxxo/task-rail/src/drafts.ts
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * @voxxo/task-rail — Draft Lifecycle
+ *
+ * Pure state transition functions for ghost drafts: creation, editing,
+ * stale-base detection, merge with conflict protection, abandon, and
+ * force-merge override. Hosts provide persistence, ID generation, and access
+ * control around these dependency-free helpers.
+ */
+
+function bumpDraft(
+  draft: TaskRailDraft,
+  operation: string,
+  stepId?: string,
+  ctx?: LifecycleContext,
+): void {
+  draft.revision += 1;
+  draft.updatedAt = ts(ctx?.now);
+  appendHistory(
+    draft,
+    operation,
+    stepId,
+    ctx?.note,
+    ctx?.actorId,
+    ctx?.actorName,
+    ctx?.now,
+  );
+}
+
+/** Returns true if the draft can be edited. Only open and conflicted drafts are editable. */
+export function isDraftEditable(draft: TaskRailDraft): boolean {
+  return draft.state === 'open' || draft.state === 'conflicted';
+}
+
+/** Reopen a conflicted draft by clearing its conflict and returning it to open state. */
+export function reopenAfterConflict(draft: TaskRailDraft): void {
+  if (draft.state === 'conflicted') {
+    draft.state = 'open';
+    draft.conflict = undefined;
+  }
+}
+
+export interface CreateDraftArgs {
+  id: string;
+  ownerInstanceId: string;
+  baseRailId?: string;
+  baseRevision: number;
+  authorId: string;
+  authorName?: string;
+  title: string;
+  objective?: string;
+  steps?: TaskRailStep[];
+  note?: string;
+  actorId?: string;
+  actorName?: string;
+}
+
+/** Create a new ghost draft and record its base revision for stale-base checks. */
+export function createDraft(args: CreateDraftArgs, now?: string): TaskRailDraft {
+  const createdAt = ts(now);
+  return {
+    id: args.id,
+    ownerInstanceId: args.ownerInstanceId,
+    baseRailId: args.baseRailId,
+    baseRevision: args.baseRevision,
+    authorId: args.authorId,
+    authorName: args.authorName,
+    title: args.title,
+    objective: args.objective ?? '',
+    state: 'open',
+    revision: 1,
+    createdAt,
+    updatedAt: createdAt,
+    steps: args.steps ?? [],
+    history: [
+      {
+        ts: createdAt,
+        operation: 'create',
+        ...(args.note ? { note: args.note } : {}),
+        ...(args.actorId ? { actorId: args.actorId } : {}),
+        ...(args.actorName ? { actorName: args.actorName } : {}),
+      },
+    ],
+  };
+}
+
+/** Abandon a draft, returning an error string when it is already terminal. */
+export function abandonDraft(
+  draft: TaskRailDraft,
+  ctx?: LifecycleContext,
+): string | null {
+  if (draft.state === 'merged') {
+    return `Draft ${draft.id} is already merged and cannot be abandoned.`;
+  }
+  if (draft.state === 'abandoned') {
+    return `Draft ${draft.id} is already abandoned.`;
+  }
+  draft.state = 'abandoned';
+  draft.abandonedAt = ts(ctx?.now);
+  bumpDraft(draft, 'abandon', undefined, ctx);
+  return null;
+}
+
+export interface MergeGuardInput {
+  draft: TaskRailDraft;
+  liveRevision: number;
+  liveRailId?: string;
+  force: boolean;
+}
+
+export interface MergeConflict {
+  ts: string;
+  liveRevision: number;
+  reason: string;
+}
+
+/** Check whether a draft merge would conflict with the current live rail. */
+export function checkMergeConflict(input: MergeGuardInput, now?: string): MergeConflict | null {
+  if (input.force) return null;
+
+  const { draft, liveRevision, liveRailId } = input;
+  if (draft.baseRailId && liveRailId !== draft.baseRailId) {
+    return {
+      ts: ts(now),
+      liveRevision,
+      reason: `Base rail changed from ${draft.baseRailId} to ${liveRailId ?? 'none'}.`,
+    };
+  }
+
+  if (liveRevision !== draft.baseRevision) {
+    return {
+      ts: ts(now),
+      liveRevision,
+      reason: `Live rail revision moved from ${draft.baseRevision} to ${liveRevision}.`,
+    };
+  }
+
+  return null;
+}
+
+/** Apply a merge conflict to a draft and record it in draft history. */
+export function applyConflict(
+  draft: TaskRailDraft,
+  conflict: MergeConflict,
+  ctx?: LifecycleContext,
+): void {
+  draft.state = 'conflicted';
+  draft.conflict = conflict;
+  bumpDraft(draft, 'conflict', undefined, {
+    note: conflict.reason,
+    actorId: ctx?.actorId,
+    actorName: ctx?.actorName,
+    now: ctx?.now,
+  });
+}
+
+/** Check if an actor is authorized to merge a draft. */
+export function canMergeDraft(
+  draft: TaskRailDraft,
+  actorId: string,
+): string | null {
+  if (actorId !== draft.ownerInstanceId && actorId !== 'user') {
+    return `Only the rail owner can merge draft ${draft.id}. Ask owner ${draft.ownerInstanceId} to merge it.`;
+  }
+  if (draft.state === 'merged' || draft.state === 'abandoned') {
+    return `Draft ${draft.id} is ${draft.state} and cannot be merged.`;
+  }
+  return null;
+}
+
+/** Mark a draft as merged. The caller applies draft steps to the live rail. */
+export function markDraftMerged(
+  draft: TaskRailDraft,
+  force: boolean,
+  ctx?: LifecycleContext,
+): void {
+  draft.state = 'merged';
+  draft.mergedAt = ts(ctx?.now);
+  draft.conflict = undefined;
+  bumpDraft(draft, force ? 'merge:forced' : 'merge', undefined, ctx);
+}
+
+export interface FullMergeInput {
+  draft: TaskRailDraft;
+  actorId: string;
+  liveRevision: number;
+  liveRailId?: string;
+  force: boolean;
+}
+
+export interface FullMergeResult {
+  success: boolean;
+  error?: string;
+}
+
+/** Run authorization, conflict detection, and mark-as-merged for a draft. */
+export function attemptMerge(input: FullMergeInput, ctx?: LifecycleContext): FullMergeResult {
+  const authError = canMergeDraft(input.draft, input.actorId);
+  if (authError) return { success: false, error: authError };
+
+  const conflict = checkMergeConflict({
+    draft: input.draft,
+    liveRevision: input.liveRevision,
+    liveRailId: input.liveRailId,
+    force: input.force,
+  }, ctx?.now);
+
+  if (conflict) {
+    applyConflict(input.draft, conflict, ctx);
+    return { success: false, error: conflict.reason };
+  }
+
+  markDraftMerged(input.draft, input.force, ctx);
+  return { success: true };
+}
+
+/** Update a single step in a draft. Conflicted drafts reopen before the edit. */
+export function updateDraftStep(
+  draft: TaskRailDraft,
+  stepId: string,
+  changes: StepUpdateFields,
+  ctx?: LifecycleContext,
+): TaskRailStep {
+  if (!isDraftEditable(draft)) {
+    throw new Error(`Draft ${draft.id} is ${draft.state} and cannot be edited.`);
+  }
+  const idx = draft.steps.findIndex((s) => s.id === stepId);
+  if (idx < 0) throw new Error(`Step not found: ${stepId}`);
+  const step = draft.steps[idx];
+  const timestamp = ts(ctx?.now);
+
+  if (changes.title !== undefined) step.title = changes.title;
+  if (changes.instruction !== undefined) step.instruction = changes.instruction;
+  if (changes.acceptanceCriteria !== undefined) step.acceptanceCriteria = changes.acceptanceCriteria;
+  if (changes.notes !== undefined) step.notes = changes.notes ?? undefined;
+  if (changes.scope !== undefined) step.scope = changes.scope ?? undefined;
+  if (changes.status !== undefined) {
+    step.status = changes.status;
+    if (changes.status === 'pending') {
+      step.startedAt = undefined;
+      step.completedAt = undefined;
+    }
+  }
+  step.updatedAt = timestamp;
+  reopenAfterConflict(draft);
+  bumpDraft(draft, 'update', stepId, ctx);
+  return step;
+}
+
+/** Batch-update multiple draft steps. Conflicted drafts reopen before history bump. */
+export function batchUpdateDraftSteps(
+  draft: TaskRailDraft,
+  updates: Array<{ stepId: string; changes: StepUpdateFields }>,
+  ctx?: LifecycleContext,
+): string[] {
+  if (!isDraftEditable(draft)) {
+    throw new Error(`Draft ${draft.id} is ${draft.state} and cannot be edited.`);
+  }
+  if (updates.length === 0) return [];
+
+  const timestamp = ts(ctx?.now);
+  const updatedIds: string[] = [];
+  for (const { stepId, changes } of updates) {
+    const idx = draft.steps.findIndex((s) => s.id === stepId);
+    if (idx < 0) throw new Error(`Step not found: ${stepId}`);
+    const step = draft.steps[idx];
+    if (changes.title !== undefined) step.title = changes.title;
+    if (changes.instruction !== undefined) step.instruction = changes.instruction;
+    if (changes.acceptanceCriteria !== undefined) step.acceptanceCriteria = changes.acceptanceCriteria;
+    if (changes.notes !== undefined) step.notes = changes.notes ?? undefined;
+    if (changes.scope !== undefined) step.scope = changes.scope ?? undefined;
+    if (changes.status !== undefined) {
+      step.status = changes.status;
+      if (changes.status === 'pending') {
+        step.startedAt = undefined;
+        step.completedAt = undefined;
+      }
+    }
+    step.updatedAt = timestamp;
+    updatedIds.push(stepId);
+  }
+
+  reopenAfterConflict(draft);
+  bumpDraft(draft, 'batch_update', updatedIds.join(','), ctx);
+  return updatedIds;
+}
+
+/** Append steps to a draft. */
+export function appendDraftSteps(
+  draft: TaskRailDraft,
+  steps: TaskRailStep[],
+  ctx?: LifecycleContext,
+): void {
+  if (!isDraftEditable(draft)) {
+    throw new Error(`Draft ${draft.id} is ${draft.state} and cannot be edited.`);
+  }
+  if (steps.length === 0) return;
+  draft.steps.push(...steps);
+  reopenAfterConflict(draft);
+  bumpDraft(draft, 'append', steps[0].id, ctx);
+}
+
+/** Insert steps into a draft at a specific index. */
+export function insertDraftSteps(
+  draft: TaskRailDraft,
+  steps: TaskRailStep[],
+  index: number,
+  ctx?: LifecycleContext,
+): void {
+  if (!isDraftEditable(draft)) {
+    throw new Error(`Draft ${draft.id} is ${draft.state} and cannot be edited.`);
+  }
+  if (steps.length === 0) return;
+  const clamped = Math.max(0, Math.min(draft.steps.length, Math.floor(index)));
+  draft.steps.splice(clamped, 0, ...steps);
+  reopenAfterConflict(draft);
+  bumpDraft(draft, 'insert', steps[0].id, ctx);
+}
+
+/** Remove a step from a draft. */
+export function removeDraftStep(
+  draft: TaskRailDraft,
+  stepId: string,
+  ctx?: LifecycleContext,
+): TaskRailStep {
+  if (!isDraftEditable(draft)) {
+    throw new Error(`Draft ${draft.id} is ${draft.state} and cannot be edited.`);
+  }
+  const idx = draft.steps.findIndex((s) => s.id === stepId);
+  if (idx < 0) throw new Error(`Step not found: ${stepId}`);
+  const [removed] = draft.steps.splice(idx, 1);
+  reopenAfterConflict(draft);
+  bumpDraft(draft, 'remove', removed.id, ctx);
+  return removed;
+}
+
+/** Move a step within a draft. */
+export function moveDraftStep(
+  draft: TaskRailDraft,
+  stepId: string,
+  targetIndex: number,
+  ctx?: LifecycleContext,
+): TaskRailStep {
+  if (!isDraftEditable(draft)) {
+    throw new Error(`Draft ${draft.id} is ${draft.state} and cannot be edited.`);
+  }
+  const idx = draft.steps.findIndex((s) => s.id === stepId);
+  if (idx < 0) throw new Error(`Step not found: ${stepId}`);
+  const [step] = draft.steps.splice(idx, 1);
+  const clamped = Math.max(0, Math.min(draft.steps.length, Math.floor(targetIndex)));
+  draft.steps.splice(clamped, 0, step);
+  reopenAfterConflict(draft);
+  bumpDraft(draft, 'move', stepId, ctx);
+  return step;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 //  Source: @voxxo/task-rail/src/execution.ts
 // ══════════════════════════════════════════════════════════════════════
 
@@ -1072,7 +1433,7 @@ export function shoot(
   if (!wasTerminalOnLoad && rail.state !== 'complete' && rail.state !== 'review') {
     // Force-complete: all steps are resolved but state didn't flip (edge case)
     rail.state = 'complete';
-    rail.completedAt ??= new Date().toISOString();
+    rail.completedAt ??= ctx?.now ?? new Date().toISOString();
   }
   return { complete: true };
 }
@@ -1129,7 +1490,7 @@ export function sprint(
   // ── Reserve phase ──
   const limit = resolveSprintCount(args);
   const selected: TaskRailStep[] = [];
-  const now = new Date().toISOString();
+  const now = ctx?.now ?? new Date().toISOString();
 
   // Guard: if a step is already active, do not promote any newly-reserved
   // step to active — that would create two active steps and cause the
@@ -1166,7 +1527,7 @@ export function sprint(
   refreshRailState(rail);
   if (!wasTerminalOnLoad && rail.state !== 'complete' && rail.state !== 'review') {
     rail.state = 'complete';
-    rail.completedAt ??= new Date().toISOString();
+    rail.completedAt ??= ctx?.now ?? new Date().toISOString();
   }
   return { complete: true };
 }
