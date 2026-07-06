@@ -237,7 +237,7 @@ describe('ClaudeTmuxFoldLoop', () => {
     expect(epoch.dryRun).toBe(true);
     expect(epoch.write?.path).toBe(`${filePath}.dryrun`);
     expect(await fs.promises.readFile(filePath, 'utf8')).toBe(before);
-    expect(await fs.promises.readFile(`${filePath}.dryrun`, 'utf8')).toContain('hard-compacted for continuity');
+    expect(await fs.promises.readFile(`${filePath}.dryrun`, 'utf8')).toContain('[CONTEXT REBIRTH]');
   });
 
   it('kills tmux, rewrites the session chain, and respawns interactive Claude with --resume', async () => {
@@ -269,7 +269,7 @@ describe('ClaudeTmuxFoldLoop', () => {
     expect(commands[2]?.at(-1)).toContain('--resume tmux-session-A');
     const rewritten = await fs.promises.readFile(filePath, 'utf8');
     expect(rewritten).not.toContain('OLD RAW');
-    expect(rewritten).toContain('hard-compacted for continuity');
+    expect(rewritten).toContain('[CONTEXT REBIRTH]');
     expect(JSON.parse(rewritten.trim().split('\n').at(-1)!).type).toBe('last-prompt');
   });
 });

@@ -254,38 +254,11 @@ export function convertLocalMessagesToSeedHistory(
     usedRows += 1;
   };
 
+  const renderBudgets: RowRenderBudgets = { maxToolInputChars, maxToolResultChars, maxMessageChars };
   for (const row of sourceRows) {
-    if (row.sg === true) continue;
-    switch (row.ty) {
-      case 'user': {
-        const text = typeof row.tx === 'string' ? row.tx : '';
-        if (!text.trim()) break;
-        const stamp = shortTs(row.ts);
-        append('user', clip(stamp ? `[${stamp}] ${text}` : text, maxMessageChars));
-        break;
-      }
-      case 'assistant_text': {
-        const text = typeof row.tx === 'string' ? row.tx : '';
-        if (!text.trim()) break;
-        append('assistant', clip(text, maxMessageChars));
-        break;
-      }
-      case 'tool_use': {
-        const name = typeof row.tn === 'string' && row.tn ? row.tn : 'tool';
-        const preview = safeJsonPreview(row.ti, maxToolInputChars);
-        append('assistant', preview ? `⟨tool ${name} ${preview}⟩` : `⟨tool ${name}⟩`);
-        break;
-      }
-      case 'tool_result': {
-        const text = typeof row.tx === 'string' ? collapseWhitespace(row.tx) : '';
-        if (!text) break;
-        const name = typeof row.tn === 'string' && row.tn ? ` ${row.tn}` : '';
-        append('assistant', `⟨tool result${name}: ${clip(text, maxToolResultChars)}⟩`);
-        break;
-      }
-      default:
-        break;
-    }
+    const part = renderRowPart(row, renderBudgets);
+    if (!part) continue;
+    append(part.role, part.text);
   }
 
   const rendered: BirthFoldSeedMessage[] = blocks.map((b) => ({
@@ -386,12 +359,219 @@ export function convertLocalMessagesToSeedHistory(
   };
 }
 
+// ── Per-row rendering (shared by block + trace converters) ──
+
+/** Per-row render budgets shared by the block and trace converters. */
+interface RowRenderBudgets {
+  maxToolInputChars: number;
+  maxToolResultChars: number;
+  maxMessageChars: number;
+}
+
+/**
+ * Render one transcript row to its seed part. Single source of truth for both
+ * convertLocalMessagesToSeedHistory (block-merged birth seeds) and
+ * convertLocalMessagesToTraceMessages (per-row hard-epoch traces). Returns
+ * null for rows that contribute nothing (streaming duplicates, reasoning,
+ * system reminders, empty text).
+ */
+function renderRowPart(
+  row: BirthFoldSourceRow,
+  budgets: RowRenderBudgets,
+): { role: 'user' | 'assistant'; text: string } | null {
+  if (row.sg === true) return null;
+  switch (row.ty) {
+    case 'user': {
+      const text = typeof row.tx === 'string' ? row.tx : '';
+      if (!text.trim()) return null;
+      const stamp = shortTs(row.ts);
+      return { role: 'user', text: clip(stamp ? `[${stamp}] ${text}` : text, budgets.maxMessageChars) };
+    }
+    case 'assistant_text': {
+      const text = typeof row.tx === 'string' ? row.tx : '';
+      if (!text.trim()) return null;
+      return { role: 'assistant', text: clip(text, budgets.maxMessageChars) };
+    }
+    case 'tool_use': {
+      const name = typeof row.tn === 'string' && row.tn ? row.tn : 'tool';
+      const preview = safeJsonPreview(row.ti, budgets.maxToolInputChars);
+      return { role: 'assistant', text: preview ? `⟨tool ${name} ${preview}⟩` : `⟨tool ${name}⟩` };
+    }
+    case 'tool_result': {
+      const text = typeof row.tx === 'string' ? collapseWhitespace(row.tx) : '';
+      if (!text) return null;
+      const name = typeof row.tn === 'string' && row.tn ? ` ${row.tn}` : '';
+      return { role: 'assistant', text: `⟨tool result${name}: ${clip(text, budgets.maxToolResultChars)}⟩` };
+    }
+    default:
+      return null;
+  }
+}
+
+// ── Per-row trace conversion (hard-epoch seed bodies) ──
+
+/** Stats for convertLocalMessagesToTraceMessages. */
+export interface BirthFoldTraceConversionStats {
+  sourceRows: number;
+  /** Rendered per-row messages before newest-first retention. */
+  renderedMessages: number;
+  droppedOlderMessages: number;
+  /** Rows excluded by the bounded pre-trim before rendering. */
+  preTrimmedRows: number;
+  totalChars: number;
+  truncated: boolean;
+}
+
+/**
+ * Per-row trace conversion for hard-epoch seed bodies (rail-2dcc0c4f).
+ *
+ * Renders the SAME per-row parts as convertLocalMessagesToSeedHistory but
+ * WITHOUT consecutive-role block merging, alternation repair, or synthetic
+ * trailers. Why: the block converter collapses tool-only stretches into one
+ * giant assistant block (a transcript with no real user rows becomes a single
+ * mega-block). Downstream newest-first section builders (buildRawHardEpochSeed)
+ * truncate each MESSAGE from the front, so a seed built over merged blocks
+ * pins to the oldest content of the mega-block and never advances as the
+ * trace grows — the byte-identical hard-epoch seed bug. Per-row granularity
+ * restores a real chronological message list so newest-first fills see the
+ * newest work and the seed advances with the trace.
+ *
+ * ⚠ NOT provider-history-safe: output does NOT alternate roles and must never
+ * be fed to a provider as message history. Consumers are text-section builders
+ * (buildRawHardEpochSeed) only. Birth hydration keeps using
+ * convertLocalMessagesToSeedHistory, whose alternation contract is untouched.
+ *
+ * Newest-first retention under maxChars drops the OLDEST messages first; the
+ * newest message is never dropped (tail-clipped if singly oversized). A
+ * compact truncation marker is prepended when anything was dropped.
+ */
+export function convertLocalMessagesToTraceMessages(
+  rows: readonly BirthFoldSourceRow[],
+  options?: BirthFoldConversionOptions,
+): { messages: BirthFoldSeedMessage[]; stats: BirthFoldTraceConversionStats } {
+  const maxChars = options?.maxChars ?? DEFAULT_BIRTH_FOLD_MAX_CHARS;
+  const maxToolInputChars = options?.maxToolInputChars ?? DEFAULT_TOOL_INPUT_CHARS;
+  const maxToolResultChars = options?.maxToolResultChars ?? DEFAULT_TOOL_RESULT_CHARS;
+  const maxMessageChars = options?.maxMessageChars ?? DEFAULT_MESSAGE_CHARS;
+
+  // Same event-loop pre-trim guard as convertLocalMessagesToSeedHistory: bound
+  // rendering work before any string assembly (hard epochs run on the relay
+  // main thread against full transcripts).
+  let sourceRows: readonly BirthFoldSourceRow[] = rows;
+  let preTrimmedRows = 0;
+  if (rows.length > 1) {
+    const budget = maxChars * 2.5;
+    let acc = 0;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      acc += typeof rows[i].tx === 'string' ? (rows[i].tx as string).length + 32 : 96;
+      if (acc > budget && i < rows.length - 1) {
+        preTrimmedRows = i + 1;
+        sourceRows = rows.slice(i + 1);
+        break;
+      }
+    }
+  }
+
+  const budgets: RowRenderBudgets = { maxToolInputChars, maxToolResultChars, maxMessageChars };
+  const rendered: BirthFoldSeedMessage[] = [];
+  for (const row of sourceRows) {
+    const part = renderRowPart(row, budgets);
+    if (!part) continue;
+    rendered.push({ role: part.role, content: part.text });
+  }
+
+  // Newest-first retention over whole messages; the newest message always survives.
+  let cutStart = 0;
+  {
+    let total = 0;
+    for (let i = rendered.length - 1; i >= 0; i--) {
+      const len = rendered[i].content.length;
+      if (i < rendered.length - 1 && total + len > maxChars) {
+        cutStart = i + 1;
+        break;
+      }
+      total += len;
+    }
+  }
+  let kept = rendered.slice(cutStart);
+  if (kept.length === 1 && kept[0].content.length > maxChars) {
+    const keep = Math.max(1, maxChars - 160);
+    const elided = kept[0].content.length - keep;
+    kept = [{
+      role: kept[0].role,
+      content: `${BIRTH_FOLD_TAG} (oversized message: ${elided} chars elided; newest tail kept)\n\n…${kept[0].content.slice(-keep)}`,
+    }];
+  }
+
+  const droppedOlderMessages = cutStart;
+  const truncated = droppedOlderMessages > 0 || preTrimmedRows > 0;
+  if (truncated && kept.length > 0) {
+    const omitted = droppedOlderMessages > 0
+      ? `${droppedOlderMessages} older message(s)`
+      : `${preTrimmedRows} older transcript row(s)`;
+    kept.unshift({ role: 'user', content: `${BIRTH_FOLD_TAG} Trace truncated: ${omitted} omitted.` });
+  }
+
+  let totalChars = 0;
+  for (const m of kept) totalChars += m.content.length;
+
+  return {
+    messages: kept,
+    stats: {
+      sourceRows: rows.length,
+      renderedMessages: rendered.length,
+      droppedOlderMessages,
+      preTrimmedRows,
+      totalChars,
+      truncated,
+    },
+  };
+}
+
 // ── Env knob (pure parse; callers read process.env) ──
 
 export function resolveBirthFoldMaxChars(raw: string | undefined): number {
   if (!raw) return DEFAULT_BIRTH_FOLD_MAX_CHARS;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BIRTH_FOLD_MAX_CHARS;
+}
+
+const BIRTH_FOLD_SEED_CHARS_PER_TOKEN = 4;
+const BIRTH_FOLD_SEED_WINDOW_FRACTION = 0.15;
+const BIRTH_FOLD_SEED_MIN_CHARS = 40_000;
+
+export interface BirthFoldSeedMaxOptions {
+  /** Optional hard ceiling layered above the env/default ceiling. */
+  ceilingChars?: number;
+}
+
+/**
+ * Window-aware seed cap for provider-visible birth-fold hydration.
+ *
+ * `effectiveWindowTokens` is a config token ceiling, not a live text estimate:
+ * FC call sites pass the resolved pressure ceiling when enabled, while CLI
+ * reconstruction paths may pass the model window. The optional `ceilingChars`
+ * lets callers mirror stricter package envelopes without changing the pure
+ * converter's historical default.
+ */
+export function resolveBirthFoldSeedMaxChars(
+  effectiveWindowTokens: number | null | undefined,
+  rawMaxChars?: string,
+  options: BirthFoldSeedMaxOptions = {},
+): number {
+  const configuredCeiling = resolveBirthFoldMaxChars(rawMaxChars);
+  const optionCeiling = Number.isFinite(options.ceilingChars) && (options.ceilingChars ?? 0) > 0
+    ? Math.floor(options.ceilingChars as number)
+    : configuredCeiling;
+  const ceiling = Math.min(configuredCeiling, optionCeiling);
+  if (!Number.isFinite(effectiveWindowTokens) || (effectiveWindowTokens ?? 0) <= 0) {
+    return ceiling;
+  }
+  const windowFitChars = Math.round(
+    (effectiveWindowTokens as number) * BIRTH_FOLD_SEED_WINDOW_FRACTION * BIRTH_FOLD_SEED_CHARS_PER_TOKEN,
+  );
+  const floor = Math.min(ceiling, BIRTH_FOLD_SEED_MIN_CHARS);
+  return Math.max(floor, Math.min(ceiling, windowFitChars));
 }
 
 // ── Engine mappers (structurally assignable to each engine's native types) ──

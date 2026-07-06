@@ -10,7 +10,6 @@ import {
   shouldReconstructClaudeCliEpoch,
   DEFAULT_CLAUDE_CLI_RECONSTRUCT_RUNWAY_TOKENS,
   DEFAULT_CLAUDE_CLI_RECONSTRUCT_INTERVAL,
-  DEFAULT_CLAUDE_CLI_HARD_EPOCH_SEED_PROMPT,
   CLAUDE_CLI_MODEL_FALLBACK,
   CLAUDE_CLI_JSONL_VERSION_FALLBACK,
   type ClaudeCliJsonlLine,
@@ -280,7 +279,9 @@ describe('buildClaudeCliHardEpochChain — pressure-ceiling live-turn preservati
     expect(messages[0].type).toBe('user');
     const seed = messages[0].type === 'user' ? messages[0].message.content : '';
     expect(seed).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
-    expect(seed).toContain(DEFAULT_CLAUDE_CLI_HARD_EPOCH_SEED_PROMPT);
+    // The default seed now uses buildRawHardEpochSeed (rich rebirth package),
+    // not the old static DEFAULT_CLAUDE_CLI_HARD_EPOCH_SEED_PROMPT.
+    expect(seed).toContain('[CONTEXT REBIRTH]');
     expect(seed).toContain(HARD_EPOCH_LIVE_TURN_HEADER);
     expect(seed).toContain('LIVE-MARKER-9931'); // live turn never silently trimmed
   });
@@ -302,5 +303,44 @@ describe('buildClaudeCliHardEpochChain — pressure-ceiling live-turn preservati
     const second = buildClaudeCliHardEpochChain(liveRows(), opts());
     expect(second.chain.lines).toEqual(first.chain.lines);
     expect(second.foldedMessages).toEqual(first.foldedMessages);
+  });
+
+  // ── Head-pinning regression (rail-2dcc0c4f) ──
+  // A tool-only transcript (no real user rows — the common autonomous-agent
+  // shape) used to collapse into ONE merged assistant mega-block, and the seed
+  // builder's front-truncating sections pinned every hard-epoch seed to the
+  // block's immutable HEAD: byte-identical seeds across epochs showing
+  // birth-era content while new work accumulated invisibly in the tail.
+  describe('head-pinning regression (rail-2dcc0c4f)', () => {
+    const opts = () => ({ sessionId: SESSION_ID, cwd: CWD, makeUuid: seqUuid(), baseTimeMs: BASE_MS });
+    const toolRows = (n: number, offset = 0): BirthFoldSourceRow[] =>
+      Array.from({ length: n }, (_, i) => row({
+        ty: 'tool_result',
+        tn: 'Read',
+        tx: `file chunk ${offset + i} content UNIQUE-${offset + i} ${'y'.repeat(80)}`,
+      }));
+
+    it('seed advances with the trace: newest activity present, growth changes the seed', () => {
+      const base = toolRows(60);
+      const first = buildClaudeCliHardEpochChain(base, opts());
+      const grown = [
+        ...base,
+        ...toolRows(20, 100),
+        row({ ty: 'tool_result', tn: 'Read', tx: 'NEWEST-MARKER-777 latest work product' }),
+      ];
+      const second = buildClaudeCliHardEpochChain(grown, opts());
+      // The newest tool activity must be visible in the seed body...
+      expect(second.seedBodyText).toContain('NEWEST-MARKER-777');
+      // ...and appending rows must change the seed (no byte-identical pinning).
+      expect(second.seedBodyText).not.toBe(first.seedBodyText);
+    });
+
+    it('tool-only transcript keeps per-message granularity (not one merged mega-block)', () => {
+      const built = buildClaudeCliHardEpochChain(toolRows(40), opts());
+      // Per-row conversion: many raw messages, not 1-2 merged blocks.
+      expect(built.rawMessages.length).toBeGreaterThan(10);
+      // Newest row content reaches the seed even with zero user rows.
+      expect(built.seedBodyText).toContain('UNIQUE-39');
+    });
   });
 });

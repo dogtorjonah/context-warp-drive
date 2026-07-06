@@ -141,6 +141,11 @@ export interface FoldSessionOptions {
    */
   readonly foldConfig?: FoldConfig;
   /**
+   * Host-specific fold-block preamble. Defaults to the package preamble; override
+   * when the host cannot provide the package's default recall-card mechanics.
+   */
+  readonly foldBlockPreamble?: string;
+  /**
    * Quality-driven fidelity override (session default). Sets what fraction of
    * the band stays at full / essence retention, independent of band size. The
    * governor (governByTrace) can also supply this per-turn via
@@ -166,7 +171,7 @@ export interface FoldSessionOptions {
   readonly eviction?: boolean | { readonly thresholdChars?: number };
   /**
    * Absolute pressure guard for large-window models. Enabled by default at
-   * 120k measured input tokens (the shared
+   * 150k measured input tokens (the shared
    * DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS); pass false to disable or
    * a number/config to tune. The host must pass measuredInputTokens to
    * prepare() for it to fire.
@@ -390,7 +395,10 @@ export class FoldSession {
   private hardEpochCompactBaselineActive = false;
 
   constructor(options: FoldSessionOptions = {}) {
-    this.foldConfig = options.foldConfig ?? resolveFoldConfigForBand(DEFAULT_FOLD_TARGET_BAND_TOKENS);
+    const baseFoldConfig = options.foldConfig ?? resolveFoldConfigForBand(DEFAULT_FOLD_TARGET_BAND_TOKENS);
+    this.foldConfig = options.foldBlockPreamble === undefined
+      ? baseFoldConfig
+      : { ...baseFoldConfig, foldBlockPreamble: options.foldBlockPreamble };
     this.activeFidelity = options.fidelity ?? null;
     this.readBurstGuardEnabled = options.readBurstGuard === true;
     this.valueFidelityInput = options.valueFidelity?.enabled === true
@@ -916,6 +924,7 @@ export class FoldSession {
     const ctx: FoldFreezeContext = {
       thinningMode: context.thinningMode ?? '',
       claimedPaths: context.claimedPaths ?? EMPTY_CLAIMED,
+      measuredInputTokens: context.measuredInputTokens,
     };
     const decision = evaluateFoldFreeze(this.freezeState, messages, ctx, now, this.freezeConfig);
 
@@ -1116,6 +1125,7 @@ export class FoldSession {
       const ctx: FoldFreezeContext = {
         thinningMode: context.thinningMode ?? '',
         claimedPaths: context.claimedPaths ?? EMPTY_CLAIMED,
+        measuredInputTokens: context.measuredInputTokens,
       };
       commitFoldFreeze(this.freezeState, messages, view, ctx, now, 'hard-epoch');
       this.freezeState.lastAppendBoundaryViewCount = view.length;

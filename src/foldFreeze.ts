@@ -684,6 +684,8 @@ export function getFoldFreezeMetadata(state: FoldFreezeState): FoldFreezeStateMe
 export interface FoldFreezeContext {
   thinningMode: string;
   claimedPaths: ReadonlySet<string>;
+  /** Real provider/relay input-token telemetry only. Omit when unknown. */
+  measuredInputTokens?: number;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -796,6 +798,13 @@ export function evaluateFoldFreeze(
 
   const tail = history.slice(state.frozenRawCount);
   const tailChars = tail.length > 0 ? countChars(tail) : 0;
+  // INVARIANT: the raw-tail char cap must ALWAYS fire — no measured-token floor,
+  // no suppression. Append-only tail-epoch routing preserves the frozen prefix
+  // byte-identical (cache-safe), so gating this protects nothing; a measured
+  // floor here created a blind zone where a bursty tool result rode hot-reuse
+  // from sub-floor measured input straight past the pressure ceiling with zero
+  // tail epochs (nova-cobra, 2026-07-05). It must stay structurally impossible
+  // to reach the hard-epoch ceiling with an over-cap raw tail still unfolded.
   if (tailChars > config.maxTailChars) {
     return { action: 'recompute', reason: 'tail-epoch', gapMs };
   }

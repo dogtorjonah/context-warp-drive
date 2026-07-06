@@ -138,10 +138,17 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'kimi-k2.5': 256_000,
 
   // ── Qwen / DashScope models ──
+  'qwen3.7-plus': 1_000_000,
+  'qwen3.7-max': 1_000_000,
+  'qwen3.6-flash': 1_000_000,
+  'qwen3-coder-next': 1_000_000,
   'qwen3.6-max': 1_000_000,
   'qwen3.6-plus': 1_000_000,
   'qwen3.5-max': 1_000_000,
   'qwen3.5-plus': 1_000_000,
+  'qwen-3.7-plus': 1_000_000,
+  'qwen-3.7-max': 1_000_000,
+  'qwen-3.6-flash': 1_000_000,
   'qwen-3.6-max': 1_000_000,
   'qwen-3.6-plus': 1_000_000,
   'qwen-3.5-max': 1_000_000,

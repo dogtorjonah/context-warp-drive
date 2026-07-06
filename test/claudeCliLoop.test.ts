@@ -212,7 +212,7 @@ describe('ClaudeCliFoldLoop — live stream harness', () => {
     expect(epoch.dryRun).toBe(true);
     expect(epoch.write?.path).toBe(`${filePath}.dryrun`);
     expect(await fs.promises.readFile(filePath, 'utf8')).toBe(before);
-    expect(await fs.promises.readFile(`${filePath}.dryrun`, 'utf8')).toContain('hard-compacted for continuity');
+    expect(await fs.promises.readFile(`${filePath}.dryrun`, 'utf8')).toContain('[CONTEXT REBIRTH]');
   });
 
   it('stops the live process, rewrites the session chain, and respawns with --resume', async () => {
@@ -248,7 +248,7 @@ describe('ClaudeCliFoldLoop — live stream harness', () => {
     expect(spawnArgs[1]).toContain(SESSION_ID);
     const rewritten = await fs.promises.readFile(filePath, 'utf8');
     expect(rewritten).not.toContain('OLD RAW');
-    expect(rewritten).toContain('hard-compacted for continuity');
+    expect(rewritten).toContain('[CONTEXT REBIRTH]');
     expect(JSON.parse(rewritten.trim().split('\n').at(-1)!).type).toBe('last-prompt');
   });
 });

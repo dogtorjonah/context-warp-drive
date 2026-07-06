@@ -48,12 +48,15 @@ import { promises as fs } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
-  BIRTH_FOLD_TAG,
-  convertLocalMessagesToSeedHistory,
+  convertLocalMessagesToTraceMessages,
   DEFAULT_BIRTH_FOLD_MAX_CHARS,
   type BirthFoldSourceRow,
 } from '../foldBirthHydration.ts';
-import { buildHardEpochSeedView } from '../foldFreeze.ts';
+import {
+  buildHardEpochSeedView,
+  buildRawHardEpochSeed,
+  DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS,
+} from '../foldFreeze.ts';
 import type { FoldMessage, Turn } from '../rollingFold.ts';
 import { resolveContextBudget, type ContextBudgetEnv } from '../contextBudget.ts';
 import {
@@ -454,11 +457,11 @@ export function buildClaudeCliFold(
 // ~15% tail seed cap) so the live turn survives, then buildHardEpochSeedView
 // (shared foldFreeze helper) collapses them to one seed message.
 //
-// v1 supplies a minimal continuity directive as the seed prompt. The canonical
-// rebirth-seed preamble (codex/gemini inject it via instanceManager's
-// buildHardEpochPrompt callback) is a documented fast-follow — claude-cli's
-// existing external session-swap rebirth already covers full-continuity reseed
-// at the ceiling, so v1 prioritizes guaranteed live-turn preservation here.
+// v1 supplied a minimal continuity directive as the seed prompt. That proved
+// insufficient: autonomous tool-only transcripts collapsed into a stale
+// same-role block, and hard epochs woke with no useful recency. The default now
+// builds the rich raw rebirth package from a per-row trace; the static prompt is
+// retained only for explicit compatibility/test overrides.
 // ════════════════════════════════════════════════════════════════════════
 
 /** Minimal continuity directive used as the hard-epoch seed when no canonical rebirth preamble is wired. */
@@ -472,13 +475,19 @@ export interface ClaudeCliHardEpochResult {
   rawMessages: FoldMessage[];
   /** Single-message hard-epoch seed view serialized into the chain. */
   foldedMessages: FoldMessage[];
+  /** Raw rebirth-style seed body before buildHardEpochSeedView merges the live turn. */
+  seedBodyText: string;
+  /** Exact provider-visible hard-epoch seed text delivered as the single folded user message. */
+  seedText: string;
 }
 
 export interface BuildClaudeCliHardEpochOptions extends BuildClaudeCliFoldChainOptions {
-  /** Continuity seed prompt. Default DEFAULT_CLAUDE_CLI_HARD_EPOCH_SEED_PROMPT. */
+  /** Continuity seed prompt override (tests / host callbacks). Default: buildRawHardEpochSeed package. */
   seedPrompt?: string;
-  /** Newest-first conversion cap. Default DEFAULT_BIRTH_FOLD_MAX_CHARS (residency ceiling). */
+  /** Newest-first trace conversion cap. Default DEFAULT_BIRTH_FOLD_MAX_CHARS (residency ceiling). */
   maxChars?: number;
+  /** Package budget for the default buildRawHardEpochSeed body. Default DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS (FC parity). */
+  packageBudget?: number;
 }
 
 /**
@@ -493,37 +502,28 @@ export function buildClaudeCliHardEpochChain(
   options: BuildClaudeCliHardEpochOptions,
 ): ClaudeCliHardEpochResult {
   const maxChars = options.maxChars ?? DEFAULT_BIRTH_FOLD_MAX_CHARS;
-  const { messages: seed } = convertLocalMessagesToSeedHistory(rows, { maxChars });
 
-  // convertLocalMessagesToSeedHistory appends a synthetic assistant trailer
-  // ("[birth-fold] (Archived before the assistant replied; continuing from here.)")
-  // when the last source row is a user turn. This hides the trailing user message
-  // from buildHardEpochSeedView, which requires it to merge the live turn under
-  // the HARD_EPOCH_LIVE_TURN_HEADER. Strip the trailer so live-turn preservation
-  // works for both normal turn-end folds (last row = assistant → no trailer → no-op)
-  // and edge cases (crash recovery: last row = user → trailer → strip → merge).
-  // Match the trailer EXACTLY, not a bare BIRTH_FOLD_TAG prefix: the converter
-  // also stamps its oversized-block clip marker with BIRTH_FOLD_TAG, so a real
-  // (clipped) trailing assistant turn would otherwise be mis-stripped — dropping
-  // its content and mis-flagging the prior, already-answered user turn as live.
-  // Source of truth for this literal: foldBirthHydration end-alternation repair.
-  const SYNTHETIC_ASSISTANT_TRAILER =
-    `${BIRTH_FOLD_TAG} (Archived before the assistant replied; continuing from here.)`;
-  if (
-    seed.length > 0
-    && seed[seed.length - 1].role === 'assistant'
-    && seed[seed.length - 1].content === SYNTHETIC_ASSISTANT_TRAILER
-  ) {
-    seed.pop();
-  }
+  // Per-row trace granularity (rail-2dcc0c4f). The block-merged birth-hydration
+  // view can collapse autonomous tool-only traces into one giant assistant
+  // block; buildRawHardEpochSeed truncates each message from the front, which
+  // pins hard-epoch seeds to birth-era content while new work appends invisibly
+  // to the tail. Per-row conversion keeps chronology addressable so the
+  // newest-first seed sections advance with the trace.
+  const { messages: trace } = convertLocalMessagesToTraceMessages(rows, { maxChars });
+  const fullMessages: FoldMessage[] = trace.map((m) => ({ role: m.role, content: m.content }));
 
-  const fullMessages: FoldMessage[] = seed.map((m) => ({ role: m.role, content: m.content }));
+  const seedBody = options.seedPrompt
+    ?? buildRawHardEpochSeed(fullMessages, {
+      maxChars: options.packageBudget ?? DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS,
+      predecessorName: 'predecessor',
+    });
   const hardView = buildHardEpochSeedView(
     [...fullMessages],
-    options.seedPrompt ?? DEFAULT_CLAUDE_CLI_HARD_EPOCH_SEED_PROMPT,
+    seedBody,
   );
   const chain = buildClaudeCliFoldChain(hardView, options);
-  return { chain, rawMessages: fullMessages, foldedMessages: hardView };
+  const seedText = typeof hardView[0]?.content === 'string' ? hardView[0].content : '';
+  return { chain, rawMessages: fullMessages, foldedMessages: hardView, seedBodyText: seedBody, seedText };
 }
 
 // ════════════════════════════════════════════════════════════════════════

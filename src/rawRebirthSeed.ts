@@ -257,6 +257,8 @@ export interface RawRebirthSeedInput {
   readonly rawTraceCoordinateCloset?: string;
   readonly activeEditDelta?: string;
   readonly taskRailContext?: string;
+  // Resume Point — pre-rendered by the relay builder.
+  readonly resumePoint?: string;
   readonly episodicCrossRef?: string;
   readonly lineageGlyphLog?: string;
   readonly openQuestions?: string;
@@ -289,6 +291,8 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly workspaceContext?: RawRebirthWorkspaceContext | string;
   readonly activeEditDelta?: string;
   readonly taskRailContext?: string;
+  // pre-rendered Resume Point string.
+  readonly resumePoint?: string;
   readonly predecessorStatus?: string;
   readonly userMessageTriggered?: boolean;
   /** Trace-derived episodic recall text (portable-mode memory section). */
@@ -718,6 +722,107 @@ function renderUserMessageForRebirth(text: string): string {
   return truncateMiddle(trimmed, 1_500);
 }
 
+// ── portable cross-section containment dedupe ────
+// Suppress episodic cards / glyph-log entries whose body is verbatim in the
+// Current Thread. Pure string containment, no I/O. Never drops the only copy.
+
+const PORTABLE_DEDUPE_MIN_CHARS = 100;
+
+/** Extract the longest content line from a card body, skipping speaker/provenance markers. */
+function extractCardProbeLine(cardBody: string): string {
+  let longest = '';
+  for (const rawLine of cardBody.split('\n')) {
+    // Strip speaker attribution (🗣 name:), leading quotes, indentation
+    const cleaned = rawLine
+      .replace(/^[\s"']*/, '')
+      .replace(/^🗣\s*\S+:\s*/, '')
+      .replace(/["']\s*$/, '')
+      .trim();
+    if (cleaned.length > longest.length) longest = cleaned;
+  }
+  return longest;
+}
+
+/** Strip speaker attribution, quotes, and indentation from a content line. */
+function cleanCardLine(rawLine: string): string {
+  return rawLine
+    .replace(/^[\s"']*/, '')
+    .replace(/^🗣\s*\S+:\s*/, '')
+    .replace(/["']\s*$/, '')
+    .trim();
+}
+
+/** Minimum cleaned line length to test for containment. */
+const CARD_LINE_MIN_CHARS = 40;
+
+function dedupePortableEpisodic(episodicCrossRef: string, threadText: string): string {
+  // Header line starts with "## " (markdown header)
+  const headerEnd = episodicCrossRef.indexOf('\n');
+  if (headerEnd < 0) return episodicCrossRef;
+  const header = episodicCrossRef.slice(0, headerEnd);
+  const body = episodicCrossRef.slice(headerEnd + 1);
+
+  // Split on double-newline; each block is one card
+  const cards = body.split(/\n\n+/);
+  const kept: string[] = [];
+  let suppressed = 0;
+
+  for (const card of cards) {
+    const trimmed = card.trim();
+    if (!trimmed) continue;
+    // Extract body after provenance (↞) line
+    const provenanceEnd = trimmed.indexOf('\n');
+    const cardBody = provenanceEnd > 0 ? trimmed.slice(provenanceEnd + 1).trim() : trimmed;
+    // Suppress only if ALL content lines of the card body are individually
+    // present in the thread. Lines are cleaned (speaker attribution, quotes,
+    // indentation stripped) before checking. Protects cards with unique lines.
+    const cardLines = cardBody.split('\n')
+      .map(cleanCardLine)
+      .filter(line => line.length >= CARD_LINE_MIN_CHARS);
+    if (cardLines.length > 0 && cardLines.every(line => threadText.includes(line))) {
+      suppressed++;
+    } else {
+      kept.push(trimmed);
+    }
+  }
+
+  if (suppressed === 0) return episodicCrossRef;
+  const result = kept.length > 0 ? `${header}\n${kept.join('\n\n')}` : header;
+  return `${result}\n[↑ ${suppressed} redundant episodic card(s) suppressed — content verbatim in Current Thread above]`;
+}
+
+function dedupePortableGlyphLog(lineageGlyphLog: string, threadText: string): string {
+  // Header line starts with "## "
+  const headerEnd = lineageGlyphLog.indexOf('\n');
+  if (headerEnd < 0) return lineageGlyphLog;
+  const header = lineageGlyphLog.slice(0, headerEnd);
+  const body = lineageGlyphLog.slice(headerEnd + 1);
+
+  const lines = body.split('\n');
+  const kept: string[] = [];
+  let collapsed = 0;
+
+  for (const line of lines) {
+    const bracketEnd = line.indexOf('] ');
+    if (bracketEnd < 0) { kept.push(line); continue; }
+    const entryText = line.slice(bracketEnd + 2);
+    const timestamp = line.slice(0, bracketEnd + 1);
+    const glyphMatch = entryText.match(/^(.{1,6})/);
+    const glyph = glyphMatch?.[1]?.trim() ?? '';
+    // Probe: first 200 chars of entry text
+    const probe = entryText.slice(0, Math.min(entryText.length, 200));
+    if (probe.length >= 50 && threadText.includes(probe)) {
+      kept.push(`${timestamp} ${glyph} (verbatim in thread)`);
+      collapsed++;
+    } else {
+      kept.push(line);
+    }
+  }
+
+  if (collapsed === 0) return lineageGlyphLog;
+  return `${header}\n${kept.join('\n')}`;
+}
+
 function pushSection(
   sections: BudgetedPromptSection[],
   input: RawRebirthSeedInput,
@@ -755,8 +860,14 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     input,
     'lastUserAiMessages',
     input.lastUserAiMessages?.trim()
-      ? `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. These are the freshest human and AI messages available at rebirth.***\n\n${input.lastUserAiMessages.trim()}`
-      : undefined,
+      ? (() => {
+          const base = `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. These are the freshest human and AI messages available at rebirth.***\n\n${input.lastUserAiMessages!.trim()}`;
+          // append Resume Point to Last User + AI block.
+          return input.resumePoint?.trim() ? `${base}\n\n${input.resumePoint.trim()}` : base;
+        })()
+      : input.resumePoint?.trim()
+        ? `\n${input.resumePoint.trim()}`
+        : undefined,
   );
 
   const currentThreadBlocks = [
@@ -789,20 +900,36 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     'taskRailContext',
     input.taskRailContext?.trim() ? `\n── Task Rail Context (process truth) ──\n${input.taskRailContext.trim()}` : undefined,
   );
+  // cross-section containment dedupe for portable path.
+  // Suppress episodic cards and glyph-log entries whose body is verbatim in the
+  // Current Thread. Gate behind VOXXO_REBIRTH_SEED_DEDUPE (default on).
+  const seedDedupeEnabled = typeof process !== 'undefined' && process.env?.VOXXO_REBIRTH_SEED_DEDUPE !== '0';
+  const currentThreadText = currentThreadBlocks.join('\n\n');
+  const portableDedupeMinChars = 100;
+
+  const portableEpisodic = input.episodicCrossRef?.trim() ?? '';
+  const dedupedEpisodic = seedDedupeEnabled && portableEpisodic && currentThreadText.length > portableDedupeMinChars
+    ? dedupePortableEpisodic(portableEpisodic, currentThreadText)
+    : portableEpisodic;
   pushSection(
     budgetedSections,
     input,
     'episodicCrossRef',
-    input.episodicCrossRef?.trim()
-      ? `\n── Episodic Cross-Reference (trace-derived recall — matched on your active paths + recent-trace terms) ──\n${input.episodicCrossRef.trim()}`
+    dedupedEpisodic
+      ? `\n── Episodic Cross-Reference (trace-derived recall — matched on your active paths + recent-trace terms) ──\n${dedupedEpisodic}`
       : undefined,
   );
+
+  const portableGlyphLog = input.lineageGlyphLog?.trim() ?? '';
+  const dedupedGlyphLog = seedDedupeEnabled && portableGlyphLog && currentThreadText.length > portableDedupeMinChars
+    ? dedupePortableGlyphLog(portableGlyphLog, currentThreadText)
+    : portableGlyphLog;
   pushSection(
     budgetedSections,
     input,
     'lineageGlyphLog',
-    input.lineageGlyphLog?.trim()
-      ? `\n── Lineage Glyph Log (chronological verdicts + hazards from your own glyph trail) ──\n${input.lineageGlyphLog.trim()}`
+    dedupedGlyphLog
+      ? `\n── Lineage Glyph Log (chronological verdicts + hazards from your own glyph trail) ──\n${dedupedGlyphLog}`
       : undefined,
   );
   pushSection(
@@ -893,6 +1020,13 @@ export function buildRawTraceCoordinateCloset(
   const sourceTexts = visibleMessages.flatMap((message) => {
     const text = message.text?.trim();
     if (!text) return [];
+    // exclude prior-rebirth-seed messages from closet
+    // mining. The rebirth seed is injected into the trace as a user message
+    // containing '[CONTEXT REBIRTH]'. Mining its text (which includes the
+    // previous rebirth's Coordinate Closet) causes recursive compounding —
+    // closet noise amplifies across consecutive rebirths. Skip the entire
+    // message so only real conversation/agent turns contribute literals.
+    if (text.includes('[CONTEXT REBIRTH]')) return [];
     const scrubbed = stripEphemeralCoordinationBlocks(text).trim();
     if (!scrubbed) return [];
     const role = message.type === 'user' ? 'user' : message.type === 'assistant_text' ? 'assistant' : message.type;
@@ -1066,30 +1200,87 @@ function buildActivityLogFromMessages(
   return rows.join('\n\n');
 }
 
+// portable genuine-operator filter.
+// Skip system-generated user messages (chatroom deliveries, mention pings,
+// digest deltas, rebirth seeds, ephemeral-only turns).
+function isPortableGenuineOperatorMessage(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.includes('[CONTEXT REBIRTH]')) return false;
+  if (/^@\w+/.test(trimmed) && trimmed.length < 200) return false;
+  if (trimmed.startsWith('[DIGEST DELTA') || trimmed.startsWith('[Digest Delta')) return false;
+  if (trimmed.startsWith('[Control Signals]') || trimmed.startsWith('[System]')) return false;
+  // Strip known ephemeral coordination markers
+  const stripped = trimmed
+    .replace(/\[DIGEST DELTA[^\]]*\][\s\S]*?\[END DIGEST DELTA\]/g, '')
+    .replace(/\[Control Signals\][\s\S]*?\[\/Control Signals\]/g, '')
+    .trim();
+  if (stripped.length === 0) return false;
+  return true;
+}
+
 function buildLastUserAiMessagesFromMessages(
   messages: readonly FoldMessage[],
   traceEnd: number,
   excludedMessageIndexes: ReadonlySet<number>,
 ): string {
   let lastUser = '';
-  let lastAssistant = '';
-  for (let i = traceEnd - 1; i >= 0 && (!lastUser || !lastAssistant); i -= 1) {
+  let lastUserIndex = -1;
+  // glyph-aware ranking for AI messages.
+  // Collect all assistant messages, score by glyph weight, pick the best.
+  let bestAssistant = '';
+  let bestAssistantWeight = 0;
+  let bestAssistantIndex = -1;
+  for (let i = 0; i < traceEnd; i++) {
     if (excludedMessageIndexes.has(i)) continue;
     const message = messages[i];
     if (!message) continue;
-    if (!lastUser && message.role === 'user') lastUser = providerMessageToTraceText(message);
-    if (!lastAssistant && (message.role === 'assistant' || message.role === 'model')) {
-      lastAssistant = providerMessageToTraceText(message);
+    // Genuine-operator filter: skip chatroom deliveries, mention pings,
+    // digest deltas, and ephemeral-only turns. The newest genuine operator
+    // message wins (iterate forward, overwrite — latest by index wins).
+    if (message.role === 'user') {
+      const text = providerMessageToTraceText(message);
+      if (isPortableGenuineOperatorMessage(text)) {
+        lastUser = text;
+        lastUserIndex = i;
+      }
+    }
+    if (message.role === 'assistant' || message.role === 'model') {
+      const text = providerMessageToTraceText(message);
+      if (text) {
+        const glyph = classifyMessageGlyph(text);
+        const weight = glyph === 'verdict' ? 10
+          : glyph === 'hazard' ? 8
+          : glyph === 'blocked' ? 6
+          : glyph === 'working' ? 2
+          : 1;
+        // Prefer higher weight; on tie, prefer more recent (higher index)
+        if (weight > bestAssistantWeight || (weight === bestAssistantWeight && i > bestAssistantIndex)) {
+          bestAssistant = text;
+          bestAssistantWeight = weight;
+          bestAssistantIndex = i;
+        }
+      }
     }
   }
-  const renderedAssistant = lastAssistant
-    ? lastAssistant.length > 360
-      ? `${truncate(lastAssistant, 360)}\n[Full text appears below in Current Thread.]`
-      : lastAssistant
+  // Citation refs tie these highlight blocks to the same message's existing
+  // [message N] row label in Current Thread / the Activity Log — the raw trace
+  // index is the shared coordinate space, so no new numbering is introduced.
+  // Flag-off (or index unknown) renders the historical marker-free output.
+  const markersEnabled = typeof process !== 'undefined' && process.env?.VOXXO_REBIRTH_SEED_MSG_MARKERS !== '0';
+  const userMarker = markersEnabled && lastUserIndex >= 0 ? ` [message ${lastUserIndex}]` : '';
+  const aiMarker = markersEnabled && bestAssistantIndex >= 0 ? ` [message ${bestAssistantIndex}]` : '';
+  const threadPointer = aiMarker
+    ? `[Full text appears below in Current Thread at${aiMarker}.]`
+    : '[Full text appears below in Current Thread.]';
+  const renderedAssistant = bestAssistant
+    ? bestAssistant.length > 360
+      ? `${truncate(bestAssistant, 360)}\n${threadPointer}`
+      : bestAssistant
     : '';
   return [
-    lastUser ? `👤 LAST USER MESSAGE:\n${truncateMiddle(lastUser, 6_000)}` : '',
-    renderedAssistant ? `🤖 LAST AI MESSAGE:\n${renderedAssistant}` : '',
+    lastUser ? `👤 LAST USER MESSAGE${userMarker}:\n${truncateMiddle(lastUser, 6_000)}` : '',
+    renderedAssistant ? `🤖 LAST AI MESSAGE${aiMarker}:\n${renderedAssistant}` : '',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -1143,6 +1334,7 @@ export function buildRawRebirthSeedFromMessages(
     rawTraceCoordinateCloset,
     activeEditDelta: options.activeEditDelta,
     taskRailContext: options.taskRailContext,
+    resumePoint: options.resumePoint,
     workspaceContext: options.workspaceContext,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,

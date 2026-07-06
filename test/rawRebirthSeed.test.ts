@@ -253,12 +253,13 @@ describe('raw rebirth seed renderer', () => {
       packageBudget: 30_000,
     });
 
-    const lastAiStart = seed.indexOf('🤖 LAST AI MESSAGE:');
+    const lastAiStart = seed.indexOf('🤖 LAST AI MESSAGE');
+    expect(lastAiStart).toBeGreaterThan(-1);
     const currentThreadStart = seed.indexOf('── Current Thread ──');
     // Isolate just the LAST AI MESSAGE section (before Current Thread)
     const lastAiSection = seed.slice(lastAiStart, currentThreadStart);
-    // Should contain the pointer
-    expect(lastAiSection).toContain('[Full text appears below in Current Thread.]');
+    // Should contain the pointer (with or without a [message N] coordinate)
+    expect(lastAiSection).toContain('[Full text appears below in Current Thread');
     // Should not dump all 400 chars in the READ FIRST section
     expect(lastAiSection.indexOf('A'.repeat(400))).toBe(-1);
     // Full text should appear in Current Thread
@@ -317,5 +318,226 @@ describe('open questions ledger (buildOpenQuestionsFromMessages)', () => {
   test('passing empty string suppresses the section', () => {
     const seed = buildRawRebirthSeedFromMessages(messages, { openQuestions: '' });
     expect(seed).not.toContain('── Open Questions');
+  });
+});
+
+// ── Cross-section containment dedupe tests ──────────────────────────────
+describe('cross-section containment dedupe', () => {
+  const LONG_THREAD = `[05:04 PM] 👤 USER: Hi there
+[05:05 PM] 🤖 ASSISTANT: 🔍 Let me investigate the issue with the rebirth package.
+I've read through rollingFold.ts, foldFreeze.ts, foldRecall.ts and found several issues.
+The freeze layer is the best idea — cache writes at 1.25x vs reads at 0.1x means recomputing
+the fold every call costs more than the compression saves. The Coordinate Closet preserving
+exact identifiers is critical for continuity across rebirth boundaries.
+[05:10 PM] 🤖 ASSISTANT: 🏁 Ghost preview read in full — 2,885 persisted rows, ~2h autonomous
+session, 16-step rail completed, judged as an outside observer. The task-state gap is a no-rail
+gap, not a package gap. The closet extractor is tuned for tool-call traces and degrades on
+prose-heavy ones. Five near-identical polling messages consume the section budget.`;
+
+  test('young fixture: episodic cards verbatim in thread are suppressed', () => {
+    const episodicContent = `## 🧠 Episodic Recall (pushed at wake)
+↞ why: path-match packages/context-warp/src/rollingFold.ts
+🗣 agent-name:
+    "Let me investigate the issue with the rebirth package.
+I've read through rollingFold.ts, foldFreeze.ts, foldRecall.ts and found several issues.
+The freeze layer is the best idea — cache writes at 1.25x vs reads at 0.1x means recomputing
+the fold every call costs more than the compression saves."`;
+
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'young-agent',
+      runtimeModel: {
+        predecessor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        successor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        changed: false,
+      },
+      traceEventCount: 10,
+      currentThread: LONG_THREAD,
+      episodicCrossRef: episodicContent,
+    });
+
+    // The card body is verbatim in LONG_THREAD → should be suppressed
+    expect(seed).toContain('redundant episodic card(s) suppressed');
+  });
+
+  test('mature fixture: episodic cards with unique content are retained', () => {
+    const uniqueEpisodic = `## 🧠 Episodic Recall (pushed at wake)
+↞ why: path-match relay/src/taskRail.ts
+🗣 old-agent:
+    "Earlier session: implemented the task rail persistence layer with SQLite storage,
+    added sprint/shoot execution modes, and verified the rail state survives relay restarts.
+    The acceptance criteria were met for all 16 steps in the implementation rail."`;
+
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'mature-agent',
+      runtimeModel: {
+        predecessor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        successor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        changed: false,
+      },
+      traceEventCount: 2885,
+      currentThread: LONG_THREAD,
+      episodicCrossRef: uniqueEpisodic,
+    });
+
+    // Unique content NOT in thread → should be retained
+    expect(seed).toContain('task rail persistence layer');
+    expect(seed).not.toContain('redundant episodic card(s) suppressed');
+  });
+
+  test('glyph log entries verbatim in thread are collapsed', () => {
+    const glyphLog = `## 🗒️ Lineage Glyph Log — 3 entries
+[05:05 PM] 🔍 Let me investigate the issue with the rebirth package.
+I've read through rollingFold.ts, foldFreeze.ts, foldRecall.ts and found several issues.
+[05:10 PM] 🏁 Ghost preview read in full — 2,885 persisted rows, ~2h autonomous
+session, 16-step rail completed.
+[05:15 PM] ⚠️ Unique hazard: the relay event loop must not be blocked`;
+
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'glyph-agent',
+      runtimeModel: {
+        predecessor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        successor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        changed: false,
+      },
+      traceEventCount: 50,
+      currentThread: LONG_THREAD,
+      lineageGlyphLog: glyphLog,
+    });
+
+    // First two entries have probes verbatim in thread → collapsed
+    expect(seed).toContain('(verbatim in thread)');
+    // Third entry has unique content → retained
+    expect(seed).toContain('Unique hazard: the relay event loop must not be blocked');
+  });
+
+  test('VOXXO_REBIRTH_SEED_DEDUPE=0 disables cross-section dedupe', () => {
+    const original = process.env.VOXXO_REBIRTH_SEED_DEDUPE;
+    process.env.VOXXO_REBIRTH_SEED_DEDUPE = '0';
+    try {
+      const episodicContent = `## 🧠 Episodic Recall
+↞ why: path-match
+🗣 agent:
+    "Let me investigate the issue with the rebirth package.
+I've read through rollingFold.ts, foldFreeze.ts, foldRecall.ts and found several issues.
+The freeze layer is the best idea — cache writes at 1.25x vs reads at 0.1x means recomputing
+the fold every call costs more than the compression saves."`;
+
+      const seed = renderRawRebirthSeed({
+        predecessorName: 'flagged-agent',
+        runtimeModel: {
+          predecessor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+          successor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+          changed: false,
+        },
+        traceEventCount: 10,
+        currentThread: LONG_THREAD,
+        episodicCrossRef: episodicContent,
+      });
+
+      // Flag=0 → dedupe disabled → card should be retained
+      expect(seed).not.toContain('redundant episodic card(s) suppressed');
+      expect(seed).toContain('freeze layer is the best idea');
+    } finally {
+      if (original === undefined) {
+        delete process.env.VOXXO_REBIRTH_SEED_DEDUPE;
+      } else {
+        process.env.VOXXO_REBIRTH_SEED_DEDUPE = original;
+      }
+    }
+  });
+
+  test('short thread (< 100 chars) skips dedupe entirely', () => {
+    const shortThread = '[05:04 PM] 👤 USER: Hi\n[05:04 PM] 🤖 ASSISTANT: Hello!';
+    const episodicContent = `## 🧠 Episodic Recall
+↞ why: path-match
+🗣 agent:
+    "Some content that is definitely longer than the minimum threshold and would normally
+    be checked against the thread for containment deduplication."`;
+
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'short-thread-agent',
+      runtimeModel: {
+        predecessor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        successor: { engine: 'claude', model: 'claude-sonnet-5', modelTier: 'sonnet-5' },
+        changed: false,
+      },
+      traceEventCount: 2,
+      currentThread: shortThread,
+      episodicCrossRef: episodicContent,
+    });
+
+    // Short thread → dedupe skipped → card retained
+    expect(seed).not.toContain('redundant episodic card(s) suppressed');
+    expect(seed).toContain('containment deduplication');
+  });
+});
+
+describe('portable citation markers ([message N] refs)', () => {
+  const MARKER_MESSAGES: FoldMessage[] = [
+    { role: 'user', content: 'Please inspect /repo/src/mod.ts and report your findings.' },
+    {
+      role: 'assistant',
+      content: '🏁 Verified /repo/src/mod.ts — the exported helpers are sound and covered by tests.',
+    },
+    { role: 'user', content: 'LIVE_TRIGGER_MARKER current request' },
+  ];
+
+  test('last-user/AI headers carry [message N] refs matching thread rows', () => {
+    const seed = buildRawRebirthSeedFromMessages(MARKER_MESSAGES, {
+      predecessorName: 'marker-agent',
+      includeTrailingUserTurn: false,
+      packageBudget: 30_000,
+    });
+
+    expect(seed).toContain('👤 LAST USER MESSAGE [message 0]:');
+    expect(seed).toContain('🤖 LAST AI MESSAGE [message 1]:');
+    // The refs reuse the thread's existing coordinate space — the same
+    // [message N] labels must exist as real rendered thread rows.
+    expect(seed).toContain('[message 0] 👤 USER:');
+    expect(seed).toContain('[message 1] 🤖 YOU:');
+  });
+
+  test('truncated AI body pointer carries the [message N] coordinate', () => {
+    const longBody = `🏁 Verified the fold engine end to end. ${'The rolling fold preserves continuity across epochs and the freeze layer caches rendered bands. '.repeat(6)}`;
+    const messages: FoldMessage[] = [
+      { role: 'user', content: 'Run the full fold verification pass.' },
+      { role: 'assistant', content: longBody },
+      { role: 'user', content: 'LIVE_TRIGGER_MARKER current request' },
+    ];
+
+    const seed = buildRawRebirthSeedFromMessages(messages, {
+      predecessorName: 'pointer-agent',
+      includeTrailingUserTurn: false,
+      packageBudget: 30_000,
+    });
+
+    expect(seed).toContain('🤖 LAST AI MESSAGE [message 1]:');
+    expect(seed).toContain('[Full text appears below in Current Thread at [message 1].]');
+  });
+
+  test('VOXXO_REBIRTH_SEED_MSG_MARKERS=0 renders marker-free headers', () => {
+    const original = process.env.VOXXO_REBIRTH_SEED_MSG_MARKERS;
+    process.env.VOXXO_REBIRTH_SEED_MSG_MARKERS = '0';
+    try {
+      const seed = buildRawRebirthSeedFromMessages(MARKER_MESSAGES, {
+        predecessorName: 'flag-off-agent',
+        includeTrailingUserTurn: false,
+        packageBudget: 30_000,
+      });
+
+      expect(seed).toContain('👤 LAST USER MESSAGE:\n');
+      expect(seed).toContain('🤖 LAST AI MESSAGE:\n');
+      expect(seed).not.toContain('LAST USER MESSAGE [message');
+      expect(seed).not.toContain('LAST AI MESSAGE [message');
+      // Thread rows keep their pre-existing [message N] labels — only the
+      // header refs are flag-gated.
+      expect(seed).toContain('[message 0] 👤 USER:');
+    } finally {
+      if (original === undefined) {
+        delete process.env.VOXXO_REBIRTH_SEED_MSG_MARKERS;
+      } else {
+        process.env.VOXXO_REBIRTH_SEED_MSG_MARKERS = original;
+      }
+    }
   });
 });

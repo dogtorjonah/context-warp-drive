@@ -54,6 +54,11 @@ export interface FoldConfig {
    * Set 0 to disable. Default: 4000.
    */
   verbatimKeepChars?: number;
+  /**
+   * Host-specific preamble rendered inside each fold block. Defaults to the
+   * package preamble; override only when a host lacks the default recall hooks.
+   */
+  foldBlockPreamble?: string;
 }
 
 export interface FoldedTurn {
@@ -491,11 +496,12 @@ export function formatFoldEpochStamp(epoch: number, detail: string): string {
 }
 
 /**
- * Self-documenting preamble rendered inside every fold block immediately after
- * the header line. Single line by invariant: it must never start with '[' and
- * must never contain a line starting with FOLD_MARKER or a recall prefix —
- * the block's FIRST line stays the FOLD_MARKER header that foldRecall's
- * buildFoldIndex parses. Full mechanics: docs/context-folding.md.
+ * Default self-documenting preamble rendered inside every fold block immediately
+ * after the header line. Hosts can override it through FoldConfig when they do
+ * not provide the default recall hooks. Single line by invariant: it must never
+ * start with '[' and must never contain a line starting with FOLD_MARKER or a
+ * recall prefix — the block's FIRST line stays the FOLD_MARKER header that
+ * foldRecall's buildFoldIndex parses. Full mechanics: docs/context-folding.md.
  */
 export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves closet items — ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
 
@@ -1338,6 +1344,14 @@ export function isClosetNoiseLiteral(value: string): boolean {
   if (/^[A-Za-z]{2,}\/[A-Za-z]{2,}$/.test(v) && /[A-Z]/.test(v)) return true;
   if (isLowSignalSlashChain(v)) return true;
   if (hasSingleCharNoiseSegment(v)) return true;
+  // ── Version-range / prose-artifact fragments ──
+  // Multi-segment dash+slash chains like "4-6/4-7/4-8" or "1-2/3-4" that are
+  // prose artifacts (version ranges, line ranges in prose, page ranges), not
+  // real file paths. Real paths have alphabetic segments.
+  if (/^\d+(?:-\d+)?(?:\/\d+(?:-\d+)?)+$/.test(v)) return true;
+  // Short relative-path fragments like "./pa" or "../ab" — 1-2 char relative
+  // paths with no extension are truncation artifacts from prose extraction.
+  if (/^\.{1,2}\/[A-Za-z]{1,2}$/.test(v)) return true;
   return false;
 }
 
@@ -1827,11 +1841,12 @@ function renderFoldedBlock(
   closetLine?: string,
   tombstoneLines?: readonly string[],
   counterStamp?: string,
+  preamble: string = FOLD_BLOCK_PREAMBLE,
 ): string {
   const lines: string[] = [
     `[Conversation Context — ${stats.turnsFolded} turns folded, ${Math.round(stats.origChars / 1000)}K → ${Math.round(stats.blockChars / 1000)}K chars${counterStamp ? ` · ${counterStamp}` : ''}]`,
     '',
-    FOLD_BLOCK_PREAMBLE,
+    preamble,
     '',
   ];
 
@@ -2009,6 +2024,7 @@ export function foldContext(
   fidelityValue?: FoldFidelityValueInput,
 ): FoldResult {
   const originalChars = countChars(messages);
+  const foldBlockPreamble = config.foldBlockPreamble ?? FOLD_BLOCK_PREAMBLE;
 
   if (turnsToFold <= 0 || messages.length === 0) {
     return {
@@ -2296,7 +2312,7 @@ export function foldContext(
     const blockChars =
       collapsed.reduce((s, ft) => s + ft.skeleton.length + (ft.retained?.length ?? 0), 0) +
       (closetLine?.length ?? 0) +
-      FOLD_BLOCK_PREAMBLE.length +
+      foldBlockPreamble.length +
       tombstoneLines.reduce((s, line) => s + line.length, 0);
     return { collapsed, closetLine, blockChars, tombstoneLines };
   };
@@ -2371,7 +2387,7 @@ export function foldContext(
     turnsFolded: actualFoldCount,
     origChars: countChars(foldZone) - countChars(systemInFoldZone),
     blockChars: block.blockChars,
-  }, block.closetLine, block.tombstoneLines, counterStamp);
+  }, block.closetLine, block.tombstoneLines, counterStamp, foldBlockPreamble);
 
   const foldedMessage: FoldMessage = { role: 'user', content: foldedBlockText };
   const ackMessage: FoldMessage = {

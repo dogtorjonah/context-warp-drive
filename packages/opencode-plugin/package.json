@@ -1,0 +1,50 @@
+{
+  "name": "opencode-plugin-context-warp-drive",
+  "version": "0.1.0",
+  "description": "Context Warp Drive plugin for OpenCode — deterministic context folding with zero LLM summarization calls, hybrid tail/hard epoch support, and provider-cache-hot reuse.",
+  "license": "MIT",
+  "type": "module",
+  "author": "Jonah",
+  "homepage": "https://github.com/dogtorjonah/context-warp-drive",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dogtorjonah/context-warp-drive.git",
+    "directory": "packages/opencode-plugin"
+  },
+  "keywords": [
+    "opencode",
+    "context-window",
+    "context-compaction",
+    "rolling-fold",
+    "prompt-cache",
+    "function-calling",
+    "agents",
+    "deterministic",
+    "infinite-context"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "*",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0"
+  }
+}
