@@ -18,6 +18,11 @@ import { contextWindowForModel } from './contextWindow.ts';
 //   P = 150K universal pressure ceiling default (fraction clamp protects small
 //       windows). No model/engine gets a hidden wider default; explicit overrides
 //       can still opt sessions into a different ceiling.
+//   TRIG = 120K universal fold trigger for EVERY engine = P − 30K runway (Jonah
+//       2026-07-04: "all fold triggers for all engines need to be the same").
+//       Invariant: TRIG < P. Do NOT raise TRIG up to P — trigger==ceiling
+//       collapses the reconstruct/tail-epoch runway to 0 (measured: Claude CLI
+//       got 0 tail epochs). See DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS.
 //   CLI codex = full-recompute-only transport, using the shared trigger by
 //               default while still clamping to message ceiling − F runway
 //
@@ -66,14 +71,15 @@ export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 150_000;
  */
 export const DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS =
   DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
-// Claude Code CLI hard-epoch fallback ceiling. The Claude CLI surfaces (claude /
-// claude-cli / claude-interactive) cannot fold in-process
-// (engineSupportsRollingFold=false), so instead of mid-stream folding the relay
-// can fire an in-place session-swap rebirth ("hard epoch") once provider-MEASURED
-// context tokens cross a hard ceiling. Kept distinct from the standard 150K
-// pressure ceiling because fold pressure and out-of-process session-swap
-// saturation can diverge independently. Consumed by relay handleResultEvent
-// (instanceManager/eventHandlers.ts).
+// Claude Code CLI hard-epoch fallback ceiling. The Claude CLI surfaces
+// (claude / claude-cli / claude-interactive) own their own transcript file and
+// fold via out-of-process band-append tail epochs (FC/Codex parity), NOT inline.
+// When a tail epoch declines (ledger drift, or nothing safely foldable within
+// the tail char budget), the relay falls back to an in-place session-swap
+// rebirth ("hard epoch") once provider-MEASURED context tokens cross this
+// ceiling. Kept distinct from the standard 150K pressure ceiling because fold
+// pressure and out-of-process session-swap saturation can diverge independently.
+// Consumed by relay handleResultEvent (instanceManager/eventHandlers.ts).
 export const DEFAULT_CONTEXT_BUDGET_CLAUDE_CLI_HARD_EPOCH_TOKENS = 180_000;
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION = 0.9;
