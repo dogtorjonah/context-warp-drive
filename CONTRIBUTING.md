@@ -1,37 +1,48 @@
-# Contributing
+# Contributing to Context Warp Drive
 
-Thanks for your interest in Context Warp Drive.
+Thanks for your interest in contributing! This is a solo project, but all contributions are welcome.
 
-## Development
+## Getting Started
 
 ```bash
-npm install
-npm run typecheck                # tsc --noEmit
-npm test                         # deterministic vitest suite
-npm run build                    # tsup bundle
-npx tsx examples/benchmark.ts    # the measured benchmark
+git clone https://github.com/dogtorjonah/context-warp-drive.git
+cd context-warp-drive
+npm install        # builds dist/ automatically via prepare script
+npm test           # runs the 380+ deterministic test suite
 ```
 
-## Ground rules
+## Development Workflow
 
-- **Determinism is the contract.** Identical inputs must produce byte-identical
-  output — that is the provider-cache invariant the whole engine rests on. Any
-  change that introduces nondeterminism (reading the wall clock directly,
-  randomness, unstable ordering in the prepared view) will be rejected. Inject a
-  clock (`now: () => number`) instead of calling `Date.now` in engine paths.
-- **Keep the core dependency-free.** The fold core (`context-warp-drive/fold`) has
-  zero runtime dependencies; `better-sqlite3` is an optional peer used only by the
-  reference episodic store. Don't add runtime dependencies to the core.
-- **Tests come with changes.** Add or update deterministic tests for any behavioral
-  change. CI runs the suite on Node 18, 20, and 22.
+1. Fork the repo and create a branch from `main`
+2. Make your changes — keep them focused and minimal
+3. Run `npm test` to verify all tests pass
+4. If adding new functionality, add tests
+5. Submit a PR with a clear description of what and why
 
-## Reporting issues
+## Areas Where Help Is Welcome
 
-Open an issue with a minimal reproduction: a small message array plus the prepared
-output you got versus what you expected. For benchmark questions, paste the output
-of `npx tsx examples/benchmark.ts`.
+- **Python SDK** — the engine is TypeScript; a Python port would unlock a huge audience
+- **New provider adapters** — Rust CLI, additional LLM CLIs
+- **Benchmark extensions** — longer sessions, different workload types, head-to-head comparisons
+- **Documentation** — examples, use cases, architecture deep-dives
+- **Bug reports** — file an issue with a reproducible test case
 
-## License
+## Code Style
 
-By contributing, you agree that your contributions are licensed under the project's
-MIT License.
+- TypeScript strict mode — no `any` without justification
+- ESM imports use `.ts` extensions
+- Zero runtime dependencies in the core engine (`src/fold/`)
+- `better-sqlite3` is an optional peer dependency only
+
+## Testing
+
+The engine's correctness contract is its test suite. Every fold, freeze, recall, and task rail operation has deterministic tests. If you change behavior, update or add tests accordingly.
+
+```bash
+npm test                    # full suite
+npx vitest run src/__tests__/fold/   # just the fold engine
+```
+
+## Questions?
+
+Open a GitHub Discussion or an issue. I'll respond as fast as I can.

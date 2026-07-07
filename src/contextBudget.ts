@@ -8,23 +8,25 @@
 
 import { contextWindowForModel } from './contextWindow.ts';
 
-// Context Warp geometry signposts (Jonah, 2026-06-19; P standard set to 150K
-// 2026-07-04 after temporary 120K/180K experiments):
+// Context Warp geometry signposts (rail-bd1654c4, Uniform Warp Geometry
+// P180/TRIG150 for ALL engines — Jonah 2026-07-07):
 //   S = 37K static system/tools prefix reserve (provider-measured floor model)
 //   M = 40K folded memory after full recompute
 //   A = 5K expected appended folded-tail band
 //   T = 10K preferred/default live-tail runway
-//   F = 10K default append runway floor (explicit overrides can keep a larger floor)
-//   P = 150K universal pressure ceiling default (fraction clamp protects small
+//   F = 30K hard minimum runway constant (default minRunway resolves to
+//       min(T, F_const) = 10K when no explicit override is given)
+//   P = 180K universal pressure ceiling default (fraction clamp protects small
 //       windows). No model/engine gets a hidden wider default; explicit overrides
 //       can still opt sessions into a different ceiling.
-//   TRIG = 120K universal fold trigger for EVERY engine = P − 30K runway (Jonah
-//       2026-07-04: "all fold triggers for all engines need to be the same").
-//       Invariant: TRIG < P. Do NOT raise TRIG up to P — trigger==ceiling
-//       collapses the reconstruct/tail-epoch runway to 0 (measured: Claude CLI
-//       got 0 tail epochs). See DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS.
+//   TRIG = 150K universal fold trigger for EVERY engine (Jonah 2026-07-07:
+//       "same ceiling of 180k"). The trigger is clamped to ≤ min(P, msgCeil) −
+//       minRunway so it stays strictly below P. Do NOT raise TRIG up to P —
+//       trigger==ceiling collapses the reconstruct/tail-epoch runway to 0
+//       (measured: Claude CLI got 0 tail epochs). See
+//       DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS.
 //   CLI codex = full-recompute-only transport, using the shared trigger by
-//               default while still clamping to message ceiling − F runway
+//               default while still clamping to message ceiling − minRunway
 //
 // Runtime invariant: at a boundary, append a folded tail band only if the
 // post-append prompt can still guarantee F runway before P. The default tail
@@ -41,30 +43,40 @@ export const DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS =
 /**
  * Fold TRIGGER default — the SINGLE uniform measured-prompt-token threshold at
  * which every engine folds/reconstructs (FC API, Codex CLI, Claude CLI, and
- * Gemini CLI all resolve to this). Deliberately 120K = 30K BELOW the P=150K
- * pressure ceiling (Jonah, 2026-07-04: "all fold triggers for all engines need to
- * be the same"). 120K is the LARGEST value that still sits under every engine's
- * runway clamp (Claude CLI: ceiling−20K=130K; Codex CLI: msgCeiling−30K), so all
- * engines collapse to exactly 120K instead of diverging (previously FC/Codex 150K
- * vs Claude CLI 130K) or colliding with the ceiling (trigger==ceiling ⇒ 0 tail
- * epochs, measured live 2026-07-04).
+ * Gemini CLI all resolve to this). Deliberately 150K = 30K BELOW the P=180K
+ * pressure ceiling (Jonah, 2026-07-07: "I wanna give everyone the same ceiling
+ * of 180k" — raising the 2026-07-04 uniform 120K/150K geometry; that raise is
+ * intentional, do not "restore" the old values). 150K is the LARGEST value that
+ * still sits under every engine's runway clamp (Claude CLI:
+ * min(msgCeiling, ceiling)−20K = 160K on 200K windows; Codex CLI:
+ * msgCeiling−30K), so all engines collapse to exactly 150K instead of diverging
+ * or colliding with the ceiling (trigger==ceiling ⇒ 0 tail epochs, measured
+ * live 2026-07-04 — never set trigger equal to the ceiling).
  *
- * NOTE: this is the TRIGGER — a DISTINCT knob from the P=150K pressure ceiling
+ * NOTE: this is the TRIGGER — a DISTINCT knob from the P=180K pressure ceiling
  * (DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS below). Do not conflate them
- * (recurring regression) and do not "restore" this to 150K. Gemini CLI reads this
- * constant directly as its own default; FC/Codex/Claude CLI honor the same value
- * via VOXXO_/WARP_FOLD_TRIGGER_TOKENS — keep the env pin and this constant in
- * agreement. Distinct from the steady-state band (M=40K folded memory): FC folds
- * continuously toward this target; CLI engines clamp it under the pressure ceiling.
+ * (recurring regression). Gemini CLI reads this constant directly as its own
+ * default; FC/Codex/Claude CLI honor the same value via
+ * VOXXO_/WARP_FOLD_TRIGGER_TOKENS — keep the env pin (ecosystem.config.cjs) and
+ * this constant in agreement. Distinct from the steady-state band (M=40K folded
+ * memory): FC folds continuously toward this target; CLI engines clamp it under
+ * the pressure ceiling.
  */
-export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 120_000;
+export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 150_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
 export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
 /**
  * Universal pressure ceiling default. Applies to every model/engine unless an
- * explicit per-session/env override supplies another ceiling.
+ * explicit per-session/env override supplies another ceiling. Uniform P=180K
+ * for FC AND CLI engines (Jonah, 2026-07-07: "I wanna give everyone the same
+ * ceiling of 180k") — deliberately raised from the 2026-07-04 uniform 150K so
+ * every engine shares the Claude CLI's 180K hard-epoch ceiling; do not "fix"
+ * this back to 150K. On 200K windows this rides 20K under the window: the
+ * TRIG=150K fold trigger keeps normal occupancy well below it, so P is
+ * strictly the hard-epoch/full-recompute backstop, and messageCeiling
+ * (window − output 16K − emergency 4K = 180K) still bounds it.
  */
-export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 150_000;
+export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 180_000;
 /**
  * Back-compat alias for callers that used the old Opus max-context name.
  * It intentionally equals the universal default: no hidden model-specific carve-out.
@@ -77,21 +89,27 @@ export const DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS =
 // When a tail epoch declines (ledger drift, or nothing safely foldable within
 // the tail char budget), the relay falls back to an in-place session-swap
 // rebirth ("hard epoch") once provider-MEASURED context tokens cross this
-// ceiling. Kept distinct from the standard 150K pressure ceiling because fold
-// pressure and out-of-process session-swap saturation can diverge independently.
+// ceiling. Kept distinct from the standard pressure ceiling — the two knobs
+// now coincide at the uniform 180K by design but remain independent — because
+// fold pressure and out-of-process session-swap saturation can diverge independently.
 // Consumed by relay handleResultEvent (instanceManager/eventHandlers.ts).
 export const DEFAULT_CONTEXT_BUDGET_CLAUDE_CLI_HARD_EPOCH_TOKENS = 180_000;
-export const DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION = 0.8;
+// 0.9 (not 0.8) so a 200K window admits the uniform P=180K default via the
+// default-resolution path (0.8 would silently clamp it to 160K); smaller
+// windows still degrade proportionally (128K → 115.2K).
+export const DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION = 0.9;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION = 0.9;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_HEADROOM_SAFETY = 0.8;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION = 0.15;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION = 0.25;
 /**
  * Fallback headroom (tokens) kept between S + M + T and the pressure ceiling
- * when no pressure ceiling is configured. For the standard P150 geometry this
- * is P150 − S37 − M40 − T10 = 63K.
+ * when no pressure ceiling is configured. For the standard P180 geometry this
+ * is P180 − S37 − M40 − T10 = 93K. (Only consumed when the pressure ceiling is
+ * explicitly disabled; with a ceiling present the margin re-derives live as
+ * P − S − M − T, which algebraically pins the default tail-epoch cap to T.)
  */
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 63_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 93_000;
 /** Absolute floor for the tail-epoch cap so a tight window never collapses to a ~0 tail (fold-every-turn pathology). */
 export const MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS = 4_000;
 
@@ -360,7 +378,12 @@ function defaultSystemToolsReserveTokens(windowTokens: number): number {
 }
 
 function defaultEmergencyMarginTokens(windowTokens: number): number {
-  return reserveFloor(windowTokens, windowTokens <= 258_000 ? 0.04 : 0.03, 4_000, 48_000);
+  // The ≤258K tier uses 0.02 (200K window → 4K) so messageCeiling =
+  // window − output(16K) − emergency reaches the uniform P=180K ceiling; the
+  // old 0.04 left msgCeil at 176K and silently clamped P180 to 176K even under
+  // an explicit env pin. Wider windows keep the roomier 0.03 margin.
+  // Runtime consumers: messageCeiling here + status display only (verified).
+  return reserveFloor(windowTokens, windowTokens <= 258_000 ? 0.02 : 0.03, 4_000, 48_000);
 }
 
 function defaultTailEpochPressureMarginTokens(windowTokens: number): number {
@@ -470,17 +493,36 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     pressureCeilingTokens = clampToCeiling(requestedPressure, messageCeilingTokens, unsafeDevOverrides);
   }
 
+  // Tail-epoch runway floor, hoisted above the fold trigger because the trigger
+  // clamp reserves this much room below the ceiling (see foldTriggerUpperBound).
+  const explicitTailEpochRunwayTokens = positiveInt(input.tailEpochRunwayTokens)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS', 'WARP_FOLD_TAIL_EPOCH_RUNWAY_TOKENS'));
+  const tailEpochRunwayTokens = explicitTailEpochRunwayTokens
+    ?? DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
+  const tailEpochMinRunwayTokens = positiveInt(input.tailEpochMinRunwayTokens)
+    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS', 'WARP_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS'))
+    ?? (explicitTailEpochRunwayTokens === undefined
+      ? Math.min(tailEpochRunwayTokens, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
+      : tailEpochRunwayTokens);
+
   // Fold trigger sits between the steady-state band and the pressure ceiling:
-  // band ≤ trigger ≤ min(pressureCeiling, messageCeiling). Engines fold/reconstruct
-  // when measured occupancy crosses this, then crush back toward the band — so M40
-  // is the orbit, NOT the trigger. Tiny windows clamp the trigger down to the ceiling.
+  // band ≤ trigger ≤ min(pressureCeiling, messageCeiling) − minRunway. Engines
+  // fold/reconstruct when measured occupancy crosses this, then crush back toward
+  // the band — so M40 is the orbit, NOT the trigger. The minRunway subtraction
+  // keeps trigger STRICTLY below the ceiling even on tiny windows where both
+  // clamp: trigger==ceiling means every fold fires at/above pressure — the
+  // measured 2026-07-04 zero-tail-epochs failure mode. Small windows degrade to
+  // a thin-but-real fold corridor instead of a collision.
   const requestedFoldTriggerTokens = positiveInt(input.foldTriggerTokens)
     ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TRIGGER_TOKENS', 'WARP_FOLD_TRIGGER_TOKENS'))
     ?? codexCliDefaultReconstructTriggerTokens
     ?? DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS;
-  const foldTriggerUpperBound = Math.min(
-    pressureCeilingTokens ?? messageCeilingTokens,
-    messageCeilingTokens,
+  const foldTriggerUpperBound = Math.max(
+    1,
+    Math.min(
+      pressureCeilingTokens ?? messageCeilingTokens,
+      messageCeilingTokens,
+    ) - tailEpochMinRunwayTokens,
   );
   const foldTriggerTokens = unsafeDevOverrides
     ? requestedFoldTriggerTokens
@@ -529,15 +571,6 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   const appendBandTargetTokens = positiveInt(input.appendBandTargetTokens)
     ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_APPEND_BAND_TARGET_TOKENS', 'WARP_FOLD_APPEND_BAND_TARGET_TOKENS'))
     ?? DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS;
-  const explicitTailEpochRunwayTokens = positiveInt(input.tailEpochRunwayTokens)
-    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_RUNWAY_TOKENS', 'WARP_FOLD_TAIL_EPOCH_RUNWAY_TOKENS'));
-  const tailEpochRunwayTokens = explicitTailEpochRunwayTokens
-    ?? DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
-  const tailEpochMinRunwayTokens = positiveInt(input.tailEpochMinRunwayTokens)
-    ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS', 'WARP_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS'))
-    ?? (explicitTailEpochRunwayTokens === undefined
-      ? Math.min(tailEpochRunwayTokens, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
-      : tailEpochRunwayTokens);
   const defaultPressureMarginTokens = pressureCeilingTokens === null
     ? defaultTailEpochPressureMarginTokens(hardWindowTokens)
     : Math.max(0, pressureCeilingTokens - systemToolsReserveTokens - bandTokens - tailEpochRunwayTokens);

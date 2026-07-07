@@ -425,6 +425,43 @@ export const RECALL_CARD_PREFIX = '[Recalled from fold —';
 /** Prefix of one-line fold-recall hints injected at tool boundaries (see foldRecall.ts). */
 export const RECALL_HINT_PREFIX = '[Fold recall hint —';
 
+/** End marker for recall-card blocks (set by foldRecall.ts collectRecallCardsFromText). */
+const RECALL_CARD_END = '[End fold recall]';
+
+/**
+ * Strip fold-recall card and hint blocks from text. Cards are multi-line
+ * `[Recalled from fold — …]` blocks ending with `[End fold recall]`; hints
+ * are single-line `[Fold recall hint — …]` entries. Both are re-derivable
+ * by construction — foldRecall re-injects them on path touch — so carrying
+ * their full text through fold bands wastes budget. Band-append builders
+ * call this to lean band bodies before serializing.
+ */
+export function stripRecallCardBlocks(text: string): string {
+  let result = text;
+  // Strip multi-line card blocks (paired: prefix → end marker).
+  for (let guard = 0; guard < 30; guard += 1) {
+    const start = result.indexOf(RECALL_CARD_PREFIX);
+    if (start < 0) break;
+    const end = result.indexOf(RECALL_CARD_END, start + RECALL_CARD_PREFIX.length);
+    if (end < 0) break;
+    const removeEnd = end + RECALL_CARD_END.length;
+    const before = result.slice(0, start).replace(/[ \t]*\n{0,2}$/, '');
+    const after = result.slice(removeEnd).replace(/^\n{0,2}[ \t]*/, '');
+    result = before && after ? `${before}\n\n${after}` : `${before}${after}`;
+  }
+  // Strip single-line hint entries.
+  for (let guard = 0; guard < 30; guard += 1) {
+    const idx = result.indexOf(RECALL_HINT_PREFIX);
+    if (idx < 0) break;
+    const lineEnd = result.indexOf('\n', idx);
+    const removeEnd = lineEnd < 0 ? result.length : lineEnd + 1;
+    const before = result.slice(0, idx).replace(/[ \t]*\n{0,2}$/, '');
+    const after = result.slice(removeEnd).replace(/^\n{0,2}[ \t]*/, '');
+    result = before && after ? `${before}\n\n${after}` : `${before}${after}`;
+  }
+  return result;
+}
+
 /** Prefix of the one-line fold-epoch stamp emitted at the first tool boundary after a freeze epoch (see fcBaseSession.ts). */
 export const FOLD_EPOCH_STAMP_PREFIX = '[Fold epoch #';
 

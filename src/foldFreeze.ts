@@ -292,6 +292,56 @@ export function isTailEpochEfficiencyAlarm(shrinkRatio: number | null): boolean 
   return shrinkRatio !== null && shrinkRatio > TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO;
 }
 
+/**
+ * Tail-epoch YIELD-ESCALATION threshold (rail P180/TRIG150 — the per-fold yield
+ * gate). Distinct from the 0.6 efficiency ALARM above: the alarm only SURFACES a
+ * weak fold in the epoch/skip log line and changes NO behavior. This stricter-
+ * action threshold makes a genuinely useless fold ACTIONABLE. When a would-be
+ * tail-epoch band retains more than 70% of the raw it folds (saved < 30%),
+ * appending it buys almost nothing — the frozen floor barely drops and the very
+ * next turn tail-epochs again (the "folds barely dropping the tail" livelock,
+ * complement to the floor gate's "not enough raw tail to fold" livelock). AT
+ * PRESSURE (measured occupancy at/above the fold trigger) that class of fold
+ * escalates to a hard epoch (topology-resetting seed) instead: a full recompute
+ * of the SAME incompressible content (dense tool-result / code / JSON) would not
+ * drop the tail either — only the seed reset does. 0.7 (not the 0.6 alarm) tracks
+ * the operator's stated "retain >~70%" bar and keeps escalation conservative, so
+ * only the truly-stuck folds hard-epoch. Escalation ⊂ alarm: every fold that
+ * escalates (>0.7) also alarms (>0.6), but not vice-versa.
+ */
+export const TAIL_EPOCH_YIELD_ESCALATE_SHRINK_RATIO = 0.7;
+
+/**
+ * Whole-gate decision for the per-fold yield escalation: should THIS would-be
+ * tail-epoch band be abandoned for a hard epoch instead of appended? True only
+ * when BOTH (a) the band retains > 70% of raw (shrinkRatio > the escalate
+ * threshold — a low-yield fold) AND (b) the session is at pressure (measured
+ * occupancy ≥ the fold trigger). Off-pressure a weak fold is harmless (ample
+ * runway) and still appends/hot-reuses, so the gate never fires early on a cold
+ * session. shrinkRatio is a text-compression ratio (folded chars / raw chars) —
+ * NOT a token count — so this is GOD-RULE-7-safe; pressure is judged only from
+ * provider-measured tokens vs the resolved trigger, never synthesized from chars.
+ * Returns false whenever shrinkRatio is null (no raw tail to judge) or the
+ * measured/trigger pair is unavailable (cannot assess pressure → legacy append).
+ */
+export function shouldEscalateTailEpochForLowYield(
+  shrinkRatio: number | null,
+  measuredInputTokens: number | null | undefined,
+  foldTriggerTokens: number | null | undefined,
+): boolean {
+  if (shrinkRatio === null || !Number.isFinite(shrinkRatio) || shrinkRatio <= TAIL_EPOCH_YIELD_ESCALATE_SHRINK_RATIO) {
+    return false;
+  }
+  const measured = typeof measuredInputTokens === 'number' && Number.isFinite(measuredInputTokens) && measuredInputTokens > 0
+    ? measuredInputTokens
+    : null;
+  const trigger = typeof foldTriggerTokens === 'number' && Number.isFinite(foldTriggerTokens) && foldTriggerTokens > 0
+    ? foldTriggerTokens
+    : null;
+  if (measured === null || trigger === null) return false;
+  return measured >= trigger;
+}
+
 export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecomputeCause[] = [
   'first-call',
   'cold-gap',

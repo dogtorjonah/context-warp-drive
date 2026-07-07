@@ -134,6 +134,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 
   // ── Moonshot / Kimi models ──
   'kimi-k2.7-code': 256_000,
+  'kimi-k2.7-code-highspeed': 256_000,
   'kimi-k2.6': 256_000,
   'kimi-k2.5': 256_000,
 

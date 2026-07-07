@@ -1,0 +1,77 @@
+===================================================================
+SHOW HN POST — READY TO PASTE
+===================================================================
+
+TIMING: Tuesday, Wednesday, or Thursday, 7:00-10:00 AM Pacific
+        (Peak HN traffic + moderator activity window)
+        First hour is critical — need 30-50 upvotes in 60 min.
+
+-------------------------------------------------------------------
+
+TITLE (pick one):
+
+Option A (recommended — most HN-native):
+Show HN: Context Warp Drive – Deterministic context compaction for AI agents (zero LLM calls, 92% cache hit)
+
+Option B (problem-forward):
+Show HN: I ran an AI agent for 1h49m straight with 954 tool calls – here's how context folding kept it alive
+
+Option C (contrarian wedge):
+Show HN: Stop summarizing your agent's memory – deterministic context folding that keeps prompt caches hot
+
+-------------------------------------------------------------------
+
+POST BODY:
+
+Hi HN, I'm a solo developer (and veterinarian by day) who's been building a multi-agent AI orchestration system. The recurring problem I kept hitting: long-running agent sessions fill up the context window and degrade or crash. The existing solutions all use LLM summarization, which (1) costs extra model calls, (2) adds latency, (3) is non-deterministic, and (4) busts your provider prompt cache every time it rewrites the prefix.
+
+So I built a deterministic approach. Context Warp Drive folds old turns into compact structural skeletons, conserves the exact identifiers agents need (UUIDs, file paths, SHAs, ports) in a Coordinate Closet, freezes the folded prefix so it's reused byte-identical while the provider cache is warm, and pages folded content back in automatically when the agent touches a path again.
+
+No model calls. No truncation. Cache stays hot.
+
+Production telemetry from a real agent marathon (measured from the provider's own usage ledger, not estimated):
+- 92.6% cache-read hit rate across 954 tool calls
+- 1h49m continuous run, zero reorientation tax at epoch boundaries
+- $56 total cost for the full session
+- 173 recall suppressions vs 27 injections (the engine filters aggressively)
+
+Offline benchmark (reproducible, no API key):
+- CWD: $0.0208, 0 extra calls, 94% retention
+- Truncation: $0.0516, 0 calls, 44% retention
+- LLM Summarization: $0.0685, 6 calls, 44% retention
+
+It's provider-agnostic (Anthropic content blocks, OpenAI tool_calls, Gemini parts) and the core engine has zero runtime dependencies.
+
+Repo + reproducible benchmark: https://github.com/dogtorjonah/context-warp-drive
+
+I'd love feedback on the architecture — especially from anyone who's dealt with context management for long-running agents. Happy to answer questions about the fold mechanics, the Coordinate Closet identifier conservation, or the cache economics.
+
+-------------------------------------------------------------------
+
+FIRST COMMENT (post this immediately after the main post):
+
+For anyone curious about what happens inside the engine during a long session, here's the epoch boundary timeline from the marathon run:
+
+The engine performed 12 hard epochs over ~46 minutes of active work. At each epoch boundary, the provider-visible view collapsed to a single compact rebirth seed message (~15K tokens), while the raw transcript kept growing (ended at 723 items). The frozen prefix stayed bounded the entire time — it never grew past the pressure ceiling.
+
+The recall system is the other half: across the full session, it decided NOT to inject content 173 times and only injected 27 times (6.4:1 suppression ratio). It's not blindly paging things back in — it's evaluating whether the agent's current activity actually touches something folded.
+
+You can reproduce the cost/retention numbers yourself:
+
+  git clone https://github.com/dogtorjonah/context-warp-drive.git
+  cd context-warp-drive && npm install
+  npx tsx examples/benchmark.ts    # deterministic, no API key
+
+For live Claude calls with real provider cache telemetry:
+
+  ANTHROPIC_API_KEY=... npx tsx examples/benchmark-live.ts
+
+-------------------------------------------------------------------
+
+COMMENT STRATEGY (be present for 4+ hours):
+
+- Answer every comment within 15 minutes for the first 4 hours
+- When asked "how is this different from Mem0/Letta": answer factually — "They use LLM calls to extract/manage memory. CWD is deterministic — zero model calls. The architectural difference is that CWD never rewrites the prefix, so the prompt cache stays hot."
+- When asked "is this production-ready": "Extracted from a production multi-agent system running hundreds of turns. 380+ deterministic tests. Every number is measured."
+- Be honest about limitations: "The current package doesn't include the session management and episodic value-ledger layers from the production system — those are tightly coupled to the relay. The standalone is the portable engine."
+- Be humble. Don't use superlatives. Let the numbers speak.

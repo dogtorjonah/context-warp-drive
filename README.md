@@ -1,8 +1,10 @@
 # Context Warp Drive
 
-[![CI](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![CI](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![GitHub stars](https://img.shields.io/github/stars/dogtorjonah/context-warp-drive?style=social)](https://github.com/dogtorjonah/context-warp-drive)
 
 **Stop summarizing your agent's memory.** Every compaction call burns a model round-trip, rewrites your prefix so the provider prompt cache goes cold, and quietly drops the exact identifiers your agent needs. Fold it deterministically instead.
+
+> **92.6% cache-read hit rate** across 954 tool calls in a 1h49m agent marathon. **−60% cost vs truncation, −70% vs summarization.** Zero extra LLM calls. Every number measured from the provider's own usage ledger — not estimated.
 
 **The Infinite Context Warp Engine.** Keep long function-calling agent sessions under the context window **without LLM summarization calls** and **without ending the session** — while keeping provider prompt caches **hot** — and page folded content back in the moment the agent touches it again.
 
@@ -13,7 +15,11 @@ Extracted from a production multi-agent system, where it folds context continuou
 - The core engine passes **380+ deterministic tests** across rolling fold, recall, freeze, and integration.
 - Every number below is **measured, not estimated** — production cache rates from the Claude provider usage ledger, reproducible live against Claude (`ANTHROPIC_API_KEY=… npx tsx examples/benchmark-live.ts`, real model + real summarizer) and offline with exact `o200k_base` BPE token counts (`npx tsx examples/benchmark.ts`, deterministic, no key).
 
-**Provenance note:** this public package is production-derived. It is the portable distribution of an engine that runs live inside a private multi-agent system, so it deliberately uses generic `WARP_*` environment names, package-neutral examples, raw-history recovery wording, and tool-agnostic voice mining. The byte-identical invariant is local to this package — identical inputs produce identical folded views — and is not a claim of bit-for-bit parity with any private integration layer.
+<details>
+<summary><strong>Provenance note</strong> (click to expand)</summary>
+
+This public package is production-derived. It is the portable distribution of an engine that runs live inside a private multi-agent system, so it deliberately uses generic `WARP_*` environment names, package-neutral examples, raw-history recovery wording, and tool-agnostic voice mining. The byte-identical invariant is local to this package — identical inputs produce identical folded views — and is not a claim of bit-for-bit parity with any private integration layer.
+</details>
 
 ---
 
@@ -51,6 +57,35 @@ Real Claude calls every turn with Anthropic `cache_control` breakpoints, a **rea
 | **Context Warp Drive** | **$0.0208** | 0 | **94% (15/16)** |
 
 CWD is cheapest (**−70% vs summarization, −60% vs truncation** at Claude-sonnet rates — the ratio holds across tiers since Anthropic's cache discount is model-invariant), makes zero extra model calls, and beats truncation decisively on retention. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + a hot cache.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI or a cheaper Claude tier.
+
+### How it compares to LLM-based memory tools
+
+| | **Context Warp Drive** | **Mem0** | **Letta (MemGPT)** | **Zep (Graphiti)** |
+|---|---|---|---|---|
+| **Approach** | Deterministic fold | LLM extraction + vector DB | LLM-managed 3-tier memory | LLM extraction + knowledge graph |
+| **Extra LLM calls** | **0** | Per memory operation | Per memory decision | Per entity extraction |
+| **Prompt cache impact** | **Stays hot** (byte-identical prefix) | Invalidated (rewritten prefix) | Invalidated | Invalidated |
+| **Runtime deps** | **Zero** (core engine) | Vector DB required | Full agent runtime replacement | Neo4j + LLM + embeddings |
+| **Provider support** | Anthropic · OpenAI · Gemini | Multi (SDK wrappers) | Python only | Python only |
+| **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
+
+Every funded competitor uses LLM calls to extract, summarize, or manage memory. Context Warp Drive is the only deterministic approach — zero model calls, zero latency, zero cache invalidation.
+
+---
+
+## Try it in 5 minutes
+
+```bash
+git clone https://github.com/dogtorjonah/context-warp-drive.git
+cd context-warp-drive && npm install
+npx tsx examples/benchmark.ts    # no API key needed — deterministic, byte-identical every run
+```
+
+For the live benchmark with real Claude calls and provider cache telemetry:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... npx tsx examples/benchmark-live.ts
+```
 
 ---
 

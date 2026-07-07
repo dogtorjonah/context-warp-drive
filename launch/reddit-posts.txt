@@ -1,0 +1,125 @@
+===================================================================
+REDDIT POSTS — READY TO PASTE
+===================================================================
+
+CRITICAL RULES:
+1. Wait 24-48 hours AFTER the HN post before posting to Reddit.
+   HN mods penalize cross-posting on the same day.
+2. One post per subreddit, ever. Then be a community member.
+3. Respect the 10:1 rule: for every self-promo post, make 10 genuine
+   community contributions (comments, answers, discussions).
+4. NEVER post the same content to multiple subs on the same day
+   (Reddit spam detection will flag it).
+
+-------------------------------------------------------------------
+
+## r/LocalLLaMA (350K members — HIGHEST VALUE)
+
+Format: Technical deep-dive, NOT a project announcement.
+Flair: Resources (NOT News)
+
+Title:
+[D] I ran an AI agent for 109 minutes straight and measured everything — here's what deterministic context folding looks like in practice
+
+Body:
+---
+
+I've been building a multi-agent AI system and kept hitting the same wall every developer hits: long-running tool-calling sessions fill up the context window and degrade or crash.
+
+The existing solutions (Mem0, Letta, Zep) all use LLM summarization — which costs model calls, adds latency, and busts your provider prompt cache every time it rewrites the prefix.
+
+So I built a deterministic alternative. No LLM calls for compaction. Pure CPU, byte-identical output.
+
+**What it does:** folds old turns into structural skeletons, conserves exact identifiers (UUIDs, paths, SHAs, ports) in a budget-scored Coordinate Closet, freezes the folded prefix byte-identical so the provider prompt cache stays hot, and pages content back in on demand when the agent re-touches a path.
+
+**Production telemetry** (measured from Claude's own usage ledger, not estimated):
+
+| Metric | Value |
+|--------|-------|
+| Duration | 1h49m continuous |
+| Tool calls | 954 |
+| Cache-read hit rate | 92.6% |
+| Hard epochs | 12 |
+| Recall suppressions vs injections | 173 vs 27 (6.4:1) |
+| Total cost | $56 |
+
+**Offline benchmark** (reproducible, no API key):
+
+| Strategy | Input Cost | Extra LLM Calls | Fact Retention |
+|----------|-----------|-----------------|----------------|
+| Truncation | $0.0516 | 0 | 44% (7/16) |
+| LLM Summarization | $0.0685 | 6 | 44% (7/16) |
+| Context Warp Drive | $0.0208 | 0 | 94% (15/16) |
+
+Provider-agnostic (Anthropic, OpenAI, Gemini). Zero runtime dependencies in the core. 380+ deterministic tests. MIT licensed.
+
+Reproduce it yourself:
+```
+git clone https://github.com/dogtorjonah/context-warp-drive.git
+cd context-warp-drive && npm install
+npx tsx examples/benchmark.ts    # deterministic, no API key
+```
+
+Happy to answer technical questions about the fold mechanics, the Coordinate Closet identifier conservation, or the cache economics.
+
+---
+
+Best posting time: Weekday morning US (8-10 AM ET)
+
+-------------------------------------------------------------------
+
+## r/MachineLearning (3M members — ACADEMIC DEPTH)
+
+Format: Research-style post with methodology. [R] tag.
+This sub is hostile to product marketing but rewards novel methods.
+
+Title:
+[R] Deterministic context folding for long-running AI agents — measured cache economics and retention benchmarks
+
+Body:
+Same technical content as r/LocalLLaMA but framed as engineering research:
+- Lead with the methodology and benchmark design
+- Emphasize "novel method (deterministic folding vs LLM summarization)"
+- Include the reproducibility commands prominently
+- Be transparent about what IS and ISN'T a controlled study (the production telemetry is single-deployment, not A/B; the offline benchmark is controlled but small-scale)
+- Frame contributions: (1) deterministic fold as alternative to LLM summarization, (2) Coordinate Closet identifier conservation mechanism, (3) cache-hot freeze invariant and its economic implications
+
+Best posting time: Day AFTER the r/LocalLLaMA post (not same day)
+
+-------------------------------------------------------------------
+
+## r/programming (4.4M members — BROADER DEV AUDIENCE)
+
+Format: Problem-solution narrative. Frame as an interesting systems problem.
+
+Title:
+I built a deterministic context compaction engine because LLM summarization was costing me model calls and busting my cache
+
+Body:
+Lead with the engineering problem, not the repo. The repo link is the payoff, not the hook. This audience cares about the systems challenge.
+
+Key angle: "Here's an interesting systems problem: how do you keep an AI agent running for hours without it (a) running out of context, (b) spending extra money on summarization calls, or (c) invalidating the provider cache? Here's what I came up with."
+
+Best posting time: Day +2 after r/LocalLLaMA
+
+-------------------------------------------------------------------
+
+## r/singularity (OPTIONAL — LOWEST PRIORITY)
+
+Only post here if the other posts gained traction.
+Simpler framing: "Open-source tool lets AI agents run for hours without forgetting."
+Less technical detail. Broader appeal angle.
+
+-------------------------------------------------------------------
+
+## 10:1 COMPLIANCE STRATEGY
+
+Week BEFORE launch:
+- Comment on 10+ posts across r/LocalLLaMA and r/MachineLearning
+- Answer questions about agent context, memory, long-running sessions
+- Be genuinely helpful. Build credibility.
+
+After launch:
+- Answer every comment in your threads for 48+ hours
+- Continue participating in community discussions
+- Every comment counts toward your ratio

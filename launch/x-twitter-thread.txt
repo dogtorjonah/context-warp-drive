@@ -1,0 +1,106 @@
+===================================================================
+X/TWITTER THREAD — READY TO PASTE
+===================================================================
+
+TIMING: Post 1-2 hours AFTER the Show HN goes live.
+        Reference the HN post: "Just posted on HN: [link]"
+
+-------------------------------------------------------------------
+
+TWEET 1 (hook):
+I just ran an AI agent for 1 hour 49 minutes straight.
+
+954 tool calls. 92.6% cache hit rate. Zero reorientation tax. $56 total cost.
+
+No LLM summarization. No context window resets. Just deterministic context folding.
+
+Here's what happened inside the engine 🧵
+
+-------------------------------------------------------------------
+
+TWEET 2 (the problem):
+Every long agent session hits the same wall: the context window fills up.
+
+The usual answers are bad:
+- Truncation → agent forgets what it was doing
+- LLM summarization → costs a model call, adds latency, busts your prompt cache
+
+I built a third option.
+
+-------------------------------------------------------------------
+
+TWEET 3 (the architecture):
+Context Warp Drive folds old turns into compact structural skeletons.
+
+It conserves exact identifiers (UUIDs, paths, SHAs, ports) in a "Coordinate Closet."
+
+It freezes the folded prefix → byte-identical → provider cache stays hot.
+
+It pages content back in when the agent touches a path again.
+
+Zero model calls. Zero latency.
+
+-------------------------------------------------------------------
+
+TWEET 4 (the evidence — money tweet):
+Production telemetry from a real agent marathon:
+
+📊 92.6% cache-read hit rate (measured from provider ledger)
+📊 954 tool calls in 109 minutes
+📊 12 hard epochs, frozen prefix stayed at ~15K tokens
+📊 173 recall suppressions vs 27 injections
+📊 Zero reorientation tax — 3-5s from epoch to recall
+
+-------------------------------------------------------------------
+
+TWEET 5 (the economics):
+The cost math:
+
+Cache reads: $0.30/MTok
+Fresh input: $3.00/MTok
+
+When 92.6% of your tokens are cache reads, the economics flip.
+
+Offline benchmark:
+CWD: $0.0208 (94% retention)
+Truncation: $0.0516 (44%)
+Summarization: $0.0685 (44%)
+
+-------------------------------------------------------------------
+
+TWEET 6 (provider-agnostic + open source):
+Provider-agnostic: Anthropic content blocks, OpenAI tool_calls, Gemini parts.
+
+Zero runtime dependencies in the core engine.
+
+380+ deterministic tests.
+
+Open source (MIT): https://github.com/dogtorjonah/context-warp-drive
+
+Reproduce the benchmark yourself:
+ANTHROPIC_API_KEY=... npx tsx examples/benchmark-live.ts
+
+-------------------------------------------------------------------
+
+TWEET 7 (the human element):
+I'm a veterinarian and jazz musician who built this in a few weeks because my AI agents kept hitting context limits.
+
+No funding. No team. Just the problem and the evidence.
+
+If you're building long-running agents and hitting the context wall, I'd love your feedback.
+
+-------------------------------------------------------------------
+
+POST-LAUNCH CADENCE (first 2 weeks):
+- Daily: 1-2 posts — build progress, honest takes, technical observations
+- Day +1: "Top questions from HN about context folding" follow-up thread
+- Day +2: Architecture deep-dive — "How the Coordinate Closet works"
+- Day +3: Economics thread — "Why 92.6% cache hit rate flips the cost math"
+- Ongoing: Reply to anyone working on agent infra. Become a known voice in the niche.
+
+KEY ACCOUNTS TO ENGAGE WITH (reply genuinely, don't tag-promo):
+- @swyx / Latent Space
+- @simonw
+- Agent framework authors (CrewAI, AutoGen, LangChain communities)
+
+PIN this thread to your profile after posting.
