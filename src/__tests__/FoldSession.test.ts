@@ -324,16 +324,38 @@ describe('FoldSession tail-epoch runway gate', () => {
 
     // Each committed cycle bakes exactly one [cognitive] block for its own
     // delta; earlier cycles' blocks are carried forward verbatim in the
-    // frozen prefix, never re-synthesized or duplicated.
-    const cognitiveTexts = cycle3.messages
+    // frozen prefix, never re-synthesized or duplicated. The block is MERGED
+    // into each band's final message (never appended as a separate assistant
+    // message — a trailing assistant message 400s providers that require the
+    // request to end with a user message), so count needles within the
+    // [cognitive] block portion of each message, not the whole message text
+    // (the folded band content legitimately carries the raw headline too).
+    // The slice is bounded at [micro-seed] since v2 micro-seeds contain the
+    // actual thread text (which carries the same verdict headlines).
+    const extractCognitiveBlock = (text: string): string => {
+      const start = text.indexOf('[cognitive]');
+      if (start < 0) return '';
+      const microSeedIdx = text.indexOf('[micro-seed]', start);
+      return microSeedIdx > start ? text.slice(start, microSeedIdx) : text.slice(start);
+    };
+    const cognitiveBlocks = cycle3.messages
       .map((msg) => (typeof msg.content === 'string' ? msg.content : ''))
-      .filter((text) => text.includes('[cognitive]'));
-    const countInCognitiveMessages = (needle: string): number =>
-      cognitiveTexts.reduce((count, text) => count + text.split(needle).length - 1, 0);
-    expect(cognitiveTexts).toHaveLength(3);
-    expect(countInCognitiveMessages('🏁 cycle-one verdict')).toBe(1);
-    expect(countInCognitiveMessages('⚠️ cycle-two hazard')).toBe(1);
-    expect(countInCognitiveMessages('🏁 cycle-three verdict')).toBe(1);
+      .map(extractCognitiveBlock)
+      .filter((text) => text.length > 0);
+    const countInCognitiveBlocks = (needle: string): number =>
+      cognitiveBlocks.reduce((count, text) => count + text.split(needle).length - 1, 0);
+    expect(cognitiveBlocks).toHaveLength(3);
+    expect(countInCognitiveBlocks('🏁 cycle-one verdict')).toBe(1);
+    expect(countInCognitiveBlocks('⚠️ cycle-two hazard')).toBe(1);
+    expect(countInCognitiveBlocks('🏁 cycle-three verdict')).toBe(1);
+
+    // Terminal-role invariant: the enrichment must never leave the folded view
+    // ending on an appended assistant block message. The view's last message is
+    // the band's final folded raw message (with the block merged INTO it), so
+    // its text is never just the [cognitive] block.
+    const lastMessage = cycle3.messages[cycle3.messages.length - 1];
+    const lastText = typeof lastMessage.content === 'string' ? lastMessage.content : '';
+    expect(lastText.startsWith('[cognitive]')).toBe(false);
 
     expect(session.telemetry.epochs).toBe(4);
   });
@@ -519,11 +541,11 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(resumed.sealedBoundary).toBe(ceiling.messages.length);
   });
 
-  it('escalates a tail epoch to a hard epoch when the trigger-anchored post-fold floor rises within min runway (CLI floor-gate parity)', () => {
-    // Uniform geometry: 180K ceiling, 150K trigger, 30K min runway. The measured
-    // ceiling basis alone (180K − measured) would keep appending forever (the
-    // 22-tail-epochs-never-hard-epoch pathology); the trigger-anchored floor gate
-    // (150K − post-fold floor) escalates once the frozen prefix rests too high.
+  it('keeps appending while the trigger-anchored post-fold floor remains below trigger (CLI floor-gate parity)', () => {
+    // Uniform geometry: 180K ceiling, 150K trigger, 30K min runway. The runway is
+    // already encoded by the trigger sitting 30K below the ceiling; the floor gate
+    // must not subtract it a second time from healthy staircase bands. A floor at
+    // 125K under TRIG150 still has below-trigger raw-tail budget to reclaim.
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -541,17 +563,17 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(firstAppend.stats.epochReason).toBe('tail-epoch-append');
     expect(firstAppend.stats.appendDecision).toBe('committed');
     // Next tail epoch: the append dropped occupancy to 125K, RE-BASELINING the
-    // floor (125K < armed 140K). Now appendEpochsSinceHardReset ≥ 1, so floor gate engages:
-    // 150K trigger − 125K floor = 25K < 30K min runway → escalate. The stale
-    // ceiling basis (180K − 125K = 55K) would still have appended.
+    // floor (125K < armed 140K). Now appendEpochsSinceHardReset ≥ 1, but the
+    // floor is still below the 150K trigger, so the append remains viable. The
+    // old trigger-minus-minRunway gate would have hard-epoched here.
     const t3 = appendProfitableTail(t2, 'tail two');
-    const escalated = session.prepare(t3, { measuredInputTokens: 125_000 });
-    expect(escalated.cacheHot).toBe(false);
-    expect(escalated.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
-    expect(escalated.messages).toHaveLength(1);
+    const secondAppend = session.prepare(t3, { measuredInputTokens: 125_000 });
+    expect(secondAppend.stats.epochReason).toBe('tail-epoch-append');
+    expect(secondAppend.stats.appendDecision).toBe('committed');
+    expect(secondAppend.messages.length).toBeGreaterThan(1);
   });
 
-  it('keeps the trigger floor gate armed across a cold full recompute that clears sealed bands', () => {
+  it('hard-epochs when an armed trigger floor reaches the trigger after a cold full recompute clears sealed bands', () => {
     let now = 1_000;
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
@@ -570,14 +592,14 @@ describe('FoldSession tail-epoch runway gate', () => {
     // A cold-gap full recompute clears the sealed band set, but not the
     // provider-measured floor. The arming counter must survive that recompute,
     // otherwise the next tail epoch falls back to the stale ceiling basis and
-    // appends through a floor that is already inside minRunway of the trigger.
+    // appends through a floor that has reached the trigger.
     now += 61_000;
-    const coldRecompute = session.prepare(t2, { measuredInputTokens: 125_000 });
+    const coldRecompute = session.prepare(t2, { measuredInputTokens: 150_000 });
     expect(coldRecompute.cacheHot).toBe(false);
     expect(coldRecompute.stats.appendDecision).toBeUndefined();
 
     const t3 = appendProfitableTail(t2, 'tail two');
-    const escalated = session.prepare(t3, { measuredInputTokens: 125_000 });
+    const escalated = session.prepare(t3, { measuredInputTokens: 150_000 });
     expect(escalated.cacheHot).toBe(false);
     expect(escalated.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
     expect(escalated.messages).toHaveLength(1);
@@ -869,7 +891,7 @@ describe('FoldSession per-band vault sealing', () => {
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
 
     const third = appendProfitableTail(second, 'vault tail two');
-    const hardEpoch = session.prepare(third, { measuredInputTokens: 125_000 });
+    const hardEpoch = session.prepare(third, { measuredInputTokens: 150_000 });
     expect(hardEpoch.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
     expect(hardEpoch.messages).toHaveLength(1);
     const joined = vaultText(hardEpoch.messages);

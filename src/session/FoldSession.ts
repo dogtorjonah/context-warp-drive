@@ -43,7 +43,7 @@ import {
   type FoldFidelityValueInput,
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
-import { extractCognitiveArtifacts, renderCognitiveBlock } from '../cognitiveArtifacts.ts';
+import { extractCognitiveArtifacts, renderCognitiveBlock, mergeBlockIntoViewTail } from '../cognitiveArtifacts.ts';
 import { buildMicroSeedBlock } from '../microRebirthSeed.ts';
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
@@ -909,23 +909,22 @@ export class FoldSession {
       if (floorTokens !== null && triggerTokens !== null && this.appendEpochsSinceHardReset >= 1) {
         // Trigger-anchored post-fold-floor gate (CLI parity —
         // checkClaudeCliHardEpochFromFloor; the fcBaseSession/foldMeasuredPressure
-        // mirror). Once ≥1 epoch has committed on this hard-epoch generation, the
-        // runway that matters is how far the IRREDUCIBLE frozen prefix (the
-        // measured post-fold floor) sits below the fold TRIGGER — not how far
-        // current pre-fold occupancy sits below the ceiling. A band append cannot
-        // reclaim the frozen prefix, so once the floor rises within minRunway of
-        // the trigger each further append reclaims ~nothing (the band-append
-        // livelock: the 22-tail-epochs-never-hard-epoch pathology). Escalate to a
-        // HARD epoch (seed reset — the only epoch kind that drops the floor).
-        // Arming counts epochs since the last hard reset, NOT sealed bands: an
-        // in-place recompute clears the bands without dropping the floor, and
-        // band-count arming disarmed the gate exactly inside the churn window.
-        // The ≥1-epoch requirement is the instant-loop guard: a fresh post-reset
-        // floor can never gate itself into back-to-back hard epochs.
-        // GOD RULE 7: floor + trigger are measured/resolved tokens.
+        // mirror). Once ≥1 epoch has committed on this hard-epoch generation,
+        // compare the IRREDUCIBLE frozen prefix (the measured post-fold floor)
+        // directly to the fold TRIGGER. The minimum runway is already encoded by
+        // the trigger sitting below the P180 ceiling; subtracting it a second
+        // time from the floor hard-epochs healthy stair-step bands too early.
+        // Escalate only when the captured floor itself reaches or exceeds the
+        // trigger, because another append would leave no below-trigger raw-tail
+        // budget to reclaim. Arming counts epochs since the last hard reset, NOT
+        // sealed bands: an in-place recompute clears the bands without dropping
+        // the floor, and band-count arming disarmed the gate exactly inside the
+        // churn window. The ≥1-epoch requirement is the instant-loop guard: a
+        // fresh post-reset floor can never gate itself into back-to-back hard
+        // epochs. GOD RULE 7: floor + trigger are measured/resolved tokens.
         const postAppendRunwayTokens = triggerTokens - floorTokens;
         return {
-          ok: postAppendRunwayTokens >= this.tailEpochMinRunwayTokens,
+          ok: postAppendRunwayTokens > 0,
           basis: 'floor',
           measuredInputTokens: measuredTokens,
           sealedAppendBandCount,
@@ -1035,8 +1034,11 @@ export class FoldSession {
         ? renderCognitiveBlock(extractCognitiveArtifacts(messages))
         : '';
       const preparedMessages = stepResult?.messages ?? result.messages;
+      // Merge (never append): a trailing assistant enrichment message breaks
+      // providers that require the request to end with a user message when the
+      // fold consumes the whole tail (Anthropic 400 assistant-prefill).
       const messagesWithCognitive = cognitiveBlock
-        ? [...preparedMessages, { role: 'assistant', content: cognitiveBlock }]
+        ? mergeBlockIntoViewTail(preparedMessages, cognitiveBlock)
         : preparedMessages;
       this.commitEvictionEpoch(bookkeepingResult, upcomingEpoch);
       return this.applyVault({
@@ -1152,10 +1154,16 @@ export class FoldSession {
       if (appendCommit.committed) {
         let appendView = appendCommit.view;
         if (cognitiveBlock && this.freezeState.frozenView) {
-          const enrichedFrozenView = [
-            ...this.freezeState.frozenView,
-            { role: 'assistant', content: cognitiveBlock },
-          ];
+          // Merge into the band's final message (never append a new assistant
+          // message): when the fold consumes the whole raw tail, the frozen
+          // view IS the full request body, and a trailing assistant message
+          // 400s providers that require ending on a user message. Merging
+          // preserves the terminal role AND the message count, keeping sealed
+          // band view indexes valid.
+          const enrichedFrozenView = mergeBlockIntoViewTail(
+            this.freezeState.frozenView,
+            cognitiveBlock,
+          );
           this.freezeState.frozenView = enrichedFrozenView;
           this.freezeState.frozenViewChars = countChars(enrichedFrozenView);
           appendView = enrichedFrozenView;
@@ -1219,12 +1227,11 @@ export class FoldSession {
     if (recomputeReason === 'tail-epoch' && !pressureCeilingTriggered && !appendOnlyTailEpoch) {
       // Runway-gate escalation (FC parity — resolveTailEpochRouting's
       // runwayGateForcesFullRecompute routes to the portable seed reset). A tail
-      // epoch whose post-append floor would sit within minRunway of the fold
-      // trigger buys ~no working runway, and an in-place recompute does not drop
-      // the frozen floor either (measured: five recomputes pinned at 81K→90K
-      // frozen chars while folds churned 10-38s apart). Only a HARD epoch (seed
-      // reset) drops the floor to the bottom of the sawtooth and regains
-      // runway — route there directly instead of the legacy recompute.
+      // epoch whose captured post-fold floor reaches the fold trigger buys no
+      // below-trigger working runway, and an in-place recompute does not drop
+      // the frozen floor either. Only a HARD epoch (seed reset) drops the floor
+      // to the bottom of the sawtooth and regains runway — route there directly
+      // instead of the legacy recompute.
       const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
         maxChars: this.rawHardEpochSeedMaxChars,
       });
@@ -1253,8 +1260,10 @@ export class FoldSession {
       ? renderCognitiveBlock(extractCognitiveArtifacts(messages))
       : '';
     const sealedBaseView = this.bakeVault(stepResult?.messages ?? result.messages, 'full');
+    // Merge (never append) — same terminal-role invariant as the tail-epoch
+    // path: the sealed view may be the entire request body.
     const sealedView = recomputeCognitiveBlock
-      ? [...sealedBaseView, { role: 'assistant', content: recomputeCognitiveBlock }]
+      ? mergeBlockIntoViewTail(sealedBaseView, recomputeCognitiveBlock)
       : sealedBaseView;
     commitFoldFreeze(this.freezeState, messages, sealedView, ctx, now);
     this.hardEpochCompactBaselineActive = false;

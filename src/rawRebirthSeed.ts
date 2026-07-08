@@ -15,6 +15,7 @@ import {
   type FoldMessage,
 } from './rollingFold.ts';
 import { classifyMessageGlyph } from './foldEpisodes.ts';
+import { DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS } from './contextBudget.ts';
 
 /**
  * Build a portable lineage glyph log from the message trace: scan assistant
@@ -274,12 +275,24 @@ export interface RawRebirthSeedInput {
 
   readonly predecessorStatus?: string;
   readonly userMessageTriggered?: boolean;
+
+  // ── Band-level overrides ─────────────────────────────────────────────
+  // When provided, these replace the default header/footer framing. Used by
+  // the micro-seed band profile to render continuation guidance for a folded
+  // band tail (instead of a full identity-rebirth header + orientation
+  // footer). The header/footer are the ONLY framing the seed controls;
+  // section content is governed by sectionToggles/sectionMaxChars as usual.
+  readonly headerOverride?: string;
+  readonly footerOverride?: string;
 }
 
 export interface RawRebirthSeedFromMessagesOptions {
   readonly predecessorName?: string;
   readonly packageBudget?: number;
   readonly sectionMaxChars?: Partial<Record<RawRebirthSeedSectionId, number>>;
+  readonly sectionPriority?: Partial<Record<RawRebirthSeedSectionId, number>>;
+  readonly renderOrder?: readonly RawRebirthSeedSectionId[];
+  readonly sectionToggles?: Partial<Record<RawRebirthSeedSectionId | 'runtimeModel' | 'rebirthHistory', boolean>>;
   readonly rawTraceCoordinateClosetChars?: number;
   readonly includeTrailingUserTurn?: boolean;
   readonly currentThreadMessageLimit?: number;
@@ -305,6 +318,10 @@ export interface RawRebirthSeedFromMessagesOptions {
    * trace via buildOpenQuestionsFromMessages; pass '' to suppress.
    */
   readonly openQuestions?: string;
+  /** Replace the default [CONTEXT REBIRTH] header (band micro-seed use). */
+  readonly headerOverride?: string;
+  /** Replace the default orientation footer (band micro-seed use). */
+  readonly footerOverride?: string;
 }
 
 interface BudgetedPromptSection {
@@ -845,8 +862,9 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     : enabled(input, 'runtimeModel')
       ? formatRuntimeModelBlock(input.runtimeModel, input.relayBootTime, input.traceEventCount)
       : '';
+  const defaultHeader = `[CONTEXT REBIRTH] You are the continuation of "${input.predecessorName}". Same identity, coordination context, tools — pick up where it left off. Read Last User + AI Messages first, then Current Thread; Active Edit Delta is authoritative for in-flight files.`;
   const headerBlocks = [
-    `[CONTEXT REBIRTH] You are the continuation of "${input.predecessorName}". Same identity, coordination context, tools — pick up where it left off. Read Last User + AI Messages first, then Current Thread; Active Edit Delta is authoritative for in-flight files.`,
+    input.headerOverride?.trim() ?? defaultHeader,
     formatMergedLineageProvenance(input),
     formatDurableMergedLineageBanner(input),
     formatSummonVaultLedger(input),
@@ -995,12 +1013,14 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     input.squadThoughts ? `\n── Squad Awareness ──\n${input.squadThoughts}` : undefined,
   );
 
-  const footer = input.userMessageTriggered === true
-    ? 'The active user message is included in Last User + AI Messages and Current Thread — respond to it directly. Engage with its actual content; do not reduce a substantive message to a generic prompt.'
-    : input.predecessorStatus === 'idle'
-      ? 'Predecessor was idle with no active task — default to waiting for the next request; do not invent work or re-investigate the codebase from scratch. But if Last User + AI Messages or Current Thread shows a user request that was never answered or was cut off mid-work, treat that as your active task and engage with it directly rather than sitting idle.'
-      : 'Resume the active task. The Activity Log + Active Edit Delta are your primary context. Evaluate predecessor work on its merits before diverging — if the approach is flawed, refactor it rather than discarding (see Core Principle 15). Continue using atlas_query as your primary codebase investigation tool — the File Context above is a handoff snapshot, not a substitute for live Atlas queries when exploring new files or verifying current state. Self-tap only if the package is insufficient or contradictory.';
-  const footerBlock = `\n── Orientation ──\n${footer}`;
+  const footer = input.footerOverride !== undefined
+    ? input.footerOverride
+    : input.userMessageTriggered === true
+      ? 'The active user message is included in Last User + AI Messages and Current Thread — respond to it directly. Engage with its actual content; do not reduce a substantive message to a generic prompt.'
+      : input.predecessorStatus === 'idle'
+        ? 'Predecessor was idle with no active task — default to waiting for the next request; do not invent work or re-investigate the codebase from scratch. But if Last User + AI Messages or Current Thread shows a user request that was never answered or was cut off mid-work, treat that as your active task and engage with it directly rather than sitting idle.'
+        : 'Resume the active task. The Activity Log + Active Edit Delta are your primary context. Evaluate predecessor work on its merits before diverging — if the approach is flawed, refactor it rather than discarding (see Core Principle 15). Continue using atlas_query as your primary codebase investigation tool — the File Context above is a handoff snapshot, not a substitute for live Atlas queries when exploring new files or verifying current state. Self-tap only if the package is insufficient or contradictory.';
+  const footerBlock = footer ? `\n── Orientation ──\n${footer}` : '';
   const fixedOverhead = headerBlocks.join('\n').length + footerBlock.length;
   const allocatedBlocks = allocateSectionBlocks(budgetedSections, packageBudget - fixedOverhead);
   const renderOrder = input.renderOrder ?? DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER;
@@ -1107,11 +1127,24 @@ function messageValueToText(value: unknown): string {
   }
 }
 
+function messagePartsToText(message: FoldMessage): string {
+  return messageValueToText((message as FoldMessage & { parts?: unknown }).parts);
+}
+
+function messageContentAndPartsToText(message: FoldMessage): string {
+  return [
+    messageValueToText(message.content),
+    messagePartsToText(message),
+  ].filter((part) => part.trim().length > 0).join('\n');
+}
+
 function providerMessageToTraceText(message: FoldMessage | undefined): string {
   if (!message) return '';
   const lines = [`role:${message.role}`];
   const content = messageValueToText(message.content);
   if (content) lines.push(`content:\n${content}`);
+  const parts = messagePartsToText(message);
+  if (parts) lines.push(`parts:\n${parts}`);
   if (message.name !== undefined) lines.push(`name: ${messageValueToText(message.name)}`);
   if (message.tool_call_id !== undefined) lines.push(`tool_call_id: ${messageValueToText(message.tool_call_id)}`);
   if (message.tool_calls !== undefined) lines.push(`tool_calls:\n${messageValueToText(message.tool_calls)}`);
@@ -1224,6 +1257,23 @@ export function isPortableGenuineOperatorMessage(text: string): boolean {
   return true;
 }
 
+function hasMicroSeedTrajectory(messages: readonly FoldMessage[]): boolean {
+  for (const message of messages) {
+    if (message.role === 'user') {
+      if (isPortableGenuineOperatorMessage(messageContentAndPartsToText(message))) return true;
+      continue;
+    }
+    if (message.role !== 'assistant' && message.role !== 'model') continue;
+    const assistantPayload = [
+      messageContentAndPartsToText(message),
+      messageValueToText(message.tool_calls),
+      messageValueToText(message.reasoning_content),
+    ].some((part) => part.trim().length > 0);
+    if (assistantPayload) return true;
+  }
+  return false;
+}
+
 function buildLastUserAiMessagesFromMessages(
   messages: readonly FoldMessage[],
   traceEnd: number,
@@ -1244,9 +1294,8 @@ function buildLastUserAiMessagesFromMessages(
     // digest deltas, and ephemeral-only turns. The newest genuine operator
     // message wins (iterate forward, overwrite — latest by index wins).
     if (message.role === 'user') {
-      const text = providerMessageToTraceText(message);
-      if (isPortableGenuineOperatorMessage(text)) {
-        lastUser = text;
+      if (isPortableGenuineOperatorMessage(messageContentAndPartsToText(message))) {
+        lastUser = providerMessageToTraceText(message);
         lastUserIndex = i;
       }
     }
@@ -1334,6 +1383,9 @@ export function buildRawRebirthSeedFromMessages(
     relayBootTime: options.relayBootTime,
     traceEventCount: options.traceEventCount ?? traceEnd,
     sectionMaxChars: options.sectionMaxChars,
+    sectionPriority: options.sectionPriority,
+    renderOrder: options.renderOrder,
+    sectionToggles: options.sectionToggles,
     lastUserAiMessages: buildLastUserAiMessagesFromMessages(messages, traceEnd, excluded),
     currentThread,
     rawTraceCoordinateCloset,
@@ -1352,5 +1404,115 @@ export function buildRawRebirthSeedFromMessages(
     ),
     predecessorStatus: options.predecessorStatus,
     userMessageTriggered: options.userMessageTriggered,
+    headerOverride: options.headerOverride,
+    footerOverride: options.footerOverride,
   });
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Band-level micro-seed profile
+// ══════════════════════════════════════════════════════════════════════════
+// A tail-epoch fold band skeletonizes the freshest window of trace — exactly
+// the material that gives the successor direction (what was asked, what was
+// in flight, which files were mid-edit). Instead of a bespoke 3-line
+// approximation, this profile points the ACTUAL rebirth seed machinery at the
+// fold window, producing a compact "you are here" block that rides inside the
+// band body alongside the [cognitive] block.
+//
+// The profile is lean: only trace-derived sections (last-user-AI + current
+// thread) survive, all external-state sections (rail, chatroom, squad,
+// workspace, episodic, etc.) are disabled since they live outside the fold
+// and survive it anyway. The append band target is a TOKEN budget owned by
+// contextBudget/runway gates; this renderer remains character-budgeted and
+// must not pretend its character safety caps are token accounting.
+
+/**
+ * Token target for the append-only tail band geometry (A). Exported here so
+ * tests and callers can assert the micro-seed profile is anchored to the real
+ * runway constant, not a character-count substitute. The renderer below does
+ * not tokenize or estimate; provider/relay measured tokens remain the only
+ * source of token telemetry.
+ */
+export const BAND_MICRO_SEED_TARGET_TOKENS = DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS;
+
+/**
+ * Character-only render safety cap for a band-level micro-seed. This is not a
+ * token budget and must not be used for pressure/runway math. It only bounds
+ * deterministic text rendering inside rawRebirthSeed.ts because this portable
+ * module has no provider tokenizer. Set above the 5K-token target so the v2
+ * seed is not accidentally squeezed by the old 3K-character mistake; token
+ * safety is enforced by measured-token gates around the whole band append.
+ */
+export const BAND_MICRO_SEED_RENDER_SAFETY_MAX_CHARS = 20_000;
+
+/**
+ * Character-only section safety caps for the band profile. Only the two
+ * trace-derived narrative sections are enabled; everything else is toggled
+ * off. These caps bound deterministic rendering only — they are not token
+ * estimates or token telemetry.
+ */
+export const BAND_MICRO_SEED_SECTION_MAX_CHARS: Partial<Record<RawRebirthSeedSectionId, number>> = {
+  lastUserAiMessages: 6_000,
+  currentThread: 12_000,
+};
+
+/**
+ * Section toggles for the band profile. Only lastUserAiMessages and
+ * currentThread are enabled; every other section (coordinate closet, edit
+ * delta, rail, episodic, glyph log, open questions, atlas, workspace,
+ * starred moments, thinking trail, changelog arc, chatroom, delegated work,
+ * coordination state, squad thoughts) is suppressed because those live
+ * outside the fold and survive the epoch intact.
+ */
+export const BAND_MICRO_SEED_SECTION_TOGGLES: Partial<Record<RawRebirthSeedSectionId | 'runtimeModel' | 'rebirthHistory', boolean>> = {
+  lastUserAiMessages: true,
+  currentThread: true,
+  rawTraceCoordinateCloset: false,
+  activeEditDelta: false,
+  taskRailContext: false,
+  episodicCrossRef: false,
+  lineageGlyphLog: false,
+  openQuestions: false,
+  atlasCrossRef: false,
+  workspaceContext: false,
+  starredMoments: false,
+  thinkingTrail: false,
+  lifetimeChangelogArc: false,
+  chatroomMembership: false,
+  delegatedWork: false,
+  coordinationState: false,
+  squadThoughts: false,
+  runtimeModel: false,
+};
+
+/**
+ * Build a compact band-level micro-seed from the fold window messages using
+ * the actual rebirth seed machinery with a lean band profile. This is the v2
+ * replacement for the bespoke 3-line extractor: same rebirth pipeline that
+ * powers hard-epoch seeds, pointed at just the destroyed window, with band-
+ * appropriate framing and a character-only render safety cap.
+ *
+ * Returns '' when the window has no extractable trajectory (empty messages
+ * or no genuine operator / assistant turns). The band then carries no
+ * [micro-seed] block, same as before.
+ */
+export function buildMicroSeedFromMessages(
+  messages: readonly FoldMessage[],
+  options: RawRebirthSeedFromMessagesOptions = {},
+): string {
+  if (!messages || messages.length === 0) return '';
+  if (!hasMicroSeedTrajectory(messages)) return '';
+  return buildRawRebirthSeedFromMessages(messages, {
+    ...options,
+    packageBudget: options.packageBudget ?? BAND_MICRO_SEED_RENDER_SAFETY_MAX_CHARS,
+    sectionMaxChars: { ...BAND_MICRO_SEED_SECTION_MAX_CHARS, ...options.sectionMaxChars },
+    sectionToggles: { ...BAND_MICRO_SEED_SECTION_TOGGLES, ...options.sectionToggles },
+    currentThreadMessageLimit: options.currentThreadMessageLimit ?? 6,
+    currentThreadMessageChars: options.currentThreadMessageChars ?? 400,
+    headerOverride: options.headerOverride ?? BAND_MICRO_SEED_HEADER,
+    footerOverride: options.footerOverride ?? '',
+  });
+}
+
+/** Band-level framing header (replaces [CONTEXT REBIRTH] for micro-seeds). */
+const BAND_MICRO_SEED_HEADER = '[micro-seed] Fold-window continuation — the trace below was skeletonized into this band; use it to recover direction (what was asked, what was in flight, which files were touched).';

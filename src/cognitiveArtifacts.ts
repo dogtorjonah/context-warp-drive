@@ -268,3 +268,41 @@ export function enrichFoldedBandBody(
   }
   return parts;
 }
+
+/**
+ * Merge a rendered enrichment block ([cognitive] / [micro-seed]) into the LAST
+ * message of a folded view WITHOUT appending a new message.
+ *
+ * Why this exists: appending the enrichment as a separate trailing
+ * `role:'assistant'` message crashes providers that require the conversation
+ * to end with a user message (Anthropic 400 "This model does not support
+ * assistant message prefill") whenever the fold consumes the entire raw tail —
+ * the folded view IS the full request body, so its terminal role must be
+ * whatever the last folded raw message had (a tool-result/user boundary).
+ * Merging into the final message preserves both the terminal role and the
+ * message count, so band metadata indexes stay valid.
+ *
+ * Copy-on-write: returns a new array with a new last-message object; the input
+ * array and its other elements are not mutated. Content handling:
+ * string → appended with a blank-line separator; array of parts → a text part
+ * is pushed; null/absent → the block becomes the content. Empty views return
+ * the input unchanged (nothing safe to merge into — callers always have at
+ * least the seed message in practice).
+ */
+export function mergeBlockIntoViewTail<T extends FoldMessage>(
+  view: readonly T[],
+  block: string,
+): T[] {
+  if (!block) return view.slice() as T[];
+  if (view.length === 0) return view.slice() as T[];
+  const last = view[view.length - 1];
+  let content: FoldMessage['content'];
+  if (typeof last.content === 'string' && last.content.length > 0) {
+    content = `${last.content}\n\n${block}`;
+  } else if (Array.isArray(last.content)) {
+    content = [...last.content, { type: 'text', text: block }];
+  } else {
+    content = block;
+  }
+  return [...view.slice(0, -1), { ...last, content }] as T[];
+}
