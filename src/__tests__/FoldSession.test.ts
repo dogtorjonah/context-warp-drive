@@ -853,6 +853,31 @@ describe('FoldSession per-band vault sealing', () => {
     expect(joined.split('[User Message Vault]').length - 1).toBe(1);
   });
 
+  it('bakes answered vault rows into a runway-gated hard epoch', () => {
+    const session = vaultSession({
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 180_000,
+      tailEpochRunway: { foldTriggerTokens: 150_000, minRunwayTokens: 30_000 },
+    });
+    session.recordOperatorMessage('OPERATOR-IOTA hard epoch ask', '2026-06-19T10:00:00Z');
+    session.recordAssistantMessage('🏁 hard epoch ask handled', '2026-06-19T10:01:00Z');
+    const first = twoTurnHistory();
+    session.prepare(first);
+
+    const second = appendProfitableTail(first, 'vault tail one');
+    const appended = session.prepare(second, { measuredInputTokens: 140_000 });
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+
+    const third = appendProfitableTail(second, 'vault tail two');
+    const hardEpoch = session.prepare(third, { measuredInputTokens: 125_000 });
+    expect(hardEpoch.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
+    expect(hardEpoch.messages).toHaveLength(1);
+    const joined = vaultText(hardEpoch.messages);
+    expect(joined).toContain('OPERATOR-IOTA hard epoch ask');
+    expect(joined.split('[User Message Vault]').length - 1).toBe(1);
+    expect(joined).not.toContain('⌖ LIVE');
+  });
+
   it('defers the unanswered newest operator row from band sealing and re-seals it once answered', () => {
     const session = vaultSession({
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },

@@ -1203,7 +1203,12 @@ function buildActivityLogFromMessages(
 // portable genuine-operator filter.
 // Skip system-generated user messages (chatroom deliveries, mention pings,
 // digest deltas, rebirth seeds, ephemeral-only turns).
-function isPortableGenuineOperatorMessage(text: string): boolean {
+/**
+ * Genuine-operator filter shared with band-enrichment modules: true when a
+ * user-role message is an actual operator turn rather than a chatroom
+ * delivery, mention ping, digest delta, or ephemeral-only coordination frame.
+ */
+export function isPortableGenuineOperatorMessage(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
   if (trimmed.includes('[CONTEXT REBIRTH]')) return false;

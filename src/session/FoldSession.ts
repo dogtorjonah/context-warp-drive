@@ -44,6 +44,7 @@ import {
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
 import { extractCognitiveArtifacts, renderCognitiveBlock } from '../cognitiveArtifacts.ts';
+import { buildMicroSeedBlock } from '../microRebirthSeed.ts';
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
   createFoldFreezeState,
@@ -1139,9 +1140,13 @@ export class FoldSession {
       }
       // Seal only the per-band DELTA (rows not already sealed into an earlier
       // band) into this folded tail band before it joins the byte-frozen prefix.
-      // Cognitive artifacts are appended after a successful commit so the append
-      // gate's shrink math is computed from pure fold output.
-      const cognitiveBlock = renderCognitiveBlock(extractCognitiveArtifacts(tail));
+      // Enrichment blocks ([cognitive] results + [micro-seed] trajectory) are
+      // appended after a successful commit so the append gate's shrink math is
+      // computed from pure fold output.
+      const cognitiveBlock = [
+        renderCognitiveBlock(extractCognitiveArtifacts(tail)),
+        buildMicroSeedBlock(tail),
+      ].filter(Boolean).join('\n\n');
       const sealedTail = this.bakeVault(tailResult.messages, 'delta');
       const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, sealedTail, ctx, now);
       if (appendCommit.committed) {

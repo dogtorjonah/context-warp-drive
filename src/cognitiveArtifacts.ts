@@ -131,6 +131,19 @@ function flattenPartsArray(parts: unknown): string {
 }
 
 /**
+ * Public flattener for FoldMessage content across all transport shapes
+ * (string, content-block array, Gemini `parts` array). Exported so sibling
+ * band-enrichment modules (e.g. the micro rebirth seed) read message text
+ * through the exact same shape handling instead of duplicating it.
+ */
+export function flattenFoldMessageText(
+  content: FoldMessage['content'],
+  parts?: unknown,
+): string {
+  return flattenContent(content, parts);
+}
+
+/**
  * Extract a headline from the glyph body — the first non-empty line,
  * truncated to MAX_HEADLINE_CHARS. Skips leading markdown headers
  * and code fences that would render as noise.
