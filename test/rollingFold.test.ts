@@ -50,6 +50,7 @@ import {
   computeEvictableThroughOrdinal,
   resolveFoldBandBudgets,
   resolveFoldConfigForBand,
+  resolveColdFoldConfigForBand,
   FOLD_BLOCK_PREAMBLE,
   FOLD_TOMBSTONE_PREFIX,
   ALWAYS_ON_FOLD_CONFIG,
@@ -2639,5 +2640,31 @@ describe('resolveFoldBandBudgets / resolveFoldConfigForBand (E10b target band)',
     expect(cfg).not.toBe(ALWAYS_ON_FOLD_CONFIG);
     expect(cfg.assistantTextBudget?.fullRetentionChars).toBe(42_500);
     expect(cfg.assistantTextBudget?.essenceRetentionChars).toBe(85_000);
+  });
+
+  test('cold append-band config disables warm prose retention', () => {
+    const cold = resolveColdFoldConfigForBand(5_000);
+    expect(cold.assistantTextBudget).toEqual({
+      fullRetentionChars: 0,
+      essenceRetentionChars: 0,
+    });
+    expect(cold.retainNewestUserTextInFoldBlock).toBe(false);
+    expect(cold.verbatimKeepChars).toBe(1_000);
+
+    const messages = [
+      userMsg(`tail user request ${'operator wording '.repeat(300)} USER_DEEP_TOKEN`),
+      assistantMsg(`brief status line\n${'assistant reasoning '.repeat(300)} ASSIST_DEEP_TOKEN`),
+    ];
+    const warm = foldContext(messages, 1, resolveFoldConfigForBand(5_000));
+    const coldResult = foldContext(messages, 1, cold);
+    const warmText = warm.messages.map((msg) => typeof msg.content === 'string' ? msg.content : '').join('\n');
+    const coldText = coldResult.messages.map((msg) => typeof msg.content === 'string' ? msg.content : '').join('\n');
+
+    expect(warmText).toContain('User request:');
+    expect(warmText).toContain('USER_DEEP_TOKEN');
+    expect(coldText).not.toContain('User request:');
+    expect(coldText).not.toContain('USER_DEEP_TOKEN');
+    expect(coldText).not.toContain('ASSIST_DEEP_TOKEN');
+    expect(coldResult.foldedChars).toBeLessThan(warm.foldedChars);
   });
 });

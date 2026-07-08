@@ -25,12 +25,14 @@
 import {
   foldContext,
   detectTurns,
+  checkFoldTrigger,
   planActiveTurnStepFold,
   computeEvictableThroughOrdinal,
   countChars,
   DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
   DEFAULT_ASSISTANT_TEXT_BUDGET,
   resolveFoldConfigForBand,
+  resolveColdFoldConfigForBand,
   type FoldMessage,
   type FoldConfig,
   type FoldResult,
@@ -38,6 +40,7 @@ import {
   type FoldEvictionOutcome,
   type FoldEvictionSpan,
   type StepFoldPlan,
+  type Turn,
   type FidelityOverrides,
   type FidelityValueWeights,
   type FoldFidelityValueInput,
@@ -669,23 +672,28 @@ export class FoldSession {
     measuredInputTokens: number | undefined,
     durableCursorIndex: number,
     foldConfig: FoldConfig,
+    keepLastSteps = 12,
+    force = false,
   ): StepFoldPlan | null {
     if (durableCursorIndex < messages.length) return null;
     if (
-      typeof measuredInputTokens !== 'number'
-      || !Number.isFinite(measuredInputTokens)
-      || measuredInputTokens <= this.tailEpochTargetBandTokens
+      !force
+      && (
+        typeof measuredInputTokens !== 'number'
+        || !Number.isFinite(measuredInputTokens)
+        || measuredInputTokens <= this.tailEpochTargetBandTokens
+      )
     ) {
       return null;
     }
     const budget = foldConfig.assistantTextBudget;
     const budgetBasedActiveTurnChars = budget
-      ? budget.fullRetentionChars + budget.essenceRetentionChars
+      ? Math.max(1, budget.fullRetentionChars + budget.essenceRetentionChars)
       : 150_000;
     const activeTurnCharBudget = Math.min(budgetBasedActiveTurnChars, this.freezeConfig.maxTailChars);
     return planActiveTurnStepFold(messages, {
       activeTurnCharBudget,
-      keepLastSteps: 12,
+      keepLastSteps,
     }, this.syntheticContext);
   }
 
@@ -706,6 +714,37 @@ export class FoldSession {
       plan.turns,
       this.syntheticContext,
     );
+  }
+
+  private planOrphanTailStepFold(
+    fullHistory: FoldMessage[],
+    tailStartIndex: number,
+    foldConfig: FoldConfig,
+    keepLastSteps: number,
+  ): StepFoldPlan | undefined {
+    if (tailStartIndex <= 0 || tailStartIndex >= fullHistory.length) return undefined;
+    const tail = fullHistory.slice(tailStartIndex);
+    const tailTurns = detectTurns(tail, this.syntheticContext);
+    if (tailTurns.length > 0) return undefined;
+    const allTurns = detectTurns(fullHistory, this.syntheticContext);
+    const activeTurn = allTurns[allTurns.length - 1];
+    if (!activeTurn || activeTurn.startIndex >= tailStartIndex) return undefined;
+    const stepPlan = this.planMarathonStepFold(fullHistory, undefined, fullHistory.length, foldConfig, keepLastSteps, true);
+    const tailSegments = stepPlan?.turns
+      .map((turn, index) => ({ turn, index }))
+      .filter(({ turn }) => turn.startIndex >= tailStartIndex);
+    if (!stepPlan || !tailSegments || tailSegments.length === 0) return undefined;
+    const localTurns: Turn[] = tailSegments.map(({ turn }) => ({
+      startIndex: turn.startIndex - tailStartIndex,
+      endIndex: turn.endIndex - tailStartIndex,
+      messages: turn.messages,
+    }));
+    const localTurnsToFold = tailSegments.filter(({ index }) => index < stepPlan.turnsToFold).length;
+    if (localTurnsToFold <= 0) return undefined;
+    return {
+      turns: localTurns,
+      turnsToFold: localTurnsToFold,
+    };
   }
 
   /**
@@ -738,6 +777,13 @@ export class FoldSession {
         ? Math.round(base.essenceRetentionChars * (fidelity.essenceRetentionFraction / DEFAULT_ESSENCE_RETENTION_FRACTION))
         : base.essenceRetentionChars;
     return { ...this.foldConfig, assistantTextBudget: { fullRetentionChars, essenceRetentionChars } };
+  }
+
+  private effectiveAppendFoldConfig(): FoldConfig {
+    const cold = resolveColdFoldConfigForBand(this.tailEpochAppendBandTargetTokens);
+    return this.foldConfig.foldBlockPreamble === undefined
+      ? cold
+      : { ...cold, foldBlockPreamble: this.foldConfig.foldBlockPreamble };
   }
 
   /**
@@ -1108,13 +1154,23 @@ export class FoldSession {
       && (runway.ok || hardEpochBaselineRunwayBypass);
     if (appendOnlyTailEpoch) {
       const tail = messages.slice(this.freezeState.frozenRawCount);
+      const appendFoldConfig = this.effectiveAppendFoldConfig();
+      const tailStepPlan = this.planOrphanTailStepFold(
+        messages,
+        this.freezeState.frozenRawCount,
+        appendFoldConfig,
+        1,
+      );
+      const appendTrigger = tailStepPlan
+        ? null
+        : checkFoldTrigger(tail, appendFoldConfig, this.syntheticContext);
       const tailResult = foldContext(
         tail,
-        this.guardedTurnsToFold(tail, false),
-        this.effectiveFoldConfig(desiredFidelity),
+        tailStepPlan?.turnsToFold ?? (appendTrigger?.shouldFold ? appendTrigger.turnsToFold : 0),
+        appendFoldConfig,
         undefined,
         undefined,
-        undefined,
+        tailStepPlan?.turns,
         this.syntheticContext,
       );
       // Per-fold yield gate — evaluated on the PURE fold output BEFORE bakeVault

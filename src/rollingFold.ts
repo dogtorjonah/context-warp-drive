@@ -50,6 +50,12 @@ export interface FoldConfig {
    *  leaves this undefined -> existing threshold-gated behavior is unchanged. */
   continuous?: boolean;
   /**
+   * Preserve the newest user text inside the fold block when a fold consumes the
+   * whole view. Defaults to true for ordinary folds; cold append bands disable it
+   * because vault/cognitive deltas carry continuity and the band must collapse.
+   */
+  retainNewestUserTextInFoldBlock?: boolean;
+  /**
    * Budget in chars for the Coordinate Closet appended to the fold block.
    * Set 0 to disable. Default: 4000.
    */
@@ -378,6 +384,35 @@ export function resolveFoldConfigForBand(
       fullRetentionChars: band.fullRetentionChars,
       essenceRetentionChars: band.essenceRetentionChars,
     },
+  };
+}
+
+/**
+ * Cold append-band config for tail epochs. It keeps the same trigger geometry
+ * as resolveFoldConfigForBand, but removes warm prose retention: no full/essence
+ * assistant text, no newest-user text carry, and a smaller coordinate closet.
+ * Tail bands should be skeleton/tool receipts plus vault/cognitive deltas.
+ */
+export function resolveColdFoldConfigForBand(
+  bandTokens: number | undefined = DEFAULT_FOLD_BAND_TOKENS,
+  charsPerToken: number = BAND_CHARS_PER_TOKEN,
+  fidelity?: FidelityOverrides,
+): FoldConfig {
+  const resolvedBandTokens = bandTokens ?? DEFAULT_FOLD_BAND_TOKENS;
+  const band = resolveFoldBandBudgets(resolvedBandTokens, charsPerToken, fidelity);
+  const base = resolveFoldConfigForBand(resolvedBandTokens, charsPerToken, fidelity);
+  const baseVerbatimKeepChars = base.verbatimKeepChars ?? DEFAULT_FOLD_CONFIG.verbatimKeepChars ?? 4000;
+  return {
+    ...base,
+    assistantTextBudget: {
+      fullRetentionChars: 0,
+      essenceRetentionChars: 0,
+    },
+    retainNewestUserTextInFoldBlock: false,
+    verbatimKeepChars: Math.min(
+      baseVerbatimKeepChars,
+      Math.max(1000, Math.round(band.bandChars * 0.05)),
+    ),
   };
 }
 
@@ -2277,6 +2312,7 @@ export function foldContext(
 
     let retained: string | undefined;
     const shouldRetainNewestUserText =
+      config.retainNewestUserTextInFoldBlock !== false &&
       actualFoldCount === turns.length &&
       turnIdx === turnsToCompress.length - 1 &&
       userNominationText.trim().length > 0;

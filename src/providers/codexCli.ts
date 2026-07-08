@@ -367,7 +367,7 @@ function expandCodexStepBoundaries(messages: readonly FoldMessage[]): FoldMessag
 function resolveCodexStepFoldActiveTurnBudget(maxChars: number, foldConfig: FoldConfig): number {
   const budget = foldConfig.assistantTextBudget;
   const budgetBasedActiveTurnChars = budget
-    ? budget.fullRetentionChars + budget.essenceRetentionChars
+    ? Math.max(1, budget.fullRetentionChars + budget.essenceRetentionChars)
     : 150_000;
   const capBasedActiveTurnChars = Math.floor(maxChars * 0.25);
   return Math.min(

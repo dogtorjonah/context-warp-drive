@@ -97,6 +97,18 @@ function hybridMarathonHistory(): FoldMessage[] {
   return messages;
 }
 
+function appendAssistantLedToolTail(history: FoldMessage[], count: number): FoldMessage[] {
+  const messages = [...history];
+  for (let i = 0; i < count; i += 1) {
+    const id = `toolu_orphan_tail_${i}`;
+    messages.push(
+      anthropicToolUse(id, `/home/jonah/context-warp-drive/src/orphan_${i}.ts`),
+      anthropicToolResult(id, `${'x'.repeat(5_000)}\nORPHAN_DEEP_TOKEN_${i}`),
+    );
+  }
+  return messages;
+}
+
 describe('FoldSession fidelity overrides', () => {
   it('applies per-turn fidelity to the epoch fold config', () => {
     const withoutOverride = new FoldSession({ foldConfig: TEST_FOLD_CONFIG, freeze: false });
@@ -441,6 +453,30 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.appendDecision).toBe('committed');
     expect(appended.sealedBoundary).not.toBeNull();
     expect(session.telemetry.epochs).toBe(2);
+  });
+
+  it('cold-folds assistant-led orphan tool tails before append commit', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [
+      { role: 'user', content: 'active kickoff: keep processing tool steps' },
+    ];
+    session.prepare(first);
+    const appended = session.prepare(appendAssistantLedToolTail(first, 4), {
+      measuredInputTokens: 70_000,
+    });
+    const joined = vaultText(appended.messages);
+
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(appended.stats.appendDecision).toBe('committed');
+    expect(joined).not.toContain('ORPHAN_DEEP_TOKEN_0');
+    expect(joined).not.toContain('ORPHAN_DEEP_TOKEN_1');
+    expect(joined).not.toContain('ORPHAN_DEEP_TOKEN_2');
+    expect(joined).toContain('ORPHAN_DEEP_TOKEN_3');
   });
 
   it('accepts an append when measured runway lands exactly on the 10k floor', () => {
