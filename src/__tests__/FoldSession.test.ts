@@ -330,13 +330,10 @@ describe('FoldSession tail-epoch runway gate', () => {
     // request to end with a user message), so count needles within the
     // [cognitive] block portion of each message, not the whole message text
     // (the folded band content legitimately carries the raw headline too).
-    // The slice is bounded at [micro-seed] since v2 micro-seeds contain the
-    // actual thread text (which carries the same verdict headlines).
     const extractCognitiveBlock = (text: string): string => {
       const start = text.indexOf('[cognitive]');
       if (start < 0) return '';
-      const microSeedIdx = text.indexOf('[micro-seed]', start);
-      return microSeedIdx > start ? text.slice(start, microSeedIdx) : text.slice(start);
+      return text.slice(start);
     };
     const cognitiveBlocks = cycle3.messages
       .map((msg) => (typeof msg.content === 'string' ? msg.content : ''))

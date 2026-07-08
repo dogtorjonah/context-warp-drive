@@ -727,9 +727,15 @@ describe('planActiveTurnStepFold — marathon step-fold (single oversized turn)'
     expect(planActiveTurnStepFold(buildMarathon(3, 400), { activeTurnCharBudget: 100_000, keepLastSteps: 8 })).toBeNull();
   });
 
-  test('returns null when too few steps to fold beyond the kept tail', () => {
-    // 10 steps → 11 segments ≤ keepLastSteps(12)+1 → not worth a cache rewrite
-    expect(planActiveTurnStepFold(buildMarathon(10, 8000), { activeTurnCharBudget: 20_000, keepLastSteps: 12 })).toBeNull();
+  test('folds one old tool step when an oversized turn has fewer steps than the kept tail', () => {
+    const msgs = buildMarathon(10, 8000);
+    const plan = planActiveTurnStepFold(msgs, { activeTurnCharBudget: 20_000, keepLastSteps: 12 });
+    expect(plan).not.toBeNull();
+    expect(plan!.turns).toHaveLength(11);
+    expect(plan!.turnsToFold).toBe(2);
+    const result = foldContext(msgs, plan!.turnsToFold, DEFAULT_FOLD_CONFIG, undefined, undefined, plan!.turns);
+    expect(result.turnsFolded).toBe(2);
+    expect(result.foldedChars).toBeLessThan(result.originalChars);
   });
 
   test('segments an OpenAI/tool_calls marathon (MiniMax message format)', () => {

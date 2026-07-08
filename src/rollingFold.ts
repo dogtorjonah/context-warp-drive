@@ -864,11 +864,22 @@ export function planActiveTurnStepFold(
   if (activeChars < opts.activeTurnCharBudget) return null;
 
   const segments = segmentTurnBySteps(active);
-  if (segments.length <= opts.keepLastSteps + 1) return null;
+  // Need at least 2 steps to fold anything (fold the older ones, keep >=1 live).
+  if (segments.length <= 1) return null;
+
+  // Normally keep the last `keepLastSteps` steps at full fidelity. But oversized
+  // tool payloads can blow past activeTurnCharBudget before the step count
+  // reaches that floor. Clamp the retained tail so oversized user-led marathons
+  // fold the kickoff plus at least one old tool step; assistant-led/orphan tails
+  // can fold a single old step because their first segment is already a step.
+  const firstSegmentIsStep = isStepBoundary(segments[0].messages[0]);
+  const minSegmentsToFold = firstSegmentIsStep ? 1 : 2;
+  if (segments.length <= minSegmentsToFold) return null;
+  const effectiveKeepLastSteps = Math.min(opts.keepLastSteps, segments.length - minSegmentsToFold);
 
   const priorTurns = turns.slice(0, turns.length - 1);
   const allTurns = [...priorTurns, ...segments];
-  const turnsToFold = allTurns.length - opts.keepLastSteps;
+  const turnsToFold = allTurns.length - effectiveKeepLastSteps;
   if (turnsToFold <= priorTurns.length) return null;
 
   return { turns: allTurns, turnsToFold };

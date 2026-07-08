@@ -44,7 +44,7 @@ import {
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
 import { extractCognitiveArtifacts, renderCognitiveBlock, mergeBlockIntoViewTail } from '../cognitiveArtifacts.ts';
-import { buildMicroSeedBlock } from '../microRebirthSeed.ts';
+// microRebirthSeed import removed — tail epochs now use vault + cognitive block only
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
   createFoldFreezeState,
@@ -1142,32 +1142,20 @@ export class FoldSession {
       }
       // Seal only the per-band DELTA (rows not already sealed into an earlier
       // band) into this folded tail band before it joins the byte-frozen prefix.
-      // Enrichment blocks ([cognitive] results + [micro-seed] trajectory) are
-      // appended after a successful commit so the append gate's shrink math is
-      // computed from pure fold output.
-      const cognitiveBlock = [
-        renderCognitiveBlock(extractCognitiveArtifacts(tail)),
-        buildMicroSeedBlock(tail),
-      ].filter(Boolean).join('\n\n');
+      // The cognitive block (results/decisions/hazards) is merged into the sealed
+      // tail BEFORE the commit so the shrink-ratio gate sees the true committed
+      // band size — no post-commit inflation.
+      const cognitiveBlock = renderCognitiveBlock(extractCognitiveArtifacts(tail));
       const sealedTail = this.bakeVault(tailResult.messages, 'delta');
-      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, sealedTail, ctx, now);
+      // Pre-commit enrichment: merge cognitive block into the sealed tail's
+      // final message so the gate measures the actual committed size.
+      // Merging (not appending) preserves the terminal role and message count.
+      const enrichedTail = cognitiveBlock
+        ? mergeBlockIntoViewTail(sealedTail, cognitiveBlock)
+        : sealedTail;
+      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, enrichedTail, ctx, now);
       if (appendCommit.committed) {
-        let appendView = appendCommit.view;
-        if (cognitiveBlock && this.freezeState.frozenView) {
-          // Merge into the band's final message (never append a new assistant
-          // message): when the fold consumes the whole raw tail, the frozen
-          // view IS the full request body, and a trailing assistant message
-          // 400s providers that require ending on a user message. Merging
-          // preserves the terminal role AND the message count, keeping sealed
-          // band view indexes valid.
-          const enrichedFrozenView = mergeBlockIntoViewTail(
-            this.freezeState.frozenView,
-            cognitiveBlock,
-          );
-          this.freezeState.frozenView = enrichedFrozenView;
-          this.freezeState.frozenViewChars = countChars(enrichedFrozenView);
-          appendView = enrichedFrozenView;
-        }
+        const appendView = appendCommit.view;
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
         this.appendEpochsSinceHardReset += 1;
         // Arm the post-fold floor capture: the next measured reading after this
