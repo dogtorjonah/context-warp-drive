@@ -15,6 +15,7 @@ export * from './contextWindow.ts';
 export * from './contextBudget.ts';
 export * from './userMessageVault.ts';
 export * from './rawRebirthSeed.ts';
+export * from './foldProvenance.ts';
 
 export { DEFAULT_FOLD_PRESSURE_CEILING_TOKENS, FoldSession } from './session/FoldSession.ts';
 export type {

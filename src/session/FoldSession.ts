@@ -43,6 +43,7 @@ import {
   type FoldFidelityValueInput,
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
+import { extractCognitiveArtifacts, renderCognitiveBlock } from '../cognitiveArtifacts.ts';
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
   createFoldFreezeState,
@@ -1007,9 +1008,16 @@ export class FoldSession {
       );
       const stepResult = this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig);
       const bookkeepingResult = result.turnsFolded > 0 ? result : stepResult ?? result;
+      const cognitiveBlock = bookkeepingResult.turnsFolded > 0
+        ? renderCognitiveBlock(extractCognitiveArtifacts(messages))
+        : '';
+      const preparedMessages = stepResult?.messages ?? result.messages;
+      const messagesWithCognitive = cognitiveBlock
+        ? [...preparedMessages, { role: 'assistant', content: cognitiveBlock }]
+        : preparedMessages;
       this.commitEvictionEpoch(bookkeepingResult, upcomingEpoch);
       return this.applyVault({
-        messages: stepResult?.messages ?? result.messages,
+        messages: messagesWithCognitive,
         cacheHot: false,
         result: bookkeepingResult,
         appliedFidelity: this.activeFidelity,
@@ -1107,9 +1115,22 @@ export class FoldSession {
       }
       // Seal only the per-band DELTA (rows not already sealed into an earlier
       // band) into this folded tail band before it joins the byte-frozen prefix.
+      // Cognitive artifacts are appended after a successful commit so the append
+      // gate's shrink math is computed from pure fold output.
+      const cognitiveBlock = renderCognitiveBlock(extractCognitiveArtifacts(tail));
       const sealedTail = this.bakeVault(tailResult.messages, 'delta');
       const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, sealedTail, ctx, now);
       if (appendCommit.committed) {
+        let appendView = appendCommit.view;
+        if (cognitiveBlock && this.freezeState.frozenView) {
+          const enrichedFrozenView = [
+            ...this.freezeState.frozenView,
+            { role: 'assistant', content: cognitiveBlock },
+          ];
+          this.freezeState.frozenView = enrichedFrozenView;
+          this.freezeState.frozenViewChars = countChars(enrichedFrozenView);
+          appendView = enrichedFrozenView;
+        }
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
         // Arm the post-fold floor capture: the next measured reading after this
         // append reflects the new frozen-prefix resting level, which the
@@ -1123,7 +1144,7 @@ export class FoldSession {
         // Live overlay: deferred live row (excluded from the sealed band by
         // selectSealableVaultRows) still renders transiently (rail-c5d53b27).
         return this.applyLiveVaultOverlay({
-          messages: appendCommit.view,
+          messages: appendView,
           cacheHot: false,
           sealedBoundary: appendCommit.sealedPrefixMessageCount,
           result: tailResult,
@@ -1184,7 +1205,13 @@ export class FoldSession {
     // Full recompute: render the whole vault and bake it into the frozen view
     // before sealing (resets the sealed set, mirroring commitFoldFreeze clearing
     // sealedBands). Subsequent append epochs seal only deltas on top of this.
-    const sealedView = this.bakeVault(stepResult?.messages ?? result.messages, 'full');
+    const recomputeCognitiveBlock = bookkeepingResult.turnsFolded > 0
+      ? renderCognitiveBlock(extractCognitiveArtifacts(messages))
+      : '';
+    const sealedBaseView = this.bakeVault(stepResult?.messages ?? result.messages, 'full');
+    const sealedView = recomputeCognitiveBlock
+      ? [...sealedBaseView, { role: 'assistant', content: recomputeCognitiveBlock }]
+      : sealedBaseView;
     commitFoldFreeze(this.freezeState, messages, sealedView, ctx, now);
     this.hardEpochCompactBaselineActive = false;
     this.commitEvictionEpoch(bookkeepingResult, this.freezeState.epochs);

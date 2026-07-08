@@ -605,6 +605,7 @@ describe('FoldSession per-band vault sealing', () => {
   test('bakes the full vault into the frozen view at a full recompute', () => {
     const session = makeVaultSession();
     session.recordOperatorMessage('OPERATOR-ALPHA wants the build green', '2026-06-19T10:00:00Z');
+    session.recordAssistantMessage('🏁 build made green', '2026-06-19T10:01:00Z');
     const epoch = session.prepare(vaultTwoTurns());
 
     expect(epoch.cacheHot).toBe(false);
@@ -616,6 +617,7 @@ describe('FoldSession per-band vault sealing', () => {
   test('keeps the vault byte-identical across hot reuses (cached prefix, no per-send re-append)', () => {
     const session = makeVaultSession();
     session.recordOperatorMessage('OPERATOR-BETA pivoted to the parser', '2026-06-19T10:00:00Z');
+    session.recordAssistantMessage('🏁 parser pivot done', '2026-06-19T10:01:00Z');
     const epoch = session.prepare(vaultTwoTurns());
     const hot = session.prepare(vaultTwoTurns());
 
@@ -630,9 +632,11 @@ describe('FoldSession per-band vault sealing', () => {
       pressureCeiling: 125_000,
     });
     session.recordOperatorMessage('OPERATOR-GAMMA first directive', '2026-06-19T10:00:00Z');
+    session.recordAssistantMessage('🏁 first directive handled', '2026-06-19T10:01:00Z');
     const first = vaultTwoTurns();
     const epoch = session.prepare(first);
     session.recordOperatorMessage('OPERATOR-DELTA second directive', '2026-06-19T10:05:00Z');
+    session.recordAssistantMessage('🏁 second directive handled', '2026-06-19T10:06:00Z');
     const appended = session.prepare(vaultGrowProfitable(first, 'tail one'));
 
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
@@ -650,9 +654,11 @@ describe('FoldSession per-band vault sealing', () => {
       pressureCeiling: 91_000,
     });
     session.recordOperatorMessage('OPERATOR-EPSILON one', '2026-06-19T10:00:00Z');
+    session.recordAssistantMessage('🏁 epsilon handled', '2026-06-19T10:01:00Z');
     const first = vaultTwoTurns();
     session.prepare(first);
     session.recordOperatorMessage('OPERATOR-ZETA two', '2026-06-19T10:05:00Z');
+    session.recordAssistantMessage('🏁 zeta handled', '2026-06-19T10:06:00Z');
     const recomputed = session.prepare(vaultGrow(first, 'tail one'));
 
     expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');

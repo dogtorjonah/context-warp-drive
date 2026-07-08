@@ -1839,6 +1839,21 @@ export function episodicCompletedChainPaths(state: EpisodicInjectionState): stri
   return Array.from(state.completedChainTargetPaths).sort();
 }
 
+/**
+ * Live zones keyed by a term-cluster target ('term:...') — the recall payload's
+ * servedTermKeys. Unlike servedChapterIds (which only blocks re-serving the
+ * IDENTICAL episodes), a resident term key tells the worker the session already
+ * holds a card for that term cluster, so near-duplicate sibling episodes under
+ * the same cluster are skipped instead of re-fired on back-to-back boundaries.
+ */
+export function episodicServedTermKeys(state: EpisodicInjectionState): string[] {
+  const keys: string[] = [];
+  for (const targetPath of state.zones.keys()) {
+    if (targetPath.startsWith('term:')) keys.push(targetPath);
+  }
+  return keys.sort();
+}
+
 function cloneEpisodicCard(card: EpisodicRecallCardLike): EpisodicRecallCardLike {
   return {
     targetPath: card.targetPath,

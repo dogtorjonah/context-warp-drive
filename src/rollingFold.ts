@@ -412,6 +412,65 @@ export function countChars(messages: FoldMessage[]): number {
   return total;
 }
 
+/** Result of {@link countCharsByKind}: total is always toolChars + textChars. */
+export interface CharsByKind {
+  total: number;
+  toolChars: number;
+  textChars: number;
+}
+
+/**
+ * Same traversal shape as {@link countChars}, but classifies each counted
+ * chunk as tool content (tool-role messages, tool_use/tool_result content
+ * blocks, and function-call/response parts) or plain text/reasoning.
+ * OpenAI tool_calls metadata is intentionally not added here because countChars
+ * does not count it. Used for Mission Control vitals telemetry only
+ * (GOD RULE 7: real measured chars, never a token estimate).
+ */
+export function countCharsByKind(messages: FoldMessage[]): CharsByKind {
+  let toolChars = 0;
+  let textChars = 0;
+  for (const msg of messages) {
+    const isToolRole = msg.role === 'tool';
+    if (typeof msg.content === 'string') {
+      if (isToolRole) toolChars += msg.content.length;
+      else textChars += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (typeof block === 'string') {
+          if (isToolRole) toolChars += block.length;
+          else textChars += block.length;
+        } else if (typeof block === 'object' && block !== null) {
+          const len = JSON.stringify(block).length;
+          const blockType = (block as { type?: unknown }).type;
+          if (isToolRole || blockType === 'tool_use' || blockType === 'tool_result') {
+            toolChars += len;
+          } else {
+            textChars += len;
+          }
+        }
+      }
+    } else if (Array.isArray((msg as any).parts)) {
+      for (const part of (msg as any).parts as any[]) {
+        if (typeof part?.text === 'string') {
+          textChars += part.text.length;
+        } else if (part !== null && typeof part === 'object') {
+          const len = JSON.stringify(part).length;
+          if (isToolRole || part.functionCall !== undefined || part.functionResponse !== undefined) {
+            toolChars += len;
+          } else {
+            textChars += len;
+          }
+        }
+      }
+    }
+    const rc = msg.reasoning_content;
+    if (typeof rc === 'string') textChars += rc.length;
+
+  }
+  return { total: toolChars + textChars, toolChars, textChars };
+}
+
 export interface Turn {
   startIndex: number;
   endIndex: number;

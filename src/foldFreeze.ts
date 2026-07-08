@@ -726,6 +726,50 @@ export function getFoldFreezeMetadata(state: FoldFreezeState): FoldFreezeStateMe
   };
 }
 
+/** Per-band char summary for one sealed append-only tail-epoch band. */
+export interface FoldFreezeBandCharSummary {
+  /** 0-based band position, oldest first. */
+  bandIndex: number;
+  /** Folded chars this band contributes to the frozen view. */
+  viewChars: number;
+  /** Raw tail chars before folding produced this band, when known. */
+  rawTailChars?: number;
+  /** Chars saved by folding (rawTailChars - viewChars), when known. */
+  savedChars?: number;
+  /** viewChars / rawTailChars, when known. */
+  shrinkRatio?: number;
+}
+
+/** Seed-base + per-band char decomposition of a frozen view (see summarizeFrozenBands). */
+export interface FrozenBandsSummary {
+  /**
+   * Chars of the hard-epoch seed prefix that predates any append-only
+   * tail-epoch bands. Equal to the full frozenViewChars when no bands have
+   * been sealed yet (the whole frozen view IS the seed base).
+   */
+  seedBaseChars: number;
+  /** Per-band char breakdown, oldest first. */
+  bands: FoldFreezeBandCharSummary[];
+}
+
+/**
+ * Decompose a fold-freeze state's frozen view into its hard-epoch seed base
+ * and each append-only tail-epoch band's own char contribution. Pure, no I/O.
+ * Invariant: seedBaseChars + sum(bands[].viewChars) === state.frozenViewChars.
+ */
+export function summarizeFrozenBands(state: FoldFreezeState): FrozenBandsSummary {
+  const bands: FoldFreezeBandCharSummary[] = state.sealedBands.map((band, index) => ({
+    bandIndex: index,
+    viewChars: band.bandViewChars,
+    rawTailChars: band.rawTailChars,
+    savedChars: band.savedChars,
+    shrinkRatio: band.shrinkRatio,
+  }));
+  const seedBaseChars =
+    state.sealedBands.length > 0 ? state.sealedBands[0].sealedPrefixChars : state.frozenViewChars;
+  return { seedBaseChars, bands };
+}
+
 /**
  * Session context the freeze decision depends on: the thinning mode (hard
  * epoch trigger on change) and the CURRENT global claimed-paths set (raw

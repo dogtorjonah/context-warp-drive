@@ -23,6 +23,7 @@ This repo (`/home/jonah/context-warp-drive/`) is the **standalone public copy** 
 | `src/contextBudget.ts` | Model-aware budget resolver |
 | `src/contextWindow.ts` | Model context window registry |
 | `src/glyphs.ts` | Register glyph grammar |
+| `src/foldProvenance.ts` | Digest-only prepare receipts (buildPrepareReceipt/verifyPrepareReceipt) attesting fold determinism to outside verifiers |
 | `src/rawRebirthSeed.ts` | Trace-only rebirth seed renderer |
 | `src/session/FoldSession.ts` | Provider-agnostic fold/freeze orchestrator |
 | `src/userMessageVault.ts` | User/assistant vault blocks used by FoldSession |

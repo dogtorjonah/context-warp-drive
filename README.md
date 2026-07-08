@@ -423,6 +423,9 @@ import { parseRegisterGlyph, REGISTER_GLYPHS, classifyAssistantRegister } from '
 // Model-aware fold/pressure knobs — also at "context-warp-drive/budget"
 import { resolveContextBudget } from 'context-warp-drive';
 
+// Fold provenance receipts — digest-only trust boundary for prepared views
+import { buildPrepareReceipt, verifyPrepareReceipt } from 'context-warp-drive';
+
 // Portable execution state — also at "context-warp-drive/task-rail"
 import { startTaskRail, sprint, shoot, ackStep, serializeTaskRail } from 'context-warp-drive';
 
@@ -507,6 +510,7 @@ All optional; sensible defaults. `WARP_FOLD_FREEZE` (freeze on/off) · `WARP_FOL
 - [`docs/context-folding.md`](./docs/context-folding.md) — the authoritative engine reference (what folds, Coordinate Closet, freeze epochs, recall, episodic, env switches, source map).
 - [`docs/architecture.md`](./docs/architecture.md) — how the layers compose and how to wire them into any FC loop.
 - [`docs/glyph-grammar.md`](./docs/glyph-grammar.md) — the register-glyph contract and why it powers episodic narration.
+- [`docs/fold-provenance.md`](./docs/fold-provenance.md) — prepare receipts: sha256 provenance artifacts that make the deterministic fold/freeze invariant externally attestable and give downstream agents a `safe_to_resume`/`stale` verdict without replaying private raw history.
 
 ## Tests
 

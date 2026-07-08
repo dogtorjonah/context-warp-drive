@@ -21,9 +21,11 @@ import {
   DEFAULT_FOLD_FREEZE_CONFIG,
   isTailEpochEfficiencyAlarm,
   TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO,
+  summarizeFrozenBands,
   type FoldFreezeConfig,
   type FoldFreezeContext,
   type FoldFreezeState,
+  type FoldFreezeSealedBandMetadata,
 } from '../src/foldFreeze.ts';
 import type { FoldMessage } from '../src/rollingFold.ts';
 
@@ -594,5 +596,78 @@ describe('isTailEpochEfficiencyAlarm — tail-epoch efficiency ALARM threshold (
       expect(result.shrinkRatio).toBeCloseTo(0.7, 5);
       expect(isTailEpochEfficiencyAlarm(result.shrinkRatio)).toBe(true);
     }
+  });
+});
+
+describe('summarizeFrozenBands — seed base + per-band char decomposition', () => {
+  it('reports zero bands for a fresh (never-frozen) state', () => {
+    const state = createFoldFreezeState();
+    const summary = summarizeFrozenBands(state);
+    expect(summary.bands).toEqual([]);
+    expect(summary.seedBaseChars).toBe(0);
+    expect(summary.seedBaseChars).toBe(state.frozenViewChars);
+  });
+
+  it('reports the whole frozen view as the seed base when no bands are sealed yet', () => {
+    const { state } = frozenFixture();
+    const summary = summarizeFrozenBands(state);
+    expect(summary.bands).toEqual([]);
+    expect(summary.seedBaseChars).toBeGreaterThan(0);
+    expect(summary.seedBaseChars).toBe(state.frozenViewChars);
+  });
+
+  it('decomposes seed base + one appended tail-epoch band after a committed append', () => {
+    const { state, history } = frozenFixture();
+    const seedBaseCharsBeforeAppend = state.frozenViewChars;
+    const rawTail = [msg('user', 'x'.repeat(1000)), msg('assistant', 'y'.repeat(1000))];
+    const tailFolded = [msg('user', 'x'.repeat(1000)), msg('assistant', 'y'.repeat(100))];
+    const grown = [...history, ...rawTail];
+    const result = appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
+    expect(result.committed).toBe(true);
+
+    const summary = summarizeFrozenBands(state);
+    expect(summary.bands).toHaveLength(1);
+    // Seed base stays fixed at the pre-append frozen view size — the append
+    // only grows the tail-epoch band, never the sealed prefix.
+    expect(summary.seedBaseChars).toBe(seedBaseCharsBeforeAppend);
+    expect(summary.bands[0]).toMatchObject({
+      bandIndex: 0,
+      viewChars: 1100,
+      rawTailChars: 2000,
+      savedChars: 900,
+      shrinkRatio: 0.55,
+    });
+    // Invariant documented on summarizeFrozenBands: seedBaseChars + sum(bands[].viewChars) === frozenViewChars.
+    const bandsTotal = summary.bands.reduce((sum, b) => sum + b.viewChars, 0);
+    expect(summary.seedBaseChars + bandsTotal).toBe(state.frozenViewChars);
+  });
+
+  it('accumulates multiple sealed bands in append order with the invariant holding', () => {
+    const { state, history } = frozenFixture();
+    const seedBaseCharsBeforeAppends = state.frozenViewChars;
+
+    const rawTail1 = [msg('user', 'a'.repeat(1000)), msg('assistant', 'b'.repeat(1000))];
+    const tailFolded1 = [msg('user', 'a'.repeat(1000)), msg('assistant', 'b'.repeat(100))];
+    const grown1 = [...history, ...rawTail1];
+    const result1 = appendFoldFreezeTailEpoch(state, grown1, tailFolded1, ctx(), T0 + 4_000);
+    expect(result1.committed).toBe(true);
+
+    const rawTail2 = [msg('user', 'c'.repeat(1000)), msg('assistant', 'd'.repeat(1000))];
+    const tailFolded2 = [msg('user', 'c'.repeat(1000)), msg('assistant', 'd'.repeat(200))];
+    const grown2 = [...grown1, ...rawTail2];
+    const result2 = appendFoldFreezeTailEpoch(state, grown2, tailFolded2, ctx(), T0 + 8_000);
+    expect(result2.committed).toBe(true);
+
+    const summary = summarizeFrozenBands(state);
+    expect(summary.bands).toHaveLength(2);
+    expect(summary.bands[0].bandIndex).toBe(0);
+    expect(summary.bands[1].bandIndex).toBe(1);
+    expect(summary.bands[0].viewChars).toBe(1100);
+    expect(summary.bands[1].viewChars).toBe(1200);
+    // Seed base is still the ORIGINAL frozen prefix — multiple append-only
+    // epochs never touch it, only the per-band list grows.
+    expect(summary.seedBaseChars).toBe(seedBaseCharsBeforeAppends);
+    const bandsTotal = summary.bands.reduce((sum, b) => sum + b.viewChars, 0);
+    expect(summary.seedBaseChars + bandsTotal).toBe(state.frozenViewChars);
   });
 });

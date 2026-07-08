@@ -31,6 +31,7 @@ import {
   foldContext,
   planActiveTurnStepFold,
   countChars,
+  countCharsByKind,
   detectTurns,
   intraTurnFold,
   nominateVerbatim,
@@ -909,6 +910,65 @@ describe('countChars', () => {
   test('counts reasoning_content', () => {
     const msg: FoldMessage = { role: 'assistant', content: 'hi', reasoning_content: 'thinking...' };
     expect(countChars([msg])).toBe(2 + 11);
+  });
+});
+
+describe('countCharsByKind', () => {
+  test('text-only messages: toolChars is 0, textChars === total', () => {
+    const messages: FoldMessage[] = [
+      { role: 'user', content: 'hello there' },
+      { role: 'assistant', content: 'general kenobi' },
+    ];
+    const result = countCharsByKind(messages);
+    expect(result.total).toBe(countChars(messages));
+    expect(result.toolChars).toBe(0);
+    expect(result.textChars).toBe(result.total);
+  });
+
+  test('tool_use/tool_result content blocks count as toolChars, not textChars', () => {
+    const messages: FoldMessage[] = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'checking the file' },
+          { type: 'tool_use', name: 'Read', input: { file_path: '/tmp/x.ts' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', content: 'file contents here' }],
+      },
+    ];
+    const result = countCharsByKind(messages);
+    expect(result.total).toBe(countChars(messages));
+    expect(result.toolChars).toBeGreaterThan(0);
+    expect(result.textChars).toBeGreaterThan(0);
+    expect(result.toolChars + result.textChars).toBe(result.total);
+  });
+
+  test('tool role content counts as toolChars while tool_calls metadata is ignored', () => {
+    const toolOutput = 'tool output payload';
+    const messages: FoldMessage[] = [
+      { role: 'tool', content: toolOutput },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { id: 't1', type: 'function', function: { name: 'search', arguments: '{"q":"x"}' } },
+        ],
+      } as FoldMessage,
+    ];
+    const result = countCharsByKind(messages);
+    expect(result.total).toBe(countChars(messages));
+    expect(result.total).toBe(toolOutput.length);
+    expect(result.toolChars).toBe(toolOutput.length);
+    expect(result.textChars).toBe(0);
+    expect(result.toolChars + result.textChars).toBe(result.total);
+  });
+
+  test('empty message array: all zero', () => {
+    const result = countCharsByKind([]);
+    expect(result).toEqual({ total: 0, toolChars: 0, textChars: 0 });
   });
 });
 
