@@ -204,7 +204,7 @@ export interface FoldSessionOptions {
   readonly rawHardEpochSeedMaxChars?: number;
 
   /**
-   * Read-burst fold guard (rail-f1b6c230). When `true`, an epoch-time fold keeps
+   * Read-burst fold guard. When `true`, an epoch-time fold keeps
    * the still-open read-burst — the trailing window of co-activated file touches
    * the episode segmenter would defer — inside the active (unfolded) window, so a
    * multi-file read is not skeletonized mid-burst (the moment that costs the most
@@ -392,14 +392,28 @@ export class FoldSession {
   private readonly tailEpochFoldTriggerTokens: number | null;
   /**
    * Provider-measured post-fold floor (frozen-prefix resting occupancy) for the
-   * trigger-anchored tail-epoch runway gate. null until the first append-only
-   * tail epoch on the current seed captures it; reset whenever the sealed set
-   * empties (hard epoch / full recompute). Comparison of two provider readings
-   * only — never char-derived (GOD RULE 7). Mutable per-turn state.
+   * trigger-anchored tail-epoch runway gate. null until the first epoch on the
+   * current hard-epoch generation captures it. The floor PERSISTS across
+   * in-place full recomputes (they clear the sealed bands but do NOT drop the
+   * frozen-prefix resting level) and is cleared only by a hard epoch (seed
+   * reset — commitHardEpoch), which then re-arms capture so the next reading
+   * re-baselines to the fresh seed resting level. Comparison of two provider
+   * readings only — never char-derived (GOD RULE 7). Mutable per-turn state.
    */
   private tailEpochPostFoldFloorTokens: number | null = null;
-  /** Armed on a committed append; the next measured reading resolves the floor. */
+  /** Armed on any epoch commit; the next measured reading resolves the floor. */
   private pendingTailEpochPostFoldFloor: { readonly preFoldTokens: number } | null = null;
+  /**
+   * Epochs committed since the last HARD epoch (seed reset) — the runway gate's
+   * arming counter (mirrors fcBaseSession appendEpochCount semantics). The gate
+   * may escalate only once ≥1 epoch has committed on the current hard-epoch
+   * generation, so a fresh post-reset floor can never instant-loop the gate
+   * into back-to-back hard epochs. The sealed-band COUNT is the wrong guard:
+   * an in-place recompute clears the bands while leaving the frozen-prefix
+   * resting level high, silently disarming the gate exactly inside the churn
+   * window it exists to stop (measured: zero-yield tail epochs 17-25s apart).
+   */
+  private appendEpochsSinceHardReset = 0;
   private readonly rawHardEpochSeedMaxChars: number;
   private readonly readBurstGuardEnabled: boolean;
   private readonly valueFidelityInput: FoldFidelityValueInput | undefined;
@@ -560,7 +574,7 @@ export class FoldSession {
    * (unanswered-newest) rows onto the outgoing view. Sealed rows already ride
    * the cached frozen prefix — re-rendering the full vault here would duplicate
    * them (band text does not dedupe row-for-row) — so this appends nothing
-   * unless a live row is currently deferred from sealing (rail-c5d53b27).
+   * unless a live row is currently deferred from sealing.
    * Cache-safe: touches only the uncached tail, never frozen bytes.
    */
   private applyLiveVaultOverlay(outcome: FoldOutcome): FoldOutcome {
@@ -831,23 +845,27 @@ export class FoldSession {
    * (CLI parity — resolvePendingPostFoldBaseline / the fcBaseSession mirror). An
    * effective append epoch drops measured occupancy → re-baseline the floor to
    * that post-fold reading so the trigger-anchored runway gate tracks the true
-   * frozen-prefix resting level. A no-drop reading means the append reclaimed
-   * nothing; keep the prior floor. When the sealed set is empty (a hard epoch /
-   * full recompute cleared the bands) the floor resets to null, keeping its
-   * lifecycle in lockstep with the sealed-band count — the gate's instant-loop
-   * guard. Two provider readings only, no char-derivation (GOD RULE 7).
+   * frozen-prefix resting level. A no-drop reading means the epoch reclaimed
+   * nothing; keep the prior floor — but when NO floor exists yet, seed it from
+   * the no-drop reading so the trigger-runway gate can catch churn on the very
+   * first ineffective epoch (previously a no-drop reading never seeded a first
+   * floor and the gate stayed blind). Deliberately does NOT clear on an empty
+   * sealed set: an in-place recompute empties the bands while leaving the
+   * frozen floor high — clearing there disarmed the gate exactly inside the
+   * churn window it exists to stop. Hard resets clear and re-arm the floor
+   * explicitly in commitHardEpoch; gate ARMING is handled separately by the
+   * appendEpochsSinceHardReset counter (instant-loop guard). Two provider
+   * readings only, no char-derivation (GOD RULE 7).
    */
   private resolvePendingTailEpochPostFoldFloor(measuredInputTokens: number | undefined): void {
-    if (this.freezeState.sealedBands.length === 0) {
-      this.tailEpochPostFoldFloorTokens = null;
-      this.pendingTailEpochPostFoldFloor = null;
-      return;
-    }
     const pending = this.pendingTailEpochPostFoldFloor;
     if (!pending) return;
     if (typeof measuredInputTokens !== 'number' || !Number.isFinite(measuredInputTokens) || measuredInputTokens <= 0) return;
     this.pendingTailEpochPostFoldFloor = null;
     if (measuredInputTokens < pending.preFoldTokens) {
+      this.tailEpochPostFoldFloorTokens = Math.floor(measuredInputTokens);
+    } else if (this.tailEpochPostFoldFloorTokens === null) {
+      // First no-drop epoch: seed the floor so the trigger-runway gate can catch churn.
       this.tailEpochPostFoldFloorTokens = Math.floor(measuredInputTokens);
     }
   }
@@ -887,19 +905,23 @@ export class FoldSession {
         && this.tailEpochFoldTriggerTokens > 0
           ? Math.floor(this.tailEpochFoldTriggerTokens)
           : null;
-      if (floorTokens !== null && triggerTokens !== null && sealedAppendBandCount >= 1) {
+      if (floorTokens !== null && triggerTokens !== null && this.appendEpochsSinceHardReset >= 1) {
         // Trigger-anchored post-fold-floor gate (CLI parity —
         // checkClaudeCliHardEpochFromFloor; the fcBaseSession/foldMeasuredPressure
-        // mirror). Once ≥1 tail epoch has sealed a band on this seed, the runway
-        // that matters is how far the IRREDUCIBLE frozen prefix (the measured
-        // post-fold floor) sits below the fold TRIGGER — not how far current
-        // pre-fold occupancy sits below the ceiling. A band append cannot reclaim
-        // the frozen prefix, so once the floor rises within minRunway of the
-        // trigger each further append reclaims ~nothing (the band-append livelock:
-        // the 22-tail-epochs-never-hard-epoch pathology). Escalate to a full
-        // recompute (hard epoch). The ≥1-sealed-band requirement is the
-        // instant-loop guard: a fresh fat seed (no bands yet) can never floor-gate
-        // itself into a loop. GOD RULE 7: floor + trigger are measured/resolved.
+        // mirror). Once ≥1 epoch has committed on this hard-epoch generation, the
+        // runway that matters is how far the IRREDUCIBLE frozen prefix (the
+        // measured post-fold floor) sits below the fold TRIGGER — not how far
+        // current pre-fold occupancy sits below the ceiling. A band append cannot
+        // reclaim the frozen prefix, so once the floor rises within minRunway of
+        // the trigger each further append reclaims ~nothing (the band-append
+        // livelock: the 22-tail-epochs-never-hard-epoch pathology). Escalate to a
+        // HARD epoch (seed reset — the only epoch kind that drops the floor).
+        // Arming counts epochs since the last hard reset, NOT sealed bands: an
+        // in-place recompute clears the bands without dropping the floor, and
+        // band-count arming disarmed the gate exactly inside the churn window.
+        // The ≥1-epoch requirement is the instant-loop guard: a fresh post-reset
+        // floor can never gate itself into back-to-back hard epochs.
+        // GOD RULE 7: floor + trigger are measured/resolved tokens.
         const postAppendRunwayTokens = triggerTokens - floorTokens;
         return {
           ok: postAppendRunwayTokens >= this.tailEpochMinRunwayTokens,
@@ -1046,8 +1068,8 @@ export class FoldSession {
       // epoch) — hot reuse re-sends them for free. The transient overlay exists
       // for rows NOT in the prefix: the deferred live (unanswered-newest)
       // operator row renders with its LIVE marker on the uncached tail, so
-      // liveness survives reuse sends without touching frozen bytes
-      // (rail-c5d53b27). NOT applyVault: a full render would duplicate the
+      // liveness survives reuse sends without touching frozen bytes. NOT
+      // applyVault: a full render would duplicate the
       // already-sealed band rows (dedupe is row-vs-visible-text, not band bytes).
       return this.applyLiveVaultOverlay({
         messages: decision.view,
@@ -1096,17 +1118,19 @@ export class FoldSession {
       // (which seals vault fingerprints) and appendFoldFreezeTailEpoch (which
       // mutates freeze state on commit), so an escalation leaves NO half-baked
       // state behind. shrinkRatio = folded chars / raw-tail chars is the fold's
-      // actual compression. AT PRESSURE (measured ≥ trigger) a low-yield fold
+      // actual compression. When trigger-runway is thin (trigger − measured <
+      // minRunway; at-pressure is the zero/negative subset), a low-yield fold
       // (retains >70%) barely drops the frozen floor, so the next turn tail-epochs
       // again (the "folds barely dropping the tail" livelock); a full recompute of
       // the same incompressible content would not help — only a topology-resetting
-      // seed hard epoch does. Measured-only pressure judgement (GOD RULE 7).
+      // seed hard epoch does. Measured-only runway judgement (GOD RULE 7).
       const yieldRawTailChars = countChars(tail);
       const yieldShrinkRatio = yieldRawTailChars > 0 ? countChars(tailResult.messages) / yieldRawTailChars : null;
       if (shouldEscalateTailEpochForLowYield(
         yieldShrinkRatio,
         context.measuredInputTokens ?? null,
         this.tailEpochFoldTriggerTokens,
+        this.tailEpochMinRunwayTokens,
       )) {
         const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
           maxChars: this.rawHardEpochSeedMaxChars,
@@ -1132,6 +1156,7 @@ export class FoldSession {
           appendView = enrichedFrozenView;
         }
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
+        this.appendEpochsSinceHardReset += 1;
         // Arm the post-fold floor capture: the next measured reading after this
         // append reflects the new frozen-prefix resting level, which the
         // trigger-anchored runway gate uses to escalate future low-yield appends
@@ -1142,7 +1167,7 @@ export class FoldSession {
           this.pendingTailEpochPostFoldFloor = { preFoldTokens: Math.floor(context.measuredInputTokens) };
         }
         // Live overlay: deferred live row (excluded from the sealed band by
-        // selectSealableVaultRows) still renders transiently (rail-c5d53b27).
+        // selectSealableVaultRows) still renders transiently.
         return this.applyLiveVaultOverlay({
           messages: appendView,
           cacheHot: false,
@@ -1164,7 +1189,7 @@ export class FoldSession {
         this.activeFidelity = previousActiveFidelity;
         touchFoldFreeze(this.freezeState, now);
         // Live overlay: same live-row transient render on the skipped-append
-        // (hot view) path (rail-c5d53b27).
+        // (hot view) path.
         return this.applyLiveVaultOverlay({
           messages: appendCommit.view,
           cacheHot: true,
@@ -1185,6 +1210,20 @@ export class FoldSession {
           },
         });
       }
+    }
+    if (recomputeReason === 'tail-epoch' && !pressureCeilingTriggered && !appendOnlyTailEpoch) {
+      // Runway-gate escalation (FC parity — resolveTailEpochRouting's
+      // runwayGateForcesFullRecompute routes to the portable seed reset). A tail
+      // epoch whose post-append floor would sit within minRunway of the fold
+      // trigger buys ~no working runway, and an in-place recompute does not drop
+      // the frozen floor either (measured: five recomputes pinned at 81K→90K
+      // frozen chars while folds churned 10-38s apart). Only a HARD epoch (seed
+      // reset) drops the floor to the bottom of the sawtooth and regains
+      // runway — route there directly instead of the legacy recompute.
+      const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
+        maxChars: this.rawHardEpochSeedMaxChars,
+      });
+      return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, false, 'tail-runway-gate+hard-epoch');
     }
     const foldConfig = this.effectiveFoldConfig(desiredFidelity);
     const result = foldContext(
@@ -1214,6 +1253,18 @@ export class FoldSession {
       : sealedBaseView;
     commitFoldFreeze(this.freezeState, messages, sealedView, ctx, now);
     this.hardEpochCompactBaselineActive = false;
+    // In-place recompute clears the sealed-band generation, but it does not
+    // reset the hard-epoch generation. Keep the runway gate's arming counter:
+    // the floor itself PERSISTS, so resetting the counter here would create a
+    // one-epoch blind spot exactly when a cold/full recompute leaves occupancy
+    // high. Only a hard epoch clears both the floor and the counter. Arm
+    // post-epoch floor capture so the next measured reading can re-baseline it
+    // downward or seed a first floor (GOD RULE 7: provider-measured readings only).
+    if (typeof context.measuredInputTokens === 'number'
+      && Number.isFinite(context.measuredInputTokens)
+      && context.measuredInputTokens > 0) {
+      this.pendingTailEpochPostFoldFloor = { preFoldTokens: Math.floor(context.measuredInputTokens) };
+    }
     this.commitEvictionEpoch(bookkeepingResult, this.freezeState.epochs);
     const epochReason = pressureCeilingTriggered
       ? recomputeReason ? `pressure-ceiling+${recomputeReason}` : 'pressure-ceiling'
@@ -1222,7 +1273,7 @@ export class FoldSession {
         : recomputeReason;
     // Live overlay: the full bake seals everything EXCEPT the deferred live
     // row; render it transiently on the outgoing view so the unanswered ask is
-    // never dropped at an epoch boundary (rail-c5d53b27).
+    // never dropped at an epoch boundary.
     return this.applyLiveVaultOverlay({
       messages: sealedView,
       cacheHot: false,
@@ -1271,7 +1322,12 @@ export class FoldSession {
     pressureCeilingTriggered: boolean,
     epochReason: string = 'hard-epoch',
   ): FoldOutcome {
-    const view = buildHardEpochSeedView(messages, seedPrompt);
+    // Bake the FULL operator vault into the seed view: the raw hard-epoch seed
+    // is char-bounded, so old operator wording can fall off its Current Thread
+    // band — the vault companion exists precisely so user messages never fold
+    // away, and hard epochs must honor that guarantee too (the recompute path
+    // it replaced always did a full bake). Empty/disabled vault → no-op.
+    const view = this.bakeVault(buildHardEpochSeedView(messages, seedPrompt), 'full');
     const originalChars = countChars(messages);
     const foldedChars = countChars(view);
     const result: FoldResult = {
@@ -1293,6 +1349,19 @@ export class FoldSession {
       this.freezeState.lastAppendBoundaryViewCount = view.length;
       this.hardEpochCompactBaselineActive = true;
     }
+    // Hard reset: the seed reset is the one epoch kind that drops the frozen
+    // floor. Clear the trigger-anchored gate state and re-arm floor capture so
+    // the next measured reading re-baselines to the fresh seed resting level.
+    // The arming counter restarts — the instant-loop guard: the gate cannot
+    // fire again until ≥1 epoch commits on this new hard-epoch generation.
+    // GOD RULE 7: floor lifecycle uses provider-measured readings only.
+    this.appendEpochsSinceHardReset = 0;
+    this.tailEpochPostFoldFloorTokens = null;
+    this.pendingTailEpochPostFoldFloor = typeof context.measuredInputTokens === 'number'
+      && Number.isFinite(context.measuredInputTokens)
+      && context.measuredInputTokens > 0
+        ? { preFoldTokens: Math.floor(context.measuredInputTokens) }
+        : null;
     return {
       messages: view,
       cacheHot: false,

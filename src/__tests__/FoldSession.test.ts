@@ -441,7 +441,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.appendDecision).toBe('committed');
   });
 
-  it('full-recomputes a telemetryless tail epoch when fallback modeling leaves less than the 10k floor', () => {
+  it('hard-epochs a telemetryless tail epoch when fallback modeling leaves less than the 10k floor', () => {
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -453,8 +453,8 @@ describe('FoldSession tail-epoch runway gate', () => {
     const recomputed = session.prepare(appendTurn(first, 'tail one'));
 
     expect(recomputed.cacheHot).toBe(false);
-    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
-    expect(recomputed.sealedBoundary).toBeNull();
+    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
+    expect(recomputed.messages).toHaveLength(1);
     expect(session.telemetry.epochs).toBe(2);
   });
 
@@ -519,7 +519,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(resumed.sealedBoundary).toBe(ceiling.messages.length);
   });
 
-  it('escalates a tail epoch to a full recompute when the trigger-anchored post-fold floor rises within min runway (CLI floor-gate parity)', () => {
+  it('escalates a tail epoch to a hard epoch when the trigger-anchored post-fold floor rises within min runway (CLI floor-gate parity)', () => {
     // Uniform geometry: 180K ceiling, 150K trigger, 30K min runway. The measured
     // ceiling basis alone (180K − measured) would keep appending forever (the
     // 22-tail-epochs-never-hard-epoch pathology); the trigger-anchored floor gate
@@ -533,22 +533,54 @@ describe('FoldSession tail-epoch runway gate', () => {
     });
     const first = twoTurnHistory();
     session.prepare(first);
-    // First tail epoch: no sealed band yet → the ≥1-band instant-loop guard keeps
-    // the floor gate OFF, so the ceiling basis (180K − 140K = 40K ≥ 30K) appends
+    // First tail epoch: no epoch has committed since the seed yet, so the ≥1-epoch
+    // instant-loop guard keeps the floor gate OFF; the ceiling basis appends
     // and ARMS the post-fold floor with this pre-fold reading (140K).
     const t2 = appendProfitableTail(first, 'tail one');
     const firstAppend = session.prepare(t2, { measuredInputTokens: 140_000 });
     expect(firstAppend.stats.epochReason).toBe('tail-epoch-append');
     expect(firstAppend.stats.appendDecision).toBe('committed');
     // Next tail epoch: the append dropped occupancy to 125K, RE-BASELINING the
-    // floor (125K < armed 140K). Now sealedBand ≥ 1 → floor gate engages:
+    // floor (125K < armed 140K). Now appendEpochsSinceHardReset ≥ 1, so floor gate engages:
     // 150K trigger − 125K floor = 25K < 30K min runway → escalate. The stale
     // ceiling basis (180K − 125K = 55K) would still have appended.
     const t3 = appendProfitableTail(t2, 'tail two');
     const escalated = session.prepare(t3, { measuredInputTokens: 125_000 });
     expect(escalated.cacheHot).toBe(false);
-    expect(escalated.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
-    expect(escalated.sealedBoundary).toBeNull();
+    expect(escalated.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
+    expect(escalated.messages).toHaveLength(1);
+  });
+
+  it('keeps the trigger floor gate armed across a cold full recompute that clears sealed bands', () => {
+    let now = 1_000;
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 180_000,
+      tailEpochRunway: { foldTriggerTokens: 150_000, minRunwayTokens: 30_000 },
+      now: () => now,
+    });
+    const first = twoTurnHistory();
+    session.prepare(first);
+    const t2 = appendProfitableTail(first, 'tail one');
+    const firstAppend = session.prepare(t2, { measuredInputTokens: 140_000 });
+    expect(firstAppend.stats.epochReason).toBe('tail-epoch-append');
+    expect(firstAppend.stats.appendDecision).toBe('committed');
+
+    // A cold-gap full recompute clears the sealed band set, but not the
+    // provider-measured floor. The arming counter must survive that recompute,
+    // otherwise the next tail epoch falls back to the stale ceiling basis and
+    // appends through a floor that is already inside minRunway of the trigger.
+    now += 61_000;
+    const coldRecompute = session.prepare(t2, { measuredInputTokens: 125_000 });
+    expect(coldRecompute.cacheHot).toBe(false);
+    expect(coldRecompute.stats.appendDecision).toBeUndefined();
+
+    const t3 = appendProfitableTail(t2, 'tail two');
+    const escalated = session.prepare(t3, { measuredInputTokens: 125_000 });
+    expect(escalated.cacheHot).toBe(false);
+    expect(escalated.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
+    expect(escalated.messages).toHaveLength(1);
   });
 
   it('keeps appending on the same occupancy when no trigger is configured (legacy ceiling basis, no floor gate)', () => {
@@ -603,7 +635,7 @@ describe('FoldSession per-fold yield gate', () => {
     expect(escalated.messages).toHaveLength(1);
   });
 
-  it('does NOT escalate the same low-yield fold below the trigger (off-pressure hot-reuse preserved)', () => {
+  it('does NOT escalate the same low-yield fold below the trigger when trigger-runway is ample', () => {
     const session = new FoldSession({
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -613,12 +645,30 @@ describe('FoldSession per-fold yield gate', () => {
     });
     const first = twoTurnHistory();
     session.prepare(first);
-    // Measured 90K < 100K trigger → not at pressure → the gate stays off and the
-    // unprofitable fold hot-reuses exactly as before the yield gate existed.
-    const reused = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 90_000 });
+    // Measured 60K < 100K trigger with 40K trigger-runway >= 30K min runway:
+    // the gate stays off and the unprofitable fold hot-reuses.
+    const reused = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 60_000 });
     expect(reused.cacheHot).toBe(true);
     expect(reused.stats.appendDecision).toBe('skipped');
     expect(reused.stats.appendSkipReason).toBe('not-smaller');
+  });
+
+  it('escalates a low-yield fold below the trigger when trigger-runway is thin', () => {
+    const session = new FoldSession({
+      foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 180_000,
+      tailEpochRunway: YIELD_RUNWAY,
+      now: () => 1_000,
+    });
+    const first = twoTurnHistory();
+    session.prepare(first);
+    // Measured 90K < 100K trigger, but trigger-runway is only 10K < 30K:
+    // appending a zero-yield band would churn, so escalate to the hard seed.
+    const escalated = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 90_000 });
+    expect(escalated.cacheHot).toBe(false);
+    expect(escalated.stats.epochReason).toBe('tail-yield-gate+hard-epoch');
+    expect(escalated.messages).toHaveLength(1);
   });
 
   it('appends a HIGH-yield fold at pressure (gate is yield-specific, not a blanket at-pressure hard epoch)', () => {
@@ -783,20 +833,19 @@ describe('FoldSession per-band vault sealing', () => {
     expect(appended.messages.slice(0, boundary)).toEqual(epoch.messages);
   });
 
-  it('re-renders the full vault on a full recompute (sealed set reset)', () => {
-    const session = vaultSession({
-      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
-      pressureCeiling: 91_000,
-    });
+  it('re-renders the full vault on a cold full recompute (sealed set reset)', () => {
+    let now = 1_000;
+    const session = vaultSession({ now: () => now });
     session.recordOperatorMessage('OPERATOR-EPSILON one', '2026-06-19T10:00:00Z');
     session.recordAssistantMessage('🏁 epsilon handled', '2026-06-19T10:01:00Z');
     const first = twoTurnHistory();
     session.prepare(first);
     session.recordOperatorMessage('OPERATOR-ZETA two', '2026-06-19T10:05:00Z');
     session.recordAssistantMessage('🏁 zeta handled', '2026-06-19T10:06:00Z');
-    const recomputed = session.prepare(appendTurn(first, 'tail one'));
+    now += 61_000;
+    const recomputed = session.prepare(first);
 
-    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
+    expect(recomputed.cacheHot).toBe(false);
     const joined = vaultText(recomputed.messages);
     expect(joined).toContain('OPERATOR-EPSILON one');
     expect(joined).toContain('OPERATOR-ZETA two');

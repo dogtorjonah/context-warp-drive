@@ -315,19 +315,27 @@ export const TAIL_EPOCH_YIELD_ESCALATE_SHRINK_RATIO = 0.7;
  * Whole-gate decision for the per-fold yield escalation: should THIS would-be
  * tail-epoch band be abandoned for a hard epoch instead of appended? True only
  * when BOTH (a) the band retains > 70% of raw (shrinkRatio > the escalate
- * threshold — a low-yield fold) AND (b) the session is at pressure (measured
- * occupancy ≥ the fold trigger). Off-pressure a weak fold is harmless (ample
- * runway) and still appends/hot-reuses, so the gate never fires early on a cold
- * session. shrinkRatio is a text-compression ratio (folded chars / raw chars) —
- * NOT a token count — so this is GOD-RULE-7-safe; pressure is judged only from
- * provider-measured tokens vs the resolved trigger, never synthesized from chars.
- * Returns false whenever shrinkRatio is null (no raw tail to judge) or the
- * measured/trigger pair is unavailable (cannot assess pressure → legacy append).
+ * threshold — a low-yield fold) AND (b) the measured trigger-runway is thin:
+ * trigger − measured < tailEpochMinRunwayTokens. At/above the trigger the
+ * runway is ≤ 0, so the legacy at-pressure condition (measured ≥ trigger) is a
+ * strict subset of the runway condition. The widening exists because gap-timer
+ * folds fire BELOW the token trigger: a zero-yield band committed there barely
+ * drops the frozen floor and the session re-folds seconds later (measured
+ * churn: 100%-retention tail epochs 17-25s apart under the trigger). When no
+ * min-runway is supplied, falls back to the legacy at-pressure check. Far from
+ * the trigger a weak fold is harmless (ample runway) and still appends/hot-
+ * reuses, so the gate never fires early on a cold session. shrinkRatio is a
+ * text-compression ratio (folded chars / raw chars) — NOT a token count — so
+ * this is GOD-RULE-7-safe; runway is judged only from provider-measured tokens
+ * vs the resolved trigger, never synthesized from chars. Returns false whenever
+ * shrinkRatio is null (no raw tail to judge) or the measured/trigger pair is
+ * unavailable (cannot assess runway → legacy append).
  */
 export function shouldEscalateTailEpochForLowYield(
   shrinkRatio: number | null,
   measuredInputTokens: number | null | undefined,
   foldTriggerTokens: number | null | undefined,
+  tailEpochMinRunwayTokens?: number | null,
 ): boolean {
   if (shrinkRatio === null || !Number.isFinite(shrinkRatio) || shrinkRatio <= TAIL_EPOCH_YIELD_ESCALATE_SHRINK_RATIO) {
     return false;
@@ -339,7 +347,11 @@ export function shouldEscalateTailEpochForLowYield(
     ? foldTriggerTokens
     : null;
   if (measured === null || trigger === null) return false;
-  return measured >= trigger;
+  const minRunway = typeof tailEpochMinRunwayTokens === 'number' && Number.isFinite(tailEpochMinRunwayTokens) && tailEpochMinRunwayTokens > 0
+    ? tailEpochMinRunwayTokens
+    : null;
+  if (minRunway === null) return measured >= trigger;
+  return trigger - measured < minRunway;
 }
 
 export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecomputeCause[] = [

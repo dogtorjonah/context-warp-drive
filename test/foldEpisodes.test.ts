@@ -7,6 +7,7 @@ import {
   EPISODIC_BOOKKEEPING_TOOLS,
   episodicCardHeaderLine,
   episodicCompletedChainPaths,
+  episodicServedTermKeys,
   expireEpisodicZones,
   formatChainCard,
   formatWalkPromotionCard,
@@ -86,6 +87,28 @@ describe('episodic completed-chain path ledger', () => {
     st.boundarySeq = 4;
     expireEpisodicZones(st);
     expect(episodicCompletedChainPaths(st)).toEqual([]);
+  });
+});
+
+describe('episodic served term keys', () => {
+  it('exposes only live term-cluster zones, sorted; path zones excluded', () => {
+    const st = createEpisodicInjectionState();
+    noteEpisodicInjection(st, [
+      card({ targetPath: 'term:zeta+alpha', kind: 'term' }),
+      card({ targetPath: 'term:beta+gamma', kind: 'term' }),
+      card(), // path-keyed chain zone must not leak into term keys
+    ]);
+    expect(episodicServedTermKeys(st)).toEqual(['term:beta+gamma', 'term:zeta+alpha']);
+    expect(episodicServedTermKeys(st)).not.toContain('src/a.ts');
+  });
+
+  it('drops a term key once its zone expires — the cluster may re-fire', () => {
+    const st = createEpisodicInjectionState();
+    noteEpisodicInjection(st, [card({ targetPath: 'term:alpha+beta', kind: 'term' })], 2);
+    expect(episodicServedTermKeys(st)).toEqual(['term:alpha+beta']);
+    st.boundarySeq = 2;
+    expireEpisodicZones(st);
+    expect(episodicServedTermKeys(st)).toEqual([]);
   });
 });
 
