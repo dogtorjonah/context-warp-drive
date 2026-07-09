@@ -13,6 +13,7 @@ import {
   formatWalkPromotionCard,
   isEpisodicBookkeepingTool,
   noteEpisodicInjection,
+  reconcileVisibleEpisodicHeaders,
   type Episode,
   type EpisodeAnnotation,
   type EpisodicRecallCardLike,
@@ -84,8 +85,7 @@ describe('episodic completed-chain path ledger', () => {
       memberPaths: [],
       kind: 'pointer',
     })], 2);
-    st.boundarySeq = 4;
-    expireEpisodicZones(st);
+    reconcileVisibleEpisodicHeaders(st, new Set());
     expect(episodicCompletedChainPaths(st)).toEqual([]);
   });
 });
@@ -102,12 +102,14 @@ describe('episodic served term keys', () => {
     expect(episodicServedTermKeys(st)).not.toContain('src/a.ts');
   });
 
-  it('drops a term key once its zone expires — the cluster may re-fire', () => {
+  it('keeps a term key past TTL while its card remains visible, then releases it at POV exit', () => {
     const st = createEpisodicInjectionState();
     noteEpisodicInjection(st, [card({ targetPath: 'term:alpha+beta', kind: 'term' })], 2);
     expect(episodicServedTermKeys(st)).toEqual(['term:alpha+beta']);
     st.boundarySeq = 2;
     expireEpisodicZones(st);
+    expect(episodicServedTermKeys(st)).toEqual(['term:alpha+beta']);
+    reconcileVisibleEpisodicHeaders(st, new Set());
     expect(episodicServedTermKeys(st)).toEqual([]);
   });
 });

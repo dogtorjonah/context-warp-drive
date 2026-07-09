@@ -740,10 +740,35 @@ function formatSummonVaultLedger(input: RawRebirthSeedInput): string {
   ].join('\n');
 }
 
+/**
+ * Control-capsule active-request cap. Matches the relay's last_user_active
+ * surface budget (6000 chars) so the portable seed preserves the same
+ * operator requests byte-complete; the old 1500-char cap silently excerpted
+ * mid-length requests while the label still claimed 'verbatim'.
+ */
+const CONTROL_ACTIVE_REQUEST_MAX_CHARS = 6_000;
+
 function renderUserMessageForRebirth(text: string): string {
   const trimmed = text.trim();
   if (!trimmed) return '';
-  return truncateMiddle(trimmed, 1_500);
+  return truncateMiddle(trimmed, CONTROL_ACTIVE_REQUEST_MAX_CHARS);
+}
+
+/**
+ * AI-only remainder of the combined Last User + AI block. When a bundled
+ * trigger renders the user's message as the control capsule's authoritative
+ * active request, re-rendering the combined block would duplicate it — but
+ * dropping the whole block loses the freshest AI message, which can be the
+ * ONLY copy of the predecessor's last words when Current Thread is empty.
+ * Splits on the builder's optional `[timestamp] 🤖 LAST AI MESSAGE` line marker
+ * and keeps everything from that line onward; returns '' when no AI half exists.
+ */
+function extractLastAiOnlyBlock(lastUserAiMessages: string | null | undefined): string {
+  const text = lastUserAiMessages?.trim();
+  if (!text) return '';
+  const marker = /^(?:\[[^\n\]]*\]\s*)?🤖 LAST AI MESSAGE/mu.exec(text);
+  if (!marker) return '';
+  return text.slice(marker.index).trim();
 }
 
 // ── portable cross-section containment dedupe ────
@@ -904,6 +929,21 @@ function findResumeLine(resumePoint: string | undefined, prefix: string): string
   return resumePoint?.split('\n').find((line) => line.startsWith(prefix))?.trim() ?? 'unknown';
 }
 
+/**
+ * Control-capsule active request with an honest label. Cap matches the
+ * relay's last_user_active surface (6000 chars) so operator requests survive
+ * byte-complete far past the old 1500-char cap. 'verbatim' appears ONLY when
+ * the rendered body is byte-identical to the full request; an excerpt is
+ * labeled as such with the true size and a tap pointer.
+ */
+function formatControlActiveRequest(activeRequest: string): string {
+  const rendered = renderUserMessageForRebirth(activeRequest);
+  if (rendered === activeRequest) {
+    return `active request (verbatim; sole authoritative body):\n${rendered}`;
+  }
+  return `active request (EXCERPT — ${activeRequest.length} chars total, middle elided; full text via tap_instance_messages; sole authoritative body):\n${rendered}`;
+}
+
 function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
   const activeRequest = cleanString(input.triggeringUserMessage);
   const rail = findResumeLine(input.resumePoint, '📋 ');
@@ -923,7 +963,7 @@ function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLi
     `edit ownership: ${editOwnership}`,
     'validation state: unknown unless stated in Current Thread or Task Rail Context',
     'truth order: this control block > active request > Active Edit Delta > Task Rail Context > recent dialogue > historical evidence',
-    activeRequest ? `active request (verbatim; sole authoritative body):\n${renderUserMessageForRebirth(activeRequest)}` : 'active request: none bundled',
+    activeRequest ? formatControlActiveRequest(activeRequest) : 'active request: none bundled',
   ].join('\n');
 }
 
@@ -951,15 +991,22 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     budgetedSections,
     input,
     'lastUserAiMessages',
-    input.lastUserAiMessages?.trim() && !input.triggeringUserMessage?.trim()
-      ? (() => {
-          const base = `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. These are the freshest human and AI messages available at rebirth.***\n\n${input.lastUserAiMessages!.trim()}`;
-          // append Resume Point to Last User + AI block.
-          return input.resumePoint?.trim() ? `${base}\n\n${input.resumePoint.trim()}` : base;
-        })()
-      : input.resumePoint?.trim()
-        ? `\n${input.resumePoint.trim()}`
-        : undefined,
+    (() => {
+      const combined = input.lastUserAiMessages?.trim();
+      // append Resume Point to Last User + AI block.
+      const resumeSuffix = input.resumePoint?.trim() ? `\n\n${input.resumePoint.trim()}` : '';
+      if (combined && !input.triggeringUserMessage?.trim()) {
+        return `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. These are the freshest human and AI messages available at rebirth.***\n\n${combined}${resumeSuffix}`;
+      }
+      // Bundled trigger: keep only the AI half — the user half is the control
+      // capsule's authoritative active request, and the AI half can be the
+      // sole copy of the freshest assistant state when Current Thread is empty.
+      const aiOnly = combined ? extractLastAiOnlyBlock(combined) : '';
+      if (aiOnly) {
+        return `\n── Last AI Message (READ FIRST) ──\n***READ THIS FIRST. This is the freshest AI message available at rebirth; the freshest user message is the active request in Rebirth Control.***\n\n${aiOnly}${resumeSuffix}`;
+      }
+      return input.resumePoint?.trim() ? `\n${input.resumePoint.trim()}` : undefined;
+    })(),
   );
 
   const currentThreadBlocks = [input.currentThread?.trim() ?? ''].filter(Boolean);

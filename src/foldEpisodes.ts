@@ -1546,6 +1546,13 @@ export interface EpisodicZoneResidency {
    */
   chapterIds: number[];
   /**
+   * Byte-stable card headers currently known to remain provider-visible for
+   * this zone. Boundary TTL is only a fallback for legacy/unreconciled state;
+   * a visible card keeps its served cursor resident until a fold view proves
+   * that header left POV.
+   */
+  visibleCardHeaders?: string[];
+  /**
    * Hot/recent card to keep as logical working memory while the agent keeps
    * touching this zone. Walk/pointer cards do not replace it — they advance the
    * older-chapter cursor while the hot card remains the path anchor.
@@ -1788,6 +1795,8 @@ export interface EpisodicInjectionState {
   episodicPinChars: number;
   /** Target paths whose completed-chain pointer was already shown during the current live zone. */
   completedChainTargetPaths: Set<string>;
+  /** Exact card headers still believed to occupy the provider-visible context. */
+  visibleCardHeaders: Set<string>;
   /**
    * Boundaries where the inhale + pin were skipped because a pure bookkeeping
    * tool dispatched (see isEpisodicBookkeepingTool). The exhale of already-earned
@@ -1811,14 +1820,21 @@ export function createEpisodicInjectionState(): EpisodicInjectionState {
     episodicPinsInjected: 0,
     episodicPinChars: 0,
     completedChainTargetPaths: new Set(),
+    visibleCardHeaders: new Set(),
     episodicBookkeepingSuppressed: 0,
   };
 }
 
-/** Drop expired zones; their chapterIds leave the served-set (walk cursor reset). */
+/**
+ * Drop expired zones only after their exact cards have left provider POV.
+ * Hosts reconcile visibleCardHeaders after each fold epoch; between epochs an
+ * injected card remains visible even if its old boundary TTL elapses.
+ */
 export function expireEpisodicZones(state: EpisodicInjectionState): void {
   for (const [path, zone] of state.zones) {
     if (zone.expiresAtBoundary <= state.boundarySeq) {
+      const remainsVisible = zone.visibleCardHeaders?.some((header) => state.visibleCardHeaders.has(header)) === true;
+      if (remainsVisible) continue;
       state.zones.delete(path);
       state.completedChainTargetPaths.delete(path);
     }
@@ -1889,7 +1905,9 @@ export function consumeEpisodicStash(
     state.episodicSuppressed += stash.cards.length;
     return null;
   }
-  return stash.cards.length > 0 ? stash.cards : null;
+  const unseen = stash.cards.filter((card) => !state.visibleCardHeaders.has(episodicCardHeaderLine(card)));
+  state.episodicSuppressed += stash.cards.length - unseen.length;
+  return unseen.length > 0 ? unseen : null;
 }
 
 /**
@@ -1909,6 +1927,10 @@ export function noteEpisodicInjection(
     const existing = state.zones.get(card.targetPath);
     const merged = new Set(existing ? existing.chapterIds : []);
     for (const id of card.chapterIds) merged.add(id);
+    const headerLine = episodicCardHeaderLine(card);
+    state.visibleCardHeaders.add(headerLine);
+    const visibleCardHeaders = new Set(existing?.visibleCardHeaders ?? []);
+    visibleCardHeaders.add(headerLine);
     const activeCard = isActivePathAnchorCard(card)
       ? cloneEpisodicCard(card)
       : existing?.activeCard;
@@ -1917,6 +1939,7 @@ export function noteEpisodicInjection(
     const zone: EpisodicZoneResidency = {
       expiresAtBoundary: state.boundarySeq + ttlBoundaries,
       chapterIds: Array.from(merged).sort((a, b) => a - b),
+      visibleCardHeaders: Array.from(visibleCardHeaders).sort(),
       ...(activeCard ? { activeCard } : {}),
       firstSeenBoundary: existing?.firstSeenBoundary ?? state.boundarySeq,
       lastEngagedBoundary: state.boundarySeq,
@@ -2048,6 +2071,51 @@ export function collectResidentEpisodicHeaders(viewText: string): Set<string> {
     if (EPISODIC_CARD_HEADER_PREFIX_RE.test(line)) out.add(line);
   }
   return out;
+}
+
+/**
+ * Replace the visible-card ledger from a committed post-fold view. Zones with
+ * no surviving card header leave the served set immediately; surviving zones
+ * keep their chronological cursor and completed-pointer suppression.
+ */
+export function reconcileVisibleEpisodicHeaders(
+  state: EpisodicInjectionState,
+  residentHeaders: ReadonlySet<string>,
+): void {
+  state.visibleCardHeaders = new Set(residentHeaders);
+  for (const [targetPath, zone] of state.zones) {
+    const visible = (zone.visibleCardHeaders ?? []).filter((header) => residentHeaders.has(header));
+    if (visible.length === 0) {
+      state.zones.delete(targetPath);
+      state.completedChainTargetPaths.delete(targetPath);
+      continue;
+    }
+    zone.visibleCardHeaders = visible;
+    if (zone.activeCard && !residentHeaders.has(episodicCardHeaderLine(zone.activeCard))) {
+      delete zone.activeCard;
+    }
+  }
+}
+
+/** Reconcile visible cards directly from a provider-ready folded message view. */
+export function reconcileVisibleEpisodicView(
+  state: EpisodicInjectionState,
+  view: readonly { content: string | null | unknown[] }[],
+): Set<string> {
+  const headers = new Set<string>();
+  for (const message of view) {
+    if (typeof message.content === 'string') {
+      for (const header of collectResidentEpisodicHeaders(message.content)) headers.add(header);
+      continue;
+    }
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content as Array<{ type?: string; text?: unknown }>) {
+      if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+      for (const header of collectResidentEpisodicHeaders(block.text)) headers.add(header);
+    }
+  }
+  reconcileVisibleEpisodicHeaders(state, headers);
+  return headers;
 }
 
 /**

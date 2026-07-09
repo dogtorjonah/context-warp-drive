@@ -78,6 +78,56 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).not.toContain('── Last User + AI Messages (READ FIRST) ──');
   });
 
+  test('keeps a mid-length active request byte-complete under the verbatim label', () => {
+    // 2000+ chars: the old 1500-char cap silently excerpted this while the
+    // label still claimed 'verbatim'; the 6000-char cap carries it whole.
+    const midRequest = `MID_HEAD_${'B'.repeat(2_000)}_MID_TAIL`;
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      triggeringUserMessage: midRequest,
+      userMessageTriggered: true,
+    });
+
+    expect(seed).toContain(`active request (verbatim; sole authoritative body):\n${midRequest}`);
+    expect(seed).not.toContain('active request (EXCERPT');
+  });
+
+  test('labels an over-cap active request as an honest excerpt, never verbatim', () => {
+    const hugeRequest = `HEAD_${'C'.repeat(7_000)}_TAIL`;
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      triggeringUserMessage: hugeRequest,
+      userMessageTriggered: true,
+    });
+
+    expect(seed).not.toContain('active request (verbatim');
+    expect(seed).toContain(
+      `active request (EXCERPT — ${hugeRequest.length} chars total, middle elided; full text via tap_instance_messages; sole authoritative body):`,
+    );
+    expect(seed).toContain('chars omitted');
+    expect(seed).toContain('HEAD_');
+    expect(seed).toContain('_TAIL');
+  });
+
+  test('preserves the last AI message when a bundled trigger suppresses the user half', () => {
+    // The user half duplicates the control capsule's authoritative active
+    // request, so it is stripped — but the AI half must survive: with no
+    // current thread it is the only copy of the predecessor's last words.
+    const trigger = 'TRIGGER_TOKEN_ZK41 please fix the flaky retry test';
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      triggeringUserMessage: trigger,
+      userMessageTriggered: true,
+      lastUserAiMessages: `👤 LAST USER MESSAGE:\n${trigger}\n\n🤖 LAST AI MESSAGE:\nPatched the retry backoff; validating now.`,
+    });
+
+    expect(seed).toContain('── Last AI Message (READ FIRST) ──');
+    expect(seed).toContain('Patched the retry backoff; validating now.');
+    expect(seed).not.toContain('👤 LAST USER MESSAGE');
+    // The active request body appears exactly once — in the control capsule.
+    expect(seed.split('TRIGGER_TOKEN_ZK41').length - 1).toBe(1);
+  });
+
   test('uses mutually exclusive hard-epoch and fresh-fork identity contracts', () => {
     const hardEpoch = renderRawRebirthSeed({
       predecessorName: 'same-agent',
