@@ -46,11 +46,11 @@ import { contextWindowForModel } from './contextWindow.ts';
 //       takes the append path (floor rule permitting), so tail epochs happen
 //       AT P by design and no sub-ceiling staging trigger exists at all.
 //   CLI reconstruction transports: Codex CLI ('codex') and Gemini CLI
-//       ('gemini') gate a P-anchored portable-reset hard epoch FIRST in their
-//       fold executors, so their single-ceiling trigger reserves the 30K
-//       reconstruct runway BELOW P (trigger = P − 30K, one derived knob);
-//       Claude CLI self-clamps to ceiling − 20K in claudeCliFold.ts. Legacy
-//       mode keeps the historical msgCeiling − minRunway codex clamp.
+//       ('gemini') use the same P trigger in single-ceiling mode. Their normal
+//       fold/rewrite path gets first chance at P; portable-reset hard epochs
+//       are a follow-up escalation when the append/full-recompute path cannot
+//       relieve pressure. Legacy mode keeps the historical msgCeiling −
+//       minRunway Codex clamp.
 //
 // Emergency margin / messageCeiling clamps are unchanged in both modes: they
 // are overshoot crash protection ABOVE P (a mid-turn tool burst can pass P
@@ -575,22 +575,12 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TRIGGER_TOKENS', 'WARP_FOLD_TRIGGER_TOKENS'))
     ?? codexCliDefaultReconstructTriggerTokens
     ?? DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS;
-  // CLI reconstruction transports (Codex CLI, Gemini CLI) fold BETWEEN turns
-  // via rewrite+respawn, and their fold executors check the P-anchored
-  // portable-reset hard-epoch gate FIRST — so trigger==P would shadow every
-  // normal fold ("trigger==ceiling ⇒ 0 tail epochs", measured live
-  // 2026-07-04). Their single-ceiling trigger therefore reserves the
-  // reconstruct runway below P; P stays the only operator knob and the sole
-  // escalation boundary. FC engines genuinely fold AT P (freeze-seam
-  // ceiling-append promotion), and Claude CLI self-clamps its trigger under
-  // the ceiling inside claudeCliFold.ts.
-  const singleCeilingCliReconstructRunwayTokens =
-    codexCliFullRecomputeOnly || isGeminiCliEngine(engine)
-      ? DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS
-      : 0;
+  // Single-ceiling means exactly one trigger: P. Engine-specific runway clamps
+  // are legacy-mode safety rails only; in single-ceiling mode Codex/Gemini CLI
+  // must not grow a hidden P-30K trigger.
   const singleCeilingFoldTriggerTokens = Math.max(
     1,
-    (pressureCeilingTokens ?? messageCeilingTokens) - singleCeilingCliReconstructRunwayTokens,
+    pressureCeilingTokens ?? messageCeilingTokens,
   );
   const foldTriggerUpperBound = Math.max(
     1,

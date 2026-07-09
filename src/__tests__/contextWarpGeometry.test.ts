@@ -25,7 +25,7 @@ import { resolveFoldConfigForBand, ALWAYS_ON_FOLD_CONFIG } from '../rollingFold.
  * Asserts that the resolved default geometry matches the numbers documented in
  * docs/context-warp-geometry.md. If any constant drifts from the documented
  * values, this test fails — making it a structural guard against accidental
- * regression of the P180/TRIG150 geometry.
+ * regression of the P180 single-ceiling geometry.
  */
 describe('context-warp-geometry god-file parity', () => {
   describe('constant defaults match the god file', () => {
@@ -53,11 +53,11 @@ describe('context-warp-geometry god-file parity', () => {
       expect(DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS).toBe(180_000);
     });
 
-    it('TRIG (fold trigger) = 150K', () => {
+    it('legacy TRIG constant = 150K', () => {
       expect(DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS).toBe(150_000);
     });
 
-    it('TRIG < P (trigger strictly below ceiling)', () => {
+    it('legacy TRIG constant < P', () => {
       expect(DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS).toBeLessThan(
         DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS,
       );
@@ -98,46 +98,50 @@ describe('context-warp-geometry god-file parity', () => {
       expect(r.pressureCeilingTokens).toBe(180_000);
     });
 
-    it('trigger = 150K (clamp(150K, band=40K, min(P,msgCeil)−F=150K))', () => {
-      expect(r.foldTriggerTokens).toBe(150_000);
+    it('trigger = P under default single-ceiling mode', () => {
+      expect(r.foldTriggerTokens).toBe(180_000);
+      expect(r.foldTriggerTokens).toBe(r.pressureCeilingTokens);
     });
 
-    it('trigger upper bound = min(P, msgCeil) − minRunway, and trigger ≤ upper bound', () => {
-      // minRunway resolves to min(T=10K, F_const=30K) = 10K when no explicit
-      // tailEpochRunwayTokens is provided. So upperBound = 180K − 10K = 170K.
-      // The invariant is trigger ≤ upper bound (150K ≤ 170K), not equality.
-      const upperBound = Math.min(
+    it('single-ceiling bypasses the legacy trigger runway clamp', () => {
+      const legacyUpperBound = Math.min(
         r.pressureCeilingTokens ?? r.messageCeilingTokens,
         r.messageCeilingTokens,
       ) - r.tailEpochMinRunwayTokens;
-      expect(r.foldTriggerTokens).toBeLessThanOrEqual(upperBound);
-      // Document the actual resolved values
-      expect(r.tailEpochMinRunwayTokens).toBe(10_000);
-      expect(upperBound).toBe(170_000);
+      expect(r.tailEpochMinRunwayTokens).toBe(30_000);
+      expect(legacyUpperBound).toBe(150_000);
+      expect(r.foldTriggerTokens).toBeGreaterThan(legacyUpperBound);
     });
 
-    it('tailCap = T = 10K (margin-cancellation tautology)', () => {
-      // margin = P − S − band − T
-      const expectedMargin = r.pressureCeilingTokens! - r.systemToolsReserveTokens - r.bandTokens - DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
-      // tailCap = P − S − band − margin = P − S − band − (P − S − band − T) = T
-      const expectedTailCap = Math.max(
-        MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS,
-        r.pressureCeilingTokens! - r.systemToolsReserveTokens - r.bandTokens - expectedMargin,
-      );
+    it('tailCap is ceiling-sized, clamped below the message ceiling by the band', () => {
+      const expectedTailCap = r.messageCeilingTokens - r.bandTokens;
       expect(r.tailEpochCapTokens).toBe(expectedTailCap);
-      // The tautology: tailCap should equal T
-      expect(expectedTailCap).toBe(DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS);
+      expect(expectedTailCap).toBe(140_000);
+      expect(expectedTailCap).toBeGreaterThan(DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS);
     });
 
-    it('trigger < ceiling (INV-1: never collide)', () => {
-      expect(r.foldTriggerTokens).toBeLessThan(r.pressureCeilingTokens!);
+    it('trigger equals the pressure ceiling', () => {
+      expect(r.foldTriggerTokens).toBe(r.pressureCeilingTokens);
     });
 
-    it('band ≤ trigger ≤ ceiling − F', () => {
+    it('band ≤ trigger and F is reserved by the floor rule, not a trigger clamp', () => {
       expect(r.bandTokens).toBeLessThanOrEqual(r.foldTriggerTokens);
-      expect(r.foldTriggerTokens).toBeLessThanOrEqual(
-        (r.pressureCeilingTokens ?? r.messageCeilingTokens) - r.tailEpochMinRunwayTokens,
-      );
+      expect(r.pressureCeilingTokens! - r.tailEpochMinRunwayTokens).toBe(150_000);
+      expect(r.foldTriggerTokens).toBe(180_000);
+    });
+  });
+
+  describe('Codex/Gemini CLI single-ceiling trigger regression', () => {
+    it('resolves Codex CLI trigger to P, not P-30K', () => {
+      const r = resolveContextBudget({ model: 'gpt-5.5', engine: 'codex', env: {} });
+      expect(r.pressureCeilingTokens).toBe(180_000);
+      expect(r.foldTriggerTokens).toBe(180_000);
+    });
+
+    it('resolves Gemini CLI trigger to P, not P-30K', () => {
+      const r = resolveContextBudget({ model: 'gemini-2.5-pro', engine: 'gemini', env: {} });
+      expect(r.pressureCeilingTokens).toBe(180_000);
+      expect(r.foldTriggerTokens).toBe(180_000);
     });
   });
 
@@ -152,11 +156,9 @@ describe('context-warp-geometry god-file parity', () => {
       expect(r.pressureCeilingTokens).toBe(115_200);
     });
 
-    it('trigger degrades below P with F runway', () => {
-      expect(r.foldTriggerTokens).toBeLessThan(r.pressureCeilingTokens!);
-      expect(r.foldTriggerTokens).toBeLessThanOrEqual(
-        r.pressureCeilingTokens! - r.tailEpochMinRunwayTokens,
-      );
+    it('trigger degrades to P with no sub-ceiling runway clamp', () => {
+      expect(r.foldTriggerTokens).toBe(r.pressureCeilingTokens);
+      expect(r.tailEpochMinRunwayTokens).toBe(30_000);
     });
 
     it('trigger ≥ band (never fold before band is full)', () => {
