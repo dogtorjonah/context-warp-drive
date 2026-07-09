@@ -19,6 +19,14 @@ export interface FoldMessage {
   tool_calls?: unknown;
   tool_call_id?: unknown;
   name?: unknown;
+  /**
+   * Epoch-millisecond timestamp of the original message creation time. When
+   * present, folded-turn skeletons render a [HH:MM AM/PM] prefix so the band
+   * body reads chronologically and a successor can position completed work
+   * relative to user messages and the rebirth seed. Optional — older code
+   * paths that don't populate it produce identical (timestampless) output.
+   */
+  tsMs?: number;
 }
 
 export type TurnCategory = 'research' | 'action' | 'decision' | 'navigation' | 'error' | 'coordination';
@@ -69,6 +77,11 @@ export interface FoldConfig {
 
 export interface FoldedTurn {
   timestamp: string;
+  /**
+   * Original message creation time rendered before the skeleton when available.
+   * Absent for older callers so their folded block text stays unchanged.
+   */
+  skeletonTimestamp?: string;
   category: TurnCategory;
   skeleton: string;
   retained?: string;
@@ -1089,6 +1102,39 @@ function truncate(s: string, max: number): string {
 }
 
 /**
+ * Extract the earliest message tsMs from a turn's raw messages. Returns the
+ * creation time of the first message that carries a tsMs field, so the folded
+ * skeleton is stamped with WHEN the turn actually happened — not fold time.
+ * Returns null when no message carries tsMs (backward-compatible: caller falls
+ * back to new Date()).
+ */
+function extractTurnTsMs(messages: readonly FoldMessage[]): number | null {
+  for (const msg of messages) {
+    if (typeof msg.tsMs === 'number' && Number.isFinite(msg.tsMs) && msg.tsMs > 0) {
+      return msg.tsMs;
+    }
+  }
+  return null;
+}
+
+/**
+ * Format an ISO timestamp or epoch-ms number into a compact [H:MM AM/PM] string
+ * for fold skeleton prefixes. Returns empty string on parse failure. Pure and
+ * deterministic for a given input — uses UTC to avoid locale-dependent output
+ * in server-side fold rendering.
+ */
+function formatFoldTime(ts: string | number): string {
+  const date = typeof ts === 'number' ? new Date(ts) : new Date(ts);
+  if (isNaN(date.getTime())) return '';
+  let h = date.getUTCHours();
+  const m = date.getUTCMinutes().toString().padStart(2, '0');
+  const period = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `[${h}:${m} ${period}]`;
+}
+
+/**
  * Normalize an absolute `/home/<user>/<repo>/…` path to repo-relative form. The
  * canonical normalization used by claimed-path matching (`isClaimedPath`) and
  * tool-arg path extraction — exported so the fold freeze (foldFreeze.ts) can
@@ -1814,6 +1860,7 @@ export function collapseSequences(foldedTurns: FoldedTurn[]): FoldedTurn[] {
 
       result.push({
         timestamp: current.timestamp,
+        skeletonTimestamp: current.skeletonTimestamp,
         category: current.category,
         skeleton: `${meta.icon} ${meta.verb} (${seqLen} turns): ${skeletonList}`,
         retained: allRetained || undefined,
@@ -1998,7 +2045,9 @@ function renderFoldedBlock(
   }
 
   for (const ft of collapsed) {
-    lines.push(ft.skeleton);
+    const formattedSkeletonTime = ft.skeletonTimestamp ? formatFoldTime(ft.skeletonTimestamp) : '';
+    const tsPrefix = formattedSkeletonTime ? `${formattedSkeletonTime} ` : '';
+    lines.push(`${tsPrefix}${ft.skeleton}`);
     if (ft.retained) {
       for (const rl of ft.retained.split('\n')) {
         lines.push(`   ${rl}`);
@@ -2360,10 +2409,14 @@ export function foldContext(
     const retainedLen = (retained?.length ?? 0) + skeleton.length;
     const charsSaved = Math.max(0, turnChars - retainedLen);
 
+    const turnTsMs = extractTurnTsMs(turn.messages);
+    const turnTimestamp = turnTsMs !== null ? new Date(turnTsMs).toISOString() : new Date().toISOString();
+
     builtTurns.push({
       ordinal: turnIdx,
       folded: {
-        timestamp: new Date().toISOString(),
+        timestamp: turnTimestamp,
+        skeletonTimestamp: turnTsMs !== null ? turnTimestamp : undefined,
         category,
         skeleton,
         retained,
