@@ -292,6 +292,43 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(session.telemetry.epochs).toBe(2);
   });
 
+  test('keeps the latest operator message and all successors raw beyond the char budget', () => {
+    const session = new FoldSession({
+      foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 125_000,
+      now: () => 1_000,
+    });
+    const first = turn(0);
+    session.prepare(first);
+    const liveObjective = 'FIX THE CONTINUITY THRASHING NOW';
+    const grown: FoldMessage[] = [
+      ...first,
+      userMsg('Summarize the older completed investigation'),
+      assistantMsg(`older foldable analysis ${'A'.repeat(20_000)}`),
+      userMsg(liveObjective),
+      anthropicToolUse('Read', { file_path: '/repo/src/live.ts' }, 'toolu_live_anchor'),
+      anthropicToolResult('toolu_live_anchor', `live tool payload ${'B'.repeat(45_000)}`),
+      assistantMsg('live analysis after the operator directive'),
+    ];
+
+    const appended = session.prepare(grown);
+    const joined = appended.messages.map((message) => typeof message.content === 'string'
+      ? message.content
+      : JSON.stringify(message.content)).join('\n');
+    const liveObjectiveIndex = appended.messages.findIndex(
+      (message) => message.role === 'user' && message.content === liveObjective,
+    );
+
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(liveObjectiveIndex).toBeGreaterThanOrEqual(0);
+    expect(joined).toContain('[Tail Epoch Seam — epoch #2 committed 1970-01-01T00:00:01.000Z]');
+    expect(joined).toContain('The band-0 hard-epoch seed above remains your intact continuity foundation.');
+    expect(joined).toContain(`live objective: "${liveObjective}"`);
+    expect(joined).not.toContain('your live working set with the current user request follows below');
+    expect(appended.messages.slice(liveObjectiveIndex)).toEqual(grown.slice(first.length + 2));
+  });
+
   test('hot-reuses instead of committing an unprofitable append band', () => {
     const session = new FoldSession({
       foldConfig: {

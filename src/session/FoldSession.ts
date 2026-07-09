@@ -1174,6 +1174,20 @@ export class FoldSession {
           keptRawSplitIndex = i;
         }
       }
+      const budgetRequiresKeptRaw = keptRawSplitIndex > 0 && keptRawSplitIndex < fullTail.length;
+      let lastUserIndex = -1;
+      if (budgetRequiresKeptRaw) {
+        for (let i = fullTail.length - 1; i >= 0; i -= 1) {
+          if (fullTail[i]?.role === 'user' && typeof fullTail[i]?.content === 'string') {
+            lastUserIndex = i;
+            break;
+          }
+        }
+      }
+      if (lastUserIndex >= 0) keptRawSplitIndex = Math.min(keptRawSplitIndex, lastUserIndex);
+      const liveObjective = lastUserIndex >= 0 && typeof fullTail[lastUserIndex]?.content === 'string'
+        ? (fullTail[lastUserIndex].content as string).replace(/\s+/g, ' ').trim().slice(0, 280)
+        : '';
       const hasKeptRaw = keptRawSplitIndex > 0 && keptRawSplitIndex < fullTail.length;
       const tail = hasKeptRaw ? fullTail.slice(0, keptRawSplitIndex) : fullTail;
       const appendFoldConfig = this.effectiveAppendFoldConfig();
@@ -1237,9 +1251,12 @@ export class FoldSession {
       // immediately after. This prevents the agent from treating stale
       // verdicts/hazards in the band as current state.
       if (hasKeptRaw) {
+        const liveObjectiveLine = liveObjective
+          ? `live objective: "${liveObjective}"`
+          : 'live objective: inspect the raw messages immediately below this marker';
         enrichedTail = mergeBlockIntoViewTail(
           enrichedTail,
-          `[fold boundary — sealed history ends here; your live working set with the current user request follows below — focus there]`,
+          `[Tail Epoch Seam — epoch #${upcomingEpoch} committed ${new Date(now).toISOString()}]\nFolded ${keptRawSplitIndex} raw message(s) into the appended band. The band-0 hard-epoch seed above remains your intact continuity foundation.\n${liveObjectiveLine}\nContinue the live conversation from the raw messages immediately below; do not redirect to older rail work unless the user asks.`,
         );
       }
       // When we kept a raw working set, pass truncated history so
@@ -1249,7 +1266,9 @@ export class FoldSession {
         : messages;
       const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, commitMessages, enrichedTail, ctx, now);
       if (appendCommit.committed) {
-        const appendView = appendCommit.view;
+        const appendView = hasKeptRaw
+          ? appendCommit.view.concat(fullTail.slice(keptRawSplitIndex))
+          : appendCommit.view;
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
         this.appendEpochsSinceHardReset += 1;
         // Arm the post-fold floor capture: the next measured reading after this

@@ -50,10 +50,18 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // read "25% healthy" at 264,175 input tokens and Codex hard-errored "ran out
   // of room in the model's context window" (2026-06-14). 258K = guaranteed
   // effective input floor so CONTEXT_THRESHOLDS trip below the real wall
-  // (AUTO_COMPACT 0.93 → ~240K). gpt-5.4/-pro share the catalog.
+  // (AUTO_COMPACT 0.93 → ~240K). GPT-5.x CLI flagship tiers share the catalog.
+  'codex-5.6': 258_000,
+  'codex-5.6-sol': 258_000,
+  'codex-5.6-terra': 258_000,
+  'codex-5.6-luna': 258_000,
   'codex-5.5': 258_000,
   'codex-5.5-instant': 258_000,
   'codex-5.4': 258_000,
+  'gpt-5.6': 258_000,
+  'gpt-5.6-sol': 258_000,
+  'gpt-5.6-terra': 258_000,
+  'gpt-5.6-luna': 258_000,
   'gpt-5.5': 258_000,
   'gpt-5.4': 258_000,
   'gpt-5.4-pro': 258_000,
@@ -179,7 +187,10 @@ const ENGINE_DEFAULTS: Record<string, number> = {
 
 function isCodexApiLargeContextModel(modelLower: string): boolean {
   if (!modelLower) return false;
-  if (modelLower === 'codex-5.5' || modelLower === 'codex-5.5-instant' || modelLower === 'codex-5.4') {
+  if (modelLower === 'codex-5.6' || modelLower.startsWith('codex-5.6-') || modelLower === 'codex-5.5' || modelLower === 'codex-5.5-instant' || modelLower === 'codex-5.4') {
+    return true;
+  }
+  if (modelLower === 'gpt-5.6' || modelLower.startsWith('gpt-5.6-')) {
     return true;
   }
   if (modelLower === 'gpt-5.5' || modelLower.startsWith('gpt-5.5-')) {
@@ -196,6 +207,9 @@ function contextWindowOverrideForEngineModel(modelLower: string, engineLower: st
   // have different effective windows. Resolve the API surface before the generic
   // model table so gpt-5.5/codex-5.5 can be 1M on API and 258K on CLI.
   if (engineLower === 'codex-api' && isCodexApiLargeContextModel(modelLower)) {
+    return 1_048_576;
+  }
+  if (engineLower === 'openai' && (modelLower === 'gpt-5.6' || modelLower.startsWith('gpt-5.6-'))) {
     return 1_048_576;
   }
   return undefined;
