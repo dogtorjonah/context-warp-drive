@@ -450,14 +450,12 @@ export function buildRawHardEpochSeed(
         Math.max(700, Math.floor(maxChars * 0.18)),
       )
     : (options.closetChars ?? DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS);
-  const compactSectionMaxChars = isCompact
-    ? {
-        lastUserAiMessages: Math.max(1_000, Math.floor(maxChars * 0.22)),
-        currentThread: Math.max(1_500, Math.floor(maxChars * 0.35)),
-        rawTraceCoordinateCloset: closetBudget,
-        thinkingTrail: Math.max(1_000, Math.floor(maxChars * 0.18)),
-      }
-    : undefined;
+  const compactSectionMaxChars = {
+    lastUserAiMessages: Math.max(1_000, Math.min(12_000, Math.floor(maxChars * 0.22))),
+    currentThread: Math.max(1_500, Math.min(24_000, Math.floor(maxChars * 0.35))),
+    rawTraceCoordinateCloset: Math.min(closetBudget, 4_000),
+    thinkingTrail: Math.max(1_000, Math.min(8_000, Math.floor(maxChars * 0.18))),
+  };
   return buildRawRebirthSeedFromMessages(messages, {
     predecessorName: options.predecessorName ?? 'predecessor',
     packageBudget: maxChars,
@@ -466,6 +464,7 @@ export function buildRawHardEpochSeed(
     includeTrailingUserTurn: options.includeTrailingUserTurn === true,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
+    lifecycleBoundary: 'same_instance_hard_epoch',
   });
 }
 

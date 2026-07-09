@@ -179,6 +179,13 @@ export interface RawRebirthForkContext {
   readonly isFreshFork?: boolean;
 }
 
+export type RawRebirthLifecycleBoundary =
+  | 'same_instance_hard_epoch'
+  | 'continuation'
+  | 'fresh_fork'
+  | 'resurrection'
+  | 'brain_merge';
+
 export interface RawRebirthWorkspaceContext {
   readonly currentCwd: string;
   readonly currentWorkspace: string;
@@ -248,6 +255,7 @@ export interface RawRebirthSeedInput {
   readonly relayBootTime?: string;
   readonly traceEventCount?: number;
   readonly forkContext?: RawRebirthForkContext;
+  readonly lifecycleBoundary?: RawRebirthLifecycleBoundary;
   readonly mergedFromLineages?: readonly RawRebirthMergedLineage[];
   readonly durableMergedLineage?: readonly RawRebirthDurableMergedLineage[];
   readonly summonVault?: readonly RawRebirthSummonVaultEntry[];
@@ -307,6 +315,7 @@ export interface RawRebirthSeedFromMessagesOptions {
   // pre-rendered Resume Point string.
   readonly resumePoint?: string;
   readonly predecessorStatus?: string;
+  readonly lifecycleBoundary?: RawRebirthLifecycleBoundary;
   readonly userMessageTriggered?: boolean;
   /** Trace-derived episodic recall text (portable-mode memory section). */
   readonly episodicCrossRef?: string;
@@ -595,10 +604,8 @@ function formatForkContextLines(forkContext: RawRebirthForkContext | undefined):
   }
 
   const lines = [
-    '🌱 YOU ARE A FORK — not the original instance.',
-    'Your transcript was copied from the source at the fork point. Everything before this is inherited reference context, not your own actions. Your work diverges from here.',
-    '',
-    'Important: You have your own instance id, your own file claims, and your own edits. The source may still be live and working in parallel. Coordinate via chatroom if needed — do not assume you share the source\'s squad or claims.',
+    '🌱 Fresh-fork provenance — the lifecycle identity contract is authoritative in Rebirth Control above.',
+    'The copied pre-fork transcript is inherited reference context. Claims, edits, and actions after the fork belong to this instance only.',
   ];
 
   if (forkContext.groupId) lines.push(`Fork group: ${forkContext.groupId}`);
@@ -613,7 +620,7 @@ function formatForkContextLines(forkContext: RawRebirthForkContext | undefined):
   }
   if (forkContext.pointMessageId) lines.push(`Fork point message: ${forkContext.pointMessageId}`);
   if (forkContext.autoCleanup) lines.push('Fork auto-cleanup: enabled');
-  lines.push('Treat inherited pre-fork context as reference. Claim files before editing. Move forward with your own divergent work.');
+  lines.push('The source may still be live. Claim files before editing and coordinate only when work overlaps.');
   return lines;
 }
 
@@ -855,6 +862,71 @@ function pushSection(
   });
 }
 
+function resolveLifecycleBoundary(input: RawRebirthSeedInput): RawRebirthLifecycleBoundary {
+  if (input.lifecycleBoundary) return input.lifecycleBoundary;
+  if (input.forkContext && input.forkContext.isFreshFork !== false) return 'fresh_fork';
+  if ((input.mergedFromLineages?.length ?? 0) > 0) return 'brain_merge';
+  return 'continuation';
+}
+
+function formatLifecycleIdentity(boundary: RawRebirthLifecycleBoundary, predecessorName: string): string {
+  switch (boundary) {
+    case 'same_instance_hard_epoch':
+      return `same running instance "${predecessorName}"; provider context reseeded, not a handoff`;
+    case 'fresh_fork':
+      return `new independent fork; "${predecessorName}" is the source identity, not this instance`;
+    case 'resurrection':
+      return `resumed durable instance "${predecessorName}" from its archived state`;
+    case 'brain_merge':
+      return `same receiving instance "${predecessorName}" with donor memories absorbed and attributed`;
+    case 'continuation':
+      return `same durable instance "${predecessorName}" across a session or model boundary`;
+  }
+}
+
+function formatLifecycleHeader(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
+  if (boundary === 'same_instance_hard_epoch') {
+    return `[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "${input.predecessorName}". Follow the authoritative Rebirth Control below. Continue silently; do not produce wake-up commentary.`;
+  }
+  if (boundary === 'fresh_fork') {
+    return `[CONTEXT REBIRTH] Lifecycle boundary: fresh_fork from "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+  }
+  if (boundary === 'resurrection') {
+    return `[CONTEXT REBIRTH] Lifecycle boundary: resurrection for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+  }
+  if (boundary === 'brain_merge') {
+    return `[CONTEXT REBIRTH] Lifecycle boundary: brain_merge for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+  }
+  return `[CONTEXT REBIRTH] Lifecycle boundary: continuation for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+}
+
+function findResumeLine(resumePoint: string | undefined, prefix: string): string {
+  return resumePoint?.split('\n').find((line) => line.startsWith(prefix))?.trim() ?? 'unknown';
+}
+
+function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
+  const activeRequest = cleanString(input.triggeringUserMessage);
+  const rail = findResumeLine(input.resumePoint, '📋 ');
+  const active = findResumeLine(input.resumePoint, '▶ Active:');
+  const next = findResumeLine(input.resumePoint, '⏭ Next:');
+  const editOwnership = cleanString(input.activeEditDelta)
+    ? 'Active Edit Delta below is authoritative; inherited/source edits are not owned unless explicitly re-claimed.'
+    : 'no active edit delta supplied';
+  return [
+    '── Rebirth Control (AUTHORITATIVE) ──',
+    `boundary: ${boundary}`,
+    `identity: ${formatLifecycleIdentity(boundary, input.predecessorName)}`,
+    `source status: ${cleanString(input.predecessorStatus) ?? 'unknown'}`,
+    `rail: ${rail}`,
+    `current objective: ${active}`,
+    `immediate next action: ${next}`,
+    `edit ownership: ${editOwnership}`,
+    'validation state: unknown unless stated in Current Thread or Task Rail Context',
+    'truth order: this control block > active request > Active Edit Delta > Task Rail Context > recent dialogue > historical evidence',
+    activeRequest ? `active request (verbatim; sole authoritative body):\n${renderUserMessageForRebirth(activeRequest)}` : 'active request: none bundled',
+  ].join('\n');
+}
+
 export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
   const packageBudget = finitePositive(input.packageBudget, DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS);
   const runtimeBlock = input.runtimeModelBlock?.trim()
@@ -862,9 +934,11 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     : enabled(input, 'runtimeModel')
       ? formatRuntimeModelBlock(input.runtimeModel, input.relayBootTime, input.traceEventCount)
       : '';
-  const defaultHeader = `[CONTEXT REBIRTH] You are the continuation of "${input.predecessorName}". Same identity, coordination context, tools — pick up where it left off. Read Last User + AI Messages first, then Current Thread; Active Edit Delta is authoritative for in-flight files.`;
+  const lifecycleBoundary = resolveLifecycleBoundary(input);
+  const defaultHeader = formatLifecycleHeader(input, lifecycleBoundary);
   const headerBlocks = [
     input.headerOverride?.trim() ?? defaultHeader,
+    input.headerOverride?.trim() ? '' : formatRebirthControl(input, lifecycleBoundary),
     formatMergedLineageProvenance(input),
     formatDurableMergedLineageBanner(input),
     formatSummonVaultLedger(input),
@@ -877,7 +951,7 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     budgetedSections,
     input,
     'lastUserAiMessages',
-    input.lastUserAiMessages?.trim()
+    input.lastUserAiMessages?.trim() && !input.triggeringUserMessage?.trim()
       ? (() => {
           const base = `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. These are the freshest human and AI messages available at rebirth.***\n\n${input.lastUserAiMessages!.trim()}`;
           // append Resume Point to Last User + AI block.
@@ -888,12 +962,7 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
         : undefined,
   );
 
-  const currentThreadBlocks = [
-    input.currentThread?.trim() ?? '',
-    input.triggeringUserMessage?.trim()
-      ? `👤 USER (active request):\n${renderUserMessageForRebirth(input.triggeringUserMessage)}`
-      : '',
-  ].filter(Boolean);
+  const currentThreadBlocks = [input.currentThread?.trim() ?? ''].filter(Boolean);
   pushSection(
     budgetedSections,
     input,
@@ -1016,7 +1085,7 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
   const footer = input.footerOverride !== undefined
     ? input.footerOverride
     : input.userMessageTriggered === true
-      ? 'The active user message is included in Last User + AI Messages and Current Thread — respond to it directly. Engage with its actual content; do not reduce a substantive message to a generic prompt.'
+      ? 'The active user message appears once in Rebirth Control as the authoritative request body — respond to it directly.'
       : input.predecessorStatus === 'idle'
         ? 'Predecessor was idle with no active task — default to waiting for the next request; do not invent work or re-investigate the codebase from scratch. But if Last User + AI Messages or Current Thread shows a user request that was never answered or was cut off mid-work, treat that as your active task and engage with it directly rather than sitting idle.'
         : 'Resume the active task. The Activity Log + Active Edit Delta are your primary context. Evaluate predecessor work on its merits before diverging — if the approach is flawed, refactor it rather than discarding (see Core Principle 15). Continue using atlas_query as your primary codebase investigation tool — the File Context above is a handoff snapshot, not a substitute for live Atlas queries when exploring new files or verifying current state. Self-tap only if the package is insufficient or contradictory.';
@@ -1079,6 +1148,8 @@ export function buildRawTraceCoordinateCloset(
     const rawLiteral = candidate.literal.trim();
     const literal = rawLiteral.includes('/') ? rawLiteral.replace(/[.,;]+$/u, '') : rawLiteral;
     if (!literal || isClosetNoiseLiteral(literal)) continue;
+    if (/(?:codex-|forge-)?tool-result-spool|rebirth-spool|\/spool\//iu.test(literal)) continue;
+    if (/^call_[A-Za-z0-9_-]{16,}(?:\.txt)?$/u.test(literal)) continue;
     if (!admitClosetLiteral(admitted, literal)) continue;
   }
 
@@ -1403,6 +1474,7 @@ export function buildRawRebirthSeedFromMessages(
       excluded,
     ),
     predecessorStatus: options.predecessorStatus,
+    lifecycleBoundary: options.lifecycleBoundary,
     userMessageTriggered: options.userMessageTriggered,
     headerOverride: options.headerOverride,
     footerOverride: options.footerOverride,

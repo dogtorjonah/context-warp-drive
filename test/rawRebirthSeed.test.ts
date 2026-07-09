@@ -39,7 +39,8 @@ describe('raw rebirth seed renderer', () => {
       thinkingTrail: 'Chronology: oldest -> newest',
     });
 
-    expect(seed.startsWith('[CONTEXT REBIRTH] You are the continuation of "source-agent".')).toBe(true);
+    expect(seed.startsWith('[CONTEXT REBIRTH] Lifecycle boundary: continuation for "source-agent"')).toBe(true);
+    expect(seed).toContain('── Rebirth Control (AUTHORITATIVE) ──');
     expect(seed).toContain('── Runtime Model ──');
     expect(seed).toContain('Predecessor trace: 42 events');
 
@@ -60,6 +61,40 @@ describe('raw rebirth seed renderer', () => {
     expect(workspaceIdx).toBeGreaterThan(railIdx);
     expect(activityIdx).toBeGreaterThan(workspaceIdx);
     expect(orientationIdx).toBeGreaterThan(activityIdx);
+  });
+
+  test('renders one authoritative active request body and suppresses lower-tier duplicates', () => {
+    const activeRequest = 'Ship the rebirth package redesign now';
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      triggeringUserMessage: activeRequest,
+      lastUserAiMessages: `👤 LAST USER MESSAGE:\n${activeRequest}`,
+      currentThread: '🤖 ASSISTANT: prior response',
+      userMessageTriggered: true,
+    });
+
+    expect(seed.match(new RegExp(activeRequest, 'g'))).toHaveLength(1);
+    expect(seed).toContain('active request (verbatim; sole authoritative body):');
+    expect(seed).not.toContain('── Last User + AI Messages (READ FIRST) ──');
+  });
+
+  test('uses mutually exclusive hard-epoch and fresh-fork identity contracts', () => {
+    const hardEpoch = renderRawRebirthSeed({
+      predecessorName: 'same-agent',
+      lifecycleBoundary: 'same_instance_hard_epoch',
+    });
+    const fork = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      forkContext: { groupId: 'fork_group', isFreshFork: true },
+    });
+
+    expect(hardEpoch).toContain('boundary: same_instance_hard_epoch');
+    expect(hardEpoch).toContain('same running instance');
+    expect(hardEpoch.split('\n').slice(0, 12).join('\n')).not.toContain('predecessor/successor');
+    expect(fork).toContain('boundary: fresh_fork');
+    expect(fork).toContain('new independent fork');
+    expect(fork).not.toContain('Same durable identity');
+    expect(fork).not.toContain('YOU ARE A FORK');
   });
 
   test('exports the relay raw package defaults', () => {
@@ -149,13 +184,13 @@ describe('raw rebirth seed renderer', () => {
       'S-A/S-B',
       'I/O',
       'So: fable-5-specific',
+      '/home/jonah/voxxo-swarm/relay/data/rebirth-spool/rebirth-SduJbsZv-1782943793927.txt',
     ];
     const gold = [
       'relay/logs/relay-out.log',
       'sop/system/fable-5.md',
       'relay/src/crossInstanceTools/rebirthPackageBuilder.ts',
       'packages/context-warp/src/rollingFold.ts',
-      '/home/jonah/voxxo-swarm/relay/data/rebirth-spool/rebirth-SduJbsZv-1782943793927.txt',
       'supabase/migrations/20260701221500_clinical_soul_drain_observability.sql',
       'rail-49b60f62',
       '285cab02 (rail)',
@@ -171,7 +206,6 @@ describe('raw rebirth seed renderer', () => {
       'sop/system/fable-5.md',
       'relay/src/crossInstanceTools/rebirthPackageBuilder.ts',
       'packages/context-warp/src/rollingFold.ts',
-      '/home/jonah/voxxo-swarm/relay/data/rebirth-spool/rebirth-SduJbsZv-1782943793927.txt',
       'supabase/migrations/20260701221500_clinical_soul_drain_observability.sql',
       'rail-49b60f62',
       'rail 285cab02',
@@ -230,7 +264,7 @@ describe('raw rebirth seed renderer', () => {
       packageBudget: 30_000,
     });
 
-    expect(seed).toContain('[CONTEXT REBIRTH] You are the continuation of "provider-loop".');
+    expect(seed).toContain('[CONTEXT REBIRTH] Lifecycle boundary: continuation for "provider-loop"');
     expect(seed).toContain('── Last User + AI Messages (READ FIRST) ──');
     expect(seed).toContain('── Current Thread ──');
     expect(seed).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
