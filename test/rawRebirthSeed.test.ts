@@ -109,6 +109,33 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).toContain('_TAIL');
   });
 
+  test('preserves boundary whitespace before calling an active request verbatim', () => {
+    const whitespaceRequest = '\n  preserve this indentation\n  and trailing spaces  \n';
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      triggeringUserMessage: whitespaceRequest,
+      userMessageTriggered: true,
+    });
+
+    expect(seed).toContain(
+      `active request (verbatim; sole authoritative body):\n${whitespaceRequest}`,
+    );
+  });
+
+  test('uses the final AI header when the active request quotes an AI marker', () => {
+    const trigger = 'Inspect this quoted block:\n🤖 LAST AI MESSAGE:\nnot the assistant boundary';
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      triggeringUserMessage: trigger,
+      userMessageTriggered: true,
+      lastUserAiMessages: `👤 LAST USER MESSAGE (active request):\n${trigger}\n\n🤖 LAST AI MESSAGE:\nActual predecessor state.`,
+    });
+
+    const aiSection = seed.split('── Last AI Message (READ FIRST) ──')[1] ?? '';
+    expect(aiSection).toContain('🤖 LAST AI MESSAGE:\nActual predecessor state.');
+    expect(aiSection).not.toContain('not the assistant boundary');
+  });
+
   test('preserves the last AI message when a bundled trigger suppresses the user half', () => {
     // The user half duplicates the control capsule's authoritative active
     // request, so it is stripped — but the AI half must survive: with no

@@ -29,6 +29,8 @@ import {
   planActiveTurnStepFold,
   computeEvictableThroughOrdinal,
   countChars,
+  extractUserText,
+  extractAssistantText,
   DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
   DEFAULT_ASSISTANT_TEXT_BUDGET,
   resolveFoldConfigForBand,
@@ -1175,19 +1177,48 @@ export class FoldSession {
         }
       }
       const budgetRequiresKeptRaw = keptRawSplitIndex > 0 && keptRawSplitIndex < fullTail.length;
+      // Anchor the kept-raw window on live intent, shape-aware. A string-only
+      // role check silently skips Anthropic content[] and Gemini parts[] user
+      // turns, leaving those sessions with NO anchor: the window degrades to
+      // the newest ~40K chars — often a single large tool result — and the
+      // live directive plus the agent's plan narration fold into a cold band
+      // that retains zero assistant prose ("lost the plot"). extractUserText
+      // reads genuine user text across all three shapes and ignores
+      // tool_result / functionResponse blocks.
       let lastUserIndex = -1;
       if (budgetRequiresKeptRaw) {
         for (let i = fullTail.length - 1; i >= 0; i -= 1) {
-          if (fullTail[i]?.role === 'user' && typeof fullTail[i]?.content === 'string') {
+          const candidate = fullTail[i];
+          if (candidate?.role !== 'user') continue;
+          if (typeof candidate.content === 'string'
+            || extractUserText([candidate], this.syntheticContext).trim()) {
             lastUserIndex = i;
             break;
           }
         }
       }
-      if (lastUserIndex >= 0) keptRawSplitIndex = Math.min(keptRawSplitIndex, lastUserIndex);
-      const liveObjective = lastUserIndex >= 0 && typeof fullTail[lastUserIndex]?.content === 'string'
-        ? (fullTail[lastUserIndex].content as string).replace(/\s+/g, ' ').trim().slice(0, 280)
+      // Assistant-narration fallback: an assistant-led tool loop can have no
+      // genuine user text in the foldable tail at all. Anchor on the newest
+      // substantive assistant text so the in-flight plan survives raw. Index 0
+      // is excluded: clamping there would fold nothing and skip the epoch.
+      let keptRawAnchorIndex = lastUserIndex;
+      if (budgetRequiresKeptRaw && keptRawAnchorIndex < 0) {
+        for (let i = fullTail.length - 1; i > 0; i -= 1) {
+          const candidate = fullTail[i];
+          if (candidate?.role !== 'assistant' && candidate?.role !== 'model') continue;
+          if (extractAssistantText([candidate]).trim().length >= 40) {
+            keptRawAnchorIndex = i;
+            break;
+          }
+        }
+      }
+      if (keptRawAnchorIndex >= 0) keptRawSplitIndex = Math.min(keptRawSplitIndex, keptRawAnchorIndex);
+      const liveObjectiveSource = lastUserIndex >= 0
+        ? (typeof fullTail[lastUserIndex]?.content === 'string'
+          ? fullTail[lastUserIndex].content as string
+          : extractUserText([fullTail[lastUserIndex]], this.syntheticContext))
         : '';
+      const liveObjective = liveObjectiveSource.replace(/\s+/g, ' ').trim().slice(0, 280);
       const hasKeptRaw = keptRawSplitIndex > 0 && keptRawSplitIndex < fullTail.length;
       const tail = hasKeptRaw ? fullTail.slice(0, keptRawSplitIndex) : fullTail;
       const appendFoldConfig = this.effectiveAppendFoldConfig();

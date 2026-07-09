@@ -748,10 +748,13 @@ function formatSummonVaultLedger(input: RawRebirthSeedInput): string {
  */
 const CONTROL_ACTIVE_REQUEST_MAX_CHARS = 6_000;
 
-function renderUserMessageForRebirth(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return '';
-  return truncateMiddle(trimmed, CONTROL_ACTIVE_REQUEST_MAX_CHARS);
+function renderUserMessageForRebirth(
+  text: string,
+  options: { preserveBoundaryWhitespace?: boolean } = {},
+): string {
+  const normalized = options.preserveBoundaryWhitespace ? text : text.trim();
+  if (!normalized.trim()) return '';
+  return truncateMiddle(normalized, CONTROL_ACTIVE_REQUEST_MAX_CHARS);
 }
 
 /**
@@ -766,7 +769,8 @@ function renderUserMessageForRebirth(text: string): string {
 function extractLastAiOnlyBlock(lastUserAiMessages: string | null | undefined): string {
   const text = lastUserAiMessages?.trim();
   if (!text) return '';
-  const marker = /^(?:\[[^\n\]]*\]\s*)?🤖 LAST AI MESSAGE/mu.exec(text);
+  const markers = [...text.matchAll(/^(?:\[[^\n\]]*\]\s*)?🤖 LAST AI MESSAGE(?:\s+⟦m\d+⟧)?:\s*$/gmu)];
+  const marker = markers.at(-1);
   if (!marker) return '';
   return text.slice(marker.index).trim();
 }
@@ -937,7 +941,9 @@ function findResumeLine(resumePoint: string | undefined, prefix: string): string
  * labeled as such with the true size and a tap pointer.
  */
 function formatControlActiveRequest(activeRequest: string): string {
-  const rendered = renderUserMessageForRebirth(activeRequest);
+  const rendered = renderUserMessageForRebirth(activeRequest, {
+    preserveBoundaryWhitespace: true,
+  });
   if (rendered === activeRequest) {
     return `active request (verbatim; sole authoritative body):\n${rendered}`;
   }
@@ -945,7 +951,7 @@ function formatControlActiveRequest(activeRequest: string): string {
 }
 
 function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
-  const activeRequest = cleanString(input.triggeringUserMessage);
+  const activeRequest = input.triggeringUserMessage;
   const rail = findResumeLine(input.resumePoint, '📋 ');
   const active = findResumeLine(input.resumePoint, '▶ Active:');
   const next = findResumeLine(input.resumePoint, '⏭ Next:');
@@ -963,7 +969,7 @@ function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLi
     `edit ownership: ${editOwnership}`,
     'validation state: unknown unless stated in Current Thread or Task Rail Context',
     'truth order: this control block > active request > Active Edit Delta > Task Rail Context > recent dialogue > historical evidence',
-    activeRequest ? formatControlActiveRequest(activeRequest) : 'active request: none bundled',
+    activeRequest?.trim() ? formatControlActiveRequest(activeRequest) : 'active request: none bundled',
   ].join('\n');
 }
 

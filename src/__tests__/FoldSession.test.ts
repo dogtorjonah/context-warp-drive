@@ -186,7 +186,8 @@ describe('FoldSession marathon pressure folding', () => {
     const preparedText = vaultText(prepared.messages);
     expect(preparedText.length).toBeLessThan(rawText.length);
     expect(preparedText.length).toBeLessThan(12_000);
-    expect(preparedText).toContain('[CONTEXT REBIRTH] You are the continuation of "predecessor".');
+    expect(preparedText).toContain('Continuity refresh: a same-instance hard epoch (context reset) just completed.');
+    expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     expect(preparedText).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
     expect(preparedText).toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
   });
@@ -477,6 +478,61 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(joined).not.toContain('ORPHAN_DEEP_TOKEN_1');
     expect(joined).not.toContain('ORPHAN_DEEP_TOKEN_2');
     expect(joined).toContain('ORPHAN_DEEP_TOKEN_3');
+  });
+
+  it('keeps a Gemini-parts operator directive in the raw suffix behind a giant tool result', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
+    session.prepare(first);
+    const directive = 'GEMINI_PARTS_DIRECTIVE keep diagnosing the live tail without changing objectives';
+    const appended = session.prepare([
+      ...first,
+      { role: 'user', content: profitableTail('older foldable request') },
+      { role: 'assistant', content: profitableTail('older foldable answer') },
+      { role: 'user', content: null, parts: [{ text: directive }] } as FoldMessage,
+      anthropicToolUse('toolu_parts_anchor', '/tmp/parts-anchor.ts'),
+      anthropicToolResult('toolu_parts_anchor', `GIANT_PARTS_RESULT\n${'x'.repeat(45_000)}`),
+    ], { measuredInputTokens: 70_000 });
+
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(appended.stats.appendDecision).toBe('committed');
+    expect(appended.sealedBoundary).not.toBeNull();
+    expect(vaultText(appended.messages.slice(appended.sealedBoundary as number))).toContain(directive);
+  });
+
+  it('keeps the latest assistant plan in the raw suffix when the foldable tail has no genuine user text', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
+    session.prepare(first);
+    const plan = 'ASSISTANT_RAW_PLAN inspect the newest tool result, preserve the current diagnosis, then report';
+    const appended = session.prepare([
+      ...first,
+      anthropicToolUse('toolu_old_orphan', '/tmp/old-orphan.ts'),
+      anthropicToolResult('toolu_old_orphan', profitableTail('older orphan result')),
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: plan },
+          { type: 'tool_use', id: 'toolu_plan_anchor', name: 'Read', input: { file_path: '/tmp/plan-anchor.ts' } },
+        ],
+      },
+      anthropicToolResult('toolu_plan_anchor', `GIANT_PLAN_RESULT\n${'y'.repeat(45_000)}`),
+    ], { measuredInputTokens: 70_000 });
+
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(appended.stats.appendDecision).toBe('committed');
+    expect(appended.sealedBoundary).not.toBeNull();
+    expect(vaultText(appended.messages.slice(appended.sealedBoundary as number))).toContain(plan);
   });
 
   it('accepts an append when measured runway lands exactly on the 10k floor', () => {
