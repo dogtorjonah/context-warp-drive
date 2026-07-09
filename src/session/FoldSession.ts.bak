@@ -1153,29 +1153,7 @@ export class FoldSession {
       && !pressureCeilingTriggered
       && (runway.ok || hardEpochBaselineRunwayBypass);
     if (appendOnlyTailEpoch) {
-      // ── Kept-raw working set ──
-      // Keep a live working set of recent messages untouched by the fold
-      // (~10K tokens ≈ 40K chars). Without this the entire raw tail folds
-      // into the frozen prefix and the agent loses active investigation
-      // context, user questions, and recent tool results. Mirrors the relay
-      // FC path and Claude CLI's DEFAULT_CLAUDE_CLI_BAND_MAX_TAIL_CHARS.
-      const KEPT_RAW_CHARS = 40_000;
-      const frozenCount = this.freezeState.frozenRawCount;
-      const fullTail = messages.slice(frozenCount);
-      let keptRawSplitIndex = fullTail.length;
-      {
-        let accChars = 0;
-        for (let i = fullTail.length - 1; i >= 0; i--) {
-          const c = typeof fullTail[i]?.content === 'string'
-            ? (fullTail[i].content as string).length
-            : JSON.stringify(fullTail[i]?.content ?? '').length;
-          if (accChars + c > KEPT_RAW_CHARS && keptRawSplitIndex < fullTail.length) break;
-          accChars += c;
-          keptRawSplitIndex = i;
-        }
-      }
-      const hasKeptRaw = keptRawSplitIndex > 0 && keptRawSplitIndex < fullTail.length;
-      const tail = hasKeptRaw ? fullTail.slice(0, keptRawSplitIndex) : fullTail;
+      const tail = messages.slice(this.freezeState.frozenRawCount);
       const appendFoldConfig = this.effectiveAppendFoldConfig();
       const tailStepPlan = this.planOrphanTailStepFold(
         messages,
@@ -1231,12 +1209,7 @@ export class FoldSession {
       const enrichedTail = cognitiveBlock
         ? mergeBlockIntoViewTail(sealedTail, cognitiveBlock)
         : sealedTail;
-      // When we kept a raw working set, pass truncated history so
-      // frozenRawCount advances only to the fold boundary.
-      const commitMessages = hasKeptRaw
-        ? messages.slice(0, frozenCount + keptRawSplitIndex)
-        : messages;
-      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, commitMessages, enrichedTail, ctx, now);
+      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, messages, enrichedTail, ctx, now);
       if (appendCommit.committed) {
         const appendView = appendCommit.view;
         this.commitEvictionEpoch(tailResult, this.freezeState.epochs);
