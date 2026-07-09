@@ -231,7 +231,7 @@ export function renderCognitiveBlock(
   const lines = artifacts.flatMap(
     (a) => [formatCognitiveArtifactProvenance(a), `${a.glyph} ${a.headline}`],
   );
-  return `[cognitive]\n${lines.join('\n')}`;
+  return `[cognitive — historical waypoints from the folded window, NOT your current state]\n${lines.join('\n')}`;
 }
 
 /**

@@ -241,7 +241,7 @@ Use the budget resolver when you want Warp Drive tuned to the real model window 
 import { resolveContextBudget } from 'context-warp-drive/budget';
 
 const sonnet = resolveContextBudget({ engine: 'claude', model: 'claude-sonnet-4' });
-// 200k survival profile: tighter pressure ceiling, full-recompute-only eviction.
+// 200k survival profile: tighter pressure ceiling, hard-epoch-only eviction.
 
 const codexCli = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5' });
 // Codex CLI/OAuth path uses its effective 258k input cap, not the Codex API 1M window.

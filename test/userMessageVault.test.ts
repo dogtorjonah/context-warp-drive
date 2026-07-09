@@ -521,8 +521,15 @@ describe('FoldSession vault opt-in', () => {
 
     expect(out.vault).toContain(USER_MESSAGE_VAULT_PREFIX);
     expect(out.vault).toContain('FOLDED_OPERATOR_REQUEST');
-    expect(out.vault).toContain('FOLDED_ASSISTANT_VERDICT');
-    expect(out.vault).toContain('your 🏁 message');
+    // The assistant verdict is no longer vaulted: durable-glyph skeleton
+    // retention and the [cognitive] waypoint block both keep it visible in
+    // the send view, so the vault's visible-text dedupe drops what would be a
+    // third copy. The interleave engages only for glyph rows the view LOST —
+    // the continuity guarantee is that the verdict survives somewhere visible.
+    expect(out.vault).not.toContain('FOLDED_ASSISTANT_VERDICT');
+    const viewText = out.messages.map(messageText).join('\n');
+    expect(viewText).toContain('🏁 FOLDED_ASSISTANT_VERDICT');
+    expect(viewText).toContain('[cognitive');
     expect(countVaultBlocks(out.messages)).toBe(1);
     expect(messageText(out.messages[out.messages.length - 2])).toContain(USER_MESSAGE_VAULT_PREFIX);
   });

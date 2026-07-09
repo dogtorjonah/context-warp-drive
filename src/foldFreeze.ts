@@ -45,6 +45,20 @@
  *     extends the frozen coverage (rebirth artifacts, truncation, in-place
  *     rewrites). Self-healing: recompute from current raw truth.
  *
+ * ── THE TWO-EPOCH LAW ──────────────────────────────────────────────────
+ * A live fold has exactly TWO epoch types — never a third:
+ *   1. TAIL EPOCH — append-only band commit (`appendFoldFreezeTailEpoch`):
+ *      the frozen prefix stays byte-identical; only the freshly folded tail
+ *      band is appended behind it.
+ *   2. HARD EPOCH — whole-view rebuild (`commitFoldFreeze`), paired by the
+ *      session layer with a rebirth-grade continuity seed (portable reset).
+ *      `FoldFreezeHardEpochCause` enumerates WHY a hard epoch fired
+ *      (first-call bootstrap, cold-gap, boundary healing, pressure, …).
+ * The legacy bandless middle tier — a seedless re-fold of
+ * the whole history — is retired vocabulary and a banned code path. Do not
+ * reintroduce it: any fold that cannot band-append escalates to the seeded
+ * hard epoch, full stop.
+ *
  * Net effect: the fold's quality machinery (graduated assistant-text budget,
  * sequence collapsing, claimed-path unfolds, atlas-metadata preservation) is
  * untouched — it simply fires in PULSES at epoch boundaries instead of on
@@ -189,7 +203,15 @@ function boundaryFingerprintInput(msg: FoldMessage): string {
 // State
 // ══════════════════════════════════════════════════════════════════════
 
-export type FoldFreezeFullRecomputeCause =
+/**
+ * Cause attached to a whole-view rebuild (`commitFoldFreeze`). Two-epoch
+ * law: a committed whole-view rebuild IS the hard epoch — the only non-tail
+ * epoch type; there is no separate bandless re-fold epoch. Note 'tail-epoch'
+ * here means "raw tail overflow made a fold due": callers attempt the
+ * append-only band first and reach commitFoldFreeze with this cause only by
+ * escalating to the seeded hard epoch.
+ */
+export type FoldFreezeHardEpochCause =
   | 'first-call'
   | 'cold-gap'
   | 'context-changed'
@@ -203,17 +225,17 @@ export type FoldFreezeFullRecomputeCause =
   // prefix the rebirth was supposed to recompute away. Both the relay
   // (FcBaseSession) and standalone (FoldSession) callers gate append-only on
   // `reason === 'tail-epoch'` exactly, so this distinct cause routes the
-  // restored overcap through full recompute + eviction instead.
+  // restored overcap through a whole-view hard epoch + eviction instead.
   | 'restored-overcap'
   | 'pressure-ceiling'
   | 'prefix-saturation'
   // Same-instance rebirth-package hard epoch: provider-visible history was
   // replaced with a compact continuity seed. Distinct from pressure-ceiling
-  // because the topology reset is the primary action, not just a recompute.
+  // because the topology reset is the primary action, not just a view rebuild.
   | 'hard-epoch';
 
 export type FoldFreezeTransitionReason =
-  | FoldFreezeFullRecomputeCause
+  | FoldFreezeHardEpochCause
   | 'hot-reuse'
   | 'append-tail-epoch';
 
@@ -302,9 +324,9 @@ export function isTailEpochEfficiencyAlarm(shrinkRatio: number | null): boolean 
  * next turn tail-epochs again (the "folds barely dropping the tail" livelock,
  * complement to the floor gate's "not enough raw tail to fold" livelock). AT
  * PRESSURE (measured occupancy at/above the fold trigger) that class of fold
- * escalates to a hard epoch (topology-resetting seed) instead: a full recompute
- * of the SAME incompressible content (dense tool-result / code / JSON) would not
- * drop the tail either — only the seed reset does. 0.7 (not the 0.6 alarm) tracks
+ * escalates to a hard epoch (topology-resetting seed) instead: re-folding the
+ * SAME incompressible content (dense tool-result / code / JSON) seedlessly would
+ * not drop the tail either — only the seed reset does. 0.7 (not the 0.6 alarm) tracks
  * the operator's stated "retain >~70%" bar and keeps escalation conservative, so
  * only the truly-stuck folds hard-epoch. Escalation ⊂ alarm: every fold that
  * escalates (>0.7) also alarms (>0.6), but not vice-versa.
@@ -354,7 +376,7 @@ export function shouldEscalateTailEpochForLowYield(
   return trigger - measured < minRunway;
 }
 
-export const FOLD_FREEZE_FULL_RECOMPUTE_CAUSES: readonly FoldFreezeFullRecomputeCause[] = [
+export const FOLD_FREEZE_HARD_EPOCH_CAUSES: readonly FoldFreezeHardEpochCause[] = [
   'first-call',
   'cold-gap',
   'context-changed',
@@ -568,18 +590,18 @@ export interface FoldFreezeState {
   lastCallAt: number;
   /** Consecutive hot reuses since the last epoch (telemetry). */
   hotReuses: number;
-  /** Lifetime epoch (recompute) count (telemetry). */
+  /** Lifetime epoch count — hard epochs AND tail epochs (telemetry). */
   epochs: number;
   /** Last state transition reason, including hot reuse and append-only growth. */
   lastTransitionReason?: FoldFreezeTransitionReason;
-  /** Last full-recompute cause; append-only tail epochs do not overwrite it. */
-  lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
+  /** Last hard-epoch (whole-view rebuild) cause; append-only tail epochs do not overwrite it. */
+  lastHardEpochReason?: FoldFreezeHardEpochCause;
   /**
    * One-shot bypass set by rebirth fold-state restoration: when true, the
    * next evaluateFoldFreeze call skips boundary/hash validation and trusts the
    * restored frozen view as-is (accepting the tail from current raw history).
    * It still honors maxTailChars: an oversized restored tail forces a
-   * 'restored-overcap' full recompute + eviction (NOT an append-only tail
+   * 'restored-overcap' hard epoch + eviction (NOT an append-only tail
    * epoch, which would preserve the bloated rebirth/fork prefix). Cleared
    * after that single evaluation regardless of outcome — normal boundary
    * checking resumes immediately. This lets the reborn session reuse the
@@ -588,8 +610,8 @@ export interface FoldFreezeState {
   forceAcceptRestoredView?: boolean;
   /**
    * Vault row fingerprints already sealed into the frozen view (the full
-   * render baked at the last full recompute + every per-band delta since).
-   * Cleared on each full recompute, mirroring sealedBands resetting — so a
+   * render baked at the last hard epoch + every per-band delta since).
+   * Cleared on each hard epoch, mirroring sealedBands resetting — so a
    * row seals into exactly one band per freeze generation. Serialized so it
    * survives rebirth: without it, a reborn session would see an empty set
    * and re-bake rows already in the restored frozen prefix → duplication.
@@ -613,7 +635,7 @@ export function createFoldFreezeState(): FoldFreezeState {
     hotReuses: 0,
     epochs: 0,
     lastTransitionReason: undefined,
-    lastFullRecomputeReason: undefined,
+    lastHardEpochReason: undefined,
     sealedVaultFingerprints: new Set(),
   };
 }
@@ -635,7 +657,13 @@ export interface SerializedFoldFreezeState {
   hotReuses: number;
   epochs: number;
   lastTransitionReason?: FoldFreezeTransitionReason;
-  lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
+  lastHardEpochReason?: FoldFreezeHardEpochCause;
+  /**
+   * Legacy pre-two-epoch-law field name for lastHardEpochReason. Read-compat
+   * only: restoreFoldFreezeState accepts it when lastHardEpochReason is
+   * absent; serializeFoldFreezeState never writes it.
+   */
+  lastFullRecomputeReason?: FoldFreezeHardEpochCause;
   forceAcceptRestoredView?: boolean;
   /** Serialized form of sealedVaultFingerprints; defaults to [] for back-compat. */
   sealedVaultFingerprints?: string[];
@@ -661,9 +689,9 @@ export interface FoldFreezeStateMetadata {
     hotReuses: number;
     epochs: number;
     lastTransitionReason?: FoldFreezeTransitionReason;
-    lastFullRecomputeReason?: FoldFreezeFullRecomputeCause;
+    lastHardEpochReason?: FoldFreezeHardEpochCause;
   };
-  fullRecomputeCauses: readonly FoldFreezeFullRecomputeCause[];
+  hardEpochCauses: readonly FoldFreezeHardEpochCause[];
 }
 
 export function serializeFoldFreezeState(state: FoldFreezeState): SerializedFoldFreezeState {
@@ -684,7 +712,7 @@ export function serializeFoldFreezeState(state: FoldFreezeState): SerializedFold
     hotReuses: state.hotReuses,
     epochs: state.epochs,
     lastTransitionReason: state.lastTransitionReason,
-    lastFullRecomputeReason: state.lastFullRecomputeReason,
+    lastHardEpochReason: state.lastHardEpochReason,
     forceAcceptRestoredView: state.forceAcceptRestoredView,
     sealedVaultFingerprints: Array.from(state.sealedVaultFingerprints).sort(),
   };
@@ -707,7 +735,8 @@ export function restoreFoldFreezeState(snapshot: SerializedFoldFreezeState): Fol
     hotReuses: snapshot.hotReuses,
     epochs: snapshot.epochs,
     lastTransitionReason: snapshot.lastTransitionReason,
-    lastFullRecomputeReason: snapshot.lastFullRecomputeReason,
+    // Legacy read compat: pre-rename snapshots carry lastFullRecomputeReason.
+    lastHardEpochReason: snapshot.lastHardEpochReason ?? snapshot.lastFullRecomputeReason,
     forceAcceptRestoredView: snapshot.forceAcceptRestoredView,
     sealedVaultFingerprints: new Set(snapshot.sealedVaultFingerprints ?? []),
   };
@@ -732,9 +761,9 @@ export function getFoldFreezeMetadata(state: FoldFreezeState): FoldFreezeStateMe
       hotReuses: state.hotReuses,
       epochs: state.epochs,
       lastTransitionReason: state.lastTransitionReason,
-      lastFullRecomputeReason: state.lastFullRecomputeReason,
+      lastHardEpochReason: state.lastHardEpochReason,
     },
-    fullRecomputeCauses: FOLD_FREEZE_FULL_RECOMPUTE_CAUSES,
+    hardEpochCauses: FOLD_FREEZE_HARD_EPOCH_CAUSES,
   };
 }
 
@@ -798,7 +827,13 @@ export interface FoldFreezeContext {
 // Decision
 // ══════════════════════════════════════════════════════════════════════
 
-export type FoldFreezeRecomputeReason = FoldFreezeFullRecomputeCause;
+/**
+ * Reason attached to an `action: 'recompute'` decision — the freeze cache
+ * saying "the whole view must be rebuilt". Under the two-epoch law every
+ * committed whole-view rebuild is a (seeded) HARD epoch, hence the alias.
+ * Callers that can still band-append do so instead of committing this.
+ */
+export type FoldFreezeRecomputeReason = FoldFreezeHardEpochCause;
 
 export type FoldFreezeDecision =
   | { action: 'reuse'; view: FoldMessage[]; tailChars: number; tailCount: number }
@@ -844,8 +879,9 @@ export function evaluateFoldFreeze(
       if (tailChars > config.maxTailChars) {
         // Distinct cause (NOT 'tail-epoch'): the append-only tail-epoch path
         // would seal and keep the oversized restored prefix. 'restored-overcap'
-        // routes both callers through full recompute + eviction so the bloated
-        // rebirth/fork prefix is recomputed away instead of carried forward.
+        // routes both callers through the whole-view hard epoch + eviction so
+        // the bloated rebirth/fork prefix is rebuilt away instead of carried
+        // forward.
         return { action: 'recompute', reason: 'restored-overcap', gapMs, detail: 'restored-tail-overcap' };
       }
       return {
@@ -935,7 +971,9 @@ export function touchFoldFreeze(state: FoldFreezeState, now: number): void {
 }
 
 /**
- * Capture a freshly recomputed pipeline output as the new frozen view.
+ * Commit the HARD-epoch transition: capture a freshly rebuilt whole-view
+ * pipeline output as the new frozen view (two-epoch law: the only non-tail
+ * epoch type — session callers pair this rebuild with the rebirth seed).
  * Stores a shallow copy of the view array so later caller-side array
  * mutations (push/splice) can never corrupt the frozen bytes; element
  * references are shared, which is what makes hot-path prefix identity exact.
@@ -946,7 +984,7 @@ export function commitFoldFreeze(
   view: FoldMessage[],
   context: FoldFreezeContext,
   now: number,
-  recomputeReason: FoldFreezeFullRecomputeCause = 'first-call',
+  hardEpochCause: FoldFreezeHardEpochCause = 'first-call',
 ): void {
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
   state.frozenView = view.slice();
@@ -972,8 +1010,8 @@ export function commitFoldFreeze(
   state.lastCallAt = now;
   state.hotReuses = 0;
   state.epochs += 1;
-  state.lastTransitionReason = recomputeReason;
-  state.lastFullRecomputeReason = recomputeReason;
+  state.lastTransitionReason = hardEpochCause;
+  state.lastHardEpochReason = hardEpochCause;
 }
 
 /**

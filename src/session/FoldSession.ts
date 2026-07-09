@@ -90,7 +90,7 @@ import {
 const EMPTY_CLAIMED: ReadonlySet<string> = new Set<string>();
 // Standalone Context Warp geometry signposts:
 //   S = system/tools reserve before folded memory
-//   M = full-recompute folded memory band
+//   M = folded memory band after a whole-view rebuild
 //   A = expected appended folded-tail band
 //   T = preferred/default next live-tail runway
 //   F = hard minimum append runway
@@ -129,7 +129,7 @@ export interface FoldPressureCeilingConfig {
 export interface FoldTailEpochRunwayConfig {
   /** S: fallback modeled system/tools prefix reserve tokens. */
   readonly systemToolsReserveTokens?: number;
-  /** M: fallback modeled folded memory band after a full recompute. */
+  /** M: fallback modeled folded memory band after a whole-view rebuild. */
   readonly targetBandTokens?: number;
   /** A: fallback modeled size of one appended folded-tail band. */
   readonly appendBandTargetTokens?: number;
@@ -179,7 +179,7 @@ export interface FoldSessionOptions {
    * E10 sawtooth eviction for the standing fold block. Enabled by default for
    * prepare(), because FoldSession's contract is full raw append-only history:
    * hosts can compose foldRecall with that raw history to page tombstoned
-   * detail back in. Full recompute epochs can target the oldest safe frontier
+   * detail back in. Whole-view rebuild epochs can target the oldest safe frontier
    * when the pressure ceiling reopens all raw history for tombstoning; pass
    * false to keep the fold block monotonic, or tune the threshold.
    */
@@ -220,8 +220,8 @@ export interface FoldSessionOptions {
    */
   readonly readBurstGuard?: boolean;
   /**
-   * Intrinsic value-aware graduated fidelity (cherry-picked, full-recompute
-   * only). When `enabled`, a freeze EPOCH full-recompute spends the same
+   * Intrinsic value-aware graduated fidelity (cherry-picked, whole-view
+   * rebuilds only). When `enabled`, a freeze EPOCH whole-view rebuild spends the same
    * full/essence budget by intrinsic trace value (forward path re-reference +
    * durable glyph) past a recency floor, instead of the pure newest-first ramp.
    * Append/hot-reuse never apply it. Default OFF (byte-identical fold).
@@ -398,7 +398,7 @@ export class FoldSession {
    * Provider-measured post-fold floor (frozen-prefix resting occupancy) for the
    * trigger-anchored tail-epoch runway gate. null until the first epoch on the
    * current hard-epoch generation captures it. The floor PERSISTS across
-   * in-place full recomputes (they clear the sealed bands but do NOT drop the
+   * in-place whole-view rebuilds (they clear the sealed bands but do NOT drop the
    * frozen-prefix resting level) and is cleared only by a hard epoch (seed
    * reset — commitHardEpoch), which then re-arms capture so the next reading
    * re-baselines to the fresh seed resting level. Comparison of two provider
@@ -821,7 +821,7 @@ export class FoldSession {
   ): FoldEvictionInput | undefined {
     if (!this.evictionEnabled || this.evictionThresholdChars <= 0) return undefined;
     const hasSpans = this.foldEvictedSpans.length > 0;
-    // Pressure-ceiling / forced-full-recompute epochs: the entire raw history
+    // Pressure-ceiling / forced whole-view-rebuild epochs: the entire raw history
     // is being recomputed through the fold pipeline, so ALL folded content is
     // eligible for eviction regardless of vault state. The raw history is the
     // durable backing — fold-recall pages evicted turns back from raw on touch,
@@ -1202,7 +1202,7 @@ export class FoldSession {
       // actual compression. When trigger-runway is thin (trigger − measured <
       // minRunway; at-pressure is the zero/negative subset), a low-yield fold
       // (retains >70%) barely drops the frozen floor, so the next turn tail-epochs
-      // again (the "folds barely dropping the tail" livelock); a full recompute of
+      // again (the "folds barely dropping the tail" livelock); a whole-view rebuild of
       // the same incompressible content would not help — only a topology-resetting
       // seed hard epoch does. Measured-only runway judgement (GOD RULE 7).
       const yieldRawTailChars = countChars(tail);
@@ -1228,9 +1228,20 @@ export class FoldSession {
       // Pre-commit enrichment: merge cognitive block into the sealed tail's
       // final message so the gate measures the actual committed size.
       // Merging (not appending) preserves the terminal role and message count.
-      const enrichedTail = cognitiveBlock
+      let enrichedTail = cognitiveBlock
         ? mergeBlockIntoViewTail(sealedTail, cognitiveBlock)
         : sealedTail;
+      // When a kept-raw working set survives, inject a boundary marker into
+      // the band's tail so the agent knows the sealed/folded history ENDS
+      // here and the live working set — the actual current state — begins
+      // immediately after. This prevents the agent from treating stale
+      // verdicts/hazards in the band as current state.
+      if (hasKeptRaw) {
+        enrichedTail = mergeBlockIntoViewTail(
+          enrichedTail,
+          `[fold boundary — sealed history ends here; your live working set with the current user request follows below — focus there]`,
+        );
+      }
       // When we kept a raw working set, pass truncated history so
       // frozenRawCount advances only to the fold boundary.
       const commitMessages = hasKeptRaw
@@ -1297,7 +1308,7 @@ export class FoldSession {
     }
     if (recomputeReason === 'tail-epoch' && !pressureCeilingTriggered && !appendOnlyTailEpoch) {
       // Runway-gate escalation (FC parity — resolveTailEpochRouting's
-      // runwayGateForcesFullRecompute routes to the portable seed reset). A tail
+      // runwayGateForcesHardEpoch routes to the portable seed reset). A tail
       // epoch whose captured post-fold floor reaches the fold trigger buys no
       // below-trigger working runway, and an in-place recompute does not drop
       // the frozen floor either. Only a HARD epoch (seed reset) drops the floor
@@ -1324,7 +1335,7 @@ export class FoldSession {
     );
     const stepResult = this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig);
     const bookkeepingResult = result.turnsFolded > 0 ? result : stepResult ?? result;
-    // Full recompute: render the whole vault and bake it into the frozen view
+    // Whole-view rebuild: render the whole vault and bake it into the frozen view
     // before sealing (resets the sealed set, mirroring commitFoldFreeze clearing
     // sealedBands). Subsequent append epochs seal only deltas on top of this.
     const recomputeCognitiveBlock = bookkeepingResult.turnsFolded > 0
@@ -1341,7 +1352,7 @@ export class FoldSession {
     // In-place recompute clears the sealed-band generation, but it does not
     // reset the hard-epoch generation. Keep the runway gate's arming counter:
     // the floor itself PERSISTS, so resetting the counter here would create a
-    // one-epoch blind spot exactly when a cold/full recompute leaves occupancy
+    // one-epoch blind spot exactly when a cold whole-view rebuild leaves occupancy
     // high. Only a hard epoch clears both the floor and the counter. Arm
     // post-epoch floor capture so the next measured reading can re-baseline it
     // downward or seed a first floor (GOD RULE 7: provider-measured readings only).
@@ -1395,7 +1406,7 @@ export class FoldSession {
    * Same-instance hard epoch: replace the prepared view with one compact seed
    * message (live turn merged in by buildHardEpochSeedView) and re-anchor the
    * freeze boundary around it. freezeState is readonly here, so we re-seal in
-   * place via commitFoldFreeze (which clears sealedBands on a full recompute)
+   * place via commitFoldFreeze (which clears sealedBands on a whole-view rebuild)
    * rather than reassigning a fresh state as the relay session does.
    */
   private commitHardEpoch(

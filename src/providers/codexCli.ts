@@ -188,8 +188,8 @@ export interface CodexEpochConfig {
 export const DEFAULT_CODEX_FOLD_BAND_FRACTION = 0.7;
 // Pure-predicate fallback trigger. Live CodexSession does not use this default:
 // it resolves a transport-aware trigger through resolveContextBudget so Codex CLI
-// reconstruction uses the shared live trigger while remaining a full-recompute-
-// only transport (no append-only cache economics).
+// reconstruction uses the shared live trigger while remaining a whole-transcript-
+// refold transport (no append-only cache economics).
 // The post-fold crush stays aggressive via ALWAYS_ON_FOLD_CONFIG ("collapse all
 // the way down"); do NOT add a token floor or soften that config to raise
 // steady-state occupancy — see the aggressive-crush hazard in Atlas history.

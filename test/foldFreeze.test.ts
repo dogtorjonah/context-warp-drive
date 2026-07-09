@@ -269,11 +269,11 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     expect(metadata.sealedBoundaryViewCount).toBe(view.length);
     expect(metadata.rawFrontierIndex).toBe(grown.length);
     expect(metadata.cache.lastTransitionReason).toBe('append-tail-epoch');
-    expect(metadata.cache.lastFullRecomputeReason).toBe('first-call');
-    expect(metadata.fullRecomputeCauses).toContain('cold-gap');
-    expect(metadata.fullRecomputeCauses).toContain('boundary-mismatch');
-    expect(metadata.fullRecomputeCauses).toContain('restored-overcap');
-    expect(metadata.fullRecomputeCauses).toContain('prefix-saturation');
+    expect(metadata.cache.lastHardEpochReason).toBe('first-call');
+    expect(metadata.hardEpochCauses).toContain('cold-gap');
+    expect(metadata.hardEpochCauses).toContain('boundary-mismatch');
+    expect(metadata.hardEpochCauses).toContain('restored-overcap');
+    expect(metadata.hardEpochCauses).toContain('prefix-saturation');
     expect(metadata.sealedBands).toHaveLength(1);
     expect(metadata.sealedBands[0]).toMatchObject({
       sealedPrefixMessageCount: view.length,
@@ -326,8 +326,8 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     const decision = evaluateFoldFreeze(restored, [...history, whale], ctx(), T0 + 5_000, CFG);
 
     // Distinct from generic 'tail-epoch' so both the relay and standalone
-    // callers force full recompute + eviction instead of appending a folded
-    // tail band onto the oversized restored prefix.
+    // callers force the whole-view hard epoch + eviction instead of appending
+    // a folded tail band onto the oversized restored prefix.
     expect(decision).toMatchObject({
       action: 'recompute',
       reason: 'restored-overcap',
@@ -347,17 +347,35 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     expect(state.epochs).toBe(2);
     expect(state.lastCallAt).toBe(T0 + 3_000);
     expect(state.lastTransitionReason).toBe('cold-gap');
-    expect(state.lastFullRecomputeReason).toBe('cold-gap');
+    expect(state.lastHardEpochReason).toBe('cold-gap');
   });
 
-  it('records prefix saturation as a caller-supplied full recompute cause', () => {
+  it('records prefix saturation as a caller-supplied hard-epoch cause', () => {
     const { state, history } = frozenFixture();
     commitFoldFreeze(state, history, [msg('user', 'prefix refreshed')], ctx(), T0 + 3_000, 'prefix-saturation');
 
     expect(state.lastTransitionReason).toBe('prefix-saturation');
-    expect(state.lastFullRecomputeReason).toBe('prefix-saturation');
-    expect(getFoldFreezeMetadata(state).cache.lastFullRecomputeReason).toBe('prefix-saturation');
-    expect(serializeFoldFreezeState(state).lastFullRecomputeReason).toBe('prefix-saturation');
+    expect(state.lastHardEpochReason).toBe('prefix-saturation');
+    expect(getFoldFreezeMetadata(state).cache.lastHardEpochReason).toBe('prefix-saturation');
+    expect(serializeFoldFreezeState(state).lastHardEpochReason).toBe('prefix-saturation');
+  });
+
+  it('restores legacy snapshots that stored lastFullRecomputeReason (pre two-epoch-law)', () => {
+    const { state } = frozenFixture();
+    const snapshot = serializeFoldFreezeState(state);
+    expect(snapshot.lastHardEpochReason).toBe('first-call');
+    // New snapshots never write the legacy key.
+    expect(snapshot.lastFullRecomputeReason).toBeUndefined();
+
+    // Simulate a pre-rename snapshot: legacy key only, new key absent.
+    const legacy = JSON.parse(JSON.stringify(snapshot)) as typeof snapshot;
+    legacy.lastFullRecomputeReason = 'pressure-ceiling';
+    delete legacy.lastHardEpochReason;
+    expect(restoreFoldFreezeState(legacy).lastHardEpochReason).toBe('pressure-ceiling');
+
+    // The new field wins when both are present.
+    const both = { ...legacy, lastHardEpochReason: 'cold-gap' as const };
+    expect(restoreFoldFreezeState(both).lastHardEpochReason).toBe('cold-gap');
   });
 
   it('empty-history commit is safe and reuse returns the pure tail', () => {

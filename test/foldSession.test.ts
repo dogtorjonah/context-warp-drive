@@ -308,7 +308,10 @@ describe('FoldSession tail-epoch runway gate', () => {
     });
     const first = turn(0);
     const epoch = session.prepare(first);
-    const skipped = session.prepare([...first, ...turn(1)]);
+    // The cold append-band profile skeletonizes band bodies, so a full turn(1)
+    // now folds profitably. A genuinely unprofitable band needs a tail smaller
+    // than the band's fixed skeleton/closet overhead: one tiny exchange.
+    const skipped = session.prepare([...first, userMsg('q?'), assistantMsg('ok.')]);
 
     expect(epoch.cacheHot).toBe(false);
     expect(skipped.cacheHot).toBe(true);
@@ -351,7 +354,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.appendDecision).toBe('committed');
   });
 
-  test('full-recomputes a telemetryless tail epoch when fallback modeling leaves less than the 10k floor', () => {
+  test('hard-epochs a telemetryless tail epoch when fallback modeling leaves less than the 10k floor', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -363,8 +366,13 @@ describe('FoldSession tail-epoch runway gate', () => {
     const recomputed = session.prepare([...first, ...turn(1)]);
 
     expect(recomputed.cacheHot).toBe(false);
-    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
-    expect(recomputed.sealedBoundary).toBeNull();
+    // Two-epoch law: the runway gate escalates straight to the seeded hard
+    // epoch — the retired in-place middle-tier re-fold no longer exists.
+    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
+    // Hard epoch replaces the view with a compact seed and re-seals around it:
+    // the one seed message IS the frozen prefix (boundary 1), not a bandless
+    // unsealed re-fold (the retired kind left sealedBoundary null).
+    expect(recomputed.sealedBoundary).toBe(1);
     expect(session.telemetry.epochs).toBe(2);
   });
 
@@ -661,7 +669,8 @@ describe('FoldSession per-band vault sealing', () => {
     session.recordAssistantMessage('🏁 zeta handled', '2026-06-19T10:06:00Z');
     const recomputed = session.prepare(vaultGrow(first, 'tail one'));
 
-    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+tail-epoch');
+    // Two-epoch law: the runway gate escalates to the seeded hard epoch.
+    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
     const joined = vaultJoin(recomputed.messages);
     expect(joined).toContain('OPERATOR-EPSILON one');
     expect(joined).toContain('OPERATOR-ZETA two');

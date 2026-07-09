@@ -11,7 +11,7 @@ import { contextWindowForModel } from './contextWindow.ts';
 // Context Warp geometry signposts — SINGLE-CEILING GEOMETRY (Jonah 2026-07-08:
 // "one ceiling, more simple" — supersedes the two-trigger P180/TRIG150 layout):
 //   S = 37K static system/tools prefix reserve (provider-measured floor model)
-//   M = 40K folded memory after full recompute
+//   M = 40K folded memory after a hard epoch
 //   P = 180K THE ceiling — the only fold trigger. Below P nothing folds: no
 //       tail-size char gate, no calm-seal/warning override, no sub-ceiling
 //       deterministic trigger. Sessions hot-reuse the frozen prefix and ride a
@@ -21,7 +21,7 @@ import { contextWindowForModel } from './contextWindow.ts';
 //       down to the floor). Real batches by design — never char-cap slices.
 //   FLOOR RULE (the only escalation): each append raises the post-fold floor
 //       (S + frozen prefix + sealed bands). A ceiling hit escalates to a HARD
-//       epoch (full recompute back to ~S+M) instead of appending when the
+//       epoch (seeded whole-view rebuild back to ~S+M) instead of appending when the
 //       PROJECTED post-append floor would exceed P − F, i.e. when
 //       (measured floor + projected band) > P − F. The projection uses
 //       measured tokens only: projected band ≈ clamp(~18% of (measured −
@@ -40,7 +40,7 @@ import { contextWindowForModel } from './contextWindow.ts';
 //   TRIG = 150K legacy sub-ceiling trigger — likewise inert under
 //       single-ceiling mode. HISTORY NOTE superseding the 2026-07-07 warning
 //       "never set trigger equal to the ceiling": that warning described the
-//       OLD architecture, where the ceiling path was hard-recompute-only, so
+//       OLD architecture, where the ceiling path was hard-epoch-only, so
 //       trigger==ceiling starved the append path entirely (measured: Claude
 //       CLI got 0 tail epochs). Under single-ceiling mode the ceiling ITSELF
 //       takes the append path (floor rule permitting), so tail epochs happen
@@ -48,7 +48,7 @@ import { contextWindowForModel } from './contextWindow.ts';
 //   CLI reconstruction transports: Codex CLI ('codex') and Gemini CLI
 //       ('gemini') use the same P trigger in single-ceiling mode. Their normal
 //       fold/rewrite path gets first chance at P; portable-reset hard epochs
-//       are a follow-up escalation when the append/full-recompute path cannot
+//       are a follow-up escalation when the append path cannot
 //       relieve pressure. Legacy mode keeps the historical msgCeiling −
 //       minRunway Codex clamp.
 //
@@ -60,13 +60,13 @@ import { contextWindowForModel } from './contextWindow.ts';
 // append the whole live tail as one band iff the projected post-append floor
 // still leaves the minimum runway (post-append floor ≤ P − F, or no floor
 // captured yet / no append since the last hard epoch); otherwise hard-epoch.
-// The first fold of a fresh session is a full recompute that builds M (append
-// requires an existing frozen prefix). Below P: hot-reuse, always. Decision
-// precedence: reuse (< P) → append (≥ P, post-append floor rule holds) →
-// hard epoch (≥ P, post-append floor rule violated).
+// The first fold of a fresh session is a first-call hard epoch that builds M
+// (append requires an existing frozen prefix). Below P: hot-reuse, always.
+// Decision precedence: reuse (< P) → append (≥ P, post-append floor rule
+// holds) → hard epoch (≥ P, post-append floor rule violated).
 // Legacy invariant (kill switch only): append a folded tail band only if the
 // post-append prompt still guarantees F runway before P, with the T=10K tail
-// cap skeletonizing the unfrozen tail; otherwise full recompute.
+// cap skeletonizing the unfrozen tail; otherwise hard epoch.
 export const DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS = 37_000;
 export const DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS = 40_000;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS = 5_000;
@@ -110,7 +110,7 @@ export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
  * every engine shares the Claude CLI's 180K hard-epoch ceiling; do not "fix"
  * this back to 150K. On 200K windows this rides 20K under the window: the
  * TRIG=150K fold trigger keeps normal occupancy well below it, so P is
- * strictly the hard-epoch/full-recompute backstop, and messageCeiling
+ * strictly the hard-epoch backstop, and messageCeiling
  * (window − output 16K − emergency 4K = 180K) still bounds it.
  */
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 180_000;
@@ -170,10 +170,15 @@ export type ContextBudgetCompressionProfile =
   | 'cache-economic'
   | 'wide-cache-economic';
 
+/**
+ * When the whole frozen view is rebuilt (evicted). Two-epoch law: every
+ * whole-view rebuild is a seeded HARD epoch — these values say WHEN the hard
+ * epoch fires; none of them is a bandless middle tier.
+ */
 export type ContextBudgetEvictionPolicy =
-  | 'full-recompute-only'
-  | 'recompute-on-prefix-saturation'
-  | 'recompute-on-cold-or-self-heal';
+  | 'hard-epoch-only'
+  | 'hard-epoch-on-prefix-saturation'
+  | 'hard-epoch-on-cold-or-self-heal';
 
 export interface ContextBudgetEnv {
   VOXXO_FOLD_TARGET_BAND_TOKENS?: string;
@@ -472,7 +477,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   const env = input.env ?? {};
   const model = input.model?.trim() ?? '';
   const engine = input.engine?.trim() ?? '';
-  const codexCliFullRecomputeOnly = isCodexCliEngine(engine);
+  const codexCliHardEpochOnly = isCodexCliEngine(engine);
   const explicitWindowTokens = positiveInt(input.contextWindowTokens);
   const contextWindowTokens = explicitWindowTokens
     ?? contextWindowForModel(model, engine || undefined);
@@ -519,7 +524,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     envAlias(env, 'VOXXO_FOLD_PRESSURE_MAX_WINDOW_FRACTION', 'WARP_FOLD_PRESSURE_MAX_WINDOW_FRACTION'),
     DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION,
   );
-  const codexCliDefaultReconstructTriggerTokens = codexCliFullRecomputeOnly
+  const codexCliDefaultReconstructTriggerTokens = codexCliHardEpochOnly
     ? defaultCodexCliReconstructTriggerTokens(
       messageCeilingTokens,
       hardWindowTokens,
@@ -616,7 +621,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   // The append-only hot tail rides ON TOP of the system+tools prefix (S, modeled
   // as systemToolsReserveTokens) and the frozen band (B). The expensive event the
   // tail-epoch exists to avoid is tripping the pressure ceiling, which forces a
-  // FULL recompute — so the tail should be as large as fits UNDER that ceiling:
+  // HARD epoch — so the tail should be as large as fits UNDER that ceiling:
   //   tail = pressureCeiling − S − band − margin
   // By default, margin is derived from the preferred next-runway target:
   //   margin = pressureCeiling − S − band − T
@@ -624,7 +629,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   // runtimes still gate ordinary tail epochs on measured provider tokens when
   // available, suppressing cap-only folds until the measured floor is reached.
   // Append eligibility also checks the stacked append bands: if appending the next
-  // A=5K band would leave less than F runway before P, runtimes full-recompute
+  // A=5K band would leave less than F runway before P, runtimes hard-epoch
   // instead of extending the staircase.
   // This shrinks automatically under heavy tool load (large S) and grows when there
   // is headroom, unlike the old pressure-blind band×fraction default that ignored S
@@ -695,8 +700,8 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   const tailEpochCapChars = Math.max(1, Math.round(tailEpochCapTokens * charsPerToken));
   const compressionProfile = compressionProfileForTier(budgetTier);
   const evictionPolicy: ContextBudgetEvictionPolicy = compressionProfile === 'survival'
-    ? 'full-recompute-only'
-    : 'recompute-on-prefix-saturation';
+    ? 'hard-epoch-only'
+    : 'hard-epoch-on-prefix-saturation';
 
   return {
     model,

@@ -229,7 +229,7 @@ describe('epoch predicate + budget resolution', () => {
     // intervening tail epoch. The hard-epoch ceiling must instead ride at prefix
     // saturation so there is a real [pressureCeiling, hardEpochCeiling) tail band.
     const big = resolveContextBudget({ engine: 'claude', contextWindowTokens: 1_000_000, env: {} });
-    expect(big.evictionPolicy).toBe('recompute-on-prefix-saturation');
+    expect(big.evictionPolicy).toBe('hard-epoch-on-prefix-saturation');
     const hard = resolveClaudeCliHardEpochCeilingTokens({ contextWindowTokens: 1_000_000, env: {} });
     expect(hard).toBe(Math.max(big.prefixSaturationTokens!, big.pressureCeilingTokens!));
     // The fix: the hard-epoch ceiling is strictly above the pressure ceiling, so a
@@ -241,7 +241,7 @@ describe('epoch predicate + budget resolution', () => {
     for (const window of [200_000, 256_000, 1_000_000]) {
       const budget = resolveContextBudget({ engine: 'claude', contextWindowTokens: window, env: {} });
       const hard = resolveClaudeCliHardEpochCeilingTokens({ contextWindowTokens: window, env: {} });
-      if (budget.evictionPolicy === 'full-recompute-only') {
+      if (budget.evictionPolicy === 'hard-epoch-only') {
         // Survival tier: every fold is hard, so the ceiling collapses back to the
         // pressure ceiling (no tail band — deliberate hard-only behavior preserved).
         expect(hard).toBe(budget.pressureCeilingTokens);

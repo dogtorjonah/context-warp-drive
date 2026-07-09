@@ -556,7 +556,7 @@ export function renderVaultRowsBlock(
 /**
  * Stable per-row identity used by the per-band seal to dedupe a row across band
  * epochs (so each operator/glyph entry seals into exactly one band until the
- * next full recompute resets the sealed set). FNV-1a over the normalized text,
+ * next whole-view rebuild resets the sealed set). FNV-1a over the normalized text,
  * namespaced by role.
  */
 export function vaultRowFingerprint(row: Pick<VaultRenderRow, 'role' | 'text'>): string {

@@ -892,7 +892,7 @@ function buildToolResultPositions(rawHistory: readonly FoldMessage[]): Map<strin
  * recomputed folded view. Call ONLY at fold-freeze epoch commits — the fold
  * is deterministic, so replaying detectTurns over raw plus summing the view's
  * fold-block counts (one block per sealed band on FC append-only tail epochs;
- * a single cumulative block on full recomputes) reproduces exactly which turns
+ * a single cumulative block on whole-view rebuilds) reproduces exactly which turns
  * folded, with zero extra fold passes and zero I/O.
  *
  * Caveat: turn replay assumes upstream pipeline stages preserve user-text
@@ -943,7 +943,7 @@ export function buildFoldIndex(
   // chronological band order; the folded raw prefix is their SUM. First-match-
   // wins pinned the page table to the oldest band forever (measured: permanent
   // cards:0 recall on multi-band FC sessions while newer folded spans stayed
-  // unindexed). Single-block full-recompute views are unchanged by summing.
+  // unindexed). Single-block whole-view-rebuild views are unchanged by summing.
   let interFoldedCount = 0;
   for (const msg of foldedView) {
     if (msg.role !== 'user' || typeof msg.content !== 'string') continue;

@@ -11,7 +11,7 @@
  * There is no inline compaction hook. So claude-cli has been hard-epoch-only
  * (session-swap rebirth at the pressure ceiling) with no mid-stream fold.
  *
- * This module gives claude-cli the SAME full-recompute fold transport codex and
+ * This module gives claude-cli the SAME whole-transcript refold transport codex and
  * gemini use: reconstruct the folded context an FC session would have had — from
  * the canonical relay transcript — and serialize it into Claude Code's on-disk
  * JSONL turn lines. The caller (claudeCliSession wiring) reads the transcript
@@ -133,7 +133,7 @@ export type ClaudeCliJsonlLine = ClaudeCliMessageLine | ClaudeCliLastPromptLine;
 // ════════════════════════════════════════════════════════════════════════
 // Epoch predicate + trigger resolution
 //
-// claude-cli is a full-recompute-only CLI transport (no append-only cache
+// claude-cli is a hard-epoch-only CLI transport (no append-only cache
 // economics): it rewrites + respawns at the epoch. The trigger must sit BELOW
 // the pressure ceiling with a reconstruct runway, so we rewrite+resume before
 // occupancy would force a hard-epoch session swap. We resolve the live trigger
@@ -214,7 +214,7 @@ export function resolveClaudeCliPressureCeilingTokens(options: ClaudeCliFoldTarg
 /**
  * Resolve the claude-cli HARD-EPOCH ceiling — the measured prompt-token level at
  * which a normal tail fold can no longer recover headroom and the session must do a
- * single full-recompute hard epoch (portable_reset) that preserves the live user
+ * single seeded hard epoch (portable_reset) that preserves the live user
  * turn. This is the PREFIX-SATURATION point, NOT the pressure ceiling: the pressure
  * ceiling is where tail folding becomes urgent, but tail folds keep the session
  * alive all the way up to prefix saturation. Separating the two gives big-window
@@ -222,10 +222,10 @@ export function resolveClaudeCliPressureCeilingTokens(options: ClaudeCliFoldTarg
  * the moment they cross the (window-independent) 180K pressure floor — the dogfood
  * bug where a 1M-window session hard-reset at ~18% utilization with ~820K of runway
  * still left. Mirrors the FC eviction policy:
- *   - 'full-recompute-only' (survival tier): every fold is hard, so the ceiling
+ *   - 'hard-epoch-only' (survival tier): every fold is hard, so the ceiling
  *     collapses back to the pressure ceiling (no tail band — preserves the
  *     deliberate hard-only behavior for tiny/constrained windows).
- *   - 'recompute-on-prefix-saturation' (default): hard only at/above prefix
+ *   - 'hard-epoch-on-prefix-saturation' (default): hard only at/above prefix
  *     saturation; tail-fold below it.
  * Never returns below the pressure ceiling (a hard epoch must not fire before the
  * session is even under pressure). Returns null only when both saturation and
@@ -239,12 +239,12 @@ export function resolveClaudeCliHardEpochCeilingTokens(options: ClaudeCliFoldTar
     env: options.env,
     contextWindowTokens: options.contextWindowTokens,
   });
-  // Survival-tier folds are full-recompute-only: every fold is hard, so the
+  // Survival-tier folds are hard-epoch-only: every fold is hard, so the
   // hard-epoch ceiling collapses to the pressure ceiling (no tail band).
-  if (budget.evictionPolicy === 'full-recompute-only') {
+  if (budget.evictionPolicy === 'hard-epoch-only') {
     return budget.pressureCeilingTokens;
   }
-  // recompute-on-prefix-saturation: tail-fold below prefix saturation, hard-epoch
+  // hard-epoch-on-prefix-saturation: tail-fold below prefix saturation, hard-epoch
   // at/above it. Floor at the pressure ceiling so a hard epoch never fires early.
   const saturation = budget.prefixSaturationTokens;
   const pressure = budget.pressureCeilingTokens;

@@ -100,7 +100,7 @@ export interface FoldResult {
   evictedSpans?: FoldEvictionSpan[];
   /** Turns newly tombstoned this pass (present only when a FoldEvictionInput was provided). */
   newlyEvictedTurns?: number;
-  /** Full-recompute eviction decision when a caller supplied a targeted eviction frontier. */
+  /** Whole-view-rebuild eviction decision when a caller supplied a targeted eviction frontier. */
   evictionOutcome?: FoldEvictionOutcome;
 }
 
@@ -145,7 +145,7 @@ export interface FoldEvictionInput {
   /** Ordinals below this may be NEWLY evicted this pass. */
   evictableThroughOrdinal: number;
   /**
-   * Optional full-recompute target: advance the tombstone frontier at least this
+   * Optional whole-view-rebuild target: advance the tombstone frontier at least this
    * far, clamped by evictableThroughOrdinal and the current fold zone. When
    * absent, foldContext keeps the legacy threshold sawtooth behavior.
    */
@@ -338,7 +338,7 @@ export const DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS = 8;
 
 /**
  * Per-call input enabling intrinsic value-aware graduated fidelity. Provided
- * ONLY by the freeze EPOCH full-recompute path (cache-safe by construction, the
+ * ONLY by the freeze EPOCH whole-view rebuild path (cache-safe by construction, the
  * same gate as FoldEvictionInput); append/hot-reuse must never pass it. Absent →
  * the newest-first recency ramp runs byte-identically.
  */
@@ -1937,10 +1937,10 @@ export function checkFoldTrigger(
 //
 // The continuous fold accretes one skeleton per folded turn for the life of a
 // session, so the standing fold block grows monotonically. Eviction bounds it:
-// at full-recompute freeze EPOCH commits only (the prefix is recomputing anyway
+// at whole-view-rebuild freeze EPOCH commits only (the prefix is recomputing anyway
 // — cache-safe by construction), the OLDEST folded spans collapse to tombstone
-// lines. Relay/FoldSession callers pass a target frontier so every full
-// recompute attempts eviction; direct foldContext callers without a target keep
+// lines. Relay/FoldSession callers pass a target frontier so every whole-view
+// rebuild attempts eviction; direct foldContext callers without a target keep
 // the legacy char-threshold sawtooth. Eligibility is the session's call
 // (fcBaseSession.buildFoldEvictionInput): a turn is evictable only when its
 // content is durably covered by the episodic store (the capture cursor advances
@@ -2061,7 +2061,7 @@ function renderFoldedBlock(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Cherry-picked graduated fidelity — intrinsic per-turn value (full-recompute)
+// Cherry-picked graduated fidelity — intrinsic per-turn value (whole-view rebuild)
 // ══════════════════════════════════════════════════════════════════════
 
 const DURABLE_GLYPH_PREFIXES = ['🏁', '⚠️', '⚠'] as const;
@@ -2300,7 +2300,7 @@ export function foldContext(
       }
     }
   } else {
-    // Cherry-picked graduated fidelity (full-recompute only): the newest K folded
+    // Cherry-picked graduated fidelity (whole-view rebuilds only): the newest K folded
     // turns keep budget priority (working-set recency floor), then the SAME
     // full/essence budget is spent on the remainder ranked by intrinsic trace
     // value (forward path re-reference + durable glyph) instead of pure age — so a
@@ -2514,7 +2514,7 @@ export function foldContext(
   };
 
   // ── E10 eviction.
-  // Targeted full-recompute callers pass targetEvictThroughOrdinal, making
+  // Targeted whole-view-rebuild callers pass targetEvictThroughOrdinal, making
   // eviction an epoch contract: advance oldest-first through the requested safe
   // frontier. Direct legacy callers without a target keep the old threshold
   // sawtooth behavior.

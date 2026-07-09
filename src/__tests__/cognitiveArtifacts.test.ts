@@ -3,10 +3,10 @@ import {
   extractCognitiveArtifacts,
   renderCognitiveBlock,
   enrichFoldedBandBody,
-} from '../src/cognitiveArtifacts.ts';
-import type { FoldMessage } from '../src/rollingFold.ts';
+} from '../cognitiveArtifacts.ts';
+import type { FoldMessage } from '../rollingFold.ts';
 
-describe('cognitiveArtifacts (standalone)', () => {
+describe('cognitiveArtifacts', () => {
   describe('extractCognitiveArtifacts', () => {
     it('extracts verdict glyph from assistant message', () => {
       const messages: FoldMessage[] = [
@@ -154,7 +154,7 @@ describe('cognitiveArtifacts (standalone)', () => {
 
   describe('formatCognitiveArtifactProvenance', () => {
     it('renders source message index and register', async () => {
-      const { formatCognitiveArtifactProvenance } = await import('../src/cognitiveArtifacts.ts');
+      const { formatCognitiveArtifactProvenance } = await import('../cognitiveArtifacts.ts');
       expect(formatCognitiveArtifactProvenance({
         register: 'blocked',
         glyph: '❓',

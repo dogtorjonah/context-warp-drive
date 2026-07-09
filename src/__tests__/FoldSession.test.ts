@@ -280,7 +280,7 @@ describe('FoldSession tail-epoch runway gate', () => {
 
     const joined = vaultText(appended.messages);
     expect(appended.stats.appendDecision).toBe('committed');
-    expect(joined).toContain('[cognitive]');
+    expect(joined).toContain('[cognitive');
     expect(joined).toContain('🏁 tail verdict survives');
   });
 
@@ -343,7 +343,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     // [cognitive] block portion of each message, not the whole message text
     // (the folded band content legitimately carries the raw headline too).
     const extractCognitiveBlock = (text: string): string => {
-      const start = text.indexOf('[cognitive]');
+      const start = text.indexOf('[cognitive');
       if (start < 0) return '';
       return text.slice(start);
     };

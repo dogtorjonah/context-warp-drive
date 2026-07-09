@@ -21,7 +21,7 @@ describe('resolveContextBudget', () => {
     expect(budget.prefixSaturationTokens).toBe(900_000);
     expect(budget.tailEpochCapTokens).toBe(180_000);
     expect(budget.tailEpochPressureMarginTokens).toBe(93_000);
-    expect(budget.evictionPolicy).toBe('recompute-on-prefix-saturation');
+    expect(budget.evictionPolicy).toBe('hard-epoch-on-prefix-saturation');
   });
 
   it('keeps a uniform 180K pressure ceiling across claude, claude-api, claude-interactive and codex surfaces', () => {
@@ -54,7 +54,7 @@ describe('resolveContextBudget', () => {
     expect(budget.messageCeilingTokens).toBe(180_000);
     expect(budget.prefixSaturationTokens).toBe(180_000);
     expect(budget.tailEpochCapTokens).toBe(140_000);
-    expect(budget.evictionPolicy).toBe('full-recompute-only');
+    expect(budget.evictionPolicy).toBe('hard-epoch-only');
   });
 
   it('sizes the single-ceiling tail-epoch cap to the whole measured P batch', () => {
@@ -80,7 +80,7 @@ describe('resolveContextBudget', () => {
     const widerMargin = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', tailEpochPressureMarginTokens: 80_000 });
     expect(widerMargin.tailEpochCapTokens).toBe(180_000);
     // glm-5 80k with oversized S: geometry collapses, so the raw-tail cap floors at MIN (4k).
-    // The runtime runway gate must full-recompute instead of appending in this impossible geometry.
+    // The runtime runway gate must hard-epoch instead of appending in this impossible geometry.
     const tiny = resolveContextBudget({
       engine: 'glm',
       model: 'glm-5',
@@ -118,7 +118,7 @@ describe('resolveContextBudget', () => {
     expect(exact.emergencyMarginTokens).toBe(12_000);
     expect(exact.messageCeilingTokens).toBe(356_000);
     expect(exact.prefixSaturationTokens).toBe(356_000);
-    expect(exact.evictionPolicy).toBe('recompute-on-prefix-saturation');
+    expect(exact.evictionPolicy).toBe('hard-epoch-on-prefix-saturation');
 
     expect(prefixed.contextWindowTokens).toBe(exact.contextWindowTokens);
     expect(prefixed.budgetTier).toBe(exact.budgetTier);
@@ -132,7 +132,7 @@ describe('resolveContextBudget', () => {
     expect(budget.contextWindowTokens).toBe(2_000_000);
     expect(budget.budgetTier).toBe('huge-2m');
     expect(budget.compressionProfile).toBe('wide-cache-economic');
-    expect(budget.evictionPolicy).toBe('recompute-on-prefix-saturation');
+    expect(budget.evictionPolicy).toBe('hard-epoch-on-prefix-saturation');
   });
 
   it('shrinks tiny-window models aggressively enough that the band cannot exceed the wall', () => {
