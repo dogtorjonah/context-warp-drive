@@ -8,31 +8,65 @@
 
 import { contextWindowForModel } from './contextWindow.ts';
 
-// Context Warp geometry signposts (rail-bd1654c4, Uniform Warp Geometry
-// P180/TRIG150 for ALL engines — Jonah 2026-07-07):
+// Context Warp geometry signposts — SINGLE-CEILING GEOMETRY (Jonah 2026-07-08:
+// "one ceiling, more simple" — supersedes the two-trigger P180/TRIG150 layout):
 //   S = 37K static system/tools prefix reserve (provider-measured floor model)
 //   M = 40K folded memory after full recompute
-//   A = 5K expected appended folded-tail band
-//   T = 10K preferred/default live-tail runway
-//   F = 30K hard minimum runway constant (default minRunway resolves to
-//       min(T, F_const) = 10K when no explicit override is given)
-//   P = 180K universal pressure ceiling default (fraction clamp protects small
-//       windows). No model/engine gets a hidden wider default; explicit overrides
-//       can still opt sessions into a different ceiling.
-//   TRIG = 150K universal fold trigger for EVERY engine (Jonah 2026-07-07:
-//       "same ceiling of 180k"). The trigger is clamped to ≤ min(P, msgCeil) −
-//       minRunway so it stays strictly below P. Do NOT raise TRIG up to P —
-//       trigger==ceiling collapses the reconstruct/tail-epoch runway to 0
-//       (measured: Claude CLI got 0 tail epochs). See
-//       DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS.
-//   CLI codex = full-recompute-only transport, using the shared trigger by
-//               default while still clamping to message ceiling − minRunway
+//   P = 180K THE ceiling — the only fold trigger. Below P nothing folds: no
+//       tail-size char gate, no calm-seal/warning override, no sub-ceiling
+//       deterministic trigger. Sessions hot-reuse the frozen prefix and ride a
+//       raw, full-fidelity live tail all the way up to P.
+//   At P: fold the ENTIRE accumulated live tail into ONE append band (frozen
+//       prefix stays byte-identical/cache-safe; measured occupancy saws back
+//       down to the floor). Real batches by design — never char-cap slices.
+//   FLOOR RULE (the only escalation): each append raises the post-fold floor
+//       (S + frozen prefix + sealed bands). A ceiling hit escalates to a HARD
+//       epoch (full recompute back to ~S+M) instead of appending when the
+//       PROJECTED post-append floor would exceed P − F, i.e. when
+//       (measured floor + projected band) > P − F. The projection uses
+//       measured tokens only: projected band ≈ clamp(~18% of (measured −
+//       floor), A_min 5K, A_cap 25K) — no char/byte estimation. Stateless per
+//       ceiling hit; may only escalate once ≥1 append has committed since the
+//       last hard epoch (instant-loop guard for degenerate giant-S sessions).
+//   F = 30K minimum runway that must remain under P after an append for the
+//       append to be worth taking. Under single-ceiling mode F resolves to the
+//       full 30K constant (no min(T, F) collapse — T is inert here).
+//   A = append band target: scales proportionally with the folded tail under
+//       single-ceiling mode (~15-20% of tail tokens, min 5K, cap ~25K); the
+//       fixed 5K default survives as the lower bound and legacy value.
+//   T = 10K legacy live-tail runway — INERT under single-ceiling mode (no
+//       sub-ceiling tail cap derives from it). Meaningful only under the kill
+//       switch (VOXXO_FOLD_SINGLE_CEILING=0 → legacy hybrid geometry).
+//   TRIG = 150K legacy sub-ceiling trigger — likewise inert under
+//       single-ceiling mode. HISTORY NOTE superseding the 2026-07-07 warning
+//       "never set trigger equal to the ceiling": that warning described the
+//       OLD architecture, where the ceiling path was hard-recompute-only, so
+//       trigger==ceiling starved the append path entirely (measured: Claude
+//       CLI got 0 tail epochs). Under single-ceiling mode the ceiling ITSELF
+//       takes the append path (floor rule permitting), so tail epochs happen
+//       AT P by design and no sub-ceiling staging trigger exists at all.
+//   CLI reconstruction transports: Codex CLI ('codex') and Gemini CLI
+//       ('gemini') gate a P-anchored portable-reset hard epoch FIRST in their
+//       fold executors, so their single-ceiling trigger reserves the 30K
+//       reconstruct runway BELOW P (trigger = P − 30K, one derived knob);
+//       Claude CLI self-clamps to ceiling − 20K in claudeCliFold.ts. Legacy
+//       mode keeps the historical msgCeiling − minRunway codex clamp.
 //
-// Runtime invariant: at a boundary, append a folded tail band only if the
-// post-append prompt can still guarantee F runway before P. The default tail
-// cap now aims for T=10K so tail epochs skeletonize nearly the whole unfrozen
-// tail instead of carrying a 45K raw runway immune to folding.
-// Otherwise do a full recompute and saw the prompt back down to the floor.
+// Emergency margin / messageCeiling clamps are unchanged in both modes: they
+// are overshoot crash protection ABOVE P (a mid-turn tool burst can pass P
+// before the next boundary), not a second trigger.
+//
+// Runtime invariant (single-ceiling): at a boundary with measured tokens ≥ P,
+// append the whole live tail as one band iff the projected post-append floor
+// still leaves the minimum runway (post-append floor ≤ P − F, or no floor
+// captured yet / no append since the last hard epoch); otherwise hard-epoch.
+// The first fold of a fresh session is a full recompute that builds M (append
+// requires an existing frozen prefix). Below P: hot-reuse, always. Decision
+// precedence: reuse (< P) → append (≥ P, post-append floor rule holds) →
+// hard epoch (≥ P, post-append floor rule violated).
+// Legacy invariant (kill switch only): append a folded tail band only if the
+// post-append prompt still guarantees F runway before P, with the T=10K tail
+// cap skeletonizing the unfrozen tail; otherwise full recompute.
 export const DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS = 37_000;
 export const DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS = 40_000;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS = 5_000;
@@ -41,22 +75,25 @@ export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS = 30_000;
 export const DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS =
   DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS;
 /**
- * Fold TRIGGER default — the SINGLE uniform measured-prompt-token threshold at
- * which every engine folds/reconstructs (FC API, Codex CLI, Claude CLI, and
- * Gemini CLI all resolve to this). Deliberately 150K = 30K BELOW the P=180K
- * pressure ceiling (Jonah, 2026-07-07: "I wanna give everyone the same ceiling
- * of 180k" — raising the 2026-07-04 uniform 120K/150K geometry; that raise is
- * intentional, do not "restore" the old values). 150K is the LARGEST value that
- * still sits under every engine's runway clamp (Claude CLI:
+ * Legacy hybrid fold TRIGGER default. Under single-ceiling mode this is an
+ * inert compatibility/kill-switch value; P is the only active fold boundary.
+ * In legacy hybrid mode, 150K remains the uniform measured-prompt-token
+ * threshold at which every engine folds/reconstructs (FC API, Codex CLI,
+ * Claude CLI, and Gemini CLI all resolve to this). Deliberately 150K = 30K
+ * BELOW the P=180K pressure ceiling (Jonah, 2026-07-07: "I wanna give everyone
+ * the same ceiling of 180k" — raising the 2026-07-04 uniform 120K/150K
+ * geometry; that raise is intentional, do not "restore" the old values). 150K
+ * is the LARGEST value that still sits under every engine's runway clamp
+ * (Claude CLI:
  * min(msgCeiling, ceiling)−20K = 160K on 200K windows; Codex CLI:
  * msgCeiling−30K), so all engines collapse to exactly 150K instead of diverging
  * or colliding with the ceiling (trigger==ceiling ⇒ 0 tail epochs, measured
  * live 2026-07-04 — never set trigger equal to the ceiling).
  *
- * NOTE: this is the TRIGGER — a DISTINCT knob from the P=180K pressure ceiling
- * (DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS below). Do not conflate them
- * (recurring regression). Gemini CLI reads this constant directly as its own
- * default; FC/Codex/Claude CLI honor the same value via
+ * LEGACY NOTE: this is the hybrid TRIGGER — a DISTINCT knob from the P=180K
+ * pressure ceiling (DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS below). Do
+ * not conflate them (recurring regression). Gemini CLI reads this constant
+ * directly as its own default; FC/Codex/Claude CLI honor the same value via
  * VOXXO_/WARP_FOLD_TRIGGER_TOKENS — keep the env pin (ecosystem.config.cjs) and
  * this constant in agreement. Distinct from the steady-state band (M=40K folded
  * memory): FC folds continuously toward this target; CLI engines clamp it under
@@ -175,6 +212,8 @@ export interface ContextBudgetEnv {
   WARP_FOLD_EMERGENCY_MARGIN_TOKENS?: string;
   VOXXO_FOLD_UNSAFE_DEV_OVERRIDES?: string;
   WARP_FOLD_UNSAFE_DEV_OVERRIDES?: string;
+  VOXXO_FOLD_SINGLE_CEILING?: string;
+  WARP_FOLD_SINGLE_CEILING?: string;
   [key: string]: string | undefined;
 }
 
@@ -202,6 +241,8 @@ export interface ResolveContextBudgetInput {
   systemToolsReserveTokens?: number;
   emergencyMarginTokens?: number;
   unsafeDevOverrides?: boolean;
+  /** Single-ceiling geometry: P is the only fold trigger (see signposts). Default on; env kill switch VOXXO_FOLD_SINGLE_CEILING=0. */
+  singleCeilingMode?: boolean;
 }
 
 export interface ContextBudgetResolution {
@@ -242,6 +283,8 @@ export interface ContextBudgetResolution {
   evictionPolicy: ContextBudgetEvictionPolicy;
   compressionProfile: ContextBudgetCompressionProfile;
   unsafeDevOverrides: boolean;
+  /** True when single-ceiling geometry is active for this budget resolution. */
+  singleCeilingMode: boolean;
 }
 
 const KNOWN_ENGINE_DEFAULTS = new Set([
@@ -394,6 +437,11 @@ function isCodexCliEngine(engine: string): boolean {
   return engine.trim().toLowerCase() === 'codex';
 }
 
+// Gemini CLI transport only ('gemini'), never the FC API path ('gemini-api').
+function isGeminiCliEngine(engine: string): boolean {
+  return engine.trim().toLowerCase() === 'gemini';
+}
+
 /**
  * Default pressure ceiling for a given model/engine pair. Kept as a function so
  * old call sites stay model-aware in shape, but the default is now deliberately
@@ -493,6 +541,15 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     pressureCeilingTokens = clampToCeiling(requestedPressure, messageCeilingTokens, unsafeDevOverrides);
   }
 
+  // Single-ceiling mode (default ON): P is the only fold trigger — the
+  // sub-ceiling tail-size gate and warning trigger are inert, tail epochs fire
+  // AT the ceiling as one whole-tail append, and the projected-floor rule is
+  // the only hard-epoch escalation (see geometry signposts at the top of this
+  // file). VOXXO_FOLD_SINGLE_CEILING=0 is the kill switch restoring the legacy
+  // hybrid two-trigger geometry.
+  const singleCeilingMode = input.singleCeilingMode
+    ?? (envAlias(env, 'VOXXO_FOLD_SINGLE_CEILING', 'WARP_FOLD_SINGLE_CEILING') !== '0');
+
   // Tail-epoch runway floor, hoisted above the fold trigger because the trigger
   // clamp reserves this much room below the ceiling (see foldTriggerUpperBound).
   const explicitTailEpochRunwayTokens = positiveInt(input.tailEpochRunwayTokens)
@@ -501,22 +558,40 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     ?? DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS;
   const tailEpochMinRunwayTokens = positiveInt(input.tailEpochMinRunwayTokens)
     ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS', 'WARP_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS'))
-    ?? (explicitTailEpochRunwayTokens === undefined
-      ? Math.min(tailEpochRunwayTokens, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
-      : tailEpochRunwayTokens);
+    // Single-ceiling: F resolves to the full 30K constant — the floor rule's
+    // one knob — with no min(T, F) collapse, because T (the legacy sub-ceiling
+    // tail runway) is inert in this geometry.
+    ?? (singleCeilingMode
+      ? DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS
+      : explicitTailEpochRunwayTokens === undefined
+        ? Math.min(tailEpochRunwayTokens, DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
+        : tailEpochRunwayTokens);
 
-  // Fold trigger sits between the steady-state band and the pressure ceiling:
-  // band ≤ trigger ≤ min(pressureCeiling, messageCeiling) − minRunway. Engines
-  // fold/reconstruct when measured occupancy crosses this, then crush back toward
-  // the band — so M40 is the orbit, NOT the trigger. The minRunway subtraction
-  // keeps trigger STRICTLY below the ceiling even on tiny windows where both
-  // clamp: trigger==ceiling means every fold fires at/above pressure — the
-  // measured 2026-07-04 zero-tail-epochs failure mode. Small windows degrade to
-  // a thin-but-real fold corridor instead of a collision.
+  // Legacy hybrid fold trigger sits between the steady-state band and the
+  // pressure ceiling: band ≤ trigger ≤ min(pressureCeiling, messageCeiling) −
+  // minRunway. Single-ceiling mode bypasses this legacy clamp below and returns
+  // P itself as the only active fold boundary.
   const requestedFoldTriggerTokens = positiveInt(input.foldTriggerTokens)
     ?? parsePositiveInt(envAlias(env, 'VOXXO_FOLD_TRIGGER_TOKENS', 'WARP_FOLD_TRIGGER_TOKENS'))
     ?? codexCliDefaultReconstructTriggerTokens
     ?? DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS;
+  // CLI reconstruction transports (Codex CLI, Gemini CLI) fold BETWEEN turns
+  // via rewrite+respawn, and their fold executors check the P-anchored
+  // portable-reset hard-epoch gate FIRST — so trigger==P would shadow every
+  // normal fold ("trigger==ceiling ⇒ 0 tail epochs", measured live
+  // 2026-07-04). Their single-ceiling trigger therefore reserves the
+  // reconstruct runway below P; P stays the only operator knob and the sole
+  // escalation boundary. FC engines genuinely fold AT P (freeze-seam
+  // ceiling-append promotion), and Claude CLI self-clamps its trigger under
+  // the ceiling inside claudeCliFold.ts.
+  const singleCeilingCliReconstructRunwayTokens =
+    codexCliFullRecomputeOnly || isGeminiCliEngine(engine)
+      ? DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS
+      : 0;
+  const singleCeilingFoldTriggerTokens = Math.max(
+    1,
+    (pressureCeilingTokens ?? messageCeilingTokens) - singleCeilingCliReconstructRunwayTokens,
+  );
   const foldTriggerUpperBound = Math.max(
     1,
     Math.min(
@@ -524,9 +599,12 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
       messageCeilingTokens,
     ) - tailEpochMinRunwayTokens,
   );
-  const foldTriggerTokens = unsafeDevOverrides
+  const legacyFoldTriggerTokens = unsafeDevOverrides
     ? requestedFoldTriggerTokens
     : Math.min(Math.max(requestedFoldTriggerTokens, bandTokens), foldTriggerUpperBound);
+  const foldTriggerTokens = singleCeilingMode
+    ? singleCeilingFoldTriggerTokens
+    : legacyFoldTriggerTokens;
 
   const appendOnlyMaxWindowFraction = resolveFraction(
     input.appendOnlyMaxWindowFraction,
@@ -544,7 +622,7 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     ? null
     : Math.round(prefixSaturationTokens * charsPerToken);
 
-  // S-aware, pressure-geometry tail-epoch cap.
+  // Legacy hybrid S-aware, pressure-geometry tail-epoch cap.
   // The append-only hot tail rides ON TOP of the system+tools prefix (S, modeled
   // as systemToolsReserveTokens) and the frozen band (B). The expensive event the
   // tail-epoch exists to avoid is tripping the pressure ceiling, which forces a
@@ -562,7 +640,9 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   // is headroom, unlike the old pressure-blind band×fraction default that ignored S
   // and let S+band+tail breach the ceiling at high tool counts. The band fraction
   // survives only as the fallback when no pressure ceiling is configured; explicit
-  // overrides and the messageCeiling−band clamp still bound the result.
+  // legacy overrides and the messageCeiling−band clamp still bound the result.
+  // Single-ceiling mode bypasses this pressure-geometry cap below and uses a
+  // ceiling-sized cap so no tail-size gate can fire before P.
   const tailEpochBandFraction = resolveFraction(
     input.tailEpochBandFraction,
     envAlias(env, 'VOXXO_FOLD_TAIL_EPOCH_BAND_FRACTION', 'WARP_FOLD_TAIL_EPOCH_BAND_FRACTION'),
@@ -581,11 +661,19 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
   const pressureGeometryTailTokens = pressureCeilingTokens === null
     ? null
     : pressureCeilingTokens - systemToolsReserveTokens - bandTokens - tailEpochPressureMarginTokens;
-  const defaultTailEpochCapTokens = pressureGeometryTailTokens === null
-    ? bandFractionTailTokens
-    : Math.max(MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS, pressureGeometryTailTokens);
-  const requestedTailEpochCapTokens = positiveInt(input.tailEpochCapTokens)
-    ?? defaultTailEpochCapTokens;
+  // Single-ceiling: the whole live tail folds in one batch AT the ceiling, so
+  // the default cap is ceiling-sized (still clamped to messageCeiling − band
+  // just below). The sub-ceiling char-cap scheduler gate then cannot fire
+  // before measured pressure reaches P — real batches by construction.
+  const defaultTailEpochCapTokens = singleCeilingMode && pressureCeilingTokens !== null
+    ? pressureCeilingTokens
+    : pressureGeometryTailTokens === null
+      ? bandFractionTailTokens
+      : Math.max(MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS, pressureGeometryTailTokens);
+  const requestedTailEpochCapTokens = singleCeilingMode
+    ? defaultTailEpochCapTokens
+    : positiveInt(input.tailEpochCapTokens)
+      ?? defaultTailEpochCapTokens;
   const tailEpochCeiling = Math.max(1, messageCeilingTokens - bandTokens);
   const tailEpochCapTokens = clampToCeiling(
     Math.max(1, requestedTailEpochCapTokens),
@@ -658,5 +746,6 @@ export function resolveContextBudget(input: ResolveContextBudgetInput = {}): Con
     evictionPolicy,
     compressionProfile,
     unsafeDevOverrides,
+    singleCeilingMode,
   };
 }
