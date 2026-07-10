@@ -1,8 +1,11 @@
 import { extractDistinctiveTerms, scoreTermOverlap } from './foldTerms.ts';
 
 export type FoldRecallUsageEventKind = 'injected' | 'path_edited' | 'verbatim_reused' | 'term_echo' | 'expired';
+export type FoldRecallUtilityOutcome = 'exposed' | 'useful' | 'ignored';
 
 export interface FoldRecallUsageCardInput {
+  /** Optional transport-owned exposure identity; card/path/episode/boundary are still folded into the correlation id. */
+  exposureId?: string;
   targetPath: string;
   renderedCard: string;
   chapterIds: readonly number[];
@@ -11,6 +14,7 @@ export interface FoldRecallUsageCardInput {
 }
 
 export interface FoldRecallUsageWatch {
+  correlationId: string;
   episodeId: number;
   cardKind: string;
   targetPath: string;
@@ -19,15 +23,32 @@ export interface FoldRecallUsageWatch {
   terms: readonly string[];
   injectedAtBoundary: number;
   expiresAtBoundary: number;
+  /** Later activity that did not use this card; makes expiry a false-positive proxy, never a causal claim. */
+  unmatchedActivityBoundaries: number;
 }
 
 export interface FoldRecallUsageEvent {
+  correlationId: string;
   episodeId: number;
   kind: FoldRecallUsageEventKind;
+  outcome: FoldRecallUtilityOutcome;
+  boundarySeq: number;
   tsMs: number;
   cardKind?: string;
   matchedPath?: string;
   weight?: number;
+  /** True only for an expiry preceded by unrelated activity after injection. */
+  falsePositiveProxy?: boolean;
+}
+
+export interface FoldRecallUtilityRank {
+  episodeId: number;
+  exposures: number;
+  usefulOutcomes: number;
+  ignoredOutcomes: number;
+  falsePositiveProxies: number;
+  /** Mean measured proxy weight across terminal outcomes; null means exposure-only. */
+  utility: number | null;
 }
 
 export interface FoldRecallUsageOptions {
@@ -78,8 +99,18 @@ function uniqSorted(values: Iterable<string>): string[] {
   return Array.from(new Set(Array.from(values).filter((v) => v.length > 0))).sort();
 }
 
-function normalizedWatchKey(watch: Pick<FoldRecallUsageWatch, 'episodeId' | 'cardKind' | 'targetPath'>): string {
-  return `${watch.episodeId}\x00${watch.cardKind}\x00${watch.targetPath}`;
+function normalizedWatchKey(watch: Pick<FoldRecallUsageWatch, 'correlationId'>): string {
+  return watch.correlationId;
+}
+
+/** Stable across transports without relying on timestamps, tokens, or process-local counters. */
+export function makeFoldRecallUsageCorrelationId(
+  card: FoldRecallUsageCardInput,
+  episodeId: number,
+  boundarySeq: number,
+): string {
+  const source = [card.exposureId?.trim() ?? '', card.kind, card.targetPath].join('\x00');
+  return `fru:${boundarySeq}:${episodeId}:${encodeURIComponent(source)}`;
 }
 
 function extractVerbatimKeys(renderedCard: string): string[] {
@@ -104,6 +135,7 @@ function watchFromCard(
   const window = Math.max(1, Math.floor(opts.windowBoundaries ?? FOLD_RECALL_USAGE_DEFAULT_WINDOW_BOUNDARIES));
   const memberPaths = uniqSorted([card.targetPath, ...card.memberPaths]);
   return {
+    correlationId: makeFoldRecallUsageCorrelationId(card, episodeId, boundarySeq),
     episodeId,
     cardKind: card.kind,
     targetPath: card.targetPath,
@@ -112,6 +144,7 @@ function watchFromCard(
     terms: extractDistinctiveTerms(card.renderedCard, { cap: termCap }),
     injectedAtBoundary: boundarySeq,
     expiresAtBoundary: boundarySeq + window,
+    unmatchedActivityBoundaries: 0,
   };
 }
 
@@ -124,12 +157,23 @@ export function addInjectedFoldRecallUsageCards(
   const tsMs = nowMs(opts);
   const added: FoldRecallUsageWatch[] = [];
   const events: FoldRecallUsageEvent[] = [];
+  const known = new Set(existing.map(normalizedWatchKey));
   for (const card of cards) {
-    for (const episodeId of card.chapterIds) {
+    for (const episodeId of new Set(card.chapterIds)) {
       const watch = watchFromCard(card, episodeId, boundarySeq, opts);
       if (!watch) continue;
+      if (known.has(watch.correlationId)) continue;
+      known.add(watch.correlationId);
       added.push(watch);
-      events.push({ episodeId, kind: 'injected', tsMs, cardKind: card.kind });
+      events.push({
+        correlationId: watch.correlationId,
+        episodeId,
+        kind: 'injected',
+        outcome: 'exposed',
+        boundarySeq,
+        tsMs,
+        cardKind: card.kind,
+      });
     }
   }
 
@@ -186,6 +230,7 @@ export function advanceFoldRecallUsageWatches(
   const assistantTerms = assistantText.length > 0
     ? extractDistinctiveTerms(assistantText, { cap: Math.max(1, Math.floor(opts.termCap ?? DEFAULT_TERM_CAP)) })
     : [];
+  const hasActivity = touched.size > 0 || toolText.trim().length > 0 || assistantText.trim().length > 0;
   const next: FoldRecallUsageWatch[] = [];
   const events: FoldRecallUsageEvent[] = [];
 
@@ -197,25 +242,85 @@ export function advanceFoldRecallUsageWatches(
 
     const matchedPath = firstMatchedPath(watch, touched);
     if (matchedPath) {
-      events.push({ episodeId: watch.episodeId, kind: 'path_edited', tsMs, cardKind: watch.cardKind, matchedPath });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'path_edited', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, matchedPath });
       continue;
     }
     if (includesVerbatimKey(watch, `${toolText}\n${assistantText}`)) {
-      events.push({ episodeId: watch.episodeId, kind: 'verbatim_reused', tsMs, cardKind: watch.cardKind });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'verbatim_reused', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind });
       continue;
     }
     if (termEchoMatched(watch, assistantTerms, opts)) {
-      events.push({ episodeId: watch.episodeId, kind: 'term_echo', tsMs, cardKind: watch.cardKind });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'term_echo', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind });
       continue;
     }
+    const unmatchedActivityBoundaries = watch.unmatchedActivityBoundaries + (hasActivity ? 1 : 0);
     if (boundarySeq > watch.expiresAtBoundary) {
-      events.push({ episodeId: watch.episodeId, kind: 'expired', tsMs, cardKind: watch.cardKind });
+      events.push({
+        correlationId: watch.correlationId,
+        episodeId: watch.episodeId,
+        kind: 'expired',
+        outcome: 'ignored',
+        boundarySeq,
+        tsMs,
+        cardKind: watch.cardKind,
+        ...(unmatchedActivityBoundaries > 0 ? { falsePositiveProxy: true } : {}),
+      });
       continue;
     }
-    next.push(watch);
+    next.push(unmatchedActivityBoundaries === watch.unmatchedActivityBoundaries
+      ? watch
+      : { ...watch, unmatchedActivityBoundaries });
   }
 
   return { watches: next, events };
+}
+
+export function foldRecallUsageEventWeight(event: FoldRecallUsageEvent): number | null {
+  if (event.kind === 'path_edited' || event.kind === 'verbatim_reused') return 1;
+  if (event.kind === 'term_echo') return 0.5;
+  if (event.kind === 'expired') return 0;
+  return null;
+}
+
+/**
+ * Deterministic outcome ranking for operator views and ranking experiments.
+ * Duplicate transport deliveries are collapsed by correlation id + event kind.
+ */
+export function rankFoldRecallUtility(events: readonly FoldRecallUsageEvent[]): FoldRecallUtilityRank[] {
+  const unique = new Map<string, FoldRecallUsageEvent>();
+  for (const event of events) unique.set(`${event.correlationId}\x00${event.kind}`, event);
+  const rows = new Map<number, FoldRecallUtilityRank & { weightTotal: number; weightedOutcomes: number }>();
+  for (const event of unique.values()) {
+    const row = rows.get(event.episodeId) ?? {
+      episodeId: event.episodeId,
+      exposures: 0,
+      usefulOutcomes: 0,
+      ignoredOutcomes: 0,
+      falsePositiveProxies: 0,
+      utility: null,
+      weightTotal: 0,
+      weightedOutcomes: 0,
+    };
+    if (event.outcome === 'exposed') row.exposures += 1;
+    if (event.outcome === 'useful') row.usefulOutcomes += 1;
+    if (event.outcome === 'ignored') row.ignoredOutcomes += 1;
+    if (event.falsePositiveProxy) row.falsePositiveProxies += 1;
+    const weight = foldRecallUsageEventWeight(event);
+    if (weight !== null) {
+      row.weightTotal += weight;
+      row.weightedOutcomes += 1;
+      row.utility = row.weightTotal / row.weightedOutcomes;
+    }
+    rows.set(event.episodeId, row);
+  }
+  return [...rows.values()]
+    .map(({ weightTotal: _weightTotal, weightedOutcomes: _weightedOutcomes, ...row }) => row)
+    .sort((a, b) =>
+      (b.utility ?? -1) - (a.utility ?? -1)
+      || b.usefulOutcomes - a.usefulOutcomes
+      || b.exposures - a.exposures
+      || a.episodeId - b.episodeId,
+    );
 }
 
 export function serializeRecallUsageText(value: unknown, cap: number = DEFAULT_TEXT_CAP): string {
