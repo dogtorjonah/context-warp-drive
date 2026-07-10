@@ -171,6 +171,8 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 // Engine-level defaults when model is unknown
 const ENGINE_DEFAULTS: Record<string, number> = {
   claude: 200_000,
+  'claude-cli': 1_000_000, // Claude Code CLI default spawn surface; exact legacy model rows still self-clamp.
+  'claude-interactive': 1_000_000,
   codex: 258_000, // CLI/OAuth-backed Codex fallback; codex-api remains the 1M API surface below
   gemini: 1_048_576,
   minimax: 512_000, // guaranteed floor, not the advertised 1M ceiling (see MiniMax-M3 above)

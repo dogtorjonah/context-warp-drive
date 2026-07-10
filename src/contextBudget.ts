@@ -12,7 +12,10 @@ import { contextWindowForModel } from './contextWindow.ts';
 // "one ceiling, more simple" — supersedes the two-trigger P180/TRIG150 layout):
 //   S = 37K static system/tools prefix reserve (provider-measured floor model)
 //   M = 40K folded memory after a hard epoch
-//   P = 180K THE ceiling — the only fold trigger. Below P nothing folds: no
+//   P = THE ceiling — the only fold trigger. Uniform 180K base default; the
+//       per-engine/model tuning tables below (ENGINE/MODEL_PRESSURE_CEILING_
+//       DEFAULTS, Jonah 2026-07-10) raise the CLI surfaces: Codex CLI and the
+//       Claude Code CLI/tmux surfaces run P=220K. Below P nothing folds: no
 //       tail-size char gate, no calm-seal/warning override, no sub-ceiling
 //       deterministic trigger. Sessions hot-reuse the frozen prefix and ride a
 //       raw, full-fidelity live tail all the way up to P.
@@ -103,15 +106,17 @@ export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 150_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
 export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
 /**
- * Universal pressure ceiling default. Applies to every model/engine unless an
- * explicit per-session/env override supplies another ceiling. Uniform P=180K
- * for FC AND CLI engines (Jonah, 2026-07-07: "I wanna give everyone the same
- * ceiling of 180k") — deliberately raised from the 2026-07-04 uniform 150K so
- * every engine shares the Claude CLI's 180K hard-epoch ceiling; do not "fix"
- * this back to 150K. On 200K windows this rides 20K under the window: the
- * TRIG=150K fold trigger keeps normal occupancy well below it, so P is
- * strictly the hard-epoch backstop, and messageCeiling
- * (window − output 16K − emergency 4K = 180K) still bounds it.
+ * BASE pressure ceiling default — the uniform fallback when neither the
+ * per-model nor the per-engine tuning table below matches. P=180K base
+ * (Jonah, 2026-07-07: "I wanna give everyone the same ceiling of 180k" —
+ * deliberately raised from the 2026-07-04 uniform 150K; do not "fix" this
+ * back to 150K). Since 2026-07-10 (Jonah) the CLI surfaces carry per-engine
+ * defaults ABOVE this base — Codex CLI and the Claude Code CLI/tmux surfaces
+ * run 220K via ENGINE_PRESSURE_CEILING_DEFAULTS — while FC engines stay on
+ * this uniform base. Explicit per-session overrides and the
+ * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env still win over every table
+ * entry. On 200K windows the resolved default rides at messageCeiling
+ * (window − output 16K − emergency 4K = 180K), which always bounds it.
  */
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 180_000;
 /**
@@ -120,15 +125,53 @@ export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 180_000;
  */
 export const DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS =
   DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
+/**
+ * ── Per-model / per-engine pressure-ceiling tuning tables ───────────────────
+ * THE easy knob for tuning the fold pressure ceiling of every spawnable model
+ * (Jonah, 2026-07-10). defaultPressureCeilingTokensForModelEngine resolves:
+ *   1. MODEL_PRESSURE_CEILING_DEFAULTS — exact model match (lowercase keys)
+ *   2. MODEL_PRESSURE_CEILING_DEFAULTS — longest model-prefix match
+ *   3. ENGINE_PRESSURE_CEILING_DEFAULTS — engine match (lowercase keys)
+ *   4. DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS — uniform 180K base
+ * These are DEFAULTS, not caps: an explicit input.pressureCeilingTokens
+ * (spawn param / live per-instance override) or the
+ * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env var still wins, and every
+ * resolved default is window-clamped (pressureMaxWindowFraction) then
+ * messageCeiling-clamped — so a 220K entry on a legacy 200K-window model
+ * degrades safely to its 180K messageCeiling instead of breaching the
+ * provider wall.
+ */
+export const ENGINE_PRESSURE_CEILING_DEFAULTS: Record<string, number> = {
+  // Codex CLI: 258K effective window → messageCeiling ≈236.8K keeps ~17K of
+  // overshoot margin above the 220K ceiling.
+  codex: 220_000,
+  // Claude Code CLI + interactive tmux surfaces. Modern Claude models carry
+  // 1M windows so 220K resolves as-is; legacy 200K-window models self-clamp
+  // to their 180K messageCeiling. NOTE: bare engine 'claude' is deliberately
+  // ABSENT from this table — that string is shared with the FC API path,
+  // which stays on the uniform 180K base; ceiling-relevant CLI call sites
+  // pass the surface-specific 'claude-cli' / 'claude-interactive' strings.
+  'claude-cli': 220_000,
+  'claude-interactive': 220_000,
+};
+/**
+ * Exact/prefix model-level ceiling overrides, consulted BEFORE the engine
+ * table. Keys must be lowercase. Add an entry here when a single model needs
+ * a different ceiling than its engine default, e.g.
+ * 'codex-5.5-instant': 200_000.
+ */
+export const MODEL_PRESSURE_CEILING_DEFAULTS: Record<string, number> = {};
 // Claude Code CLI hard-epoch fallback ceiling. The Claude CLI surfaces
 // (claude / claude-cli / claude-interactive) own their own transcript file and
 // fold via out-of-process band-append tail epochs (FC/Codex parity), NOT inline.
 // When a tail epoch declines (ledger drift, or nothing safely foldable within
 // the tail char budget), the relay falls back to an in-place session-swap
 // rebirth ("hard epoch") once provider-MEASURED context tokens cross this
-// ceiling. Kept distinct from the standard pressure ceiling — the two knobs
-// now coincide at the uniform 180K by design but remain independent — because
-// fold pressure and out-of-process session-swap saturation can diverge independently.
+// ceiling. Kept distinct from the standard pressure ceiling — since 2026-07-10
+// the resolved Claude CLI ceiling (220K via ENGINE_PRESSURE_CEILING_DEFAULTS)
+// normally sits ABOVE this constant, which survives strictly as the final
+// fallback when budget resolution cannot produce a ceiling — because fold
+// pressure and out-of-process session-swap saturation can diverge independently.
 // Consumed by relay handleResultEvent (instanceManager/eventHandlers.ts).
 export const DEFAULT_CONTEXT_BUDGET_CLAUDE_CLI_HARD_EPOCH_TOKENS = 180_000;
 // 0.9 (not 0.8) so a 200K window admits the uniform P=180K default via the
@@ -448,12 +491,30 @@ function isGeminiCliEngine(engine: string): boolean {
 }
 
 /**
- * Default pressure ceiling for a given model/engine pair. Kept as a function so
- * old call sites stay model-aware in shape, but the default is now deliberately
- * uniform. Explicit input.pressureCeilingTokens and the
- * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env override this default.
+ * Default pressure ceiling for a given model/engine pair. Resolution order:
+ * model exact match → longest model-prefix match → engine match → uniform
+ * base (see the tuning-table doc above ENGINE_PRESSURE_CEILING_DEFAULTS).
+ * Explicit input.pressureCeilingTokens and the
+ * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env override this default, and the
+ * caller window-clamps then messageCeiling-clamps whatever this returns.
  */
-function defaultPressureCeilingTokensForModelEngine(_model: string, _engine: string): number {
+function defaultPressureCeilingTokensForModelEngine(model: string, engine: string): number {
+  const modelLower = model.trim().toLowerCase();
+  if (modelLower) {
+    const exact = MODEL_PRESSURE_CEILING_DEFAULTS[modelLower];
+    if (exact !== undefined) return exact;
+    let bestKeyLength = 0;
+    let bestValue: number | undefined;
+    for (const [key, value] of Object.entries(MODEL_PRESSURE_CEILING_DEFAULTS)) {
+      if (key.length > bestKeyLength && modelLower.startsWith(key)) {
+        bestKeyLength = key.length;
+        bestValue = value;
+      }
+    }
+    if (bestValue !== undefined) return bestValue;
+  }
+  const engineDefault = ENGINE_PRESSURE_CEILING_DEFAULTS[engine.trim().toLowerCase()];
+  if (engineDefault !== undefined) return engineDefault;
   return DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
 }
 

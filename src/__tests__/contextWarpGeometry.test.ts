@@ -15,6 +15,8 @@ import {
   DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION,
   DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION,
   MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS,
+  ENGINE_PRESSURE_CEILING_DEFAULTS,
+  MODEL_PRESSURE_CEILING_DEFAULTS,
 } from '../contextBudget.ts';
 import { shouldEscalateTailEpochForLowYield, TAIL_EPOCH_YIELD_ESCALATE_SHRINK_RATIO } from '../foldFreeze.ts';
 import { resolveFoldConfigForBand, ALWAYS_ON_FOLD_CONFIG } from '../rollingFold.ts';
@@ -134,14 +136,105 @@ describe('context-warp-geometry god-file parity', () => {
   describe('Codex/Gemini CLI single-ceiling trigger regression', () => {
     it('resolves Codex CLI trigger to P, not P-30K', () => {
       const r = resolveContextBudget({ model: 'gpt-5.5', engine: 'codex', env: {} });
-      expect(r.pressureCeilingTokens).toBe(180_000);
-      expect(r.foldTriggerTokens).toBe(180_000);
+      // Codex CLI's P is 220K via ENGINE_PRESSURE_CEILING_DEFAULTS; the invariant
+      // under test is trigger === P (no P-30K runway clamp), not the base 180K.
+      expect(r.pressureCeilingTokens).toBe(220_000);
+      expect(r.foldTriggerTokens).toBe(220_000);
     });
 
     it('resolves Gemini CLI trigger to P, not P-30K', () => {
       const r = resolveContextBudget({ model: 'gemini-2.5-pro', engine: 'gemini', env: {} });
       expect(r.pressureCeilingTokens).toBe(180_000);
       expect(r.foldTriggerTokens).toBe(180_000);
+    });
+  });
+
+  describe('per-model/engine pressure-ceiling tuning tables', () => {
+    it('table constants: CLI surfaces 220K; bare FC engine keys deliberately absent', () => {
+      expect(ENGINE_PRESSURE_CEILING_DEFAULTS['codex']).toBe(220_000);
+      expect(ENGINE_PRESSURE_CEILING_DEFAULTS['claude-cli']).toBe(220_000);
+      expect(ENGINE_PRESSURE_CEILING_DEFAULTS['claude-interactive']).toBe(220_000);
+      // Bare 'claude' is shared with the FC API path, which stays on the 180K base.
+      expect(ENGINE_PRESSURE_CEILING_DEFAULTS['claude']).toBeUndefined();
+    });
+
+    it('Codex CLI resolves the 220K engine default (258K window keeps both clamps above it)', () => {
+      const r = resolveContextBudget({ model: 'codex-5.5', engine: 'codex', env: {} });
+      expect(r.pressureCeilingTokens).toBe(220_000);
+      expect(r.foldTriggerTokens).toBe(220_000);
+    });
+
+    it('Claude Code CLI resolves 220K on modern 1M-window models', () => {
+      const r = resolveContextBudget({ model: 'claude-sonnet-5', engine: 'claude-cli', env: {} });
+      expect(r.pressureCeilingTokens).toBe(220_000);
+      expect(r.foldTriggerTokens).toBe(220_000);
+    });
+
+    it('interactive tmux surface resolves 220K on modern 1M-window models', () => {
+      const r = resolveContextBudget({ model: 'claude-sonnet-5', engine: 'claude-interactive', env: {} });
+      expect(r.pressureCeilingTokens).toBe(220_000);
+    });
+
+    it('engine-only CLI surfaces resolve 220K when no model is supplied', () => {
+      for (const engine of ['codex', 'claude-cli', 'claude-interactive'] as const) {
+        const r = resolveContextBudget({ engine, env: {} });
+        expect(r.pressureCeilingTokens).toBe(220_000);
+        expect(r.foldTriggerTokens).toBe(220_000);
+      }
+    });
+
+    it('FC claude engine stays on the uniform 180K base even on 1M windows', () => {
+      const r = resolveContextBudget({ model: 'claude-sonnet-5', engine: 'claude', env: {} });
+      expect(r.pressureCeilingTokens).toBe(180_000);
+      expect(resolveContextBudget({ engine: 'claude', env: {} }).pressureCeilingTokens).toBe(180_000);
+    });
+
+    it('legacy 200K-window Claude CLI self-clamps the 220K default to its 180K messageCeiling', () => {
+      const r = resolveContextBudget({ model: 'claude-sonnet-4', engine: 'claude-cli', env: {} });
+      expect(r.messageCeilingTokens).toBe(180_000);
+      expect(r.pressureCeilingTokens).toBe(180_000);
+      expect(r.foldTriggerTokens).toBe(180_000);
+    });
+
+    it('env VOXXO_FOLD_PRESSURE_CEILING_TOKENS still beats the table', () => {
+      const r = resolveContextBudget({
+        model: 'codex-5.5',
+        engine: 'codex',
+        env: { VOXXO_FOLD_PRESSURE_CEILING_TOKENS: '190000' },
+      });
+      expect(r.pressureCeilingTokens).toBe(190_000);
+    });
+
+    it('explicit input override beats both env and table', () => {
+      const r = resolveContextBudget({
+        model: 'codex-5.5',
+        engine: 'codex',
+        env: { VOXXO_FOLD_PRESSURE_CEILING_TOKENS: '190000' },
+        pressureCeilingTokens: 205_000,
+      });
+      expect(r.pressureCeilingTokens).toBe(205_000);
+    });
+
+    it('MODEL_PRESSURE_CEILING_DEFAULTS exact and longest-prefix entries beat the engine table', () => {
+      MODEL_PRESSURE_CEILING_DEFAULTS['codex-5.5-instant'] = 200_000;
+      try {
+        const exact = resolveContextBudget({
+          model: 'codex-5.5-instant',
+          engine: 'codex',
+          env: {},
+          contextWindowTokens: 258_000,
+        });
+        expect(exact.pressureCeilingTokens).toBe(200_000);
+        const prefixed = resolveContextBudget({
+          model: 'codex-5.5-instant-2099-01',
+          engine: 'codex',
+          env: {},
+          contextWindowTokens: 258_000,
+        });
+        expect(prefixed.pressureCeilingTokens).toBe(200_000);
+      } finally {
+        delete MODEL_PRESSURE_CEILING_DEFAULTS['codex-5.5-instant'];
+      }
     });
   });
 
