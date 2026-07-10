@@ -130,7 +130,7 @@ describe('fold recall usage detector', () => {
     expect(laterExposure.events[0].correlationId).not.toBe(first.events[0].correlationId);
   });
 
-  test('marks expiry after unrelated activity as a false-positive proxy and ranks useful episodes first', () => {
+  test('marks expiry after unrelated activity as a false-positive proxy and labels ranks observational', () => {
     const irrelevant = card({
       targetPath: '/repo/src/irrelevant.ts',
       memberPaths: ['/repo/src/irrelevant.ts'],
@@ -155,20 +155,22 @@ describe('fold recall usage detector', () => {
     const ranked = rankFoldRecallUtility([...allEvents, ...allEvents]);
     expect(ranked).toEqual([
       {
+        evidence: 'observational_proxy',
         episodeId: 101,
         exposures: 1,
         usefulOutcomes: 1,
         ignoredOutcomes: 0,
         falsePositiveProxies: 0,
-        utility: 1,
+        observationalProxy: 1,
       },
       {
+        evidence: 'observational_proxy',
         episodeId: 202,
         exposures: 1,
         usefulOutcomes: 0,
         ignoredOutcomes: 1,
         falsePositiveProxies: 1,
-        utility: 0,
+        observationalProxy: 0,
       },
     ]);
   });

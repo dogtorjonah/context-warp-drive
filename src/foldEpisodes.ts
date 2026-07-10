@@ -1521,8 +1521,11 @@ export interface EpisodicRecallCardDebugLike {
   annotationBoost: number;
   annotationBoostKind?: EpisodeAnnotationKind;
   score?: number;
-  recallUtility?: number;
-  recallUtilityMultiplier?: number;
+  observationalUtilityProxy?: number;
+  observationalUtilityMultiplier?: number;
+  baselineRank?: number;
+  observationalShadowScore?: number;
+  observationalShadowRank?: number;
 }
 
 export interface EpisodicRecallCardLike {

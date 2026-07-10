@@ -42,13 +42,15 @@ export interface FoldRecallUsageEvent {
 }
 
 export interface FoldRecallUtilityRank {
+  /** Evidence class: every value below is an observed behavioral proxy, never causal lift. */
+  evidence: 'observational_proxy';
   episodeId: number;
   exposures: number;
   usefulOutcomes: number;
   ignoredOutcomes: number;
   falsePositiveProxies: number;
-  /** Mean measured proxy weight across terminal outcomes; null means exposure-only. */
-  utility: number | null;
+  /** Mean observed proxy weight across terminal outcomes; null means exposure-only. */
+  observationalProxy: number | null;
 }
 
 export interface FoldRecallUsageOptions {
@@ -283,7 +285,8 @@ export function foldRecallUsageEventWeight(event: FoldRecallUsageEvent): number 
 }
 
 /**
- * Deterministic outcome ranking for operator views and ranking experiments.
+ * Deterministic observational-proxy ranking for operator views and shadow experiments.
+ * This output is not evidence that recall caused the later behavior.
  * Duplicate transport deliveries are collapsed by correlation id + event kind.
  */
 export function rankFoldRecallUtility(events: readonly FoldRecallUsageEvent[]): FoldRecallUtilityRank[] {
@@ -292,12 +295,13 @@ export function rankFoldRecallUtility(events: readonly FoldRecallUsageEvent[]): 
   const rows = new Map<number, FoldRecallUtilityRank & { weightTotal: number; weightedOutcomes: number }>();
   for (const event of unique.values()) {
     const row = rows.get(event.episodeId) ?? {
+      evidence: 'observational_proxy' as const,
       episodeId: event.episodeId,
       exposures: 0,
       usefulOutcomes: 0,
       ignoredOutcomes: 0,
       falsePositiveProxies: 0,
-      utility: null,
+      observationalProxy: null,
       weightTotal: 0,
       weightedOutcomes: 0,
     };
@@ -309,14 +313,14 @@ export function rankFoldRecallUtility(events: readonly FoldRecallUsageEvent[]): 
     if (weight !== null) {
       row.weightTotal += weight;
       row.weightedOutcomes += 1;
-      row.utility = row.weightTotal / row.weightedOutcomes;
+      row.observationalProxy = row.weightTotal / row.weightedOutcomes;
     }
     rows.set(event.episodeId, row);
   }
   return [...rows.values()]
     .map(({ weightTotal: _weightTotal, weightedOutcomes: _weightedOutcomes, ...row }) => row)
     .sort((a, b) =>
-      (b.utility ?? -1) - (a.utility ?? -1)
+      (b.observationalProxy ?? -1) - (a.observationalProxy ?? -1)
       || b.usefulOutcomes - a.usefulOutcomes
       || b.exposures - a.exposures
       || a.episodeId - b.episodeId,
