@@ -735,7 +735,7 @@ export function foldRecallProviderPovText(
   index: FoldRecallIndex | null | undefined,
   rawHistory: readonly FoldMessage[] | null | undefined,
 ): string {
-  if (!index) return '';
+  if (!index) return rawHistory ? collectProviderViewText(rawHistory) : '';
   const tail = rawHistory && rawHistory.length > index.rawCount
     ? collectProviderViewText(rawHistory.slice(index.rawCount))
     : '';
