@@ -592,6 +592,29 @@ export interface FoldRecallIndex {
    * by view presence; buildFoldIndex always supplies a bounded array.
    */
   visibleRecallCards?: readonly string[];
+  /**
+   * Normalized text of the provider-ready view used to build this index. This
+   * is the information-residency surface: recall must not page in a body that
+   * is already literally present elsewhere in the model's POV just because it
+   * is not wrapped in a prior recall card. Bounded and optional for legacy
+   * manually-built indexes.
+   */
+  visiblePovText?: string;
+}
+
+/** Provider-view text retained for literal information-residency checks. */
+export const FOLD_RECALL_POV_TEXT_MAX_CHARS = 96_000;
+
+/** Whitespace/quote-stable normalization for exact provider-POV containment. */
+export function normalizeFoldRecallPovText(text: string): string {
+  const normalized = text
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized ? ` ${normalized} ` : '';
 }
 
 /** Matches the folded view's fold-block header: "[Conversation Context — N turns folded, …". */
@@ -691,6 +714,35 @@ function collectVisibleRecallCards(messages: readonly FoldMessage[]): string[] {
     }
   }
   return cards;
+}
+
+function collectProviderViewText(messages: readonly FoldMessage[]): string {
+  const fragments: string[] = [];
+  for (const message of messages) fragments.push(...collectMessageTextFragments(message));
+  const joined = fragments.join('\n');
+  const bounded = joined.length > FOLD_RECALL_POV_TEXT_MAX_CHARS
+    ? joined.slice(joined.length - FOLD_RECALL_POV_TEXT_MAX_CHARS)
+    : joined;
+  return normalizeFoldRecallPovText(bounded);
+}
+
+/**
+ * Current provider-visible text: the last committed folded view plus the raw
+ * messages appended since that view/index was built. Pure and bounded; callers
+ * may pass null during pre-fold warmup.
+ */
+export function foldRecallProviderPovText(
+  index: FoldRecallIndex | null | undefined,
+  rawHistory: readonly FoldMessage[] | null | undefined,
+): string {
+  if (!index) return '';
+  const tail = rawHistory && rawHistory.length > index.rawCount
+    ? collectProviderViewText(rawHistory.slice(index.rawCount))
+    : '';
+  const combined = `${index.visiblePovText ?? ''}${tail}`;
+  return combined.length > FOLD_RECALL_POV_TEXT_MAX_CHARS
+    ? combined.slice(combined.length - FOLD_RECALL_POV_TEXT_MAX_CHARS)
+    : combined;
 }
 
 function buildTurnDigest(
@@ -1031,7 +1083,12 @@ export function buildFoldIndex(
     }
   }
 
-  return { rawCount: rawHistory.length, entries, visibleRecallCards };
+  return {
+    rawCount: rawHistory.length,
+    entries,
+    visibleRecallCards,
+    visiblePovText: collectProviderViewText(foldedView),
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2669,6 +2726,7 @@ export function buildFoldRecallContext(
   }
 
   const budget = pressureBudget(utilization, config);
+  const providerPovText = foldRecallProviderPovText(state.index, rawHistory);
   const blocks: string[] = [];
   const triggers: string[] = [];
   const injected: Array<{ id: string; level: 'card' | 'hint' }> = [];
@@ -2676,6 +2734,7 @@ export function buildFoldRecallContext(
   let cards = 0;
   let hints = 0;
   let composition: RecallCompositionStats | null = null;
+  const emittedCardContentKeys = new Set<string>();
   // Radar dedup: paths the current Atlas-read tool already rendered live, whose
   // radar would duplicate the tool output (empty set ⇒ byte-identical).
   const radarSuppressPaths = new Set(signals.atlasReadPaths ?? []);
@@ -2687,6 +2746,7 @@ export function buildFoldRecallContext(
     let level: 'card' | 'hint' = item.render;
     let rendered: string | null = null;
     let cardStats: RecallCompositionStats | null = null;
+    let cardContentKey: string | null = null;
 
     if (level === 'card') {
       const uncappedBodyBudget = Math.min(config.maxCardChars, remaining - RECALL_BODY_RESERVED_GAP_CHARS);
@@ -2714,6 +2774,27 @@ export function buildFoldRecallContext(
         const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
         const episodeVoice = buildEpisodeVoiceBlock(item, state, config, Math.floor(bodyBudget / 4), radarSuppressPaths);
         const atlasMeta = buildAtlasMetaBlock(item, state, config, Math.floor(bodyBudget / 5), radarSuppressPaths);
+        // Information residency is broader than recall-card residency. Suppress
+        // only when the recovered body AND every rendered enrichment are already
+        // present. A source-delta notifier is always novel continuity evidence,
+        // so changed/beyond-source cards must still render even when their body
+        // is resident elsewhere in POV.
+        const povComponents = [rb.body, radar, episodeVoice, atlasMeta].filter((part) => part.length > 0);
+        cardContentKey = povComponents.map(normalizeFoldRecallPovText).join('\u0000');
+        const allComponentsResident = rb.applied.length === 0
+          && povComponents.length > 0
+          && povComponents.every((part) => {
+            const normalized = normalizeFoldRecallPovText(part);
+            return normalized.length >= 82 && providerPovText.includes(normalized);
+          });
+        if (allComponentsResident) {
+          suppressed++;
+          continue;
+        }
+        if (rb.applied.length === 0 && cardContentKey && emittedCardContentKeys.has(cardContentKey)) {
+          suppressed++;
+          continue;
+        }
         const rc = renderCard(item, rb.body, bodyBudget, radar, rb.applied, episodeVoice, atlasMeta);
         rendered = rc.text;
         if (rendered.length > remaining) {
@@ -2738,10 +2819,20 @@ export function buildFoldRecallContext(
     }
 
     if (rendered === null) continue;
+    // Hints are single-line and have no path-level visible-card ledger. After
+    // an index rebuild their entry residency can reset while the exact hint is
+    // still in POV. The same literal check also closes any full-card seam not
+    // covered by body/enrichment component residency above.
+    const normalizedRendered = normalizeFoldRecallPovText(rendered);
+    if (normalizedRendered.length >= 42 && providerPovText.includes(normalizedRendered)) {
+      suppressed++;
+      continue;
+    }
     blocks.push(rendered);
     triggers.push(item.trigger);
     injected.push({ id: item.entry.id, level });
     if (level === 'card') {
+      if (cardContentKey) emittedCardContentKeys.add(cardContentKey);
       // Content-level residency: keep this path quiet across index rebuilds.
       state.residentPaths.set(
         item.matchedPath,

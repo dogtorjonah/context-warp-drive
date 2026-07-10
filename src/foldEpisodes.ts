@@ -1782,6 +1782,8 @@ export interface EpisodicInjectionState {
   episodicChars: number;
   /** Stale stashes dropped (result outlived its context). */
   episodicSuppressed: number;
+  /** Cards withheld because their substantive narrative already occupied provider POV. */
+  episodicPovSuppressed: number;
   /** Boundaries where breathing paused entirely at critical pressure. */
   episodicSkippedAtPressure: number;
   /**
@@ -1816,6 +1818,7 @@ export function createEpisodicInjectionState(): EpisodicInjectionState {
     episodeCardsInjected: 0,
     episodicChars: 0,
     episodicSuppressed: 0,
+    episodicPovSuppressed: 0,
     episodicSkippedAtPressure: 0,
     episodicPinsInjected: 0,
     episodicPinChars: 0,
@@ -1908,6 +1911,71 @@ export function consumeEpisodicStash(
   const unseen = stash.cards.filter((card) => !state.visibleCardHeaders.has(episodicCardHeaderLine(card)));
   state.episodicSuppressed += stash.cards.length - unseen.length;
   return unseen.length > 0 ? unseen : null;
+}
+
+const EPISODIC_POV_PROBE_MIN_CHARS = 40;
+
+function normalizeEpisodicPovText(text: string): string {
+  const normalized = text
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized ? ` ${normalized} ` : '';
+}
+
+function cleanEpisodicPovProbe(text: string): string {
+  return text.trim().replace(/(?:\.{3}|…)+$/, '').trim();
+}
+
+function episodicCardPovProbes(card: EpisodicRecallCardLike): string[] {
+  const probes = new Set<string>();
+  const add = (raw: string | undefined): void => {
+    if (!raw) return;
+    const cleaned = cleanEpisodicPovProbe(raw);
+    if (cleaned.length < EPISODIC_POV_PROBE_MIN_CHARS || isDegenerateGist(cleaned)) return;
+    const normalized = normalizeEpisodicPovText(cleaned);
+    if (normalized) probes.add(normalized);
+  };
+  const lines = card.renderedCard.split('\n');
+  const header = lines[0] ?? '';
+  const headerSummary = /,\s*["“](.*?)["”]\]$/.exec(header)?.[1];
+  add(headerSummary);
+  for (const line of lines.slice(1)) {
+    const voice = /^\s*🗣\s+[^:]+:\s*["“](.*?)["”](?:\s+\S+)?$/.exec(line)?.[1];
+    const intent = /^\s*↞\s+intent:\s*["“](.*?)["”]/.exec(line)?.[1];
+    const beforeAfter = /^\s*(?:↞\s+before:|after:\s+↠)\s*["“](.*?)["”]/.exec(line)?.[1];
+    const sinceDelta = /^\s*Δ\s+(.+)/.exec(line)?.[1];
+    add(voice ?? intent ?? beforeAfter ?? sinceDelta);
+  }
+  return [...probes];
+}
+
+/** True only when every substantive narrative probe in a card is already in POV. */
+export function episodicCardAlreadyInPov(card: EpisodicRecallCardLike, providerPovText: string): boolean {
+  if (!providerPovText) return false;
+  const probes = episodicCardPovProbes(card);
+  return probes.length > 0 && probes.every((probe) => providerPovText.includes(probe));
+}
+
+/**
+ * Suppress information-resident cards before noteEpisodicInjection mutates
+ * served/walk state. Header replay is handled separately; this catches the
+ * first circular injection when the source narration is already visible.
+ */
+export function suppressEpisodicCardsAlreadyInPov(
+  state: EpisodicInjectionState,
+  cards: readonly EpisodicRecallCardLike[] | null,
+  providerPovText: string,
+): EpisodicRecallCardLike[] | null {
+  if (!cards || cards.length === 0 || !providerPovText) return cards ? [...cards] : null;
+  const kept = cards.filter((card) => !episodicCardAlreadyInPov(card, providerPovText));
+  const suppressed = cards.length - kept.length;
+  state.episodicSuppressed += suppressed;
+  state.episodicPovSuppressed += suppressed;
+  return kept.length > 0 ? kept : null;
 }
 
 /**
