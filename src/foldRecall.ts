@@ -1992,6 +1992,12 @@ interface AppliedSourceDelta {
   truncated: boolean;
   /** Truncated snapshot whose changed region (if any) lies beyond the window. */
   beyond?: boolean;
+  /**
+   * True when the card body was swapped to CURRENT box source (claim-tier
+   * recall); false when the historical folded copy was kept and only the
+   * notifier flags the drift (read/term-tier recall, or beyond-window).
+   */
+  swapped: boolean;
 }
 
 /** Rendered recall body plus the current-source swaps applied to it. */
@@ -2003,11 +2009,13 @@ interface RenderedEntryBody {
 /**
  * Body text for a recall card, sliced from in-memory raw history only. When a
  * recalled path's CURRENT box source (worker-fetched liveSource) genuinely
- * differs from the historical folded copy, that path's body section is replaced
- * with the current source and an AppliedSourceDelta is recorded so renderCard can
- * surface the delta. A truncated snapshot whose change is beyond the window keeps
- * the historical body but records a beyond-window flag. No carrier / no genuine
- * change ⇒ byte-identical legacy body.
+ * differs from the historical folded copy, the response is trigger-tier-aware:
+ * a claim-tier recall (`swapBodyToCurrent` — the agent is about to edit) swaps
+ * that path's body section to the current source; read/term-tier recalls keep
+ * the HISTORICAL folded copy and only record the delta so the notifier can flag
+ * the drift with a fresh-read pointer. A truncated snapshot whose change is
+ * beyond the window keeps the historical body but records a beyond-window flag.
+ * No carrier / no genuine change ⇒ byte-identical legacy body.
  */
 function renderEntryBody(
   entry: FoldIndexEntry,
@@ -2015,13 +2023,14 @@ function renderEntryBody(
   rawHistory: readonly FoldMessage[],
   syntheticContext: SyntheticContextOptions,
   sourceDeltas: ReadonlyMap<string, RecallSourceDelta>,
+  swapBodyToCurrent: boolean,
 ): RenderedEntryBody | null {
   const applied: AppliedSourceDelta[] = [];
   if (entry.kind === 'tool') {
     const text = findToolResultText(rawHistory, entry.toolId);
     if (text === null) return null;
     const historical = stripRecallBlocks(text);
-    const swap = entry.path ? swapPathToCurrentSource(entry.path, historical, sourceDeltas) : null;
+    const swap = entry.path ? swapPathToCurrentSource(entry.path, historical, sourceDeltas, swapBodyToCurrent) : null;
     if (swap) {
       applied.push(swap.applied);
       return { body: swap.body ?? historical, applied };
@@ -2038,7 +2047,7 @@ function renderEntryBody(
   if (recallPaths.length > 0) {
     for (const { path, text } of collectToolResultEntriesForPaths(slice, recallPaths)) {
       const historical = stripRecallBlocks(text);
-      const swap = swapPathToCurrentSource(path, historical, sourceDeltas);
+      const swap = swapPathToCurrentSource(path, historical, sourceDeltas, swapBodyToCurrent);
       if (swap) {
         parts.push(swap.body ?? historical);
         applied.push(swap.applied);
@@ -2248,8 +2257,19 @@ type SourceDeltaResult =
  *
  * LIMITATION: the hunk is a single contiguous prefix/suffix block, not an LCS
  * diff — scattered edits collapse into one coarse removed+added block. This only
- * coarsens the NOTIFIER; on a 'changed' result the card BODY still pages back the
- * full current box source, so no current content is lost.
+ * coarsens the NOTIFIER; on a claim-tier 'changed' result the card BODY still
+ * pages back the full current box source, so no current content is lost.
+ *
+ * CONTEXT FLOOR: a 'changed' verdict additionally requires the shared
+ * prefix+suffix (pre+post) to cover at least ~15% of the comparable region.
+ * A genuine edit of one document leaves unchanged context around the changed
+ * span; near-zero shared context means the two texts are different document
+ * *shapes* — an Atlas-lookup/metadata-shaped folded body, or a windowed
+ * mid-file read, compared against raw full-file source — not an edit.
+ * Rendering those as 'changed' produced misleading whole-file "edit" hunks,
+ * so they return null (historical body kept, no notifier). Cost, accepted: a
+ * zero-shared-context TOTAL rewrite is line-indistinguishable from a shape
+ * mismatch and is also suppressed; a fresh read still shows the real file.
  */
 function computeSourceDelta(historicalBody: string, liveSource: string, truncated: boolean, budget: number): SourceDeltaResult {
   if (budget < 80) return null;
@@ -2277,6 +2297,12 @@ function computeSourceDelta(historicalBody: string, liveSource: string, truncate
     // current state past the window is unknown ⇒ flag; else genuinely unchanged.
     return truncated ? { kind: 'beyond' } : null;
   }
+  // Context floor (see docblock): veto 'changed' when the shared prefix+suffix
+  // is too thin relative to the comparable region — different document shapes,
+  // not an edit. The floor is relative (not a fixed line count) so genuine
+  // small-file edits with proportionally substantial context still qualify.
+  const contextFloor = Math.max(1, Math.ceil(0.15 * Math.min(histLines.length, liveLines.length)));
+  if (pre + post < contextFloor) return null;
   const out: string[] = [`@@ ~line ${pre + 1} @@`];
   let used = out[0].length + 1;
   let shown = 0;
@@ -2292,7 +2318,7 @@ function computeSourceDelta(historicalBody: string, liveSource: string, truncate
   };
   for (const r of removed) push('−', r);
   for (const a of added) push('+', a);
-  if (omitted > 0) out.push(`…(${omitted} more changed line${omitted === 1 ? '' : 's'} — self-tap/fresh-read for full)`);
+  if (omitted > 0) out.push(`…(±${omitted} more line${omitted === 1 ? '' : 's'} in this region — self-tap/fresh-read for full)`);
   return { kind: 'changed', diff: out.join('\n') };
 }
 
@@ -2304,7 +2330,11 @@ function currentSourceLabel(path: string, truncated: boolean): string {
 
 /**
  * Decide how to render `path`'s worker-fetched live snapshot:
- * - genuine visible change ⇒ body becomes current box source + a recorded diff;
+ * - genuine visible change + `swapToCurrent` (claim-tier recall — the agent is
+ *   about to edit) ⇒ body becomes current box source + a recorded diff;
+ * - genuine visible change without `swapToCurrent` (read/term-tier recall — a
+ *   passive glance back) ⇒ body stays historical (null) + a recorded diff so
+ *   the notifier flags the drift with a fresh-read pointer;
  * - truncated change beyond the window ⇒ body stays historical (null) + a
  *   beyond-window flag so the notifier warns to fresh-read;
  * - no carrier / no change ⇒ null (caller keeps historical, byte-identical legacy).
@@ -2313,6 +2343,7 @@ function swapPathToCurrentSource(
   path: string,
   historical: string,
   sourceDeltas: ReadonlyMap<string, RecallSourceDelta>,
+  swapToCurrent: boolean,
 ): { body: string | null; applied: AppliedSourceDelta } | null {
   const delta = sourceDeltas.get(path);
   if (!delta || !delta.liveSource.trim()) return null;
@@ -2325,11 +2356,18 @@ function swapPathToCurrentSource(
     // body byte-identical. The first epoch a change appears (liveHash differs)
     // still flags beyond-window.
     if (delta.stableSincePrior) return null;
-    return { body: null, applied: { path, liveHash: delta.liveHash, diff: '', truncated: true, beyond: true } };
+    return { body: null, applied: { path, liveHash: delta.liveHash, diff: '', truncated: true, beyond: true, swapped: false } };
+  }
+  if (!swapToCurrent) {
+    // Read/term-tier recall: the agent is remembering, not editing. Swapping
+    // the body under a passive glance replaced remembered context with
+    // unexpected current text — keep the historical folded copy and let the
+    // notifier carry the drift warning + hunk instead.
+    return { body: null, applied: { path, liveHash: delta.liveHash, diff: res.diff, truncated: !!delta.truncated, swapped: false } };
   }
   return {
     body: `${currentSourceLabel(path, !!delta.truncated)}\n${delta.liveSource}`,
-    applied: { path, liveHash: delta.liveHash, diff: res.diff, truncated: !!delta.truncated },
+    applied: { path, liveHash: delta.liveHash, diff: res.diff, truncated: !!delta.truncated, swapped: true },
   };
 }
 
@@ -2357,20 +2395,33 @@ function resolveItemSourceDeltaMap(item: RecallPlanItem, state: FoldRecallState)
 
 /**
  * Notifier block, rendered before the body excerpt so it always survives body
- * truncation. For changed paths the heading announces the body is CURRENT box
- * source and lists each path's "what changed" hunk; when any path is a beyond-
- * window flag (truncated snapshot whose change lies past the cap) the heading
- * stays neutral — that path's body is NOT current — and the path warns to
- * fresh-read. '' when nothing was applied ⇒ byte-identical legacy.
+ * truncation. Heading is honest about what the body IS:
+ * - every changed path swapped (claim-tier) ⇒ announces the body is CURRENT
+ *   box source and lists each path's "what changed" hunk;
+ * - every changed path unswapped (read/term-tier) ⇒ announces the body is the
+ *   HISTORICAL folded copy, warns to fresh-read before relying on it, and
+ *   still lists the hunks;
+ * - mixed, or any beyond-window flag (truncated snapshot whose change lies
+ *   past the cap) ⇒ neutral heading with per-path body annotations.
+ * The heading never claims the body is CURRENT when it is not. '' when
+ * nothing was applied ⇒ byte-identical legacy.
  */
 function formatDeltaNotifier(applied: readonly AppliedSourceDelta[], budget: number): string {
   if (applied.length === 0 || budget < 80) return '';
   const allChanged = applied.every(a => !a.beyond);
-  const heading = allChanged
+  const allSwapped = allChanged && applied.every(a => a.swapped);
+  const noneSwapped = applied.every(a => !a.swapped);
+  const heading = allSwapped
     ? (applied.length === 1
         ? 'Δ Source changed since fold — body below is CURRENT box source; what changed:'
         : `Δ ${applied.length} sources changed since fold — bodies below are CURRENT box source; what changed:`)
-    : 'Δ Fold-recall live-source check:';
+    : allChanged && noneSwapped
+      ? (applied.length === 1
+          ? 'Δ Source changed since fold — body below is the HISTORICAL folded copy; fresh-read before relying on it; what changed:'
+          : `Δ ${applied.length} sources changed since fold — bodies below are the HISTORICAL folded copies; fresh-read before relying on them; what changed:`)
+      : 'Δ Fold-recall live-source check:';
+  // Per-path body annotation, only where the heading does not already say it.
+  const uniformHeading = allSwapped || (allChanged && noneSwapped);
   const out: string[] = [heading];
   let used = heading.length + 1;
   for (const a of applied) {
@@ -2380,7 +2431,12 @@ function formatDeltaNotifier(applied: readonly AppliedSourceDelta[], budget: num
       out.push(head);
       used += head.length + 1;
     } else {
-      const head = `${a.path} (liveHash=${a.liveHash})`;
+      const suffix = uniformHeading
+        ? ''
+        : a.swapped
+          ? ' [body: CURRENT box source]'
+          : ' [body: HISTORICAL folded copy — fresh-read before relying on it]';
+      const head = `${a.path} (liveHash=${a.liveHash})${suffix}`;
       if (used + head.length + 1 > budget) break;
       out.push(head);
       used += head.length + 1;
@@ -2394,11 +2450,18 @@ function formatDeltaNotifier(applied: readonly AppliedSourceDelta[], budget: num
   return out.length > 1 ? out.join('\n') : '';
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, applied: readonly AppliedSourceDelta[], episodeVoice = '', atlasMeta = ''): string {
+/** Rendered card text plus the composition breakdown of where its chars went. */
+interface RenderedCard {
+  text: string;
+  stats: RecallCompositionStats;
+}
+
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, applied: readonly AppliedSourceDelta[], episodeVoice = '', atlasMeta = ''): RenderedCard {
   // Radar (hazard + highlight guideposts), episodic voice, and the source-delta
-  // notifier all prepend the body excerpt and share the card budget. The body
-  // itself is already CURRENT box source for any changed path (swapped in
-  // renderEntryBody); the notifier shows what changed. Empty carriers ⇒ byte-identical.
+  // notifier all prepend the body excerpt and share the card budget. For a
+  // claim-tier recall the body is already swapped to CURRENT box source for
+  // changed paths (renderEntryBody); read/term-tier recalls keep the historical
+  // body and the notifier carries the drift warning. Empty carriers ⇒ byte-identical.
   const radarBlock = radar ? `${radar}\n` : '';
   const voiceBlock = episodeVoice ? `${episodeVoice}\n` : '';
   const metaBlock = atlasMeta ? `${atlasMeta}\n` : '';
@@ -2408,12 +2471,38 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, rada
   const prefixBlock = `${metaBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
   const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - prefixBlock.length));
   const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
-  return `${header}\n${prefixBlock}${excerpt}\n[End fold recall]`;
+  return {
+    text: `${header}\n${prefixBlock}${excerpt}\n[End fold recall]`,
+    stats: {
+      bodyChars: excerpt.length,
+      notifierChars: notifier.length,
+      radarChars: radar.length,
+      episodeVoiceChars: episodeVoice.length,
+      atlasMetaChars: atlasMeta.length,
+      swappedPaths: applied.reduce((n, a) => n + (a.swapped ? 1 : 0), 0),
+    },
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════
 // Session-facing orchestration
 // ══════════════════════════════════════════════════════════════════════
+
+/** Where a pass's injected card chars went + how many bodies were swapped. */
+export interface RecallCompositionStats {
+  /** Chars of body excerpts across injected cards. */
+  bodyChars: number;
+  /** Chars of source-delta notifier blocks. */
+  notifierChars: number;
+  /** Chars of Curated Code Radar blocks. */
+  radarChars: number;
+  /** Chars of episodic voice blocks. */
+  episodeVoiceChars: number;
+  /** Chars of Atlas identity metadata blocks. */
+  atlasMetaChars: number;
+  /** Paths whose card body was swapped to CURRENT box source (claim-tier). */
+  swappedPaths: number;
+}
 
 export interface FoldRecallOutcome {
   /** Rendered body-only recall block, or null when nothing injects. */
@@ -2423,6 +2512,13 @@ export interface FoldRecallOutcome {
   chars: number;
   suppressed: number;
   triggers: string[];
+  /**
+   * Additive per-pass card composition breakdown — answers "where did the
+   * injected chars go, and were any bodies swapped to current source?".
+   * Present only when at least one card rendered this pass; optional so
+   * standalone hosts consuming FoldRecallOutcome are unaffected.
+   */
+  composition?: RecallCompositionStats;
 }
 
 const EMPTY_OUTCOME: FoldRecallOutcome = { text: null, cards: 0, hints: 0, chars: 0, suppressed: 0, triggers: [] };
@@ -2579,6 +2675,7 @@ export function buildFoldRecallContext(
   let charsUsed = 0;
   let cards = 0;
   let hints = 0;
+  let composition: RecallCompositionStats | null = null;
   // Radar dedup: paths the current Atlas-read tool already rendered live, whose
   // radar would duplicate the tool output (empty set ⇒ byte-identical).
   const radarSuppressPaths = new Set(signals.atlasReadPaths ?? []);
@@ -2589,6 +2686,7 @@ export function buildFoldRecallContext(
 
     let level: 'card' | 'hint' = item.render;
     let rendered: string | null = null;
+    let cardStats: RecallCompositionStats | null = null;
 
     if (level === 'card') {
       const uncappedBodyBudget = Math.min(config.maxCardChars, remaining - RECALL_BODY_RESERVED_GAP_CHARS);
@@ -2605,17 +2703,24 @@ export function buildFoldRecallContext(
       } else {
         const recallPaths = recallZonePaths(item, state);
         const sourceDeltas = resolveItemSourceDeltaMap(item, state);
-        const rb = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext, sourceDeltas);
+        // Body-swap is claim-tier only: a claim says "about to edit this file",
+        // where stale code is actively dangerous. Read/term-tier recalls are
+        // passive glances — they keep the historical body and rely on the
+        // notifier's drift warning instead.
+        const rb = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext, sourceDeltas, item.tier === 1);
         if (rb === null) continue; // raw no longer recoverable — skip silently
         // Curated Code Radar may take up to a third of the card body budget; the
         // notifier + excerpt share the rest. '' (empty carriers / flags off) ⇒ byte-identical.
         const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
         const episodeVoice = buildEpisodeVoiceBlock(item, state, config, Math.floor(bodyBudget / 4), radarSuppressPaths);
         const atlasMeta = buildAtlasMetaBlock(item, state, config, Math.floor(bodyBudget / 5), radarSuppressPaths);
-        rendered = renderCard(item, rb.body, bodyBudget, radar, rb.applied, episodeVoice, atlasMeta);
+        const rc = renderCard(item, rb.body, bodyBudget, radar, rb.applied, episodeVoice, atlasMeta);
+        rendered = rc.text;
         if (rendered.length > remaining) {
           level = 'hint';
           rendered = null;
+        } else {
+          cardStats = rc.stats;
         }
       }
     }
@@ -2648,6 +2753,18 @@ export function buildFoldRecallContext(
     charsUsed += rendered.length;
     if (level === 'card') cards++;
     else hints++;
+    if (level === 'card' && cardStats !== null) {
+      composition = composition === null
+        ? { ...cardStats }
+        : {
+            bodyChars: composition.bodyChars + cardStats.bodyChars,
+            notifierChars: composition.notifierChars + cardStats.notifierChars,
+            radarChars: composition.radarChars + cardStats.radarChars,
+            episodeVoiceChars: composition.episodeVoiceChars + cardStats.episodeVoiceChars,
+            atlasMetaChars: composition.atlasMetaChars + cardStats.atlasMetaChars,
+            swappedPaths: composition.swappedPaths + cardStats.swappedPaths,
+          };
+    }
   }
 
   for (const { id, level } of injected) {
@@ -2659,5 +2776,13 @@ export function buildFoldRecallContext(
   state.suppressed += suppressed;
 
   if (blocks.length === 0) return { ...EMPTY_OUTCOME, suppressed };
-  return { text: blocks.join('\n\n'), cards, hints, chars: charsUsed, suppressed, triggers };
+  return {
+    text: blocks.join('\n\n'),
+    cards,
+    hints,
+    chars: charsUsed,
+    suppressed,
+    triggers,
+    ...(composition !== null ? { composition } : {}),
+  };
 }

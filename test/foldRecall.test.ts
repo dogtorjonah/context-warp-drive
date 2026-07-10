@@ -868,26 +868,37 @@ describe('buildFoldRecallContext', () => {
     expect(state.cardsInjected).toBe(1);
   });
 
-  test('live source delta: changed current source becomes the card body + delta notifier', () => {
-    const raw = buildAnthropicHistory();
-    const state = freshState(raw);
-    // Worker supplies a live source snapshot that differs from the historical
-    // folded body ('BIGFILE CONTENT START ...').
-    state.pathSourceDeltas.set(BIGFILE, {
-      path: BIGFILE,
-      liveHash: 'abcd1234',
-      liveSource: 'COMPLETELY NEW CONTENT ON DISK NOW',
-    });
-    const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+  test('live source delta: claim-tier recall on a genuinely edited path swaps the body to CURRENT box source + delta notifier', () => {
+    const edited = 'relay/src/edited.ts';
+    const staleBody = ['function handler(input) {', '  if (input === null) {', '    return legacyGuard(input);', '  }', '  return process(input);', '}'].join('\n');
+    const currentSource = ['function handler(input) {', '  if (input === null) {', '    return modernGuard(input);', '  }', '  return process(input);', '}'].join('\n');
+    const raw: FoldMessage[] = [
+      userMsg('Investigate edited.ts'),
+      anthropicToolUse('tu_ed', 'Read', { file_path: ABS(edited) }),
+      anthropicToolResult('tu_ed', staleBody),
+      assistantMsg('Reviewed the handler in edited.ts.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([toolEntry('tu_ed', edited, 10)], raw.length);
+    state.pathSourceDeltas.set(edited, { path: edited, liveHash: 'ed-new', liveSource: currentSource });
+
+    // A file CLAIM (tier 1 — about to edit) is where stale code is actively
+    // dangerous: the body swaps to CURRENT box source, heading says so.
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals(null, new Set([ABS(edited)])), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
-    // Body is the CURRENT source from disk; the notifier shows the delta.
-    expect(out.text!).toContain('Δ Source changed since fold');
-    expect(out.text!).toContain('relay/src/bigfile.ts (liveHash=abcd1234)');
-    expect(out.text!).toContain('↻ CURRENT box source — relay/src/bigfile.ts:');
-    expect(out.text!).toContain('COMPLETELY NEW CONTENT ON DISK NOW');
-    // Stale folded tail is gone from the body.
-    expect(out.text!).not.toContain('BIGFILE CONTENT END');
+    expect(out.text!).toContain('trigger: claim relay/src/edited.ts');
+    expect(out.text!).toContain('Δ Source changed since fold — body below is CURRENT box source; what changed:');
+    expect(out.text!).toContain('relay/src/edited.ts (liveHash=ed-new)');
+    expect(out.text!).toContain('↻ CURRENT box source — relay/src/edited.ts:');
+    expect(out.text!).toContain('modernGuard');
+    // Stale guard only survives as a `−` deletion line in the hunk.
+    expect(out.text!).toMatch(/−\s*return legacyGuard\(input\);/);
+    // Composition telemetry: the swap and the notifier are visible in the stats.
+    expect(out.composition).toBeDefined();
+    expect(out.composition!.swappedPaths).toBe(1);
+    expect(out.composition!.bodyChars).toBeGreaterThan(0);
+    expect(out.composition!.notifierChars).toBeGreaterThan(0);
   });
 
   test('live source delta: live source matching historical ⇒ no notifier, byte-identical legacy body', () => {
@@ -950,24 +961,96 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).toContain('BIGFILE CONTENT END');
   });
 
-  test('touching one folded read-burst member pages the CHANGED sibling back as CURRENT source + delta notifier', () => {
+  test('context floor: an Atlas-lookup-shaped folded body vs raw source is a shape mismatch — no delta, even for a claim', () => {
+    const target = 'relay/src/looked-up.ts';
+    // What an Atlas lookup result looks like folded: metadata + prose, NOT source.
+    const lookupBody = [
+      '# relay/src/looked-up.ts',
+      '## Recent Changes',
+      '1. Added the widget factory registry.',
+      '2. Hardened null handling in the parser.',
+      '📌 Purpose: widget factory registry for the relay.',
+      '🏷 Tags: registry, widgets',
+      '⌖ Key region: createWidget (L10-40)',
+      'Hazards: mutates shared registry map in place.',
+    ].join('\n');
+    const rawSource = [
+      'import { z } from "zod";',
+      '',
+      'export function createWidget(kind) {',
+      '  return registry.get(kind)?.build();',
+      '}',
+      '',
+      'export const registry = new Map();',
+      'registry.set("gauge", { build: () => new Gauge() });',
+    ].join('\n');
+    const raw: FoldMessage[] = [
+      userMsg('Look up looked-up.ts in Atlas'),
+      anthropicToolUse('tu_lk', 'Read', { file_path: ABS(target) }),
+      anthropicToolResult('tu_lk', lookupBody),
+      assistantMsg('Reviewed the Atlas record.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([toolEntry('tu_lk', target, 10)], raw.length);
+    state.pathSourceDeltas.set(target, { path: target, liveHash: 'lk-live', liveSource: rawSource });
+
+    // Even a claim (strongest swap intent) must not treat a document-shape
+    // mismatch as an edit: near-zero shared context ⇒ no delta at all.
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals(null, new Set([ABS(target)])), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.cards).toBe(1);
+    expect(out.text!).not.toContain('Δ Source changed since fold');
+    expect(out.text!).not.toContain('Δ Fold-recall live-source check');
+    expect(out.text!).not.toContain('↻ CURRENT box source');
+    // Historical lookup body retained untouched.
+    expect(out.text!).toContain('## Recent Changes');
+  });
+
+  test('context floor: a windowed mid-file Read body vs full source is a shape mismatch — no delta', () => {
+    const target = 'relay/src/windowed.ts';
+    const fullLines = Array.from({ length: 60 }, (_, i) => `const line${i} = ${i};`);
+    // A mid-file Read window: real source lines, but positionally disjoint from
+    // the full file's prefix/suffix — zero shared context at the boundaries.
+    const windowBody = fullLines.slice(30, 38).join('\n');
+    const raw: FoldMessage[] = [
+      userMsg('Read the middle of windowed.ts'),
+      anthropicToolUse('tu_win', 'Read', { file_path: ABS(target) }),
+      anthropicToolResult('tu_win', windowBody),
+      assistantMsg('Reviewed the mid-file window.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([toolEntry('tu_win', target, 10)], raw.length);
+    state.pathSourceDeltas.set(target, { path: target, liveHash: 'win-live', liveSource: fullLines.join('\n') });
+
+    const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(target) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.cards).toBe(1);
+    expect(out.text!).not.toContain('Δ Source changed since fold');
+    expect(out.text!).not.toContain('Δ Fold-recall live-source check');
+    expect(out.text!).not.toContain('↻ CURRENT box source');
+    // Historical windowed body retained untouched.
+    expect(out.text!).toContain('const line30 = 30;');
+  });
+
+  test('touching one folded read-burst member flags the CHANGED sibling with a drift notifier (historical body kept)', () => {
     const alpha = 'relay/src/alpha.ts';
     const beta = 'relay/src/beta.ts';
+    const betaOld = ['BETA HEAD', 'BETA OLD CONTENT', 'BETA TAIL'].join('\n');
     const raw: FoldMessage[] = [
       userMsg('Read alpha and beta together'),
       anthropicToolUse('tu_alpha', 'Read', { file_path: ABS(alpha) }),
       anthropicToolResult('tu_alpha', 'ALPHA OLD CONTENT'),
       anthropicToolUse('tu_beta', 'Read', { file_path: ABS(beta) }),
-      anthropicToolResult('tu_beta', 'BETA OLD CONTENT'),
+      anthropicToolResult('tu_beta', betaOld),
       assistantMsg('Alpha and beta were reviewed in one temporal burst.'),
     ];
     const state = createFoldRecallState();
     state.index = makeIndex([turnEntry('burst', 'alpha beta reviewed together', 30, [alpha, beta], 0, raw.length)], raw.length);
-    // beta changed on disk since the fold; alpha did not.
+    // beta was genuinely partially edited on disk since the fold; alpha was not.
     state.pathSourceDeltas.set(beta, {
       path: beta,
       liveHash: 'beta-new',
-      liveSource: 'BETA NEW CONTENT',
+      liveSource: ['BETA HEAD', 'BETA NEW CONTENT', 'BETA TAIL'].join('\n'),
     });
 
     const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(alpha) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
@@ -976,16 +1059,22 @@ describe('buildFoldRecallContext', () => {
     expect(out.text!).toContain('trigger: path-touch relay/src/alpha.ts');
     // alpha has no delta ⇒ its body stays the historical (legacy) content, not swapped.
     expect(out.text!).toContain('ALPHA OLD CONTENT');
-    expect(out.text!).not.toContain('↻ CURRENT box source — relay/src/alpha.ts');
-    // beta changed ⇒ its body becomes CURRENT box source; stale beta only survives as a `−` line.
+    // A path-touch is a passive glance (tier 0): beta's HISTORICAL body is kept
+    // and the notifier flags the drift with the hunk + fresh-read pointer.
     expect(out.text!).toContain('Δ Source changed since fold');
+    expect(out.text!).toContain('HISTORICAL folded copy');
     expect(out.text!).toContain('relay/src/beta.ts (liveHash=beta-new)');
-    expect(out.text!).toContain('↻ CURRENT box source — relay/src/beta.ts:');
-    expect(out.text!).toContain('BETA NEW CONTENT');
+    expect(out.text!).not.toContain('↻ CURRENT box source');
+    expect(out.text!).toContain('BETA OLD CONTENT');
+    expect(out.text!).toMatch(/\+\s*BETA NEW CONTENT/);
     expect(out.text!).toMatch(/−\s*BETA OLD CONTENT/);
+    // Composition telemetry: drift notifier rendered, but nothing was swapped.
+    expect(out.composition).toBeDefined();
+    expect(out.composition!.swappedPaths).toBe(0);
+    expect(out.composition!.notifierChars).toBeGreaterThan(0);
   });
 
-  test('source delta: reviewing a peer-edited file pages back CURRENT source, never the stale folded body (processChat trap)', () => {
+  test('source delta: reviewing a peer-edited file keeps the HISTORICAL body but flags the drift with hunk + fresh-read (processChat trap)', () => {
     const reviewed = 'src/lib/chatJob/processChat.ts';
     const staleBody = [
       'export function resolveClinicId(evidenceClinicId, practiceToolClinicId) {',
@@ -1014,11 +1103,14 @@ describe('buildFoldRecallContext', () => {
     const out = buildFoldRecallContext(state, raw, extractRecallSignals({ file_path: ABS(reviewed) }, new Set()), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
 
     expect(out.cards).toBe(1);
-    // Card body is the CURRENT source from disk — the landed `??` fix, not the gate.
-    expect(out.text!).toContain('↻ CURRENT box source — src/lib/chatJob/processChat.ts:');
-    expect(out.text!).toContain('return evidenceClinicId ?? practiceToolClinicId;');
-    // Notifier shows the delta; the stale gate only survives as a `−` deletion line.
+    // A review read is a passive glance (tier 0): the HISTORICAL folded body is
+    // kept — the reviewer sees what they folded — while the notifier carries the
+    // trap disarm: an explicit drift warning, the landed fix as a `+` hunk line,
+    // and a fresh-read pointer before relying on the stale gate.
+    expect(out.text!).not.toContain('↻ CURRENT box source');
     expect(out.text!).toContain('Δ Source changed since fold');
+    expect(out.text!).toContain('HISTORICAL folded copy');
+    expect(out.text!).toContain('fresh-read');
     expect(out.text!).toContain('liveHash=2ffe6f651e65e8a7');
     expect(out.text!).toMatch(/−\s*if \(evidenceClinicId\) \{/);
     expect(out.text!).toMatch(/\+\s*return evidenceClinicId \?\? practiceToolClinicId;/);
@@ -1518,11 +1610,12 @@ describe('buildFoldRecallContext', () => {
 
     // Relay signals a genuine live-source change since the prior pass — this
     // is the correctness guard: shrink must NOT apply to genuinely changed
-    // content, even though priorShowCount is already 2.
+    // content, even though priorShowCount is already 2. The change is a
+    // genuine append (shared prefix) so it clears the context floor.
     state.pathSourceDeltas.set(BIGFILE, {
       path: BIGFILE,
       liveHash: 'changed-hash',
-      liveSource: 'COMPLETELY DIFFERENT CONTENT ON DISK NOW '.repeat(120),
+      liveSource: `${BIGFILE_CONTENT}\nNEW TRAILING LINE ON DISK\nANOTHER NEW LINE ADDED SINCE THE FOLD`,
       stableSincePrior: false,
     });
     const third = buildFoldRecallContext(state, raw, signals, 'healthy', config);
