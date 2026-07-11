@@ -19,6 +19,7 @@ import {
   stripUserMessageVaultBlocks,
   nominateVerbatim,
 } from './rollingFold.ts';
+import { renderEmbeddedContinuityArtifactProvenance } from './chronologicalProvenance.ts';
 
 export interface UserMessageVaultEntry {
   text: string;
@@ -463,7 +464,15 @@ function renderOperatorOnlyVault(
           : rendered;
       })
       .join('\n\n');
-    const block = `${HEADER}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
+    const provenance = renderVaultBlockProvenance(
+      retained.map((entry, index) => ({
+        createdAt: entry.createdAt,
+        live: liveNewest && index === retained.length - 1,
+      })),
+      'operator-only',
+    );
+    const header = maxChars < 1_000 ? USER_MESSAGE_VAULT_PREFIX : HEADER;
+    const block = `${header}\n${provenance}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
     if (block.length <= maxChars) return block;
     retained = retained.slice(1);
   }
@@ -509,6 +518,35 @@ export interface VaultRenderRow {
   live?: boolean;
 }
 
+function renderVaultBlockProvenance(
+  rows: ReadonlyArray<{ createdAt?: string; live?: boolean }>,
+  mode: 'operator-only' | 'full' | 'delta',
+): string {
+  const includeTimestamps = resolveUserMessageVaultMaxChars(process.env) >= 1_000;
+  const firstTimestamp = includeTimestamps
+    ? rows.find((row) => row.createdAt)?.createdAt
+    : undefined;
+  let lastTimestamp: string | undefined;
+  if (includeTimestamps) {
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      if (!rows[index].createdAt) continue;
+      lastTimestamp = rows[index].createdAt;
+      break;
+    }
+  }
+  return renderEmbeddedContinuityArtifactProvenance({
+    artifact: `glyph-vault#${mode}`,
+    contentClass: 'exact-excerpt',
+    traceId: 'vault-buffer',
+    unit: 'row',
+    sourceStart: 0,
+    sourceEndExclusive: rows.length,
+    sourceFirstTimestamp: firstTimestamp,
+    sourceLastTimestamp: lastTimestamp,
+    authority: rows.some((row) => row.live) ? 'live' : 'historical-background',
+  }) ?? '';
+}
+
 function entryMs(createdAt: string | undefined): number {
   if (!createdAt) return 0;
   const ms = Date.parse(createdAt);
@@ -546,11 +584,14 @@ export function renderVaultRowsBlock(
   mode: 'full' | 'delta' = 'full',
 ): string {
   if (rows.length === 0) return '';
-  const header = mode === 'delta' ? VAULT_DELTA_HEADER : GLYPH_GRAMMAR_HEADER;
+  const header = resolveUserMessageVaultMaxChars(process.env) < 1_000
+    ? USER_MESSAGE_VAULT_PREFIX
+    : mode === 'delta' ? VAULT_DELTA_HEADER : GLYPH_GRAMMAR_HEADER;
   const body = rows
     .map((row, index) => renderVaultRow(row, index === rows.length - 1))
     .join('\n\n');
-  return `${header}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
+  const provenance = renderVaultBlockProvenance(rows, mode);
+  return `${header}\n${provenance}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
 }
 
 /**

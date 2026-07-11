@@ -141,6 +141,10 @@ describe('cognitiveArtifacts', () => {
         { register: 'hazard', glyph: '⚠️', headline: 'sync I/O risk', messageIndex: 5 },
       ]);
       expect(block).toContain('[cognitive');
+      expect(block).toContain('artifact=cognitive-waypoints class=synthesized-history');
+      expect(block).toContain('source=fold-window:message#2..fold-window:message#6 n=4');
+      expect(block).toContain('authority=historical-background');
+      expect(block).toContain('host=embedded-message-suffix representation=alias');
       expect(block).toContain('↞ msg#2 · verdict');
       expect(block).toContain('🏁 PASS — suite complete');
       expect(block).toContain('↞ msg#5 · hazard');

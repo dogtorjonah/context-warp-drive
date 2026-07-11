@@ -24,6 +24,7 @@ import {
   type AssistantRegister,
 } from './glyphs.ts';
 import type { FoldMessage } from './rollingFold.ts';
+import { renderEmbeddedContinuityArtifactProvenance } from './chronologicalProvenance.ts';
 
 // ══════════════════════════════════════════════════════════════════════
 // Types
@@ -228,10 +229,25 @@ export function renderCognitiveBlock(
   artifacts: readonly CognitiveArtifact[],
 ): string {
   if (artifacts.length === 0) return '';
+  const firstMessageIndex = artifacts[0].messageIndex;
+  const lastMessageIndex = artifacts[artifacts.length - 1].messageIndex;
+  const provenance = renderEmbeddedContinuityArtifactProvenance({
+    artifact: 'cognitive-waypoints',
+    contentClass: 'synthesized-history',
+    traceId: 'fold-window',
+    unit: 'message',
+    sourceStart: firstMessageIndex,
+    sourceEndExclusive: lastMessageIndex + 1,
+    authority: 'historical-background',
+  });
   const lines = artifacts.flatMap(
     (a) => [formatCognitiveArtifactProvenance(a), `${a.glyph} ${a.headline}`],
   );
-  return `[cognitive — historical waypoints from the folded window, NOT your current state]\n${lines.join('\n')}`;
+  return [
+    '[cognitive — historical waypoints from the folded window, NOT your current state]',
+    provenance,
+    ...lines,
+  ].filter(Boolean).join('\n');
 }
 
 /**

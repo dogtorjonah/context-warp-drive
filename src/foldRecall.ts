@@ -62,6 +62,10 @@ import {
 } from './rollingFold.ts';
 import type { ContextUtilizationLevel } from './contextWindow.ts';
 import { extractDistinctiveTerms, idfFromDocumentFrequency, scoreTermOverlap } from './foldTerms.ts';
+import {
+  foldMessageTimestampBounds,
+  renderChronologicalProvenanceCompact,
+} from './chronologicalProvenance.ts';
 
 // ══════════════════════════════════════════════════════════════════════
 // Config
@@ -2513,7 +2517,40 @@ interface RenderedCard {
   stats: RecallCompositionStats;
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, applied: readonly AppliedSourceDelta[], episodeVoice = '', atlasMeta = ''): RenderedCard {
+function renderRecallProvenance(
+  item: RecallPlanItem,
+  rawHistory: readonly FoldMessage[],
+  rawTailStart: number,
+): string {
+  const sourceStart = item.entry.kind === 'turn' ? item.entry.rawStart : item.entry.recency;
+  const sourceEnd = item.entry.kind === 'turn' ? item.entry.rawEnd : item.entry.recency + 1;
+  const sourceTime = foldMessageTimestampBounds(rawHistory.slice(sourceStart, sourceEnd));
+  const rawTailCount = Math.max(0, rawHistory.length - rawTailStart);
+  const rendered = renderChronologicalProvenanceCompact({
+    artifact: `fold-recall#${item.entry.id}`,
+    contentClass: 'retrieved-history',
+    source: {
+      start: { unit: 'message', index: sourceStart, timestamp: sourceTime.firstTimestamp },
+      endExclusive: { unit: 'message', index: sourceEnd },
+      count: sourceEnd - sourceStart,
+      lastTimestamp: sourceTime.lastTimestamp,
+    },
+    transformedAt: { unit: 'message', index: rawHistory.length },
+    ...(rawTailCount > 0 ? { rawResumesAt: { unit: 'message', index: rawTailStart } as const } : {}),
+    authority: 'historical-background',
+    supersession: rawTailCount > 0 ? 'later-raw-wins' : 'none-known',
+    topology: {
+      host: 'dedicated-synthetic-message',
+      previous: 'raw-history',
+      next: rawTailCount > 0 ? 'raw-tail' : 'none',
+      representation: 'canonical',
+      rawTailCount,
+    },
+  });
+  return rendered ?? '';
+}
+
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', atlasMeta = ''): RenderedCard {
   // Radar (hazard + highlight guideposts), episodic voice, and the source-delta
   // notifier all prepend the body excerpt and share the card budget. For a
   // claim-tier recall the body is already swapped to CURRENT box source for
@@ -2522,10 +2559,12 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, rada
   const radarBlock = radar ? `${radar}\n` : '';
   const voiceBlock = episodeVoice ? `${episodeVoice}\n` : '';
   const metaBlock = atlasMeta ? `${atlasMeta}\n` : '';
-  const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - metaBlock.length) / 2);
+  const provenance = renderRecallProvenance(item, rawHistory, rawTailStart);
+  const provenanceBlock = provenance ? `${provenance}\n` : '';
+  const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - metaBlock.length - provenanceBlock.length) / 2);
   const notifier = formatDeltaNotifier(applied, notifierBudget);
   const notifierBlock = notifier ? `${notifier}\n` : '';
-  const prefixBlock = `${metaBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
+  const prefixBlock = `${provenanceBlock}${metaBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
   const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - prefixBlock.length));
   const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
   return {
@@ -2795,7 +2834,17 @@ export function buildFoldRecallContext(
           suppressed++;
           continue;
         }
-        const rc = renderCard(item, rb.body, bodyBudget, radar, rb.applied, episodeVoice, atlasMeta);
+        const rc = renderCard(
+          item,
+          rb.body,
+          bodyBudget,
+          radar,
+          rb.applied,
+          rawHistory,
+          state.index?.rawCount ?? rawHistory.length,
+          episodeVoice,
+          atlasMeta,
+        );
         rendered = rc.text;
         if (rendered.length > remaining) {
           level = 'hint';

@@ -1809,6 +1809,17 @@ export interface EpisodicInjectionState {
    * fires, the noise-reduction signal for the bookkeeping-suppression A/B.
    */
   episodicBookkeepingSuppressed: number;
+  /**
+   * Read-boundary serve rate gate (see consumeEpisodicStashRateGated): gated-class
+   * boundaries (read/search/other non-edit, non-rail-anchor tools) elapsed since
+   * the last NEW-card serve. Edit and rail-anchor boundaries bypass the gate and
+   * do not advance or reset this.
+   */
+  episodicGatedBoundariesSinceServe: number;
+  /** Gated boundaries where a pending stash was HELD closed by the read-rate gate. */
+  episodicRateHeld: number;
+  /** Stash cards dropped by the one-new-card-per-open-boundary serve cap. */
+  episodicRateTrimmed: number;
 }
 
 export function createEpisodicInjectionState(): EpisodicInjectionState {
@@ -1828,6 +1839,9 @@ export function createEpisodicInjectionState(): EpisodicInjectionState {
     completedChainTargetPaths: new Set(),
     visibleCardHeaders: new Set(),
     episodicBookkeepingSuppressed: 0,
+    episodicGatedBoundariesSinceServe: 0,
+    episodicRateHeld: 0,
+    episodicRateTrimmed: 0,
   };
 }
 
@@ -1914,6 +1928,106 @@ export function consumeEpisodicStash(
   const unseen = stash.cards.filter((card) => !state.visibleCardHeaders.has(episodicCardHeaderLine(card)));
   state.episodicSuppressed += stash.cards.length - unseen.length;
   return unseen.length > 0 ? unseen : null;
+}
+
+// ── Read-boundary serve rate gate ────────────────────────────────────────────
+// Investigation bursts (read/grep/search sprees) can exhale a new episodic card
+// at nearly every boundary, swamping the live thread with memory. The gate
+// classifies each inject boundary by its dispatched tool and rations NEW-card
+// serving on the gated class (read/search and other non-edit, non-rail tools)
+// to at most one card per N gated boundaries. Edit and rail-anchor boundaries —
+// the high-signal moments where recall pays for itself — always serve in full.
+
+/** Default N for the read-boundary serve rate: 1 new card per 3 gated boundaries. */
+export const EPISODIC_READ_RATE_DEFAULT_BOUNDARIES = 3;
+
+/**
+ * Edit-shaped tool-name hints. Mirrors foldEpisodeCapture's EDIT_TOOL_HINTS
+ * (keep the two lists in sync): capture uses them to classify touch kinds,
+ * this gate uses them to classify inject boundaries.
+ */
+const EPISODIC_EDIT_TOOL_HINTS = ['edit', 'write', 'apply_patch', 'notebookedit', 'str_replace', 'create_file'] as const;
+
+export type EpisodicBoundaryToolClass = 'edit' | 'rail_anchor' | 'gated';
+
+/**
+ * Classify the dispatched tool at an inject boundary for the read-rate gate.
+ * Unknown/absent tool names classify as 'gated' — the conservative side: a
+ * misclassified boundary rations recall, it never over-serves. TodoWrite is
+ * excluded from the 'write' hint because a todo update is paperwork, not a
+ * file edit; task_rail (bare or MCP-prefixed) anchors the rail bypass.
+ */
+export function classifyEpisodicBoundaryTool(toolName: string | null | undefined): EpisodicBoundaryToolClass {
+  if (typeof toolName !== 'string' || toolName.length === 0) return 'gated';
+  const lower = toolName.toLowerCase();
+  if (lower === 'task_rail' || lower.endsWith('__task_rail')) return 'rail_anchor';
+  if (!lower.includes('todowrite') && EPISODIC_EDIT_TOOL_HINTS.some((hint) => lower.includes(hint))) return 'edit';
+  return 'gated';
+}
+
+/**
+ * Pure parser for the read-rate knob (env VOXXO_FOLD_EPISODIC_READ_RATE_BOUNDARIES,
+ * passed in as a raw string so the package stays host-agnostic). 0 disables the
+ * gate (legacy serve-every-boundary behavior); absent/invalid/negative falls back
+ * to EPISODIC_READ_RATE_DEFAULT_BOUNDARIES.
+ */
+export function resolveEpisodicReadRateBoundaries(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return EPISODIC_READ_RATE_DEFAULT_BOUNDARIES;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return EPISODIC_READ_RATE_DEFAULT_BOUNDARIES;
+  return parsed;
+}
+
+export interface EpisodicStashRateGateOptions {
+  /** Dispatched tool name at THIS boundary — the classification source. */
+  toolName: string | null | undefined;
+  /** Serve new cards on at most 1 of every N gated boundaries. 0 disables the gate. */
+  rateBoundaries: number;
+  /** Stash freshness bound forwarded to consumeEpisodicStash. */
+  maxAgeBoundaries?: number;
+  /** Provider-visible text used to reject duplicate candidates before spending the gated allowance. */
+  providerPovText?: string;
+}
+
+/**
+ * Rate-gated stash consume. Behavior by boundary class:
+ * - 'edit' / 'rail_anchor' (or rate 0): plain consumeEpisodicStash — full
+ *   bypass. Bypass serves do NOT advance or reset the gated counter; the
+ *   ration is a contract on the gated class alone.
+ * - 'gated': the boundary advances the counter. Below the rate the stash is
+ *   HELD in place, not consumed — its own boundary TTL keeps aging it honestly
+ *   (pressure-pause precedent), and a fresher fire overwrites it anyway. At or
+ *   above the rate the stash is consumed, provider-visible duplicates are
+ *   removed, and AT MOST ONE novel card serves (worker card order is
+ *   strongest-tier-first). The counter resets only when an injectable card
+ *   survives, so an open boundary that finds an empty, stale, or wholly
+ *   duplicate stash keeps the accrued allowance.
+ */
+export function consumeEpisodicStashRateGated(
+  state: EpisodicInjectionState,
+  options: EpisodicStashRateGateOptions,
+): EpisodicRecallCardLike[] | null {
+  const rate = Math.floor(options.rateBoundaries);
+  if (rate <= 0 || classifyEpisodicBoundaryTool(options.toolName) !== 'gated') {
+    return consumeEpisodicStash(state, options.maxAgeBoundaries);
+  }
+  state.episodicGatedBoundariesSinceServe++;
+  if (state.episodicGatedBoundariesSinceServe < rate) {
+    if (state.stash) state.episodicRateHeld++;
+    return null;
+  }
+  const cards = suppressEpisodicCardsAlreadyInPov(
+    state,
+    consumeEpisodicStash(state, options.maxAgeBoundaries),
+    options.providerPovText ?? '',
+  );
+  if (!cards || cards.length === 0) return cards;
+  state.episodicGatedBoundariesSinceServe = 0;
+  if (cards.length > 1) {
+    state.episodicRateTrimmed += cards.length - 1;
+    return [cards[0]];
+  }
+  return cards;
 }
 
 const EPISODIC_POV_PROBE_MIN_CHARS = 40;

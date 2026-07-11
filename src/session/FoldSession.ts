@@ -49,6 +49,12 @@ import {
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
 import { extractCognitiveArtifacts, renderCognitiveBlock, mergeBlockIntoViewTail } from '../cognitiveArtifacts.ts';
+import {
+  appendDedicatedChronologicalMessage,
+  foldMessageTimestampBounds,
+  renderTailEpochProvenance,
+  selectPairingSafeRawTailStart,
+} from '../chronologicalProvenance.ts';
 // microRebirthSeed import removed — tail epochs now use vault + cognitive block only
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
@@ -608,7 +614,11 @@ export class FoldSession {
    * USER_MESSAGE_VAULT_PREFIX so the fold pipeline treats it as synthetic context
    * (skipped by turn detection / eviction / recall). Never mutates raw history.
    */
-  private bakeVault(view: FoldMessage[], mode: 'full' | 'delta'): FoldMessage[] {
+  private bakeVault(
+    view: FoldMessage[],
+    mode: 'full' | 'delta',
+    additionallyVisible: readonly FoldMessage[] = [],
+  ): FoldMessage[] {
     if (!this.vaultEnabled) return view;
     // Live (unanswered-newest) rows are deferred from sealing: they ride the
     // transient applyVault path with the LIVE marker until answered, then seal
@@ -616,7 +626,7 @@ export class FoldSession {
     // frozen bytes never contain the marker or the unanswered row.
     const rows = selectSealableVaultRows(
       selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
-        visibleUserMessages: view,
+        visibleUserMessages: additionallyVisible.length > 0 ? view.concat(additionallyVisible) : view,
         newestOperatorUnanswered: this.newestOperatorUnanswered,
       }),
     );
@@ -1213,12 +1223,41 @@ export class FoldSession {
         }
       }
       if (keptRawAnchorIndex >= 0) keptRawSplitIndex = Math.min(keptRawSplitIndex, keptRawAnchorIndex);
+      // A zero split means the whole increment fits under the raw-window
+      // budget, which historically means "fold all" rather than "keep all."
+      // Probe from EOF in that case so an unresolved call can still create a
+      // real raw barrier; completed pairs leave the fold-all sentinel intact.
+      const pairingProbeStart = budgetRequiresKeptRaw ? keptRawSplitIndex : fullTail.length;
+      keptRawSplitIndex = selectPairingSafeRawTailStart(fullTail, pairingProbeStart);
       const liveObjectiveSource = lastUserIndex >= 0
         ? (typeof fullTail[lastUserIndex]?.content === 'string'
           ? fullTail[lastUserIndex].content as string
           : extractUserText([fullTail[lastUserIndex]], this.syntheticContext))
         : '';
       const liveObjective = liveObjectiveSource.replace(/\s+/g, ' ').trim().slice(0, 280);
+      const pendingCallBlocksEntireFold = pairingProbeStart === fullTail.length
+        && keptRawSplitIndex === 0
+        && fullTail.length > 0;
+      if (pendingCallBlocksEntireFold) {
+        this.activeFidelity = previousActiveFidelity;
+        touchFoldFreeze(this.freezeState, now);
+        const anchoredView = this.freezeState.frozenView
+          ? this.freezeState.frozenView.concat(fullTail)
+          : messages.slice();
+        return this.applyLiveVaultOverlay({
+          messages: anchoredView,
+          cacheHot: true,
+          sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
+          appliedFidelity: this.activeFidelity,
+          stats: {
+            totalTurns,
+            cacheHot: true,
+            hotReuses: this.freezeState.hotReuses,
+            epochs: this.freezeState.epochs,
+            ...this.pressureStats(false),
+          },
+        });
+      }
       const hasKeptRaw = keptRawSplitIndex > 0 && keptRawSplitIndex < fullTail.length;
       const tail = hasKeptRaw ? fullTail.slice(0, keptRawSplitIndex) : fullTail;
       const appendFoldConfig = this.effectiveAppendFoldConfig();
@@ -1269,33 +1308,36 @@ export class FoldSession {
       // tail BEFORE the commit so the shrink-ratio gate sees the true committed
       // band size — no post-commit inflation.
       const cognitiveBlock = renderCognitiveBlock(extractCognitiveArtifacts(tail));
-      const sealedTail = this.bakeVault(tailResult.messages, 'delta');
+      const survivingRawTail = hasKeptRaw ? fullTail.slice(keptRawSplitIndex) : [];
+      const sealedTail = this.bakeVault(tailResult.messages, 'delta', survivingRawTail);
       // Pre-commit enrichment: merge cognitive block into the sealed tail's
       // final message so the gate measures the actual committed size.
       // Merging (not appending) preserves the terminal role and message count.
-      let enrichedTail = cognitiveBlock
+      const enrichedTail = cognitiveBlock
         ? mergeBlockIntoViewTail(sealedTail, cognitiveBlock)
         : sealedTail;
-      // When a kept-raw working set survives, inject a boundary marker into
-      // the band's tail so the agent knows the sealed/folded history ENDS
-      // here and the live working set — the actual current state — begins
-      // immediately after. This prevents the agent from treating stale
-      // verdicts/hazards in the band as current state.
-      if (hasKeptRaw) {
-        const liveObjectiveLine = liveObjective
-          ? `live objective: "${liveObjective}"`
-          : 'live objective: inspect the raw messages immediately below this marker';
-        enrichedTail = mergeBlockIntoViewTail(
-          enrichedTail,
-          `[Tail Epoch Seam — epoch #${upcomingEpoch} committed ${new Date(now).toISOString()}]\nFolded ${keptRawSplitIndex} raw message(s) into the appended band. The band-0 hard-epoch seed above remains your intact continuity foundation.\n${liveObjectiveLine}\nContinue the live conversation from the raw messages immediately below; do not redirect to older rail work unless the user asks.`,
-        );
-      }
+      const sourceTime = foldMessageTimestampBounds(tail);
+      const provenance = renderTailEpochProvenance({
+        epoch: upcomingEpoch,
+        unit: 'message',
+        sourceStart: frozenCount,
+        sourceEndExclusive: frozenCount + tail.length,
+        sourceFirstTimestamp: sourceTime.firstTimestamp,
+        sourceLastTimestamp: sourceTime.lastTimestamp,
+        committedAt: new Date(now).toISOString(),
+        rawTailCount: survivingRawTail.length,
+        rawResumeIndex: hasKeptRaw ? frozenCount + keptRawSplitIndex : undefined,
+        host: 'dedicated-synthetic-message',
+        previous: 'frozen-prefix',
+        liveObjective,
+      });
+      const tailWithProvenance = appendDedicatedChronologicalMessage(enrichedTail, provenance);
       // When we kept a raw working set, pass truncated history so
       // frozenRawCount advances only to the fold boundary.
       const commitMessages = hasKeptRaw
         ? messages.slice(0, frozenCount + keptRawSplitIndex)
         : messages;
-      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, commitMessages, enrichedTail, ctx, now);
+      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, commitMessages, tailWithProvenance, ctx, now);
       if (appendCommit.committed) {
         const appendView = hasKeptRaw
           ? appendCommit.view.concat(fullTail.slice(keptRawSplitIndex))

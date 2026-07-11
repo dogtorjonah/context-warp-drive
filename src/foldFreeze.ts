@@ -970,6 +970,40 @@ export function touchFoldFreeze(state: FoldFreezeState, now: number): void {
 }
 
 /**
+ * Install a provider-visible frozen base without recording an epoch. This is
+ * for a newborn/reborn session whose initial continuity package is already
+ * compact: no history was folded and no tail band or hard reset occurred.
+ */
+export function initializeFoldFreezeBase(
+  state: FoldFreezeState,
+  history: FoldMessage[],
+  view: FoldMessage[],
+  context: FoldFreezeContext,
+  now: number,
+): void {
+  const boundary = history.length > 0 ? history[history.length - 1] : undefined;
+  state.frozenView = view.slice();
+  state.frozenViewChars = countChars(view);
+  state.lastAppendBoundaryViewCount = undefined;
+  state.sealedBands = [];
+  state.frozenRawCount = history.length;
+  state.boundaryRole = boundary?.role ?? '';
+  state.boundaryChars = boundary ? countChars([boundary]) : 0;
+  state.boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
+  state.thinningMode = context.thinningMode;
+  const toolPaths = extractToolPathSet(history);
+  const relevant = new Set<string>();
+  for (const claimed of context.claimedPaths) {
+    const normalized = normalizeToolPath(claimed);
+    if (toolPaths.has(normalized)) relevant.add(normalized);
+  }
+  state.frozenToolPaths = toolPaths;
+  state.frozenRelevantClaims = relevant;
+  state.lastCallAt = now;
+  state.hotReuses = 0;
+}
+
+/**
  * Commit the HARD-epoch transition: capture a freshly rebuilt whole-view
  * pipeline output as the new frozen view (two-epoch law: the only non-tail
  * epoch type — session callers pair this rebuild with the rebirth seed).
@@ -985,29 +1019,7 @@ export function commitFoldFreeze(
   now: number,
   hardEpochCause: FoldFreezeHardEpochCause = 'first-call',
 ): void {
-  const boundary = history.length > 0 ? history[history.length - 1] : undefined;
-  state.frozenView = view.slice();
-  state.frozenViewChars = countChars(view);
-  state.lastAppendBoundaryViewCount = undefined;
-  state.sealedBands = [];
-  state.frozenRawCount = history.length;
-  state.boundaryRole = boundary?.role ?? '';
-  state.boundaryChars = boundary ? countChars([boundary]) : 0;
-  state.boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
-  state.thinningMode = context.thinningMode;
-  // Index the covered history's tool-arg paths and the subset of current
-  // claims that are relevant to them. Pure CPU over tool_use input args
-  // (no content scans); runs only at epochs.
-  const toolPaths = extractToolPathSet(history);
-  const relevant = new Set<string>();
-  for (const claimed of context.claimedPaths) {
-    const normalized = normalizeToolPath(claimed);
-    if (toolPaths.has(normalized)) relevant.add(normalized);
-  }
-  state.frozenToolPaths = toolPaths;
-  state.frozenRelevantClaims = relevant;
-  state.lastCallAt = now;
-  state.hotReuses = 0;
+  initializeFoldFreezeBase(state, history, view, context, now);
   state.epochs += 1;
   state.lastTransitionReason = hardEpochCause;
   state.lastHardEpochReason = hardEpochCause;

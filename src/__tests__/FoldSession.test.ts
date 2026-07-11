@@ -480,6 +480,49 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(joined).toContain('ORPHAN_DEEP_TOKEN_3');
   });
 
+  it('keeps an unresolved tool call raw when a newer operator message crosses the fold seam', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
+    session.prepare(first);
+    const withHistory = appendProfitableTail(first, 'older foldable work');
+    const appended = session.prepare([
+      ...withHistory,
+      anthropicToolUse('toolu_open_across_seam', '/tmp/open-across-seam.ts'),
+      { role: 'user', content: 'steer the live operation while its tool call is still pending' },
+    ], { measuredInputTokens: 70_000 });
+    const joined = vaultText(appended.messages);
+
+    expect(appended.stats.epochReason).toBe('tail-epoch-append');
+    expect(appended.stats.appendDecision).toBe('committed');
+    expect(joined).toContain('toolu_open_across_seam');
+    expect(joined).toContain('steer the live operation while its tool call is still pending');
+    expect(joined).toContain('stack=frozen-prefix>tail-epoch#2');
+  });
+
+  it('defers the epoch when an unresolved tool call is the entire foldable increment', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
+    session.prepare(first);
+    const deferred = session.prepare([
+      ...first,
+      anthropicToolUse('toolu_only_pending_increment', '/tmp/pending-only.ts'),
+    ], { measuredInputTokens: 70_000 });
+
+    expect(deferred.cacheHot).toBe(true);
+    expect(session.telemetry.epochs).toBe(1);
+    expect(vaultText(deferred.messages)).toContain('toolu_only_pending_increment');
+  });
+
   it('keeps a Gemini-parts operator directive in the raw suffix behind a giant tool result', () => {
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
@@ -502,6 +545,14 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(appended.stats.appendDecision).toBe('committed');
     expect(appended.sealedBoundary).not.toBeNull();
+    const provenanceMessages = appended.messages.filter(
+      (message) => typeof message.content === 'string'
+        && message.content.startsWith('[Chronological Provenance v1]'),
+    );
+    expect(provenanceMessages).toHaveLength(1);
+    expect(provenanceMessages[0].role).toBe('user');
+    expect(provenanceMessages[0].content).toContain('host=dedicated-synthetic-message');
+    expect(provenanceMessages[0].content).toContain('raw-resumes=?:message#');
     expect(vaultText(appended.messages.slice(appended.sealedBoundary as number))).toContain(directive);
   });
 
@@ -942,6 +993,32 @@ describe('FoldSession per-band vault sealing', () => {
     // ... and remains in the prefix, whose bytes are identical to epoch 1.
     expect(prefixText).toContain('OPERATOR-GAMMA first directive');
     expect(appended.messages.slice(0, boundary)).toEqual(epoch.messages);
+  });
+
+  it('does not seal a vault alias for an operator message that survives in the exact raw tail', () => {
+    const session = vaultSession({
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+    });
+    const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
+    session.prepare(first);
+    const directive = 'RAW-ONLY-DIRECTIVE remain on the chronology implementation';
+    session.recordOperatorMessage(directive, '2026-07-11T04:10:00Z');
+    session.recordAssistantMessage('🏁 directive acknowledged', '2026-07-11T04:11:00Z');
+    const appended = session.prepare([
+      ...first,
+      { role: 'user', content: profitableTail('older foldable request') },
+      { role: 'assistant', content: profitableTail('older foldable answer') },
+      { role: 'user', content: directive },
+      anthropicToolUse('toolu_raw_vault', '/tmp/raw-vault.ts'),
+      anthropicToolResult('toolu_raw_vault', `RAW VAULT RESULT\n${'v'.repeat(45_000)}`),
+    ], { measuredInputTokens: 70_000 });
+
+    expect(appended.stats.appendDecision).toBe('committed');
+    const joined = vaultText(appended.messages);
+    const vaultBlocks = joined.match(/\[User Message Vault\][\s\S]*?\[\/User Message Vault\]/g) ?? [];
+    expect(vaultBlocks.join('\n')).not.toContain(directive);
+    expect(joined).toContain(directive);
   });
 
   it('re-renders the full vault on a cold full recompute (sealed set reset)', () => {

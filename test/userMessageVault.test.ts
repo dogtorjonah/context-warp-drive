@@ -58,6 +58,10 @@ describe('userMessageVault', () => {
     expect(entries).toHaveLength(6);
     expect(vault.startsWith(USER_MESSAGE_VAULT_PREFIX)).toBe(true);
     expect(vault.endsWith(USER_MESSAGE_VAULT_END)).toBe(true);
+    expect(vault).toContain('artifact=glyph-vault#operator-only class=exact-excerpt');
+    expect(vault).toContain('source=vault-buffer:row#0..vault-buffer:row#6 n=6');
+    expect(vault).toContain('authority=historical-background');
+    expect(vault).toContain('host=embedded-message-suffix representation=alias');
     expect(vault.length).toBeLessThanOrEqual(USER_MESSAGE_VAULT_MAX_CHARS);
     expect(vault).not.toContain('operator payload 1');
     expect(vault).toContain('operator payload 7');

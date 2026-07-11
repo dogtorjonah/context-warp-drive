@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   buildOpenQuestionsFromMessages,
+  buildLiteralTraceNeighborhoods,
   buildRawRebirthSeedFromMessages,
   buildRawTraceCoordinateCloset,
   buildRawTraceCoordinateClosetFromMessages,
@@ -30,6 +31,7 @@ describe('raw rebirth seed renderer', () => {
       lastUserAiMessages: '[11:44 PM] user\nOk go',
       currentThread: '[11:44 PM] user\nOk go\n\n[11:48 PM] assistant\nWorking',
       rawTraceCoordinateCloset: 'Conserved high-value literals nominated newest-first from the predecessor trace.\n- rail-raw-seed-123456',
+      traceNeighborhoods: '⌖ literal: rail-raw-seed-123456\n[trace messages 1–2 of 4]',
       activeEditDelta: 'Files claimed for editing: src/rawRebirthSeed.ts',
       taskRailContext: '[Task rail] Standalone Raw Rebirth Seed API',
       workspaceContext: {
@@ -40,6 +42,10 @@ describe('raw rebirth seed renderer', () => {
     });
 
     expect(seed.startsWith('[CONTEXT REBIRTH] Lifecycle boundary: continuation for "source-agent"')).toBe(true);
+    expect(seed).toContain('artifact=rebirth-package#continuation class=reconstructed-state authority=current-as-of-frontier');
+    expect(seed).toContain('source=source-agent:event#0..source-agent:event#42 n=42');
+    expect(seed).toContain('topology=raw-history>artifact>seam>none host=continuity-package');
+    expect(seed).toContain('raw-resumes=none (0 exact)');
     expect(seed).toContain('── Rebirth Control (AUTHORITATIVE) ──');
     expect(seed).toContain('── Runtime Model ──');
     expect(seed).toContain('Predecessor trace: 42 events');
@@ -47,6 +53,7 @@ describe('raw rebirth seed renderer', () => {
     const lastIdx = seed.indexOf('── Last User + AI Messages (READ FIRST) ──');
     const threadIdx = seed.indexOf('── Current Thread ──');
     const closetIdx = seed.indexOf('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
+    const neighborhoodsIdx = seed.indexOf('── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──');
     const editIdx = seed.indexOf('── Active Edit Delta ──');
     const railIdx = seed.indexOf('── Task Rail Context (process truth) ──');
     const workspaceIdx = seed.indexOf('── Workspace Context ──');
@@ -56,7 +63,8 @@ describe('raw rebirth seed renderer', () => {
     expect(lastIdx).toBeGreaterThan(0);
     expect(threadIdx).toBeGreaterThan(lastIdx);
     expect(closetIdx).toBeGreaterThan(threadIdx);
-    expect(editIdx).toBeGreaterThan(closetIdx);
+    expect(neighborhoodsIdx).toBeGreaterThan(closetIdx);
+    expect(editIdx).toBeGreaterThan(neighborhoodsIdx);
     expect(railIdx).toBeGreaterThan(editIdx);
     expect(workspaceIdx).toBeGreaterThan(railIdx);
     expect(activityIdx).toBeGreaterThan(workspaceIdx);
@@ -74,6 +82,8 @@ describe('raw rebirth seed renderer', () => {
     });
 
     expect(seed.match(new RegExp(activeRequest, 'g'))).toHaveLength(1);
+    expect(seed).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
+    expect(seed).toContain('raw-resumes=source-agent:event#live-frontier (1 exact)');
     expect(seed).toContain('active request (verbatim; sole authoritative body):');
     expect(seed).not.toContain('── Last User + AI Messages (READ FIRST) ──');
   });
@@ -179,6 +189,7 @@ describe('raw rebirth seed renderer', () => {
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.lastUserAiMessages).toBe(50_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.currentThread).toBe(50_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset).toBe(8_000);
+    expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.traceNeighborhoods).toBe(12_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.thinkingTrail).toBe(40_000);
   });
 
@@ -224,6 +235,132 @@ describe('raw rebirth seed renderer', () => {
     expect(closet).toContain('Conserved high-value literals nominated newest-first');
     expect(closet.indexOf('/repo/src/new.ts')).toBeLessThan(closet.indexOf('/repo/src/old.ts'));
     expect(closet.indexOf('rail-new-abcdef')).toBeLessThan(closet.indexOf('rail-old-123456'));
+  });
+
+  test('builds deterministic exact-match neighborhoods with adjacent source messages', () => {
+    const neighborhoods = buildLiteralTraceNeighborhoods([
+      { type: 'user', text: 'Investigate why rail-neighborhood-123456 is failing.' },
+      { type: 'assistant_text', text: 'I will inspect /repo/src/neighborhood.ts now.' },
+      { type: 'tool_result', text: 'The failure is termAnchorIdfFloor=0.2 in /repo/src/neighborhood.ts.' },
+      { type: 'assistant_text', text: 'Conclusion: repair the anchor gate before release.' },
+    ], { maxChars: 4_000, maxNeighborhoods: 1, contextRadius: 1 });
+
+    expect(neighborhoods).toContain('never LLM-summarized');
+    expect(neighborhoods).toContain('⌖ literal: rail-neighborhood-123456');
+    expect(neighborhoods).toContain('exact operational id');
+    expect(neighborhoods).toContain('[trace messages 1–4 of 4]');
+    expect(neighborhoods).toContain('[1] user: Investigate why rail-neighborhood-123456 is failing.');
+    expect(neighborhoods).toContain('[2] assistant: I will inspect /repo/src/neighborhood.ts now.');
+    expect(neighborhoods).toContain('[4] assistant: Conclusion: repair the anchor gate before release.');
+  });
+
+  test('ranks rare operational ids above paths and merges overlapping windows', () => {
+    const neighborhoods = buildLiteralTraceNeighborhoods([
+      { type: 'user', text: 'Open /repo/src/shared.ts for rail-rare-abcdef.' },
+      { type: 'assistant_text', text: 'Checked /repo/src/shared.ts and rail-rare-abcdef.' },
+      { type: 'tool_result', text: 'A second /repo/src/shared.ts occurrence.' },
+    ], { maxChars: 4_000, maxNeighborhoods: 6, contextRadius: 1 });
+
+    expect(neighborhoods).toContain('⌖ literal: rail-rare-abcdef');
+    expect(neighborhoods.match(/^⌖ literal:/gmu)).toHaveLength(1);
+  });
+
+  test('selects the strongest causal occurrence instead of a newer incidental mention', () => {
+    const neighborhoods = buildLiteralTraceNeighborhoods([
+      { type: 'user', text: 'Investigate rail-repeated-causal-123456 before release.' },
+      { type: 'assistant_text', text: 'I will inspect the failing workflow.' },
+      { type: 'tool_result', text: 'rail-repeated-causal-123456 failed because retryLimit=7.' },
+      { type: 'assistant_text', text: 'Conclusion: preserve the retry invariant.' },
+      { type: 'user', text: 'Later incidental note: rail-repeated-causal-123456 appeared in a summary.' },
+      { type: 'assistant_text', text: 'Acknowledged the incidental note.' },
+    ], { maxChars: 4_000, maxNeighborhoods: 1, contextRadius: 1 });
+
+    expect(neighborhoods).toContain('causal=message 3; chain-score=150');
+    expect(neighborhoods).toContain('Conclusion: preserve the retry invariant.');
+    expect(neighborhoods).not.toContain('Later incidental note');
+  });
+
+  test('suppresses conserved coordinates and prior rebirth seed recursion', () => {
+    const neighborhoods = buildLiteralTraceNeighborhoods([
+      { type: 'assistant_text', text: 'Older evidence for rail-old-evidence-123456.' },
+      { type: 'user', text: '[CONTEXT REBIRTH]\n- rail-recursive-junk-abcdef' },
+      { type: 'user', text: '[INSTANCE RESURRECTED]\n- rail-resurrection-junk-fedcba' },
+      { type: 'user', text: '[Chronological Provenance v1] artifact=tail-epoch#7\n- rail-chronology-alias-junk-123456' },
+      { type: 'tool_result', text: 'Independent evidence at /repo/src/keep.ts.' },
+    ], {
+      maxChars: 4_000,
+      excludeTexts: ['Current Thread already carries rail-old-evidence-123456.'],
+      contextRadius: 0,
+    });
+
+    expect(neighborhoods).not.toContain('rail-old-evidence-123456');
+    expect(neighborhoods).not.toContain('rail-recursive-junk-abcdef');
+    expect(neighborhoods).not.toContain('rail-resurrection-junk-fedcba');
+    expect(neighborhoods).not.toContain('rail-chronology-alias-junk-123456');
+    expect(neighborhoods).toContain('/repo/src/keep.ts');
+  });
+
+  test('honors neighborhood count and character caps without partial blocks', () => {
+    const neighborhoods = buildLiteralTraceNeighborhoods([
+      { type: 'assistant_text', text: `rail-budget-one-123456 ${'first '.repeat(40)}` },
+      { type: 'assistant_text', text: `rail-budget-two-abcdef ${'second '.repeat(40)}` },
+    ], { maxChars: 700, maxNeighborhoods: 1, contextRadius: 0, perMessageChars: 180 });
+
+    expect(neighborhoods.length).toBeLessThanOrEqual(700);
+    expect(neighborhoods.match(/^⌖ literal:/gmu)).toHaveLength(1);
+    expect(neighborhoods).toMatch(/\[trace messages \d+–\d+ of 2\]/u);
+    expect(buildLiteralTraceNeighborhoods([
+      { type: 'assistant_text', text: 'rail-budget-disabled-123456' },
+    ], { maxNeighborhoods: 0 })).toBe('');
+  });
+
+  test('keeps active edit and task rail process truth ahead of trace neighborhoods under budget pressure', () => {
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'priority-agent',
+      packageBudget: 10_000,
+      headerOverride: 'HEADER',
+      footerOverride: '',
+      traceNeighborhoods: 'TRACE_NEIGHBORHOOD '.repeat(900),
+      activeEditDelta: 'ACTIVE_PROCESS_TRUTH '.repeat(180),
+      taskRailContext: 'TASK_RAIL_PROCESS_TRUTH '.repeat(120),
+    });
+
+    expect(seed).toContain('ACTIVE_PROCESS_TRUTH');
+    expect(seed).toContain('TASK_RAIL_PROCESS_TRUTH');
+    expect(seed).toContain('artifact=continuity-package#custom class=reconstructed-state');
+    expect(seed.length).toBeLessThanOrEqual(10_000);
+  });
+
+  test('auto-builds neighborhoods only for coordinates absent from the recent thread', () => {
+    const messages: FoldMessage[] = [
+      { role: 'user', content: 'Investigate rail-buried-context-123456.' },
+      { role: 'assistant', content: 'The relevant implementation is /repo/src/buried.ts.' },
+      { role: 'tool', content: 'The failure came from retryLimit=7.' },
+      { role: 'assistant', content: 'Old conclusion: preserve the retry invariant.' },
+      { role: 'user', content: 'A newer question with no exact coordinates.' },
+      { role: 'assistant', content: 'A newer answer with ordinary prose.' },
+      { role: 'user', content: 'LIVE_TRIGGER_MARKER current request' },
+    ];
+
+    const seed = buildRawRebirthSeedFromMessages(messages, {
+      predecessorName: 'neighborhood-agent',
+      includeTrailingUserTurn: false,
+      currentThreadMessageLimit: 2,
+      packageBudget: 30_000,
+    });
+
+    expect(seed).toContain('── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──');
+    expect(seed).toContain('rail-buried-context-123456');
+    expect(seed).toContain('preserve the retry invariant');
+
+    const suppressed = buildRawRebirthSeedFromMessages(messages, {
+      predecessorName: 'neighborhood-agent',
+      includeTrailingUserTurn: false,
+      currentThreadMessageLimit: 2,
+      traceNeighborhoods: '',
+      packageBudget: 30_000,
+    });
+    expect(suppressed).not.toContain('── Trace Neighborhoods');
   });
 
   test('collapses slash/no-slash duplicate path candidates and keeps the leading slash spelling', () => {

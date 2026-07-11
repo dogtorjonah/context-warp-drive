@@ -586,6 +586,9 @@ export const EPISODIC_RECALL_PREFIX = '[Episodic recall —';
 export const USER_MESSAGE_VAULT_PREFIX = '[User Message Vault]';
 export const USER_MESSAGE_VAULT_END = '[/User Message Vault]';
 
+/** Dedicated model-visible continuity envelope; never genuine operator text. */
+export const CHRONOLOGICAL_PROVENANCE_PREFIX = '[Chronological Provenance v1]';
+
 export type SyntheticContextStripMode =
   | 'line'
   | 'line-or-paragraph'
@@ -681,6 +684,7 @@ export function isSyntheticContextText(
     || text.startsWith(FOLD_EPOCH_STAMP_PREFIX)
     || text.startsWith(USER_MESSAGE_VAULT_PREFIX)
     || text.startsWith(EPISODIC_RECALL_PREFIX)
+    || text.startsWith(CHRONOLOGICAL_PROVENANCE_PREFIX)
     || matchesHostSyntheticContext(text, syntheticContext);
 }
 

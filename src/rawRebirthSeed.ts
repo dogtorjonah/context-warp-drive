@@ -8,7 +8,9 @@
  */
 import {
   admitClosetLiteral,
+  CHRONOLOGICAL_PROVENANCE_PREFIX,
   extractVerbatimContextLabel,
+  isConservedIn,
   isClosetNoiseLiteral,
   isUnlabeledOpaqueClosetLiteral,
   nominateVerbatim,
@@ -16,6 +18,7 @@ import {
 } from './rollingFold.ts';
 import { classifyMessageGlyph } from './foldEpisodes.ts';
 import { DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS } from './contextBudget.ts';
+import { renderContinuityPackageProvenance } from './chronologicalProvenance.ts';
 
 /**
  * Build a portable lineage glyph log from the message trace: scan assistant
@@ -140,6 +143,7 @@ export type RawRebirthSeedSectionId =
   | 'lastUserAiMessages'
   | 'currentThread'
   | 'rawTraceCoordinateCloset'
+  | 'traceNeighborhoods'
   | 'activeEditDelta'
   | 'taskRailContext'
   | 'episodicCrossRef'
@@ -264,6 +268,7 @@ export interface RawRebirthSeedInput {
   readonly currentThread?: string;
   readonly triggeringUserMessage?: string;
   readonly rawTraceCoordinateCloset?: string;
+  readonly traceNeighborhoods?: string;
   readonly activeEditDelta?: string;
   readonly taskRailContext?: string;
   // Resume Point — pre-rendered by the relay builder.
@@ -302,6 +307,7 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly renderOrder?: readonly RawRebirthSeedSectionId[];
   readonly sectionToggles?: Partial<Record<RawRebirthSeedSectionId | 'runtimeModel' | 'rebirthHistory', boolean>>;
   readonly rawTraceCoordinateClosetChars?: number;
+  readonly traceNeighborhoodChars?: number;
   readonly includeTrailingUserTurn?: boolean;
   readonly currentThreadMessageLimit?: number;
   readonly currentThreadMessageChars?: number;
@@ -319,6 +325,11 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly userMessageTriggered?: boolean;
   /** Trace-derived episodic recall text (portable-mode memory section). */
   readonly episodicCrossRef?: string;
+  /**
+   * Deterministic exact-match neighborhoods around Coordinate Closet literals.
+   * Undefined auto-builds from the trace; an empty string suppresses the section.
+   */
+  readonly traceNeighborhoods?: string;
   /** Lineage glyph log text — chronological verdict/hazard register trail (portable-mode memory section). */
   readonly lineageGlyphLog?: string;
   /**
@@ -351,6 +362,7 @@ export const DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS: Record<RawRebirthSeedSe
   lastUserAiMessages: 50_000,
   currentThread: 50_000,
   rawTraceCoordinateCloset: 8_000,
+  traceNeighborhoods: 12_000,
   activeEditDelta: 50_000,
   taskRailContext: 12_000,
   episodicCrossRef: 12_000,
@@ -373,24 +385,26 @@ export const DEFAULT_RAW_REBIRTH_SEED_SECTION_PRIORITY: Record<RawRebirthSeedSec
   rawTraceCoordinateCloset: 2,
   activeEditDelta: 3,
   taskRailContext: 4,
-  episodicCrossRef: 5,
-  lineageGlyphLog: 6,
-  openQuestions: 7,
-  atlasCrossRef: 8,
-  workspaceContext: 9,
-  starredMoments: 10,
-  thinkingTrail: 11,
-  lifetimeChangelogArc: 12,
-  chatroomMembership: 13,
-  coordinationState: 14,
-  squadThoughts: 15,
-  delegatedWork: 16,
+  traceNeighborhoods: 5,
+  episodicCrossRef: 6,
+  lineageGlyphLog: 7,
+  openQuestions: 8,
+  atlasCrossRef: 9,
+  workspaceContext: 10,
+  starredMoments: 11,
+  thinkingTrail: 12,
+  lifetimeChangelogArc: 13,
+  chatroomMembership: 14,
+  coordinationState: 15,
+  squadThoughts: 16,
+  delegatedWork: 17,
 };
 
 export const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSectionId[] = [
   'lastUserAiMessages',
   'currentThread',
   'rawTraceCoordinateCloset',
+  'traceNeighborhoods',
   'activeEditDelta',
   'taskRailContext',
   'episodicCrossRef',
@@ -982,9 +996,19 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
       : '';
   const lifecycleBoundary = resolveLifecycleBoundary(input);
   const defaultHeader = formatLifecycleHeader(input, lifecycleBoundary);
+  const customHeader = input.headerOverride?.trim();
+  const chronology = renderContinuityPackageProvenance({
+    artifact: customHeader
+      ? 'continuity-package#custom'
+      : `rebirth-package#${lifecycleBoundary}`,
+    traceId: input.predecessorName,
+    sourceEventCount: input.traceEventCount,
+    rawTailCount: input.userMessageTriggered === true && Boolean(input.triggeringUserMessage?.trim()) ? 1 : 0,
+  }) ?? '';
   const headerBlocks = [
-    input.headerOverride?.trim() ?? defaultHeader,
-    input.headerOverride?.trim() ? '' : formatRebirthControl(input, lifecycleBoundary),
+    customHeader ?? defaultHeader,
+    chronology,
+    customHeader ? '' : formatRebirthControl(input, lifecycleBoundary),
     formatMergedLineageProvenance(input),
     formatDurableMergedLineageBanner(input),
     formatSummonVaultLedger(input),
@@ -1031,6 +1055,14 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     'rawTraceCoordinateCloset',
     input.rawTraceCoordinateCloset?.trim()
       ? `\n── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──\n${input.rawTraceCoordinateCloset.trim()}`
+      : undefined,
+  );
+  pushSection(
+    budgetedSections,
+    input,
+    'traceNeighborhoods',
+    input.traceNeighborhoods?.trim()
+      ? `\n── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──\n${input.traceNeighborhoods.trim()}`
       : undefined,
   );
   pushSection(budgetedSections, input, 'activeEditDelta', input.activeEditDelta ? `\n── Active Edit Delta ──\n${input.activeEditDelta}` : undefined);
@@ -1154,32 +1186,46 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
   return truncate(promptBlocks.join('\n'), packageBudget);
 }
 
-export function buildRawTraceCoordinateCloset(
+interface PreparedTraceMessage {
+  readonly sourceIndex: number;
+  readonly role: string;
+  readonly text: string;
+  readonly sourceText: string;
+}
+
+interface RawTraceCoordinate {
+  readonly literal: string;
+  readonly labelled: string;
+  readonly index: number;
+}
+
+function prepareVisibleTraceMessages(
   visibleMessages: readonly VisibleTraceMessage[],
-  maxChars = DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset,
-): string {
-  if (!Number.isFinite(maxChars) || maxChars <= 0) return '';
-  const sourceTexts = visibleMessages.flatMap((message) => {
+): PreparedTraceMessage[] {
+  return visibleMessages.flatMap((message, sourceIndex) => {
     const text = message.text?.trim();
     if (!text) return [];
-    // exclude prior-rebirth-seed messages from closet
-    // mining. The rebirth seed is injected into the trace as a user message
-    // containing '[CONTEXT REBIRTH]'. Mining its text (which includes the
-    // previous rebirth's Coordinate Closet) causes recursive compounding —
-    // closet noise amplifies across consecutive rebirths. Skip the entire
-    // message so only real conversation/agent turns contribute literals.
-    if (text.includes('[CONTEXT REBIRTH]')) return [];
+    // Prior rebirth seeds contain old Closet and neighborhood sections. Mining
+    // them would recursively amplify synthetic coordinates across boundaries.
+    if (text.includes('[CONTEXT REBIRTH]')
+      || text.includes('[INSTANCE RESURRECTED]')
+      || text.includes(CHRONOLOGICAL_PROVENANCE_PREFIX)) return [];
     const scrubbed = stripEphemeralCoordinationBlocks(text).trim();
     if (!scrubbed) return [];
     const role = message.type === 'user' ? 'user' : message.type === 'assistant_text' ? 'assistant' : message.type;
     const bounded = scrubbed.length > RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE
       ? `${scrubbed.slice(0, RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE)}\n... [message source truncated for closet nomination]`
       : scrubbed;
-    return [`${role}:\n${bounded}`];
+    return [{ sourceIndex, role, text: bounded, sourceText: `${role}:\n${bounded}` }];
   });
-  if (sourceTexts.length === 0) return '';
+}
 
-  const fullText = sourceTexts.join('\n\n');
+function collectRawTraceCoordinates(
+  prepared: readonly PreparedTraceMessage[],
+): RawTraceCoordinate[] {
+  if (prepared.length === 0) return [];
+
+  const fullText = prepared.map((message) => message.sourceText).join('\n\n');
   const candidates = [
     ...nominateVerbatim(fullText, 40).map((literal) => ({ // cap = max entries, not chars
       literal,
@@ -1195,7 +1241,6 @@ export function buildRawTraceCoordinateCloset(
     })),
   ].sort((left, right) => right.index - left.index);
 
-  const header = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact identifiers, file paths, and values when the raw package body omits the middle.';
   const admitted: string[] = [];
   for (const candidate of candidates) {
     const rawLiteral = candidate.literal.trim();
@@ -1206,13 +1251,29 @@ export function buildRawTraceCoordinateCloset(
     if (!admitClosetLiteral(admitted, literal)) continue;
   }
 
-  const lines = admitted.flatMap((literal) => {
+  return admitted.flatMap((literal): RawTraceCoordinate[] => {
     const label = extractVerbatimContextLabel(fullText, literal);
     if (label === 'bare' && /^[0-9a-f]{6,}$/i.test(literal)) return [];
     const labelled = label ? `${literal} (${label})` : literal;
     if (isUnlabeledOpaqueClosetLiteral(labelled)) return [];
-    return [`- ${labelled}`];
+    return [{
+      literal,
+      labelled,
+      index: Math.max(0, fullText.lastIndexOf(literal)),
+    }];
   });
+}
+
+export function buildRawTraceCoordinateCloset(
+  visibleMessages: readonly VisibleTraceMessage[],
+  maxChars = DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset,
+): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return '';
+  const coordinates = collectRawTraceCoordinates(prepareVisibleTraceMessages(visibleMessages));
+  if (coordinates.length === 0) return '';
+
+  const header = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact identifiers, file paths, and values when the raw package body omits the middle.';
+  const lines = coordinates.map((coordinate) => `- ${coordinate.labelled}`);
 
   const fittedLines: string[] = [];
   let usedChars = countStringChars(header);
@@ -1239,6 +1300,197 @@ export function buildRawTraceCoordinateCloset(
 
   if (fittedLines.length === 0) return '';
   return [header, ...fittedLines].join('\n');
+}
+
+export interface LiteralTraceNeighborhoodOptions {
+  /** Character-only render cap. This is not token telemetry. */
+  readonly maxChars?: number;
+  /** Maximum non-overlapping neighborhoods to render. */
+  readonly maxNeighborhoods?: number;
+  /** Number of substantive messages to retain on each side of a hit. */
+  readonly contextRadius?: number;
+  /** Character cap for each compacted source-message excerpt. */
+  readonly perMessageChars?: number;
+  /** Sections already visible to the successor; matching coordinates are skipped. */
+  readonly excludeTexts?: readonly string[];
+}
+
+function traceLiteralKind(literal: string): { label: string; score: number } {
+  if (/^(?:toolu[-_]|(?:rail|sig|msg|inst|task|thread|summon|fork|group|epoch|tool|call)[-_])/i.test(literal)) {
+    return { label: 'operational id', score: 50 };
+  }
+  if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(literal) || /^(?=.*[a-f])(?=.*\d)[0-9a-f]{8,64}$/i.test(literal)) {
+    return { label: 'uuid/hex id', score: 45 };
+  }
+  if (literal.includes('/')) return { label: 'path', score: 40 };
+  if (/^[A-Za-z_][\w.-]{0,40}[=:]/.test(literal)) return { label: 'key/value', score: 30 };
+  if (/^#\d+$/.test(literal)) return { label: 'issue reference', score: 25 };
+  return { label: 'exact coordinate', score: 15 };
+}
+
+function compactTraceExcerpt(text: string, maxChars: number): string {
+  return truncate(text.replace(/\s+/gu, ' ').trim(), maxChars);
+}
+
+function eventAwareNeighborhoodRange(
+  messages: readonly PreparedTraceMessage[],
+  hitIndex: number,
+  contextRadius: number,
+): { start: number; end: number } {
+  let start = Math.max(0, hitIndex - contextRadius);
+  let end = Math.min(messages.length - 1, hitIndex + contextRadius);
+
+  // A literal inside a tool event is often unintelligible without the user
+  // intent that launched the local chain. Search only a small bounded prefix.
+  for (let index = hitIndex; index >= Math.max(0, hitIndex - 4); index -= 1) {
+    if (messages[index]?.role === 'user') {
+      start = Math.min(start, index);
+      break;
+    }
+  }
+
+  // When a local chain contains tool evidence, retain the first assistant turn
+  // after it—the usual conclusion/decision boundary—without opening an
+  // unbounded transcript window.
+  let sawToolEvidence = false;
+  for (let index = hitIndex; index <= Math.min(messages.length - 1, hitIndex + 4); index += 1) {
+    const role = messages[index]?.role ?? '';
+    if (role.startsWith('tool')) {
+      sawToolEvidence = true;
+      end = Math.max(end, index);
+      continue;
+    }
+    if (sawToolEvidence && index > hitIndex && role === 'assistant') {
+      end = Math.max(end, index);
+      break;
+    }
+  }
+
+  return { start, end };
+}
+
+function scoreTraceOccurrence(
+  messages: readonly PreparedTraceMessage[],
+  hitIndex: number,
+  contextRadius: number,
+): { index: number; start: number; end: number; causalScore: number } {
+  const { start, end } = eventAwareNeighborhoodRange(messages, hitIndex, contextRadius);
+  let intentIndex = -1;
+  let evidenceIndex = -1;
+  let conclusionIndex = -1;
+
+  for (let index = start; index <= hitIndex; index += 1) {
+    if (messages[index]?.role === 'user') intentIndex = index;
+  }
+  if (intentIndex >= 0) {
+    for (let index = intentIndex + 1; index <= end; index += 1) {
+      if (messages[index]?.role.startsWith('tool')) {
+        evidenceIndex = index;
+        break;
+      }
+    }
+  }
+  if (evidenceIndex >= 0) {
+    for (let index = evidenceIndex + 1; index <= end; index += 1) {
+      if (messages[index]?.role === 'assistant') {
+        conclusionIndex = index;
+        break;
+      }
+    }
+  }
+
+  const hasIntent = intentIndex >= 0;
+  const hasEvidence = evidenceIndex >= 0;
+  const hasConclusion = conclusionIndex >= 0;
+  const causalScore = (hasIntent ? 20 : 0)
+    + (hasEvidence ? 30 : 0)
+    + (hasConclusion ? 30 : 0)
+    + (hasIntent && hasEvidence && hasConclusion ? 60 : 0)
+    + (messages[hitIndex]?.role.startsWith('tool') ? 10 : 0);
+  return { index: hitIndex, start, end, causalScore };
+}
+
+/**
+ * Deterministically expands emitted Coordinate Closet literals back into small
+ * source-message neighborhoods. Selection is exact-match + heuristic ranking;
+ * no LLM, embedding lookup, storage access, or other I/O participates.
+ */
+export function buildLiteralTraceNeighborhoods(
+  visibleMessages: readonly VisibleTraceMessage[],
+  options: LiteralTraceNeighborhoodOptions = {},
+): string {
+  const maxChars = Math.floor(options.maxChars ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.traceNeighborhoods);
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return '';
+  const requestedNeighborhoods = options.maxNeighborhoods ?? 6;
+  if (!Number.isFinite(requestedNeighborhoods) || requestedNeighborhoods <= 0) return '';
+  const maxNeighborhoods = Math.min(12, Math.floor(requestedNeighborhoods));
+  const requestedRadius = options.contextRadius ?? 1;
+  const contextRadius = Number.isFinite(requestedRadius)
+    ? Math.max(0, Math.min(3, Math.floor(requestedRadius)))
+    : 1;
+  const requestedMessageChars = options.perMessageChars ?? 650;
+  const perMessageChars = Number.isFinite(requestedMessageChars)
+    ? Math.max(120, Math.min(2_000, Math.floor(requestedMessageChars)))
+    : 650;
+  const excluded = (options.excludeTexts ?? []).filter((text) => text.trim().length > 0);
+  const prepared = prepareVisibleTraceMessages(visibleMessages);
+  const coordinates = collectRawTraceCoordinates(prepared);
+  if (prepared.length === 0 || coordinates.length === 0) return '';
+
+  const ranked = coordinates.flatMap((coordinate) => {
+    if (excluded.some((text) => isConservedIn(text, coordinate.literal))) return [];
+    const occurrences = prepared.flatMap((message, preparedIndex) => (
+      message.text.includes(coordinate.literal) ? [preparedIndex] : []
+    ));
+    const selected = occurrences
+      .map((index) => scoreTraceOccurrence(prepared, index, contextRadius))
+      .sort((left, right) => right.causalScore - left.causalScore || right.index - left.index)[0];
+    if (!selected) return [];
+    const kind = traceLiteralKind(coordinate.literal);
+    const rarityScore = Math.max(0, 24 - ((occurrences.length - 1) * 4));
+    const recencyScore = prepared.length <= 1
+      ? 20
+      : Math.round((selected.index / (prepared.length - 1)) * 20);
+    return [{ coordinate, occurrences, selected, kind, score: kind.score + rarityScore + recencyScore }];
+  }).sort((left, right) => (
+    right.score - left.score
+    || right.selected.causalScore - left.selected.causalScore
+    || right.selected.index - left.selected.index
+    || right.coordinate.index - left.coordinate.index
+    || left.coordinate.literal.localeCompare(right.coordinate.literal)
+  ));
+
+  const header = 'Deterministic exact-match neighborhoods around Coordinate Closet literals; source excerpts are whitespace-compacted, never LLM-summarized.';
+  const selectedRanges: Array<{ start: number; end: number }> = [];
+  const blocks: string[] = [];
+  let usedChars = countStringChars(header);
+
+  for (const candidate of ranked) {
+    if (blocks.length >= maxNeighborhoods) break;
+    const { start, end } = candidate.selected;
+    if (selectedRanges.some((range) => start <= range.end && end >= range.start)) continue;
+
+    const windowMessages = prepared.slice(start, end + 1);
+    const firstSourceIndex = windowMessages[0]?.sourceIndex ?? 0;
+    const lastSourceIndex = windowMessages.at(-1)?.sourceIndex ?? firstSourceIndex;
+    const occurrenceWord = candidate.occurrences.length === 1 ? 'occurrence' : 'occurrences';
+    const rows = windowMessages.map((message) => (
+      `  [${message.sourceIndex + 1}] ${message.role}: ${compactTraceExcerpt(message.text, perMessageChars)}`
+    ));
+    const block = [
+      `⌖ literal: ${candidate.coordinate.labelled}`,
+      `↞ selected: exact ${candidate.kind.label}; ${candidate.occurrences.length} ${occurrenceWord}; causal=message ${prepared[candidate.selected.index]!.sourceIndex + 1}; chain-score=${candidate.selected.causalScore}`,
+      `[trace messages ${firstSourceIndex + 1}–${lastSourceIndex + 1} of ${visibleMessages.length}]`,
+      ...rows,
+    ].join('\n');
+    const nextChars = usedChars + countStringChars(block) + 2;
+    if (nextChars > maxChars) continue;
+    blocks.push(block);
+    selectedRanges.push({ start, end });
+    usedChars = nextChars;
+  }
+
+  return blocks.length > 0 ? [header, ...blocks].join('\n\n') : '';
 }
 
 function messageValueToText(value: unknown): string {
@@ -1369,6 +1621,7 @@ export function isPortableGenuineOperatorMessage(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
   if (trimmed.includes('[CONTEXT REBIRTH]')) return false;
+  if (trimmed.includes(CHRONOLOGICAL_PROVENANCE_PREFIX)) return false;
   if (/^@\w+/.test(trimmed) && trimmed.length < 200) return false;
   if (trimmed.startsWith('[DIGEST DELTA') || trimmed.startsWith('[Digest Delta')) return false;
   if (trimmed.startsWith('[Control Signals]') || trimmed.startsWith('[System]')) return false;
@@ -1462,22 +1715,28 @@ function buildLastUserAiMessagesFromMessages(
   ].filter(Boolean).join('\n\n');
 }
 
-export function buildRawTraceCoordinateClosetFromMessages(
+function visibleTraceMessagesFromFoldMessages(
   messages: readonly FoldMessage[],
-  options: Pick<RawRebirthSeedFromMessagesOptions, 'includeTrailingUserTurn' | 'rawTraceCoordinateClosetChars'> = {},
-): string {
-  const includeTrailingUserTurn = options.includeTrailingUserTurn !== false;
+  includeTrailingUserTurn: boolean,
+): VisibleTraceMessage[] {
   const traceEnd = findRawRebirthSeedTraceEnd(messages, includeTrailingUserTurn);
   const excluded = excludedTrailingStringUserIndexes(messages, includeTrailingUserTurn);
-  const visible = messages.slice(0, traceEnd).flatMap((message, offset): VisibleTraceMessage[] => {
+  return messages.slice(0, traceEnd).flatMap((message, offset): VisibleTraceMessage[] => {
     if (excluded.has(offset)) return [];
     return [{
       type: message.role === 'assistant' ? 'assistant_text' : message.role,
       text: providerMessageToTraceText(message),
     }];
   });
+}
+
+export function buildRawTraceCoordinateClosetFromMessages(
+  messages: readonly FoldMessage[],
+  options: Pick<RawRebirthSeedFromMessagesOptions, 'includeTrailingUserTurn' | 'rawTraceCoordinateClosetChars'> = {},
+): string {
+  const includeTrailingUserTurn = options.includeTrailingUserTurn !== false;
   return buildRawTraceCoordinateCloset(
-    visible,
+    visibleTraceMessagesFromFoldMessages(messages, includeTrailingUserTurn),
     options.rawTraceCoordinateClosetChars ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset,
   );
 }
@@ -1496,10 +1755,23 @@ export function buildRawRebirthSeedFromMessages(
     Math.max(200, Math.floor(options.currentThreadMessageChars ?? 1_600)),
     excluded,
   );
+  const lastUserAiMessages = buildLastUserAiMessagesFromMessages(messages, traceEnd, excluded);
+  const visibleTraceMessages = visibleTraceMessagesFromFoldMessages(messages, includeTrailingUserTurn);
   const rawTraceCoordinateCloset = buildRawTraceCoordinateClosetFromMessages(messages, {
     includeTrailingUserTurn,
     rawTraceCoordinateClosetChars: options.rawTraceCoordinateClosetChars,
   });
+  const traceNeighborhoods = options.traceNeighborhoods === undefined
+    ? buildLiteralTraceNeighborhoods(visibleTraceMessages, {
+        maxChars: options.traceNeighborhoodChars,
+        excludeTexts: [
+          currentThread,
+          lastUserAiMessages,
+          options.activeEditDelta ?? '',
+          options.taskRailContext ?? '',
+        ],
+      })
+    : options.traceNeighborhoods;
   return renderRawRebirthSeed({
     predecessorName: options.predecessorName ?? 'predecessor',
     packageBudget: options.packageBudget,
@@ -1510,9 +1782,10 @@ export function buildRawRebirthSeedFromMessages(
     sectionPriority: options.sectionPriority,
     renderOrder: options.renderOrder,
     sectionToggles: options.sectionToggles,
-    lastUserAiMessages: buildLastUserAiMessagesFromMessages(messages, traceEnd, excluded),
+    lastUserAiMessages,
     currentThread,
     rawTraceCoordinateCloset,
+    traceNeighborhoods,
     activeEditDelta: options.activeEditDelta,
     taskRailContext: options.taskRailContext,
     resumePoint: options.resumePoint,
@@ -1593,6 +1866,7 @@ export const BAND_MICRO_SEED_SECTION_TOGGLES: Partial<Record<RawRebirthSeedSecti
   lastUserAiMessages: true,
   currentThread: true,
   rawTraceCoordinateCloset: false,
+  traceNeighborhoods: false,
   activeEditDelta: false,
   taskRailContext: false,
   episodicCrossRef: false,
