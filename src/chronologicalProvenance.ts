@@ -410,14 +410,29 @@ export function appendDedicatedChronologicalMessage<T extends FoldMessage>(
   return view.concat({ role: 'user', content: provenance } as T);
 }
 
-function collectToolIds(message: FoldMessage): { calls: Set<string>; results: Set<string> } {
-  const calls = new Set<string>();
-  const results = new Set<string>();
-  const add = (set: Set<string>, value: unknown): void => {
-    if (typeof value === 'string' && value.trim()) set.add(value);
+interface ToolCoordinate {
+  readonly id?: string;
+  readonly name?: string;
+}
+
+function collectToolCoordinates(message: FoldMessage): {
+  calls: ToolCoordinate[];
+  results: ToolCoordinate[];
+} {
+  const calls: ToolCoordinate[] = [];
+  const results: ToolCoordinate[] = [];
+  const text = (value: unknown): string | undefined => (
+    typeof value === 'string' && value.trim() ? value : undefined
+  );
+  const add = (target: ToolCoordinate[], id: unknown, name?: unknown): void => {
+    const coordinate = { id: text(id), name: text(name) };
+    if (coordinate.id || coordinate.name) target.push(coordinate);
   };
   if (Array.isArray(message.tool_calls)) {
-    for (const call of message.tool_calls) add(calls, (call as { id?: unknown } | null)?.id);
+    for (const call of message.tool_calls) {
+      const record = call as { id?: unknown; function?: { name?: unknown } } | null;
+      add(calls, record?.id, record?.function?.name);
+    }
   }
   add(results, message.tool_call_id);
   const collectParts = (parts: unknown): void => {
@@ -425,19 +440,19 @@ function collectToolIds(message: FoldMessage): { calls: Set<string>; results: Se
     for (const part of parts) {
       if (!part || typeof part !== 'object') continue;
       const block = part as Record<string, unknown>;
-      if (block.type === 'tool_use' || block.type === 'functionCall') add(calls, block.id ?? block.name);
+      if (block.type === 'tool_use' || block.type === 'functionCall') add(calls, block.id, block.name);
       if (block.type === 'tool_result' || block.type === 'functionResponse') {
-        add(results, block.tool_use_id ?? block.id ?? block.name);
+        add(results, block.tool_use_id ?? block.id, block.name);
       }
       const functionCall = block.functionCall;
       if (functionCall && typeof functionCall === 'object') {
         const call = functionCall as Record<string, unknown>;
-        add(calls, call.id ?? call.name);
+        add(calls, call.id, call.name);
       }
       const functionResponse = block.functionResponse;
       if (functionResponse && typeof functionResponse === 'object') {
         const response = functionResponse as Record<string, unknown>;
-        add(results, response.id ?? response.name);
+        add(results, response.id, response.name);
       }
     }
   };
@@ -456,18 +471,34 @@ export function selectPairingSafeRawTailStart(
   proposedStart: number,
 ): number {
   let start = Math.max(0, Math.min(messages.length, Math.floor(proposedStart)));
-  const lastResultIndex = new Map<string, number>();
+  const indexedCalls: Array<{ index: number; coordinate: ToolCoordinate; resolvedAt?: number }> = [];
+  const pending: typeof indexedCalls = [];
   for (let index = 0; index < messages.length; index += 1) {
-    for (const id of collectToolIds(messages[index]).results) lastResultIndex.set(id, index);
+    const coordinates = collectToolCoordinates(messages[index]);
+    for (const coordinate of coordinates.calls) {
+      const call = { index, coordinate };
+      indexedCalls.push(call);
+      pending.push(call);
+    }
+    for (const result of coordinates.results) {
+      let match = result.id
+        ? pending.findIndex((call) => call.coordinate.id === result.id)
+        : -1;
+      if (match < 0 && result.name) {
+        match = pending.findIndex((call) => call.coordinate.name === result.name);
+      }
+      if (match < 0) continue;
+      pending[match].resolvedAt = index;
+      pending.splice(match, 1);
+    }
   }
   for (;;) {
     let moved = start;
-    for (let index = 0; index < start; index += 1) {
-      const ids = collectToolIds(messages[index]).calls;
-      if ([...ids].some((id) => {
-        const resultIndex = lastResultIndex.get(id);
-        return resultIndex === undefined || resultIndex < index || resultIndex >= start;
-      })) moved = Math.min(moved, index);
+    for (const call of indexedCalls) {
+      if (call.index >= start) continue;
+      if (call.resolvedAt === undefined || call.resolvedAt >= start) {
+        moved = Math.min(moved, call.index);
+      }
     }
     if (moved === start) return start;
     start = moved;

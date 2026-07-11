@@ -1197,6 +1197,14 @@ interface RawTraceCoordinate {
   readonly literal: string;
   readonly labelled: string;
   readonly index: number;
+  readonly sourceIndex: number | null;
+  readonly sourceRole: string | null;
+}
+
+function rawTraceCoordinateOrigin(coordinate: RawTraceCoordinate): string {
+  return coordinate.sourceIndex === null
+    ? 'source=unknown'
+    : `source=${coordinate.sourceRole ?? 'unknown-role'} message ${coordinate.sourceIndex + 1}`;
 }
 
 function prepareVisibleTraceMessages(
@@ -1256,10 +1264,19 @@ function collectRawTraceCoordinates(
     if (label === 'bare' && /^[0-9a-f]{6,}$/i.test(literal)) return [];
     const labelled = label ? `${literal} (${label})` : literal;
     if (isUnlabeledOpaqueClosetLiteral(labelled)) return [];
+    let origin: PreparedTraceMessage | undefined;
+    for (let index = prepared.length - 1; index >= 0; index--) {
+      if (prepared[index]!.text.includes(literal)) {
+        origin = prepared[index];
+        break;
+      }
+    }
     return [{
       literal,
       labelled,
       index: Math.max(0, fullText.lastIndexOf(literal)),
+      sourceIndex: origin?.sourceIndex ?? null,
+      sourceRole: origin?.role ?? null,
     }];
   });
 }
@@ -1273,7 +1290,7 @@ export function buildRawTraceCoordinateCloset(
   if (coordinates.length === 0) return '';
 
   const header = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact identifiers, file paths, and values when the raw package body omits the middle.';
-  const lines = coordinates.map((coordinate) => `- ${coordinate.labelled}`);
+  const lines = coordinates.map((coordinate) => `- ${coordinate.labelled} @ ${rawTraceCoordinateOrigin(coordinate)}`);
 
   const fittedLines: string[] = [];
   let usedChars = countStringChars(header);

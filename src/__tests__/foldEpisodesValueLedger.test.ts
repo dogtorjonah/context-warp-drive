@@ -229,6 +229,10 @@ describe('refreshEpisodicZones', () => {
     const hi = st.zones.get('hi')!.expiresAtBoundary;
     const lo = st.zones.get('lo')!.expiresAtBoundary;
     expect(hi).toBeGreaterThan(lo);
+    // TTL remains the fallback only after no provider-visible card protects the
+    // zone; live cards are released by folded-view reconciliation instead.
+    st.visibleCardHeaders.clear();
+    for (const zone of st.zones.values()) delete zone.visibleCardHeaders;
     // Advance to a boundary that expires the low-value zone but not the high-value one.
     st.boundarySeq = lo;
     expireEpisodicZones(st);

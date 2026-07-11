@@ -13,6 +13,8 @@ import {
   extractPathsFromBashCommand,
   extractRecallSignals,
   findToolResultText,
+  foldRecallProviderPovText,
+  normalizeFoldRecallPovText,
   planRecall,
   repeatCardBudgetRatio,
   REPEAT_CARD_MIN_RATIO,
@@ -828,10 +830,25 @@ describe('buildFoldRecallContext', () => {
     // Body sliced from in-memory raw history: the folded turn's tool result + assistant text.
     expect(out.text!).toContain('BIGFILE CONTENT START');
     expect(out.text!).toContain('Found the bug in bigfile.ts');
+    expect(out.text!).toContain('↞ source episode: Read · relay/src/bigfile.ts');
     expect(out.text!).toContain('[End fold recall]');
     expect(out.triggers).toEqual(['path-touch relay/src/bigfile.ts']);
     expect(state.cardsInjected).toBe(1);
     expect(state.recallChars).toBe(out.chars);
+  });
+
+  test('labels a multi-file recalled episode with counted tools and a bounded path cluster', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    const signals = extractRecallSignals({ file_path: ABS('relay/src/helper0.ts') }, new Set());
+
+    const out = buildFoldRecallContext(state, raw, signals, 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.cards).toBe(1);
+    expect(out.text).toContain(
+      '↞ source episode: Read ×7 · relay/src/helper0.ts, relay/src/helper1.ts, relay/src/helper2.ts',
+    );
+    expect(out.text).not.toContain('relay/src/helper3.ts, relay/src/helper4.ts');
   });
 
   test('tier-0 path re-touch suppresses the identical entry on consecutive passes', () => {
@@ -845,10 +862,106 @@ describe('buildFoldRecallContext', () => {
     expect(first.text!).toContain('BIGFILE CONTENT START');
 
     const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
-    expect(second.text).toBeNull();
+    expect(second.text).toContain('[Fold recall suppressed manifest — 1 matching body withheld as already resident]');
+    expect(second.suppressedManifest).toBe(second.text);
+    expect(second.text).toContain('relay/src/bigfile.ts @ raw messages 1–4');
+    expect(second.text).not.toContain('BIGFILE CONTENT START');
+    expect(second.text!.length).toBeLessThanOrEqual(480);
     expect(second.cards).toBe(0);
     expect(second.suppressed).toBe(1);
     expect(state.cardsInjected).toBe(1);
+  });
+
+  test('suppresses a folded body already resident elsewhere in provider POV', () => {
+    const raw = buildAnthropicHistory();
+    const firstState = freshState(raw);
+    const first = buildFoldRecallContext(firstState, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+    expect(first.cards).toBe(1);
+    const bodyOnly = first.text!
+      .split('\n')
+      .filter((line) => !line.startsWith(RECALL_CARD_PREFIX) && line !== '[End fold recall]')
+      .join('\n');
+
+    const secondState = freshState(raw);
+    secondState.index = {
+      ...secondState.index!,
+      visibleRecallCards: [],
+      visiblePovText: normalizeFoldRecallPovText(bodyOnly),
+    };
+    const second = buildFoldRecallContext(secondState, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(second.text).toContain('[Fold recall suppressed manifest');
+    expect(second.cards).toBe(0);
+    expect(second.suppressed).toBe(1);
+    expect(secondState.cardsInjected).toBe(0);
+  });
+
+  test('prunes body paragraphs already visible in the unfolded raw tail while keeping novel recovery', () => {
+    const historical = buildAnthropicHistory();
+    const state = freshState(historical);
+    const repeatedConclusion = 'Found the bug in bigfile.ts — the handler ignores null inputs because of a legacy guard.';
+    const raw = [...historical, assistantMsg(repeatedConclusion)];
+
+    const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.cards).toBe(1);
+    expect(out.text).toContain('BIGFILE CONTENT START');
+    expect(out.text).not.toContain(repeatedConclusion);
+    expect(out.text).toContain('↞ source episode: Read · relay/src/bigfile.ts');
+  });
+
+  test('cadence-gates an unchanged suppressed manifest and periodically reminds', () => {
+    const raw = buildAnthropicHistory();
+    const state = freshState(raw);
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, ttlPasses: 20 };
+    const signals = touchBigfile();
+
+    expect(buildFoldRecallContext(state, raw, signals, 'healthy', config).cards).toBe(1);
+    const firstSuppression = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(firstSuppression.suppressedManifest).toContain('[Fold recall suppressed manifest');
+
+    for (let pass = 0; pass < 5; pass += 1) {
+      const quiet = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+      expect(quiet.text).toBeNull();
+      expect(quiet.suppressed).toBe(1);
+    }
+
+    const reminder = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+    expect(reminder.suppressedManifest).toContain('[Fold recall suppressed manifest');
+    expect(reminder.cards).toBe(0);
+  });
+
+  test('uses raw provider POV before the first fold index exists', () => {
+    const raw: FoldMessage[] = [
+      userMsg('Keep this pre-fold provider-visible instruction resident.'),
+      assistantMsg('The circular episode must not replay while this exact narration remains visible.'),
+    ];
+
+    const pov = foldRecallProviderPovText(null, raw);
+
+    expect(pov).toContain(normalizeFoldRecallPovText('The circular episode must not replay while this exact narration remains visible.'));
+  });
+
+  test('deduplicates identical recovered content across two entries in one recall pass', () => {
+    const alpha = 'relay/src/alpha.ts';
+    const beta = 'relay/src/beta.ts';
+    const raw: FoldMessage[] = [
+      userMsg('Investigate the duplicated recovery seam across both aliases in this folded turn.'),
+      assistantMsg('The same historical finding is indexed under two paths but should only be shown once to the provider.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([
+      turnEntry('alpha-alias', 'duplicated recovery seam', 2, [alpha], 0, 2),
+      turnEntry('beta-alias', 'duplicated recovery seam', 2, [beta], 0, 2),
+    ], raw.length);
+    const signals = extractRecallSignals({ paths: [ABS(alpha), ABS(beta)] }, new Set());
+    const config: FoldRecallConfig = { ...DEFAULT_FOLD_RECALL_CONFIG, maxCards: 3 };
+
+    const out = buildFoldRecallContext(state, raw, signals, 'healthy', config);
+
+    expect(out.cards).toBe(1);
+    expect(out.suppressed).toBe(1);
+    expect(out.text!.match(new RegExp(RECALL_CARD_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))).toHaveLength(1);
   });
 
   test('missing index signature is treated as first pass for legacy recall state objects', () => {
@@ -862,7 +975,7 @@ describe('buildFoldRecallContext', () => {
     delete state.lastIndexSignature;
 
     const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
-    expect(second.text).toBeNull();
+    expect(second.text).toContain('[Fold recall suppressed manifest');
     expect(second.cards).toBe(0);
     expect(second.suppressed).toBe(1);
     expect(state.cardsInjected).toBe(1);
@@ -1370,7 +1483,7 @@ describe('buildFoldRecallContext', () => {
     state.index = { ...indexFor(raw), visibleRecallCards: [first.text!] };
 
     const visible = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
-    expect(visible.text).toBeNull();
+    expect(visible.text).toContain('[Fold recall suppressed manifest');
     expect(visible.suppressed).toBeGreaterThan(0);
 
     // Burn passes with non-matching (but non-empty) signals past the old TTL.
@@ -1380,7 +1493,7 @@ describe('buildFoldRecallContext', () => {
     }
 
     const stillVisible = buildFoldRecallContext(state, raw, claimBigfile(), 'healthy', config);
-    expect(stillVisible.text).toBeNull();
+    expect(stillVisible.text).toContain('[Fold recall suppressed manifest');
     expect(stillVisible.suppressed).toBeGreaterThan(0);
 
     state.index = { ...indexFor(raw), visibleRecallCards: [] };
@@ -1468,6 +1581,24 @@ describe('buildFoldRecallContext', () => {
     expect(escalated.cards).toBe(1);
     expect(escalated.hints).toBe(0);
     expect(escalated.text!).toContain('BIGFILE CONTENT START');
+  });
+
+  test('does not replay an exact hint that survived an index rebuild in provider POV', () => {
+    const raw = buildAnthropicHistory();
+    const firstState = freshState(raw);
+    const first = buildFoldRecallContext(firstState, raw, claimBigfile(), 'auto_compact', DEFAULT_FOLD_RECALL_CONFIG);
+    expect(first.hints).toBe(1);
+
+    const rebuilt = freshState(raw);
+    rebuilt.index = {
+      ...rebuilt.index!,
+      visiblePovText: normalizeFoldRecallPovText(first.text!),
+    };
+    const repeated = buildFoldRecallContext(rebuilt, raw, claimBigfile(), 'auto_compact', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(repeated.text).toContain('[Fold recall suppressed manifest');
+    expect(repeated.hints).toBe(0);
+    expect(repeated.suppressed).toBe(1);
   });
 
   test('resident hints slide under critical pressure instead of storming duplicates', () => {
@@ -1771,7 +1902,7 @@ describe('recall feedback-loop + rebuild-survival', () => {
 
     // Immediate re-claim: suppressed by PATH residency despite the new entry ids.
     const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
-    expect(second.text).toBeNull();
+    expect(second.text).toContain('[Fold recall suppressed manifest');
     expect(second.suppressed).toBeGreaterThan(0);
 
     // After the TTL lapses, the still-visible prior card continues suppressing.
@@ -1780,7 +1911,7 @@ describe('recall feedback-loop + rebuild-survival', () => {
       buildFoldRecallContext(state, raw, unrelated, 'healthy', config);
     }
     const stillVisible = buildFoldRecallContext(state, raw, signals, 'healthy', config);
-    expect(stillVisible.text).toBeNull();
+    expect(stillVisible.text).toContain('[Fold recall suppressed manifest');
     expect(stillVisible.suppressed).toBeGreaterThan(0);
 
     // Once the rebuilt view no longer contains the exact card, recall returns —

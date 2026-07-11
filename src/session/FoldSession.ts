@@ -319,6 +319,8 @@ export interface FoldStats {
   readonly cacheHot: boolean;
   /** Recompute reason when this call was an epoch (not a hot reuse). */
   readonly epochReason?: string;
+  /** Why an otherwise-due tail epoch deliberately stayed cache-hot. */
+  readonly deferReason?: 'pending-tool-call' | 'live-user-anchor';
   /** Leading turns folded this epoch (only on a fresh fold). */
   readonly turnsFolded?: number;
   /** Original vs folded char counts and savings (only on a fresh fold). */
@@ -1238,7 +1240,10 @@ export class FoldSession {
       const pendingCallBlocksEntireFold = pairingProbeStart === fullTail.length
         && keptRawSplitIndex === 0
         && fullTail.length > 0;
-      if (pendingCallBlocksEntireFold) {
+      if ((lastUserIndex === 0 || pendingCallBlocksEntireFold)
+        && keptRawSplitIndex === 0
+        && fullTail.length > 0) {
+        const deferReason = pendingCallBlocksEntireFold ? 'pending-tool-call' : 'live-user-anchor';
         this.activeFidelity = previousActiveFidelity;
         touchFoldFreeze(this.freezeState, now);
         const anchoredView = this.freezeState.frozenView
@@ -1254,6 +1259,7 @@ export class FoldSession {
             cacheHot: true,
             hotReuses: this.freezeState.hotReuses,
             epochs: this.freezeState.epochs,
+            deferReason,
             ...this.pressureStats(false),
           },
         });

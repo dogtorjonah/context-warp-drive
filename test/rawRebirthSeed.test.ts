@@ -233,6 +233,9 @@ describe('raw rebirth seed renderer', () => {
     ], 1_000);
 
     expect(closet).toContain('Conserved high-value literals nominated newest-first');
+    expect(closet).toContain('/repo/src/new.ts @ source=tool_result message 2');
+    expect(closet).toContain('/repo/src/old.ts @ source=assistant message 1');
+    expect(closet).not.toContain('source=undefined');
     expect(closet.indexOf('/repo/src/new.ts')).toBeLessThan(closet.indexOf('/repo/src/old.ts'));
     expect(closet.indexOf('rail-new-abcdef')).toBeLessThan(closet.indexOf('rail-old-123456'));
   });
@@ -370,7 +373,7 @@ describe('raw rebirth seed renderer', () => {
     ], 1_000);
 
     expect(closetEntries(closet).filter((entry) => entry.includes('home/jonah/voxxo-swarm/relay/src/instanceManagerImpl.ts')))
-      .toEqual([absolutePath]);
+      .toEqual([`${absolutePath} @ source=assistant message 1`]);
   });
 
   test('rejects closet noise fixtures while keeping durable coordinate fixtures', () => {

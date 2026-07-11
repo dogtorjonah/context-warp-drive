@@ -523,6 +523,51 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(vaultText(deferred.messages)).toContain('toolu_only_pending_increment');
   });
 
+  it('defers when a live user anchor collapses the split ahead of a pending call', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
+    session.prepare(first);
+    const openId = 'toolu_mid_tail_behind_live_anchor';
+    const deferred = session.prepare([
+      ...first,
+      { role: 'user', content: 'keep this live request authoritative while the call is pending' },
+      anthropicToolUse(openId, '/tmp/live-anchor.ts'),
+      { role: 'assistant', content: `later bulky narration ${'x'.repeat(45_000)}` },
+    ], { measuredInputTokens: 70_000 });
+
+    expect(deferred.cacheHot).toBe(true);
+    expect(deferred.stats.deferReason).toBe('live-user-anchor');
+    expect(session.telemetry.epochs).toBe(1);
+    expect(vaultText(deferred.messages)).toContain(openId);
+  });
+
+  it('lets measured pressure override a permanently pending-call defer', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
+    const pending = [...first, anthropicToolUse('toolu_pressure_escape', '/tmp/pressure.ts')];
+    session.prepare(first);
+    const deferred = session.prepare(pending, { measuredInputTokens: 70_000 });
+    const escaped = session.prepare(pending, {
+      measuredInputTokens: 200_000,
+      hardEpochSeed: 'PRESSURE_ESCAPE_SEED',
+    });
+
+    expect(deferred.stats.deferReason).toBe('pending-tool-call');
+    expect(escaped.stats.pressureCeilingTriggered).toBe(true);
+    expect(escaped.stats.epochReason).toBe('hard-epoch');
+    expect(session.telemetry.epochs).toBe(2);
+  });
+
   it('keeps a Gemini-parts operator directive in the raw suffix behind a giant tool result', () => {
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,

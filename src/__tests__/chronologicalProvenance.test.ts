@@ -6,8 +6,8 @@ import {
   renderTailEpochAliasProvenance,
   renderTailEpochProvenance,
   selectPairingSafeRawTailStart,
-} from '../src/chronologicalProvenance.ts';
-import { isSyntheticContextText, type FoldMessage } from '../src/rollingFold.ts';
+} from '../chronologicalProvenance.ts';
+import { isSyntheticContextText, type FoldMessage } from '../rollingFold.ts';
 
 describe('chronological provenance', () => {
   it('renders source, transformation, authority, topology, and exact raw resumption', () => {

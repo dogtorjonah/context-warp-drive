@@ -2,18 +2,18 @@
 
 [![CI](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/dogtorjonah/context-warp-drive/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![GitHub stars](https://img.shields.io/github/stars/dogtorjonah/context-warp-drive?style=social)](https://github.com/dogtorjonah/context-warp-drive)
 
-**Stop summarizing your agent's memory.** Every compaction call burns a model round-trip, rewrites your prefix so the provider prompt cache goes cold, and quietly drops the exact identifiers your agent needs. Fold it deterministically instead.
+**Stop summarizing your agent's memory.** LLM-written compaction burns a model round-trip, rewrites the conversation prefix, and can quietly drop the exact identifiers your agent needs. Fold it deterministically instead.
 
-> **92.6% cache-read hit rate** across 954 tool calls in a 1h49m agent marathon. **−60% cost vs truncation, −70% vs summarization.** Zero extra LLM calls. Every number measured from the provider's own usage ledger — not estimated.
+> **92.6% cache-read hit rate** across 954 tool calls in a 1h49m agent marathon, measured from the provider usage ledger. In the included offline benchmark: **−63% cost vs truncation, −72% vs summarization**, with zero extra LLM calls and exact local BPE counts.
 
-**The Infinite Context Warp Engine.** Keep long function-calling agent sessions under the context window **without LLM summarization calls** and **without ending the session** — while keeping provider prompt caches **hot** — and page folded content back in the moment the agent touches it again.
+**The Infinite Context Warp Engine.** Keep long function-calling agent sessions under the context window **without LLM summarization calls** and **without ending the session** — preserve reusable prompt prefixes across ordinary turns and hard Rebirth boundaries, then page folded content back in when the recall layer sees it become relevant again.
 
-Deterministic. Zero-LLM. Pure CPU, zero I/O, byte-identical output for identical inputs. Provider-agnostic: **Anthropic** content blocks, **OpenAI** `tool_calls`, and **Gemini** `parts`.
+The core fold path is deterministic, zero-LLM, pure CPU, and zero I/O: identical inputs produce byte-identical output. Provider-agnostic message support includes **Anthropic** content blocks, **OpenAI** `tool_calls`, and **Gemini** `parts`. Optional host loops and the SQLite episode adapter perform I/O outside that core.
 
-Extracted from a production multi-agent system, where it folds context continuously across every model and long-running agent workloads.
+Extracted from a production multi-agent system, where it folds context continuously across heterogeneous models and long-running agent workloads.
 
-- The core engine passes **380+ deterministic tests** across rolling fold, recall, freeze, and integration.
-- Every number below is **measured, not estimated** — production cache rates from the Claude provider usage ledger, reproducible live against Claude (`ANTHROPIC_API_KEY=… npx tsx examples/benchmark-live.ts`, real model + real summarizer) and offline with exact `o200k_base` BPE token counts (`npx tsx examples/benchmark.ts`, deterministic, no key).
+- The repository contains **900+ deterministic test cases** across rolling fold, recall, freeze, providers, task rail, and integration.
+- Production cache rates come from the Claude provider usage ledger. The live benchmark uses provider-reported usage (`ANTHROPIC_API_KEY=… npx tsx examples/benchmark-live.ts`); the offline benchmark uses exact `o200k_base` BPE counts plus published pricing (`npx tsx examples/benchmark.ts`, deterministic, no key). Those are different evidence sources and are labeled separately below.
 
 <details>
 <summary><strong>Provenance note</strong> (click to expand)</summary>
@@ -34,7 +34,7 @@ The numbers that matter are from the production multi-agent system this engine p
 | Opus 4.8 agent | 691 | **89.6%** | 32.9M tok | 292.6M tok |
 | Opus agent | 510 | **93.2%** | 32.6M tok | 602.5M tok |
 
-**~90% of all input tokens are served from cache** across these high-turn Claude workloads — that is the byte-identical frozen-fold prefix doing its job, turn after turn, at $0.30/MTok cache reads instead of $3.00/MTok fresh input (Sonnet rates). A re-summarizing compactor rewrites the prefix and can never sustain this; truncation slides the window and breaks it. This is the entire economic argument, measured live.
+**~90% of all input tokens are served from cache** across these high-turn Claude workloads — that is the byte-identical frozen-fold prefix doing its job, turn after turn, at $0.30/MTok cache reads instead of $3.00/MTok fresh input (Sonnet rates). Re-summarization rewrites the conversation segment when it compacts, while a sliding truncation window changes its earliest retained message; either can reduce reuse beyond any static system/tools prefix. The production rates above measure the behavior of this deployment, not a universal rate for every integration.
 
 **Note on scope:** the table above is live single-deployment production telemetry, not a controlled A/B study — there is no held-out arm running truncation or summarization against the same real workload for a head-to-head comparison. The offline/live benchmarks below fill that gap deterministically on a small session; a larger-scale controlled long-horizon comparison across strategies is future work, gated on compute budget, not on the mechanism being unproven.
 
@@ -54,22 +54,21 @@ Real Claude calls every turn with Anthropic `cache_control` breakpoints, a **rea
 | :--- | :---: | :---: | :---: |
 | Truncation (rolling window) | $0.0516 | 0 | 44% (7/16) |
 | LLM Summarization (stand-in) | $0.0685 | 6 | 44% (7/16) |
-| **Context Warp Drive** | **$0.0208** | 0 | **94% (15/16)** |
+| **Context Warp Drive** | **$0.0190** | 0 | **94% (15/16)** |
 
-CWD is cheapest (**−70% vs summarization, −60% vs truncation** at Claude-sonnet rates — the ratio holds across tiers since Anthropic's cache discount is model-invariant), makes zero extra model calls, and beats truncation decisively on retention. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + a hot cache.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI or a cheaper Claude tier.
+CWD is cheapest (**−72% vs summarization, −63% vs truncation** at the default Claude Sonnet rates), makes zero extra model calls, and beats truncation decisively on retention in this scenario. (A well-prompted *real* summarizer can match retention at higher cost — CWD's durable edge is cost + zero calls + determinism + byte-stable cache segments.) The engine is provider-agnostic: set `WARP_BENCH_MODEL` (and `WARP_BENCH_PRICE_*` for an unlisted model) to benchmark against any model, including OpenAI or a cheaper Claude tier.
 
 ### How it compares to LLM-based memory tools
 
-| | **Context Warp Drive** | **Mem0** | **Letta (MemGPT)** | **Zep (Graphiti)** |
+| | **Context Warp Drive** | **Mem0** | **Letta** | **Zep / Graphiti** |
 |---|---|---|---|---|
-| **Approach** | Deterministic fold | LLM extraction + vector DB | LLM-managed 3-tier memory | LLM extraction + knowledge graph |
-| **Extra LLM calls** | **0** | Per memory operation | Per memory decision | Per entity extraction |
-| **Prompt cache impact** | **Stays hot** (byte-identical prefix) | Invalidated (rewritten prefix) | Invalidated | Invalidated |
-| **Runtime deps** | **Zero** (core engine) | Vector DB required | Full agent runtime replacement | Neo4j + LLM + embeddings |
-| **Provider support** | Anthropic · OpenAI · Gemini | Multi (SDK wrappers) | Python only | Python only |
+| **Primary job** | Deterministic in-session compaction + recall | Extracted long-term memory | Persistent agent memory + context management | Temporal knowledge-graph memory |
+| **Typical memory path** | Pure CPU fold/recall core | Extraction model + configured stores | Agent/model-managed blocks and retrieval | Entity/edge extraction + graph retrieval |
+| **Prompt-cache effect** | Byte-stable sealed prefix between epochs; hard Rebirth preserves the static prefix and seals a new conversation baseline | Integration-dependent | Integration-dependent | Integration-dependent |
+| **Runtime footprint** | **Zero dependencies** for the fold core | SDK plus configured model/store backends | Agent runtime/service plus memory backends | Graph/storage plus model and embedding providers |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
-Every funded competitor uses LLM calls to extract, summarize, or manage memory. Context Warp Drive is the only deterministic approach — zero model calls, zero latency, zero cache invalidation.
+These systems solve broader long-term-memory problems and can be complementary. Context Warp Drive's narrower design point is deterministic in-session compaction: zero model calls in the fold/recall core, no model-call latency, and explicit byte-stable cache segments rather than an opaque rewritten summary.
 
 ---
 
@@ -93,10 +92,10 @@ ANTHROPIC_API_KEY=sk-ant-... npx tsx examples/benchmark-live.ts
 
 Every long agent session hits the same wall: the context window fills up. The usual answers are bad:
 
-- **Truncation** drops the middle of your history — the agent forgets what it was doing.
-- **LLM summarization ("compaction")** costs a model call, adds latency, is non-deterministic, and **busts your provider prompt cache** every time it rewrites the prefix.
+- **Truncation** drops older history — the agent can lose what it was doing and the exact evidence behind it.
+- **LLM summarization ("compaction")** costs a model call, adds latency, is non-deterministic, and rewrites the summarized conversation segment, reducing cache reuse beyond any unchanged static prefix.
 
-Context Warp Drive does neither. It **deterministically folds** old turns into compact structural skeletons (one line per tool call + retained reasoning), **conserves the salient exact identifiers** (UUIDs, SHAs, paths, ports) in a budget-scored Coordinate Closet, **freezes** the folded prefix so it's reused byte-identical while the provider cache is warm, and **pages folded content back in** automatically when the agent re-touches a path. No model calls. No truncation. Cache stays hot.
+Context Warp Drive instead **deterministically folds** old turns into compact structural skeletons (one line per tool call + retained reasoning), **conserves salient exact identifiers** (UUIDs, SHAs, paths, ports) in a budget-scored Coordinate Closet, and **freezes** sealed prefix segments for byte-identical reuse. With the recall layer wired in, touching a path can page its folded evidence back into the prepared view. No model calls in the fold/recall core; raw history stays intact.
 
 ---
 
@@ -147,13 +146,13 @@ Then add the provider cache knob:
 | Provider | What to do |
 |---|---|
 | Claude / Anthropic | Use `prepareAnthropicCachedRequest()` from `context-warp-drive/providers/anthropic` with `messages`, `sealedBoundary`, `system`, and `tools`. It marks the relay-style breakpoints: tools, stable system head, sealed fold/rebirth boundary, and rolling tail. Default TTL is Anthropic's 5-minute cache shape; pass `ttl: '1h'` only when you want the paid 1-hour cache and merge the returned `requestOptions`/`anthropicBeta` into your SDK or fetch call. Log `usage.cache_read_input_tokens` and `usage.cache_creation_input_tokens`. |
-| OpenAI | No cache marker is required. Keep static tools/system/context first, pass the prepared `messages`, optionally reuse a stable `prompt_cache_key`, and log `usage.prompt_tokens_details.cached_tokens`. |
+| OpenAI | Eligible exact prefixes cache automatically. Keep static tools/system/context first and pass the prepared `messages`. For GPT-5.6+ use a stable `prompt_cache_key` for the more reliable matching path and optionally place explicit breakpoints; log cache reads/writes from the response usage fields (`cached_tokens`, and `cache_write_tokens` where supported). |
 | Gemini | Implicit caching is automatic on Gemini 2.5+ when prefixes match. For a large static document/corpus, create an explicit Gemini cache separately and pass it as `cachedContent`; keep the folded conversation after that stable prefix. Log `usage_metadata`. |
 | Gemini CLI | Use `context-warp-drive/providers/gemini-cli` to fold the CLI-owned JSONL view, preserving the metadata header and rewriting with `$set.messages` + `$set.lastUpdated`. |
 | Codex CLI | Use `context-warp-drive/providers/codex-cli` to rebuild a folded Responses item seed for `thread/inject_items` from canonical transcript rows. |
 | Claude Code CLI | Use `context-warp-drive/providers/claude-cli` to build a folded Claude Code JSONL chain and atomically rewrite `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` before `claude --resume`. |
 
-Context Warp Drive keeps the prefix byte-identical. The provider SDK call still owns provider-specific cache settings.
+Context Warp Drive keeps each sealed prefix byte-identical between epochs and preserves the static prefix across hard Rebirth boundaries. The provider SDK call still owns provider-specific cache settings.
 
 ---
 
@@ -162,7 +161,7 @@ Context Warp Drive keeps the prefix byte-identical. The provider SDK call still 
 ```ts
 import { FoldSession } from 'context-warp-drive';
 
-// One per conversation. Folds past the active window + keeps the provider cache hot.
+// One per conversation. Folds past the active window + preserves cacheable prefixes between epochs.
 const session = new FoldSession();
 
 // Your full provider-shaped history (Anthropic / OpenAI / Gemini message objects).
@@ -174,7 +173,7 @@ const history = [
 // Every turn, before you call the model:
 const { messages, cacheHot, stats } = session.prepare(history, {
   // Optional but recommended: pass real provider/relay input-token telemetry
-  // from the previous turn. At 240k by default, FoldSession forces a fresh
+  // from the previous turn. At 180k by default, FoldSession forces a fresh
   // fold epoch instead of hot-reusing into an oversized prompt.
   measuredInputTokens: previousUsage?.input_tokens,
 });
@@ -185,7 +184,7 @@ await callYourModel(messages); // Anthropic / OpenAI / Gemini — the message sh
 console.log(`sent ${messages.length} msgs · cacheHot=${cacheHot} · savings=${stats.savingsPercent ?? 0}%`);
 ```
 
-That's the whole headline. For continuous always-lean folding, pass `ALWAYS_ON_FOLD_CONFIG`; to match your provider's real cache TTL, set `freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 }`. The measured-token pressure guard defaults to `DEFAULT_FOLD_PRESSURE_CEILING_TOKENS` (240,000); pass `pressureCeiling: false` to disable it or `pressureCeiling: 120_000` to tune it.
+That's the whole headline. For continuous always-lean folding, pass `ALWAYS_ON_FOLD_CONFIG`; to match your provider's real cache TTL, set `freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 }`. The measured-token pressure guard defaults to `DEFAULT_FOLD_PRESSURE_CEILING_TOKENS` (180,000); pass `pressureCeiling: false` to disable it or `pressureCeiling: 120_000` to tune it.
 
 See [`examples/anthropic-loop.ts`](./examples/anthropic-loop.ts) and [`examples/openai-loop.ts`](./examples/openai-loop.ts) for full tool loops.
 
@@ -221,7 +220,20 @@ await client.messages.create(
 );
 ```
 
-**Bounded is what makes it boundless.** A hard epoch collapses the *provider-visible* view to one compact seed message — it does not discard anything. The raw transcript remains recall backing: fold recall (§4 below) keeps paging folded/pre-epoch content back in the moment the agent re-touches a path, a claim, or a prior identifier, exactly as it does for an ordinary rolling fold. That's the actual mechanism behind "long-horizon": the window itself never grows past its ceiling, so it stays cheap and cache-friendly turn after turn, while forward momentum — what the agent was doing, what it touched, what it decided — survives the reset because recall and episodic memory read from the untouched raw trace, not from the collapsed view. The engine is deliberately bounded; that boundedness is what lets a session run indefinitely instead of eventually blowing the context window.
+### Choose an epoch policy
+
+There are two fully supported ways to run epoch transitions:
+
+| Policy | What happens | Best fit | Cache behavior |
+|---|---|---|---|
+| **Hard Rebirth epochs** | Replace the provider-visible conversation with one deterministic continuity seed, then seal that seed as the new baseline. | Any long-running session; especially hosts that want the cleanest bounded reset policy, explicit same-instance resets, or process/model handoffs. | The large static system/tools prefix remains reusable across the boundary. The regenerated continuity package is created once, then its sealed seed becomes the byte-stable baseline for following turns. |
+| **Tail epochs plus hard Rebirth epochs** | During a hot streak, fold only the new tail and append that band behind the frozen prefix. Escalate to a hard Rebirth at the measured ceiling, when runway or fold yield is exhausted, or when the host explicitly requests it. | Hosts that want to minimize conversation-baseline rewrites between hard resets while an active streak remains healthy. | Tail bands extend the existing frozen conversation baseline; the eventual hard Rebirth retains the static cacheable prefix and immediately establishes the next sealed baseline. |
+
+**Hard Rebirth is not a degraded mode or a continuity compromise.** The bundled [rebirth-continuity paper](./docs/research/rebirth-continuity-paper/) reports first-action non-inferiority against a fair full-context compaction summary, depth-stable behavior through a 684th consecutive rebirth, and 92.8% cache-read on first boundary rows versus 94.5% on ordinary warm rows. The honest mechanism is a dominant static prefix plus a bounded, partly recreated continuity package—not reuse of the old conversation package. Those results come from one deployed system, and the controlled comparison covers first actions rather than full task outcomes.
+
+Tail epochs are therefore a cache-efficiency optimization between hard Rebirths, not a remedy for a weakness in Rebirth. With measured token telemetry, `FoldSession` uses the combined policy automatically: it appends productive tail bands while runway remains, then performs a hard Rebirth at the safety boundary. A host that prefers hard-only behavior can call `prepare(..., { hardEpoch: true })` at each chosen boundary.
+
+**Bounded is what makes it boundless.** A hard epoch collapses the *provider-visible* view to one compact seed message — it does not discard anything from the host-owned raw trace. With recall wired in, the raw transcript remains backing for paging folded/pre-epoch content in when the agent re-touches a path, a claim, or a prior identifier, exactly as after an ordinary rolling fold. With measured pressure telemetry supplied before provider calls, the visible view stays below its safety ceiling while forward momentum — what the agent was doing, what it touched, what it decided — survives because recall and episodic memory read from the untouched raw trace, not from the collapsed view. The engine is deliberately bounded; that boundedness is what lets a session run indefinitely instead of eventually blowing the context window.
 
 Parity checklist for a custom harness:
 
@@ -328,19 +340,19 @@ From the active window backward, every prior turn skeletonizes into one line per
 **"Turn" is looser than it sounds — long agentic work folds per step, not per user message.** A conversational turn only ends at real user text (`isUserTurnBoundary`); a long single-prompt agentic rail — one kickoff, hundreds of tool-call steps, no further user text — is structurally ONE turn. `planActiveTurnStepFold` detects that marathon pattern and re-segments the oversized active turn at agentic-step boundaries (each assistant tool-call + its result), so `foldContext` can skeletonize the OLD steps of a still-open turn while the newest N steps stay full-fidelity. This is what keeps a long-horizon single-turn agent session bounded without waiting for a user message that may never come.
 
 ### 2. Coordinate Closet — exact-value conservation
-Folded turns are skeletonized, **but their exact identifiers are not paraphrased**. `nominateVerbatim` extracts UUIDs, long hashes, absolute paths, digit-bearing key/values (`port=3002`), and issue refs, and conserves them in a `Coordinate Closet (conserved from folded turns): …` block. Opaque ids carry a deterministic context label (`7fd5835b ⟦changelog_id⟧`). A separate capped lane conserves identifiers from operator-pasted user text too.
+Folded turns are skeletonized, but the identifiers selected within the bounded conservation budget are kept verbatim rather than paraphrased. `nominateVerbatim` extracts UUIDs, long hashes, absolute paths, digit-bearing key/values (`port=3002`), and issue refs, and conserves them in a `Coordinate Closet (conserved from folded turns): …` block. Opaque ids carry a deterministic context label (`7fd5835b ⟦changelog_id⟧`). A separate capped lane conserves identifiers from operator-pasted user text too.
 
 ### 3. Fold freeze (cache-hot reuse) — `evaluateFoldFreeze`
-The folded prefix is **frozen** and reused **byte-identical** between epochs, so new turns just append to the raw tail and the provider prompt cache stays warm. It only recomputes at an epoch: first call, cold TTL gap, raw-tail cap exceeded, a thinning/claim change, or a boundary rewrite. **Maximizing the hot-reuse ratio is the entire point of deterministic folding** — a re-summarizing compactor can never do this.
+The folded prefix is **frozen** and reused **byte-identical** between epochs, so new turns just append to the raw tail and the provider can reuse the matching prefix. It recomputes at an epoch: first call, cold TTL gap, raw-tail cap exceeded, a thinning/claim change, or a boundary rewrite. **Maximizing this hot-reuse ratio is the point of deterministic folding**; an LLM-written summary cannot guarantee byte-identical regeneration of the same conversation segment.
 
 ### 4. Fold recall (ambient page-in) — `buildFoldRecallContext`
-A page table (`buildFoldIndex`) tracks everything the fold paged out. When activity proves relevance — you touch a path again, or claim a file — the folded content **pages back in** as a budgeted recall card, appended append-only onto the freeze tail (cache stays hot) and re-folded at the next epoch. Fully cyclic, with residency TTLs so cards don't thrash.
+A page table (`buildFoldIndex`) tracks everything the fold paged out. When host-supplied activity proves relevance — you touch a path again, or claim a file — `buildFoldRecallContext` can page the evidence back in as a budgeted recall card, appended after the sealed prefix and re-folded at the next epoch. `FoldSession` itself handles fold/freeze; use `MemoryLoop` or call the recall APIs to wire automatic signal detection and injection. Residency TTLs prevent card thrash.
 
 ### 5. Episodic recall (durable cross-session memory) — `context-warp-drive/episodes`
-Beyond the in-session fold, sealed work **episodes** (the files touched + the agent's verbatim conclusions) persist to a local store and are recalled by path the next time any session touches a member file. Turnkey portable store included (`createEpisodeStore`, SQLite); the advanced chain-card/narration engine ships namespaced as `richEpisodes`.
+Beyond the in-session fold, sealed work **episodes** (the files touched + the agent's verbatim conclusions) can persist to a local store and be recalled by path when a later session touches a member file. The host owns capture and recall orchestration; `MemoryLoop` provides the bundled wiring. A portable SQLite store is included (`createEpisodeStore`), while the advanced chain-card/narration engine ships namespaced as `richEpisodes`.
 
 ### 6. Glyph grammar (register tags) — `context-warp-drive/glyphs`
-Every agent message opens with one register glyph — 🔍 in-progress · ▶ executing · 🏁 verdict · ⚠️ hazard · ❓ blocked. `parseRegisterGlyph` classifies it; episodic recall uses it as a trust signal so only **settled** conclusions (🏁/⚠️) get harvested into durable memory while transient work (🔍/▶/❓) self-excludes. See [`docs/glyph-grammar.md`](./docs/glyph-grammar.md).
+Integrations can require every agent message to open with one register glyph — 🔍 in-progress · ▶ executing · 🏁 verdict · ⚠️ hazard · ❓ blocked. `parseRegisterGlyph` classifies it; the episodic narration path can use that as a trust signal so **settled** conclusions (🏁/⚠️) are eligible for durable memory while transient work (🔍/▶/❓) self-excludes. The package parses this contract; your host enforces it. See [`docs/glyph-grammar.md`](./docs/glyph-grammar.md).
 
 ### 7. Context budget (model-aware mechanical limits) — `context-warp-drive/budget`
 The budget resolver turns model/engine/window choices into deterministic fold knobs: active band, message ceiling, pressure ceiling, prefix saturation, tail epoch cap, and compression/eviction profile. Known model tables cover common providers, while explicit `contextWindowTokens` lets any new model opt in without waiting for a package release.
@@ -511,11 +523,13 @@ All optional; sensible defaults. `WARP_FOLD_FREEZE` (freeze on/off) · `WARP_FOL
 - [`docs/architecture.md`](./docs/architecture.md) — how the layers compose and how to wire them into any FC loop.
 - [`docs/glyph-grammar.md`](./docs/glyph-grammar.md) — the register-glyph contract and why it powers episodic narration.
 - [`docs/fold-provenance.md`](./docs/fold-provenance.md) — prepare receipts: sha256 provenance artifacts that make the deterministic fold/freeze invariant externally attestable and give downstream agents a `safe_to_resume`/`stale` verdict without replaying private raw history.
+- [`docs/raw-rebirth-seed.md`](./docs/raw-rebirth-seed.md) — hard-epoch seed construction, default budgets, host overrides, and cache-boundary wiring.
+- [`docs/research/rebirth-continuity-paper/`](./docs/research/rebirth-continuity-paper/) — the working paper, hard-number provenance, controlled A/B design, and explicit threats to validity for same-identity Rebirth continuity.
 
 ## Tests
 
 ```bash
-npm test   # runs the 380+ test deterministic suite (rolling fold, freeze, recall, task rail)
+npm test   # runs the 900+ case deterministic suite (fold, freeze, recall, providers, task rail)
 ```
 
 ## JonahT © Jonah Tarashansky

@@ -1259,6 +1259,10 @@ export interface FoldRecallState {
    * first pass (undefined preserves compatibility with older state objects).
    */
   lastIndexSignature?: string | null;
+  /** Last bounded suppressed-manifest composition shown to the provider. */
+  lastSuppressedManifestKey?: string | null;
+  /** Matching suppression passes since that manifest was last shown. */
+  suppressedManifestQuietPasses?: number;
   // ── Lifetime telemetry counters ──
   cardsInjected: number;
   hintsInjected: number;
@@ -1280,6 +1284,8 @@ export function createFoldRecallState(): FoldRecallState {
     pathAtlasMeta: new Map(),
     passSeq: 0,
     lastIndexSignature: null,
+    lastSuppressedManifestKey: null,
+    suppressedManifestQuietPasses: 0,
     cardsInjected: 0,
     hintsInjected: 0,
     recallChars: 0,
@@ -2040,6 +2046,40 @@ function describeEntry(entry: FoldIndexEntry): string {
   return preview ? `${entry.category} turn (${preview}${more})` : `${entry.category} turn`;
 }
 
+function shortRecallToolName(name: string): string {
+  const parts = name.split('__').filter(Boolean);
+  return parts[parts.length - 1] ?? name;
+}
+
+/** Ordered, counted tool-call labels for a recalled raw episode. */
+function recallEpisodeToolLabels(messages: readonly FoldMessage[]): string[] {
+  const order: string[] = [];
+  const counts = new Map<string, number>();
+  const add = (raw: unknown): void => {
+    if (typeof raw !== 'string' || !raw.trim()) return;
+    const name = shortRecallToolName(raw.trim());
+    if (!counts.has(name)) order.push(name);
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  };
+  for (const message of messages) {
+    if (Array.isArray(message.content)) {
+      for (const block of message.content as any[]) {
+        if (block?.type === 'tool_use') add(block.name);
+      }
+    }
+    if (Array.isArray((message as any).tool_calls)) {
+      for (const call of (message as any).tool_calls as any[]) add(call?.function?.name);
+    }
+    if (Array.isArray((message as any).parts)) {
+      for (const part of (message as any).parts as any[]) add(part?.functionCall?.name);
+    }
+  }
+  return order.slice(0, 4).map((name) => {
+    const count = counts.get(name) ?? 1;
+    return count > 1 ? `${name} ×${count}` : name;
+  });
+}
+
 function renderHint(item: RecallPlanItem): string {
   return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} folded earlier (${formatChars(item.entry.chars)} chars) | trigger: ${item.trigger} | self-tap to recover]`;
 }
@@ -2547,7 +2587,16 @@ function renderRecallProvenance(
       rawTailCount,
     },
   });
-  return rendered ?? '';
+  if (!rendered) return '';
+  const paths = entryPaths(item.entry).slice(0, 3);
+  const tools = recallEpisodeToolLabels(rawHistory.slice(sourceStart, sourceEnd));
+  const sourceBits = [
+    tools.length > 0 ? tools.join(' → ') : '',
+    paths.length > 0 ? paths.join(', ') : '',
+  ].filter(Boolean);
+  if (sourceBits.length === 0) return rendered;
+  const episode = `↞ source episode: ${sourceBits.join(' · ')}`;
+  return `${rendered}\n${episode.length > 260 ? `${charSafeSlice(episode, 0, 259)}…` : episode}`;
 }
 
 function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', atlasMeta = ''): RenderedCard {
@@ -2607,6 +2656,8 @@ export interface FoldRecallOutcome {
   hints: number;
   chars: number;
   suppressed: number;
+  /** Bounded paths/source-coordinates-only account of bodies withheld this pass. */
+  suppressedManifest?: string;
   triggers: string[];
   /**
    * Additive per-pass card composition breakdown — answers "where did the
@@ -2699,6 +2750,106 @@ function makeResidencyRecord(
   };
 }
 
+interface SuppressedRecallCoordinate {
+  readonly paths: readonly string[];
+  readonly source: string;
+}
+
+const SUPPRESSED_MANIFEST_MAX_ENTRIES = 6;
+const SUPPRESSED_MANIFEST_MAX_CHARS = 480;
+const SUPPRESSED_MANIFEST_REMINDER_PASSES = 6;
+
+function suppressedRecallCoordinate(
+  entry: FoldIndexEntry,
+  matchedPath: string,
+): SuppressedRecallCoordinate {
+  const paths = entryPaths(entry);
+  const fallbackPath = matchedPath.startsWith('term:') || matchedPath.startsWith('verbatim:')
+    ? []
+    : [matchedPath];
+  const source = entry.kind === 'turn'
+    ? `raw messages ${entry.rawStart + 1}–${entry.rawEnd}`
+    : `raw message ${entry.recency + 1}`;
+  return { paths: paths.length > 0 ? paths : fallbackPath, source };
+}
+
+function renderSuppressedRecallManifest(
+  suppressed: number,
+  coordinates: readonly SuppressedRecallCoordinate[],
+): string {
+  if (suppressed <= 0) return '';
+  const header = `[Fold recall suppressed manifest — ${suppressed} matching bod${suppressed === 1 ? 'y' : 'ies'} withheld as already resident]`;
+  const rows = coordinates.slice(0, SUPPRESSED_MANIFEST_MAX_ENTRIES).map((coordinate) => {
+    const pathLabel = coordinate.paths.length > 0 ? coordinate.paths.slice(0, 3).join(', ') : 'path unavailable';
+    return `- ${pathLabel} @ ${coordinate.source}`;
+  });
+  if (rows.length === 0) rows.push('- path/source coordinates unavailable');
+  if (coordinates.length > rows.length) rows.push(`- …${coordinates.length - rows.length} more coordinate${coordinates.length - rows.length === 1 ? '' : 's'} elided`);
+  const fitted: string[] = [];
+  let used = header.length;
+  for (const row of rows) {
+    const boundedRow = row.length > 220 ? `${charSafeSlice(row, 0, 219)}…` : row;
+    if (used + boundedRow.length + 1 > SUPPRESSED_MANIFEST_MAX_CHARS) break;
+    fitted.push(boundedRow);
+    used += boundedRow.length + 1;
+  }
+  return [header, ...fitted].join('\n');
+}
+
+/**
+ * Show a suppressed-body manifest on first sight, whenever its bounded
+ * composition changes, and occasionally while an identical suppression set
+ * persists. This keeps the visibility win without repeating the same block at
+ * every busy tool boundary.
+ */
+function takeSuppressedRecallManifest(
+  state: FoldRecallState,
+  suppressed: number,
+  coordinates: readonly SuppressedRecallCoordinate[],
+): string {
+  const manifest = renderSuppressedRecallManifest(suppressed, coordinates);
+  if (!manifest) {
+    state.lastSuppressedManifestKey = null;
+    state.suppressedManifestQuietPasses = 0;
+    return '';
+  }
+  if (state.lastSuppressedManifestKey !== manifest) {
+    state.lastSuppressedManifestKey = manifest;
+    state.suppressedManifestQuietPasses = 0;
+    return manifest;
+  }
+  const quietPasses = (state.suppressedManifestQuietPasses ?? 0) + 1;
+  if (quietPasses >= SUPPRESSED_MANIFEST_REMINDER_PASSES) {
+    state.suppressedManifestQuietPasses = 0;
+    return manifest;
+  }
+  state.suppressedManifestQuietPasses = quietPasses;
+  return '';
+}
+
+function rawTailProviderPovText(
+  index: FoldRecallIndex,
+  rawHistory: readonly FoldMessage[],
+): string {
+  const start = Math.max(0, Math.min(index.rawCount, rawHistory.length));
+  return collectProviderViewText(rawHistory.slice(start));
+}
+
+/**
+ * Remove exact, meaningful body paragraphs that are already visible in the
+ * unfolded raw tail. Novel paragraphs remain, so a partly redundant card can
+ * still recover unique tool output instead of being suppressed wholesale.
+ */
+function pruneRawTailResidentParagraphs(body: string, rawTailPovText: string): string {
+  if (!rawTailPovText || !body.trim()) return body;
+  const paragraphs = body.split(/\n{2,}/);
+  const kept = paragraphs.filter((paragraph) => {
+    const normalized = normalizeFoldRecallPovText(paragraph);
+    return normalized.length < 82 || !rawTailPovText.includes(normalized);
+  });
+  return kept.join('\n\n').trim();
+}
+
 /**
  * One recall pass at a tool boundary: plan against the index + residency,
  * render measured cards/hints from in-memory raw history, update residency
@@ -2755,17 +2906,35 @@ export function buildFoldRecallContext(
 
   const plan = planRecall(state.index, state.resident, state.residentPaths, passSeq, signals, utilization, config);
   let suppressed = plan.suppressed;
+  const suppressedCoordinates = new Map<string, SuppressedRecallCoordinate>();
+  const recordSuppressed = (entry: FoldIndexEntry, matchedPath: string): void => {
+    const coordinate = suppressedRecallCoordinate(entry, matchedPath);
+    const key = `${coordinate.paths.join('\u0000')}\u0001${coordinate.source}`;
+    if (!suppressedCoordinates.has(key)) suppressedCoordinates.set(key, coordinate);
+  };
+  const entriesById = new Map(state.index.entries.map((entry) => [entry.id, entry]));
   for (const residency of plan.suppressedResidencies) {
+    const entry = entriesById.get(residency.entryId);
+    if (entry) recordSuppressed(entry, residency.matchedPath);
     if (residency.refreshEntry) refreshResidency(state.resident, residency.entryId, refreshedExpiresAtPass);
     if (residency.refreshPath) refreshResidency(state.residentPaths, residency.matchedPath, refreshedExpiresAtPass);
   }
   if (plan.items.length === 0) {
+    const suppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
     state.suppressed += suppressed;
-    return { ...EMPTY_OUTCOME, suppressed };
+    state.recallChars += suppressedManifest.length;
+    return {
+      ...EMPTY_OUTCOME,
+      text: suppressedManifest || null,
+      chars: suppressedManifest.length,
+      suppressed,
+      ...(suppressedManifest ? { suppressedManifest } : {}),
+    };
   }
 
   const budget = pressureBudget(utilization, config);
   const providerPovText = foldRecallProviderPovText(state.index, rawHistory);
+  const rawTailPovText = rawTailProviderPovText(state.index, rawHistory);
   const blocks: string[] = [];
   const triggers: string[] = [];
   const injected: Array<{ id: string; level: 'card' | 'hint' }> = [];
@@ -2818,7 +2987,15 @@ export function buildFoldRecallContext(
         // present. A source-delta notifier is always novel continuity evidence,
         // so changed/beyond-source cards must still render even when their body
         // is resident elsewhere in POV.
-        const povComponents = [rb.body, radar, episodeVoice, atlasMeta].filter((part) => part.length > 0);
+        const residentPrunedBody = rb.applied.length === 0
+          ? pruneRawTailResidentParagraphs(rb.body, rawTailPovText)
+          : rb.body;
+        if (!residentPrunedBody) {
+          suppressed++;
+          recordSuppressed(item.entry, item.matchedPath);
+          continue;
+        }
+        const povComponents = [residentPrunedBody, radar, episodeVoice, atlasMeta].filter((part) => part.length > 0);
         cardContentKey = povComponents.map(normalizeFoldRecallPovText).join('\u0000');
         const allComponentsResident = rb.applied.length === 0
           && povComponents.length > 0
@@ -2828,15 +3005,17 @@ export function buildFoldRecallContext(
           });
         if (allComponentsResident) {
           suppressed++;
+          recordSuppressed(item.entry, item.matchedPath);
           continue;
         }
         if (rb.applied.length === 0 && cardContentKey && emittedCardContentKeys.has(cardContentKey)) {
           suppressed++;
+          recordSuppressed(item.entry, item.matchedPath);
           continue;
         }
         const rc = renderCard(
           item,
-          rb.body,
+          residentPrunedBody,
           bodyBudget,
           radar,
           rb.applied,
@@ -2859,6 +3038,7 @@ export function buildFoldRecallContext(
       if (item.escalatedFromHint) {
         // Already hinted recently and we cannot afford the card — stay quiet.
         suppressed++;
+        recordSuppressed(item.entry, item.matchedPath);
         refreshResidency(state.resident, item.entry.id, refreshedExpiresAtPass);
         continue;
       }
@@ -2875,6 +3055,7 @@ export function buildFoldRecallContext(
     const normalizedRendered = normalizeFoldRecallPovText(rendered);
     if (normalizedRendered.length >= 42 && providerPovText.includes(normalizedRendered)) {
       suppressed++;
+      recordSuppressed(item.entry, item.matchedPath);
       continue;
     }
     blocks.push(rendered);
@@ -2912,6 +3093,11 @@ export function buildFoldRecallContext(
   }
   state.cardsInjected += cards;
   state.hintsInjected += hints;
+  const suppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
+  if (suppressedManifest) {
+    blocks.push(suppressedManifest);
+    charsUsed += suppressedManifest.length;
+  }
   state.recallChars += charsUsed;
   state.suppressed += suppressed;
 
@@ -2922,6 +3108,7 @@ export function buildFoldRecallContext(
     hints,
     chars: charsUsed,
     suppressed,
+    ...(suppressedManifest ? { suppressedManifest } : {}),
     triggers,
     ...(composition !== null ? { composition } : {}),
   };
