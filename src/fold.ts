@@ -8,6 +8,7 @@
  * identical inputs.
  */
 export * from './rollingFold.ts';
+export * from './foldBirthHydration.ts';
 export * from './foldFreeze.ts';
 export * from './foldRecall.ts';
 export * from './foldTerms.ts';
