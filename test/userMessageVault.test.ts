@@ -58,6 +58,8 @@ describe('userMessageVault', () => {
     expect(entries).toHaveLength(6);
     expect(vault.startsWith(USER_MESSAGE_VAULT_PREFIX)).toBe(true);
     expect(vault.endsWith(USER_MESSAGE_VAULT_END)).toBe(true);
+    expect(vault).toContain('Sealed Exchange Vault');
+    expect(vault).toContain('not a transcript archive');
     expect(vault).toContain('artifact=glyph-vault#operator-only class=exact-excerpt');
     expect(vault).toContain('source=vault-buffer:row#0..vault-buffer:row#6 n=6');
     expect(vault).toContain('authority=historical-background');

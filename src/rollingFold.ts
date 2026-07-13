@@ -69,6 +69,12 @@ export interface FoldConfig {
    */
   verbatimKeepChars?: number;
   /**
+   * Coordinate literals already resident in an immutable earlier band. Append
+   * folds use this corpus only as a conservation fence, so a new closet never
+   * repeats an id/path/value already carried by the frozen prefix.
+   */
+  priorCoordinateCorpus?: string;
+  /**
    * Host-specific preamble rendered inside each fold block. Defaults to the
    * package preamble; override only when a host lacks the default recall hooks.
    */
@@ -651,6 +657,76 @@ export function formatFoldEpochStamp(epoch: number, detail: string): string {
  * foldRecall's buildFoldIndex parses. Full mechanics: docs/context-folding.md.
  */
 export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves closet items — ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
+export const COORDINATE_CLOSET_MARKER = '⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖';
+const RAW_TRACE_COORDINATE_CLOSET_PREFIX = '── Raw Trace Coordinate Closet';
+
+/**
+ * Extract only resident coordinate-carrying text from a frozen view. This keeps
+ * cross-band admission bounded to closet material instead of rescanning the
+ * entire immutable prompt for every nominated literal. Both the rolling-fold
+ * inline closet and the rebirth package's bullet-form raw closet are supported.
+ */
+export function extractCoordinateConservationCorpus(messages: readonly FoldMessage[]): string {
+  const conserved: string[] = [];
+  for (const message of messages) {
+    if (typeof message.content !== 'string') continue;
+    let inRawTraceCloset = false;
+    let sawRawTraceLiteral = false;
+    for (const rawLine of message.content.split('\n')) {
+      const line = rawLine.trim();
+      if (line.includes(COORDINATE_CLOSET_MARKER)) {
+        conserved.push(line);
+        inRawTraceCloset = false;
+        sawRawTraceLiteral = false;
+        continue;
+      }
+      if (line.startsWith(RAW_TRACE_COORDINATE_CLOSET_PREFIX)) {
+        inRawTraceCloset = true;
+        sawRawTraceLiteral = false;
+        continue;
+      }
+      if (!inRawTraceCloset) continue;
+      if (line.startsWith('── ') || (sawRawTraceLiteral && line.length === 0)) {
+        inRawTraceCloset = false;
+        sawRawTraceLiteral = false;
+        continue;
+      }
+      if (line.startsWith('- ') && line.length > 2) {
+        conserved.push(line.slice(2));
+        sawRawTraceLiteral = true;
+      }
+    }
+  }
+  return conserved.join('\n');
+}
+
+/**
+ * Remove entries from rendered inline closet lines when an immutable prefix
+ * already carries the same bare literal. Used by transports that assemble a
+ * band before they acquire the live frozen-prefix bytes (Codex/Claude CLI).
+ */
+export function dedupeCoordinateClosetText(text: string, priorCoordinateCorpus: string): string {
+  if (!text.includes(COORDINATE_CLOSET_MARKER) || !priorCoordinateCorpus) return text;
+  return text
+    .split('\n')
+    .map((line) => {
+      const markerIndex = line.indexOf(COORDINATE_CLOSET_MARKER);
+      if (markerIndex < 0) return line;
+      const itemsIndex = line.indexOf(': ', markerIndex + COORDINATE_CLOSET_MARKER.length);
+      if (itemsIndex < 0) return line;
+      const kept = line
+        .slice(itemsIndex + 2)
+        .split(' · ')
+        .filter(Boolean)
+        .filter((item) => {
+          const bare = item.replace(/\s+⟦[^⟧]*⟧$/u, '');
+          return !isConservedIn(priorCoordinateCorpus, bare);
+        });
+      return kept.length > 0 ? `${line.slice(0, itemsIndex + 1)} ${kept.join(' · ')}` : null;
+    })
+    .filter((line): line is string => line !== null)
+    .join('\n');
+}
 
 function matchesHostSyntheticContext(text: string, options: SyntheticContextOptions): boolean {
   for (const prefix of options.prefixes ?? []) {
@@ -2220,6 +2296,8 @@ export function foldContext(
 ): FoldResult {
   const originalChars = countChars(messages);
   const foldBlockPreamble = config.foldBlockPreamble ?? FOLD_BLOCK_PREAMBLE;
+  const priorCoordinateCorpus = config.priorCoordinateCorpus
+    || extractCoordinateConservationCorpus(messages);
 
   if (turnsToFold <= 0 || messages.length === 0) {
     return {
@@ -2467,6 +2545,7 @@ export function foldContext(
         // they spend closet budget. Artifact-type gate, lineage-blind — see
         // isClosetNoiseLiteral. Real source paths/rail ids/ports/pids survive.
         if (isClosetNoiseLiteral(lit)) return;
+        if (priorCoordinateCorpus && isConservedIn(priorCoordinateCorpus, lit)) return;
         if (isConservedIn(bodyCorpus, lit)) return;
         if (closetItems && isConservedIn(closetItems, lit)) return;
         const sep = closetItems ? ' · ' : '';
@@ -2505,7 +2584,7 @@ export function foldContext(
       }
     }
     const closetLine = closetItems
-      ? `⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖ conserved verbatim ids/paths/values from folded turns — trust before re-reading files: ${closetItems}`
+      ? `${COORDINATE_CLOSET_MARKER} conserved verbatim ids/paths/values from folded turns — trust before re-reading files: ${closetItems}`
       : undefined;
 
     // Tombstones count into blockChars like other lines.

@@ -31,6 +31,7 @@ import {
   countChars,
   extractUserText,
   extractAssistantText,
+  extractCoordinateConservationCorpus,
   DEFAULT_FOLD_EVICT_THRESHOLD_CHARS,
   DEFAULT_ASSISTANT_TEXT_BUDGET,
   resolveFoldConfigForBand,
@@ -795,9 +796,11 @@ export class FoldSession {
 
   private effectiveAppendFoldConfig(): FoldConfig {
     const cold = resolveColdFoldConfigForBand(this.tailEpochAppendBandTargetTokens);
-    return this.foldConfig.foldBlockPreamble === undefined
+    const base = this.foldConfig.foldBlockPreamble === undefined
       ? cold
       : { ...cold, foldBlockPreamble: this.foldConfig.foldBlockPreamble };
+    const priorCoordinateCorpus = extractCoordinateConservationCorpus(this.freezeState.frozenView ?? []);
+    return priorCoordinateCorpus ? { ...base, priorCoordinateCorpus } : base;
   }
 
   /**

@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
   FoldSession,
   FOLD_TOMBSTONE_PREFIX,
+  dedupeCoordinateClosetText,
+  extractCoordinateConservationCorpus,
   type FoldConfig,
   type FoldMessage,
 } from '../index.ts';
@@ -242,6 +244,36 @@ describe('FoldSession marathon pressure folding', () => {
 });
 
 describe('FoldSession tail-epoch runway gate', () => {
+  it('extracts coordinate literals from rolling-fold and rebirth closet forms', () => {
+    const corpus = extractCoordinateConservationCorpus([{
+      role: 'user',
+      content: `⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖ conserved: record-existing-1234 · /repo/existing.ts
+
+── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──
+Conserved high-value literals newest-first.
+- 00000000-0000-4000-8000-000000000111
+- /repo/from-rebirth.ts
+
+── Next Section ──
+- not-part-of-the-closet`,
+    }]);
+
+    expect(corpus).toContain('record-existing-1234');
+    expect(corpus).toContain('/repo/existing.ts');
+    expect(corpus).toContain('00000000-0000-4000-8000-000000000111');
+    expect(corpus).toContain('/repo/from-rebirth.ts');
+    expect(corpus).not.toContain('not-part-of-the-closet');
+  });
+
+  it('deduplicates closet items without stripping unrelated blank lines', () => {
+    const marker = '⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖ conserved: ';
+    const text = `intro\n\n${marker}/repo/existing.ts · /repo/new.ts\n\nending`;
+
+    expect(dedupeCoordinateClosetText(text, '/repo/existing.ts')).toBe(
+      `intro\n\n${marker}/repo/new.ts\n\nending`,
+    );
+  });
+
   it('appends a folded tail epoch when the fallback modeled runway satisfies the 10k default floor', () => {
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
@@ -260,6 +292,43 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.appendSavedChars).toBeGreaterThan(0);
     expect(appended.sealedBoundary).toBe(epoch.messages.length);
     expect(session.telemetry.epochs).toBe(2);
+  });
+
+  it('does not repeat frozen-prefix coordinates in a later appended closet', () => {
+    const residentId = '00000000-0000-4000-8000-000000000321';
+    const newId = '00000000-0000-4000-8000-000000000654';
+    const session = new FoldSession({
+      foldConfig: { ...TEST_FOLD_CONFIG, verbatimKeepChars: 4_000 },
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 125_000,
+      now: () => 1_000,
+    });
+    const first: FoldMessage[] = [
+      { role: 'user', content: 'establish the first coordinate band' },
+      { role: 'assistant', content: `${'baseline detail '.repeat(80)}\nresident coordinate ${residentId}` },
+      { role: 'user', content: 'finish the first band' },
+      { role: 'assistant', content: 'baseline complete' },
+    ];
+    const baseline = session.prepare(first);
+    expect(vaultText(baseline.messages)).toContain(residentId);
+
+    const history = [...first];
+    for (let index = 0; index < 3; index += 1) {
+      history.push(
+        { role: 'user', content: `append coordinate pass ${index}` },
+        {
+          role: 'assistant',
+          content: `${'compressible appended detail '.repeat(300)}\nresident ${residentId}\nnew ${newId}`,
+        },
+      );
+    }
+    const appended = session.prepare(history);
+    expect(appended.stats.appendDecision).toBe('committed');
+    const fullText = vaultText(appended.messages);
+    const appendedBandText = vaultText(appended.messages.slice(baseline.messages.length));
+    expect(fullText.split(residentId)).toHaveLength(2);
+    expect(appendedBandText).not.toContain(residentId);
+    expect(appendedBandText).toContain(newId);
   });
 
   it('adds cognitive artifacts to committed tail append views', () => {

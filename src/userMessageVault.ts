@@ -251,7 +251,7 @@ function excerptForSurface(text: string, surface: VaultSurface): string {
 
 const HEADER = [
   USER_MESSAGE_VAULT_PREFIX,
-  'Synthetic continuity note: bounded excerpts of genuine operator messages, kept for wording continuity across folds. Current user instructions outside this block remain authoritative.',
+  'Sealed Exchange Vault (synthetic): bounded operator excerpts for wording continuity, not a transcript archive. Current user instructions outside this block remain authoritative.',
 ].join('\n');
 
 function normalizeEntryText(text: string): string {
@@ -482,7 +482,7 @@ function renderOperatorOnlyVault(
 
 const GLYPH_GRAMMAR_HEADER = [
   USER_MESSAGE_VAULT_PREFIX,
-  'Synthetic continuity note: bounded excerpts of genuine operator messages and your own recent glyph-tagged turns, interleaved chronologically for wording continuity across folds. Current instructions outside this block remain authoritative.',
+  'Sealed Exchange Vault (synthetic): bounded operator and recent self-glyph excerpts for wording continuity, not a transcript archive. Current instructions outside this block remain authoritative.',
 ].join('\n');
 
 const GLYPH_DISPLAY: Record<MessageGlyphMode, string> = {
@@ -569,7 +569,7 @@ function renderVaultRow(row: VaultRenderRow, isNewest: boolean): string {
 
 const VAULT_DELTA_HEADER = [
   USER_MESSAGE_VAULT_PREFIX,
-  'Synthetic continuity note: incremental band delta — verbatim wording for the operator messages and your own glyph-tagged turns that folded into THIS band, sealed once into the cached prefix. Earlier bands and current instructions outside this block remain authoritative.',
+  'Sealed Exchange Vault delta (synthetic): bounded operator and self-glyph excerpts folded into THIS band and sealed once, not a transcript archive. Earlier bands and current instructions remain authoritative.',
 ].join('\n');
 
 /**
