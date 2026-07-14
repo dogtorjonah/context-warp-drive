@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   activeEpisodicPathCards,
+  buildBranchTrace,
   collectResidentEpisodicHeaders,
   createEpisodicInjectionState,
   EPISODIC_BOOKKEEPING_TOOLS,
@@ -17,6 +18,7 @@ import {
   type Episode,
   type EpisodeAnnotation,
   type EpisodicRecallCardLike,
+  type TraceStep,
 } from '../src/foldEpisodes.ts';
 import { deriveEpisodesFromMessages, type EpisodeCaptureIdentity } from '../src/foldEpisodeCapture.ts';
 import type { FoldMessage } from '../src/rollingFold.ts';
@@ -134,7 +136,7 @@ describe('walk breadcrumb rendering', () => {
     expect(lines[1]).toBe(
       '  ↞ origin [T-9d] origin decision that explains the invariant | reopen: inst-1 events 1..9',
     );
-    expect(lines[2]).toBe('  members: src/a.ts*, src/b.ts');
+    expect(lines[2]).toBe('  members: src/a.ts*×3, src/b.ts');
   });
 
   it('keeps the origin reopen pointer when the origin summary truncates', () => {
@@ -249,6 +251,95 @@ describe('formatChainCard lineage filtering', () => {
   });
 });
 
+describe('episodic card richness', () => {
+  it('keeps decisive middle evidence while bounding the trace', () => {
+    const steps: TraceStep[] = Array.from({ length: 18 }, (_, index) => ({
+      tool: 'Read',
+      target: `long-investigation-file-${String(index).padStart(2, '0')}.ts`,
+      ...(index === 9
+        ? { result: 'foldRecall.ts:417 root cause: resident headers matched unrelated card bodies' }
+        : {}),
+    }));
+    const trace = buildBranchTrace(steps, 240);
+
+    expect(trace.length).toBeLessThanOrEqual(240);
+    expect(trace).toContain('long-investigation-file-00.ts');
+    expect(trace).toContain('long-investigation-file-17.ts');
+    expect(trace).toContain('root cause: resident headers matched unrelated card bodies');
+  });
+
+  it('counts omitted actions rather than collapsed trace tokens', () => {
+    const trace = buildBranchTrace([
+      { tool: 'Read', target: 'first.ts' },
+      ...Array.from({ length: 10 }, () => ({ tool: 'Read', target: 'noise.ts' })),
+      { tool: 'Read', target: 'middle.ts', result: 'root cause: decisive finding' },
+      { tool: 'Edit', target: 'last.ts' },
+    ], 120);
+
+    expect(trace.length).toBeLessThanOrEqual(120);
+    expect(trace).toContain('⟨10 steps⟩');
+    expect(trace).toContain('first.ts');
+    expect(trace).toContain('root cause: decisive finding');
+    expect(trace).toContain('last.ts');
+  });
+
+  it('honors zero and tiny trace caps', () => {
+    const step = [{ tool: 'Read', target: 'long-file-name.ts', result: 'root cause: decisive finding' }];
+    expect(buildBranchTrace(step, 0)).toBe('');
+    expect(buildBranchTrace(step, 6).length).toBeLessThanOrEqual(6);
+  });
+
+  it('renders a bounded hot-first member list with touch counts', () => {
+    const episode = makeEpisode({
+      endedAt: '2026-06-11T13:00:00.000Z',
+      members: [
+        { path: 'src/cold-a.ts', touchKind: 'read', touchCount: 1, firstSeen: 1, lastSeen: 1 },
+        { path: 'src/hot.ts', touchKind: 'edit', touchCount: 9, firstSeen: 2, lastSeen: 20 },
+        { path: 'src/warm.ts', touchKind: 'read', touchCount: 4, firstSeen: 3, lastSeen: 18 },
+        { path: 'src/cold-b.ts', touchKind: 'read', touchCount: 1, firstSeen: 4, lastSeen: 4 },
+        { path: 'src/cold-c.ts', touchKind: 'read', touchCount: 1, firstSeen: 5, lastSeen: 5 },
+        { path: 'src/cold-d.ts', touchKind: 'read', touchCount: 1, firstSeen: 6, lastSeen: 6 },
+      ],
+    });
+    const members = formatChainCard([episode], 'src/hot.ts', []).split('\n')[1];
+
+    expect(members).toBe(
+      '  members: src/hot.ts*×9, src/warm.ts×4, src/cold-a.ts, src/cold-b.ts, src/cold-c.ts (+1)',
+    );
+  });
+
+  it('hard-bounds rich chain and walk cards while retaining evidence and the pointer', () => {
+    const longPath = (letter: string): string => `src/${letter.repeat(260)}.ts`;
+    const episode = makeEpisode({
+      endedAt: '2026-06-11T13:00:00.000Z',
+      summary: 's'.repeat(120),
+      intent: 'i'.repeat(200),
+      members: ['a', 'b', 'c', 'd', 'e'].map((letter, index) => ({
+        path: longPath(letter),
+        touchKind: index === 0 ? 'edit' as const : 'read' as const,
+        touchCount: 9 - index,
+        firstSeen: index,
+        lastSeen: 10 - index,
+      })),
+      trace: `Read(a.ts) ⇢ "${'e'.repeat(96)}"`,
+      annotations: [
+        annotation('2026-06-11T12:30:00.000Z', 'star:gotcha', 'g'.repeat(200)),
+        annotation('2026-06-11T12:31:00.000Z', 'star:decision', 'd'.repeat(200)),
+      ],
+    });
+
+    const chain = formatChainCard([episode], longPath('a'), []);
+    expect(chain.length).toBeLessThanOrEqual(1_600);
+    expect(chain).toContain('⇢');
+    expect(chain.split('\n').at(-1)).toMatch(/^  ⌖ verbatim:/);
+
+    const walk = formatWalkPromotionCard(episode, { index: 1, total: 1 }, [], { charBudget: 500 });
+    expect(walk.length).toBeLessThanOrEqual(500);
+    expect(walk).toContain('⇢');
+    expect(walk.split('\n').at(-1)).toMatch(/^  ⌖ verbatim:/);
+  });
+});
+
 describe('operator intent (Episode.intent)', () => {
   const identity: EpisodeCaptureIdentity = {
     workspace: 'context-warp-drive',
@@ -261,8 +352,8 @@ describe('operator intent (Episode.intent)', () => {
     ({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'Edit', input: { file_path: file } }] });
   const readCall = (id: string, file: string): FoldMessage =>
     ({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: file } }] });
-  const toolResult = (id: string): FoldMessage =>
-    ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] });
+  const toolResult = (id: string, content: unknown = 'ok'): FoldMessage =>
+    ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] });
   const hostSyntheticContext = {
     leadingBlocks: [
       { prefix: '[Host Time]', mode: 'line-or-paragraph' },
@@ -429,16 +520,82 @@ Make your fixes`;
     expect(episodes[0].intent).toBe(ask);
   });
 
+  it('captures bounded process voice from substantive investigation bursts', () => {
+    const combined = (id: string, file: string, text: string): FoldMessage => ({
+      role: 'assistant',
+      content: [
+        { type: 'text', text },
+        { type: 'tool_use', id, name: 'Read', input: { file_path: file } },
+      ],
+    });
+    const messages: FoldMessage[] = [
+      combined('p1', 'src/foldEpisodeCapture.ts', '🔍 The audit found the key seam between capture and recall dispatch.'),
+      toolResult('p1'),
+      combined('p2', 'src/foldEpisodes.ts', '▶ I am choosing typed process memory rather than promoting hypotheses to verdicts.'),
+      toolResult('p2'),
+      combined('p3', 'src/foldRecall.ts', '🔍 I am tracing the recall path through the whole boundary.'),
+      toolResult('p3'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    const process = episodes[0].annotations.filter((annotation) => annotation.kind.startsWith('process:'));
+    expect(process.map((annotation) => annotation.kind)).toEqual(['process:discovery', 'process:decision']);
+    expect(process).toHaveLength(2);
+  });
+
+  it('carries one decisive tool result into the rendered episode card', () => {
+    const messages: FoldMessage[] = [
+      readCall('r1', 'src/foldRecall.ts'),
+      toolResult('r1', [
+        { type: 'text', text: 'ordinary scan prelude' },
+        {
+          type: 'text',
+          text: [
+            'src/foldRecall.ts:417 root cause: resident headers matched unrelated card bodies',
+            'ordinary scan trailer',
+          ].join('\n'),
+        },
+      ]),
+      editCall('e1', 'src/foldRecall.ts'),
+      toolResult('e1', 'Done'),
+      readCall('r2', 'src/foldEpisodes.ts'),
+      toolResult('r2'),
+      editCall('e2', 'src/foldRecall.ts'),
+      toolResult('e2', 'updated'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    const card = formatChainCard(episodes, 'src/foldRecall.ts', [], { charBudget: 600 });
+
+    expect(episodes[0].trace.match(/⇢/g)).toHaveLength(1);
+    expect(card).toContain('  members: src/foldRecall.ts*×3, src/foldEpisodes.ts');
+    expect(card).toContain('root cause: resident headers matched unrelated card bodies');
+    expect(card.length).toBeLessThanOrEqual(600);
+  });
+
+  it('rejects synthetic completion reminders as decisive tool evidence', () => {
+    const messages: FoldMessage[] = [
+      readCall('meta1', 'src/foldEpisodes.ts'),
+      toolResult(
+        'meta1',
+        '[Completion reminder: Post a #result about src/foldEpisodes.ts after validation.]',
+      ),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].trace).toBe('Read(foldEpisodes.ts)');
+    expect(episodes[0].trace).not.toContain('⇢');
+  });
+
   it('renders the ask anchor first in the hot chapter when present, byte-identical when absent', () => {
     const base = { endedAt: '2026-06-11T13:00:00.000Z', summary: 'did the work' } as const;
     const withIntent = makeEpisode({ ...base, intent: 'Fix the cold-zone proximity fallback' });
     const withLines = formatChainCard([withIntent], 'src/a.ts', []).split('\n');
     expect(withLines[0]).toBe('[Episode recall src/a.ts — 2026-06-11 13:00, "did the work"]');
     expect(withLines[1]).toBe('  ↳ ask:"Fix the cold-zone proximity fallback"');
-    expect(withLines[2]).toBe('  members: src/a.ts*, src/b.ts');
+    expect(withLines[2]).toBe('  members: src/a.ts*×3, src/b.ts');
 
     const cardWithout = formatChainCard([makeEpisode(base)], 'src/a.ts', []);
-    expect(cardWithout.split('\n')[1]).toBe('  members: src/a.ts*, src/b.ts');
+    expect(cardWithout.split('\n')[1]).toBe('  members: src/a.ts*×3, src/b.ts');
     expect(cardWithout).not.toContain('↳ ask');
   });
 });

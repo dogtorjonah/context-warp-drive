@@ -65,6 +65,15 @@ export type EpisodeAnnotationKind =
    */
   | 'narration:verdict'
   | 'narration:hazard'
+  /**
+   * Bounded, explicitly low-trust process voice. These preserve how an agent
+   * investigated and chose a direction without laundering an in-progress
+   * hypothesis into verdict memory. Capture requires a substantive tool burst;
+   * read-time priority keeps every process kind below deliberate voice.
+   */
+  | 'process:decision'
+  | 'process:discovery'
+  | 'process:investigation'
   | 'narration';
 
 export interface EpisodeAnnotation {
@@ -276,6 +285,8 @@ export interface TraceStep {
   outcome?: 'ok' | 'error';
   /** Short verbatim detail: test count ('49'), error count ('3'), commit head. */
   detail?: string;
+  /** One burst-local tool-result excerpt that explains the decisive turn. */
+  result?: string;
   /** When set, this step renders as a voice inlay instead of a tool token. */
   voice?: EpisodeAnnotation;
 }
@@ -353,6 +364,7 @@ export const SUMMARY_CAP_CHARS = 120;
 export const HEADER_SUMMARY_CAP_CHARS = 60;
 export const VOICE_TEXT_CAP_CHARS = 200;
 export const TRACE_VOICE_TEXT_CAP_CHARS = 60;
+export const TRACE_RESULT_TEXT_CAP_CHARS = 96;
 /**
  * Verbatim cap for the operator-ask intent anchor (Episode.intent). The driving
  * user message can run long; bound it like voice and keep it to a single anchor
@@ -383,11 +395,14 @@ const ANNOTATION_PRIORITY: Record<EpisodeAnnotationKind, number> = {
   // ambient chat — it is an explicit, contemporaneous statement about the work.
   rail: 9,
   chat: 10,
+  'process:decision': 11,
+  'process:discovery': 12,
+  'process:investigation': 13,
   // UNTAGGED tier-B distillate: still always LAST, so it fills voice vacuum but
   // never displaces deliberate voice under the inlay cap. At 0% glyph
   // compliance all narration lands here — ranking stays byte-identical to the
   // pre-promotion engine.
-  narration: 11,
+  narration: 14,
 };
 
 /**
@@ -514,6 +529,72 @@ export const NARRATION_MAX_LINES_TAGGED = 3;
 /** Shape bounds: shorter is filler ("Done."), longer is paragraph prose. */
 export const NARRATION_MIN_LINE_CHARS = 25;
 export const NARRATION_MAX_LINE_CHARS = 300;
+
+/** Minimum structural tool steps before process narration can be harvested. */
+export const PROCESS_MIN_TOOL_STEPS = 2;
+/** Investigation-only prose needs a thicker trail than a shaped decision/discovery. */
+export const PROCESS_INVESTIGATION_MIN_TOOL_STEPS = 3;
+/** Hard write-time cap; card rendering applies its own independent inlay budget. */
+export const PROCESS_MAX_LINES = 2;
+
+const PROCESS_DECISION_RE = /\b(?:chose|choosing|selected|selecting|decided|deciding|went with|going with|will use|will keep|approach (?:is|will be)|rather than|instead of)\b/i;
+const PROCESS_DISCOVERY_RE = /\b(?:found|discovered|identified|isolated|key seam|key gap|root cause|evidence (?:shows|points)|audit (?:found|shows|revealed)|trace (?:shows|revealed)|turns out)\b/i;
+const PROCESS_INVESTIGATION_RE = /\b(?:audit(?:ing)?|trac(?:e|ed|ing)|inspect(?:ed|ing|ion)?|investigat(?:e|ed|ing|ion)|compar(?:e|ed|ing|ison)|map(?:ped|ping)?|review(?:ed|ing)?|check(?:ed|ing)?|narrow(?:ed|ing)?|verify(?:ing)?)\b/i;
+
+export interface ProcessNarrationLine {
+  kind: Extract<EpisodeAnnotationKind, `process:${string}`>;
+  text: string;
+}
+
+/**
+ * Extract bounded process memory from assistant prose inside a substantive tool
+ * burst. Unlike verdict narration, working/executing registers are accepted —
+ * but their lines are labelled as process, never durable truth. Decisions and
+ * discoveries require a shaped signal plus two tool steps; generic investigation
+ * requires three. Questions, synthetic/card voice, code, filler, and blocked or
+ * terminal registers are excluded. Pure and deterministic.
+ */
+export function extractProcessNarrationLines(
+  text: string,
+  messageMode: MessageGlyphMode | undefined,
+  isSyntheticLine: (line: string) => boolean,
+  toolStepCount: number,
+  cap = PROCESS_MAX_LINES,
+): ProcessNarrationLine[] {
+  if (!text || toolStepCount < PROCESS_MIN_TOOL_STEPS || cap <= 0) return [];
+  if (messageMode === 'blocked' || messageMode === 'verdict' || messageMode === 'hazard') return [];
+
+  const out: ProcessNarrationLine[] = [];
+  const seenKinds = new Set<ProcessNarrationLine['kind']>();
+  let inCodeBlock = false;
+  for (const rawLine of text.split('\n')) {
+    if (out.length >= cap) break;
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith('```')) { inCodeBlock = !inCodeBlock; continue; }
+    if (inCodeBlock || trimmed.length === 0) continue;
+    const lineMode = classifyMessageGlyph(trimmed) ?? messageMode;
+    if (lineMode === 'blocked' || lineMode === 'verdict' || lineMode === 'hazard') continue;
+    if (isSyntheticLine(trimmed) || NARRATION_QUOTED_VOICE_RE.test(trimmed)) continue;
+    const stripped = trimmed
+      .replace(/^(?:🔍|▶️?)\s*/u, '')
+      .replace(NARRATION_DECORATION_RE, '');
+    if (stripped.length < NARRATION_MIN_LINE_CHARS || stripped.length > NARRATION_MAX_LINE_CHARS) continue;
+    if (stripped.endsWith('?')) continue;
+
+    let kind: ProcessNarrationLine['kind'] | null = null;
+    if (PROCESS_DECISION_RE.test(stripped)) kind = 'process:decision';
+    else if (PROCESS_DISCOVERY_RE.test(stripped)) kind = 'process:discovery';
+    else if (
+      toolStepCount >= PROCESS_INVESTIGATION_MIN_TOOL_STEPS
+      && lineMode === 'working'
+      && PROCESS_INVESTIGATION_RE.test(stripped)
+    ) kind = 'process:investigation';
+    if (!kind || seenKinds.has(kind)) continue;
+    seenKinds.add(kind);
+    out.push({ kind, text: truncateVerbatim(stripped, VOICE_TEXT_CAP_CHARS) });
+  }
+  return out;
+}
 
 // Conclusion-shaped openers for UNTAGGED narration only. A curated whitelist —
 // additive over time, never loosened to position-only: mid-work hypotheses
@@ -943,6 +1024,7 @@ function renderStructuralStep(step: TraceStep): string {
   } else if (step.detail) {
     token += `("${step.detail}")`;
   }
+  if (step.result) token += ` ⇢ "${truncateVerbatim(step.result, TRACE_RESULT_TEXT_CAP_CHARS)}"`;
   return token;
 }
 
@@ -960,7 +1042,28 @@ function structuralKey(step: TraceStep): string {
 }
 
 function fullKey(step: TraceStep): string {
-  return `${structuralKey(step)}\u0000${step.outcome ?? ''}\u0000${step.detail ?? ''}`;
+  return `${structuralKey(step)}\u0000${step.outcome ?? ''}\u0000${step.detail ?? ''}\u0000${step.result ?? ''}`;
+}
+
+function traceTokenPriority(step: TraceStep): number {
+  if (step.result) return 100;
+  if (step.outcome === 'error') return 90;
+  if (step.voice) return 80;
+  if (step.outcome === 'ok') return 45;
+  if (/edit|write|patch|commit/i.test(step.tool)) return 25;
+  return 10;
+}
+
+function truncateEvidenceToken(token: string, capChars: number): string {
+  const cap = Math.max(0, Math.floor(capChars));
+  if (cap === 0) return '';
+  if (token.length <= cap) return token;
+  const marker = token.indexOf(' ⇢ ');
+  if (marker < 0) return truncateVerbatim(token, cap);
+  const evidence = token.slice(marker);
+  if (evidence.length >= cap) return truncateVerbatim(evidence, cap);
+  const prefixRoom = cap - evidence.length;
+  return `${truncateVerbatim(token.slice(0, marker), prefixRoom)}${evidence}`;
 }
 
 /**
@@ -969,19 +1072,22 @@ function fullKey(step: TraceStep): string {
  * tokens joined by ` → `, with run-length collapse (identical consecutive
  * steps → `×N`) and edit⇄check loop collapse (alternating A·B pairs →
  * `[A ⇄ B ×N → final]`). Voice steps render inline at their chronological
- * position, verbatim. Over-cap traces elide from the MIDDLE — the opening
- * move and the final outcome are the load-bearing ends.
+ * position, verbatim. Over-cap traces preserve the opening and closing action,
+ * pin one decisive result/voice/error token, then fill remaining room by
+ * information priority while retaining exact omitted-step counts.
  */
 export function buildBranchTrace(steps: readonly TraceStep[], capChars = BRANCH_TRACE_CAP_CHARS): string {
   if (steps.length === 0) return '';
+  const cap = Number.isFinite(capChars) ? Math.max(0, Math.floor(capChars)) : BRANCH_TRACE_CAP_CHARS;
+  if (cap === 0) return '';
 
-  interface Token { text: string; voice: boolean }
+  interface Token { text: string; voice: boolean; priority: number; stepCount: number }
   const tokens: Token[] = [];
   let i = 0;
   while (i < steps.length) {
     const step = steps[i];
     if (step.voice) {
-      tokens.push({ text: renderVoiceInline(step.voice), voice: true });
+      tokens.push({ text: renderVoiceInline(step.voice), voice: true, priority: traceTokenPriority(step), stepCount: 1 });
       i += 1;
       continue;
     }
@@ -991,12 +1097,15 @@ export function buildBranchTrace(steps: readonly TraceStep[], capChars = BRANCH_
     if (i + 3 < steps.length) {
       const a = steps[i];
       const b = steps[i + 1];
-      if (!b.voice && structuralKey(steps[i + 2]) === structuralKey(a) && !steps[i + 2].voice
-        && i + 3 < steps.length && structuralKey(steps[i + 3]) === structuralKey(b) && !steps[i + 3].voice) {
+      if (!a.result && !b.voice && !b.result
+        && structuralKey(steps[i + 2]) === structuralKey(a) && !steps[i + 2].voice && !steps[i + 2].result
+        && i + 3 < steps.length && structuralKey(steps[i + 3]) === structuralKey(b)
+        && !steps[i + 3].voice && !steps[i + 3].result) {
         let pairs = 2;
         let end = i + 4;
         while (end + 1 < steps.length
           && !steps[end].voice && !steps[end + 1].voice
+          && !steps[end].result && !steps[end + 1].result
           && structuralKey(steps[end]) === structuralKey(a)
           && structuralKey(steps[end + 1]) === structuralKey(b)) {
           pairs += 1;
@@ -1006,7 +1115,12 @@ export function buildBranchTrace(steps: readonly TraceStep[], capChars = BRANCH_
         const finalMark = lastB.outcome ? `${lastB.outcome === 'ok' ? '✓' : '✗'}${lastB.detail ?? ''}` : '·';
         const aToken = a.target ? `${a.tool}(${a.target})` : a.tool;
         const bToken = b.target ? `${b.tool}(${b.target})` : b.tool;
-        tokens.push({ text: `[${aToken} ⇄ ${bToken} ×${pairs} → ${finalMark}]`, voice: false });
+        tokens.push({
+          text: `[${aToken} ⇄ ${bToken} ×${pairs} → ${finalMark}]`,
+          voice: false,
+          priority: lastB.outcome === 'error' ? 90 : lastB.outcome === 'ok' ? 45 : 20,
+          stepCount: pairs * 2,
+        });
         i = end;
         continue;
       }
@@ -1016,33 +1130,110 @@ export function buildBranchTrace(steps: readonly TraceStep[], capChars = BRANCH_
     let run = 1;
     while (i + run < steps.length && !steps[i + run].voice && fullKey(steps[i + run]) === fullKey(step)) run += 1;
     const rendered = renderStructuralStep(step);
-    tokens.push({ text: run > 1 ? `${rendered} ×${run}` : rendered, voice: false });
+    tokens.push({
+      text: run > 1 ? `${rendered} ×${run}` : rendered,
+      voice: false,
+      priority: traceTokenPriority(step),
+      stepCount: run,
+    });
     i += run;
   }
 
   const join = (parts: readonly Token[]): string => parts.map((t) => t.text).join(' → ');
-  if (join(tokens).length <= capChars) return join(tokens);
+  if (join(tokens).length <= cap) return join(tokens);
 
-  // Middle elision: drop tokens nearest the center until under cap, then mark.
-  const working = [...tokens];
-  let dropped = 0;
-  while (working.length > 2) {
-    const mid = Math.floor(working.length / 2);
-    working.splice(mid, 1);
-    dropped += 1;
-    const marker = ` → … ⟨${dropped} steps⟩ … → `;
-    const head = working.slice(0, Math.ceil(working.length / 2));
-    const tail = working.slice(Math.ceil(working.length / 2));
-    const candidate = `${join(head)}${marker}${join(tail)}`;
-    if (candidate.length <= capChars) return candidate;
+  // Evidence-aware elision: always keep the opening and closing action plus
+  // the strongest interior result/voice/error token. Fill remaining room with
+  // the most informative nearby actions. Omitted runs retain exact counts.
+  const renderSelection = (selected: ReadonlySet<number>): string => {
+    const indexes = [...selected].sort((a, b) => a - b);
+    const parts: string[] = [];
+    let previous = -1;
+    for (const index of indexes) {
+      const omitted = tokens
+        .slice(previous + 1, index)
+        .reduce((total, token) => total + token.stepCount, 0);
+      if (omitted > 0) parts.push(`… ⟨${omitted} steps⟩ …`);
+      parts.push(tokens[index].text);
+      previous = index;
+    }
+    const trailing = tokens
+      .slice(previous + 1)
+      .reduce((total, token) => total + token.stepCount, 0);
+    if (trailing > 0) parts.push(`… ⟨${trailing} steps⟩ …`);
+    return parts.join(' → ');
+  };
+
+  const selected = new Set<number>([0, tokens.length - 1]);
+  let anchor = -1;
+  for (let index = 1; index < tokens.length - 1; index++) {
+    if (anchor < 0 || tokens[index].priority > tokens[anchor].priority) anchor = index;
   }
-  return truncateVerbatim(join(working), capChars);
+  if (anchor >= 0 && tokens[anchor].priority >= 80) selected.add(anchor);
+
+  let compact = renderSelection(selected);
+  if (compact.length > cap) {
+    const essentialIndexes = [...new Set([
+      0,
+      ...(anchor >= 0 && tokens[anchor].priority >= 80 ? [anchor] : []),
+      tokens.length - 1,
+    ])].sort((a, b) => a - b);
+    const separator = ' → ';
+    const separatorChars = separator.length * (essentialIndexes.length - 1);
+    const strongestIndex = anchor >= 0 && tokens[anchor].priority >= 80 ? anchor : 0;
+    if (cap < separatorChars + essentialIndexes.length) {
+      return truncateEvidenceToken(tokens[strongestIndex].text, cap);
+    }
+
+    const allocations = essentialIndexes.map(() => 1);
+    let remaining = cap - separatorChars - allocations.length;
+    const growthOrder = essentialIndexes
+      .map((tokenIndex, position) => ({ tokenIndex, position }))
+      .sort((a, b) => tokens[b.tokenIndex].priority - tokens[a.tokenIndex].priority || a.position - b.position)
+      .flatMap((entry) => entry.tokenIndex === strongestIndex ? [entry.position, entry.position] : [entry.position]);
+    while (remaining > 0) {
+      let grew = false;
+      for (const position of growthOrder) {
+        if (remaining === 0) break;
+        const token = tokens[essentialIndexes[position]];
+        if (allocations[position] >= token.text.length) continue;
+        allocations[position] += 1;
+        remaining -= 1;
+        grew = true;
+      }
+      if (!grew) break;
+    }
+    return essentialIndexes.map((tokenIndex, position) => {
+      const token = tokens[tokenIndex];
+      return token.text.includes(' ⇢ ')
+        ? truncateEvidenceToken(token.text, allocations[position])
+        : truncateVerbatim(token.text, allocations[position]);
+    }).join(separator);
+  }
+
+  const anchors = [...selected];
+  const candidates = tokens
+    .map((token, index) => ({ token, index }))
+    .filter(({ index }) => !selected.has(index))
+    .sort((a, b) =>
+      b.token.priority - a.token.priority
+      || Math.min(...anchors.map((value) => Math.abs(a.index - value)))
+        - Math.min(...anchors.map((value) => Math.abs(b.index - value)))
+      || a.index - b.index,
+    );
+  for (const candidate of candidates) {
+    selected.add(candidate.index);
+    const expanded = renderSelection(selected);
+    if (expanded.length <= cap) compact = expanded;
+    else selected.delete(candidate.index);
+  }
+  return compact;
 }
 
 /**
  * One-line episode header. Fallback chain (most-verbatim first):
  * changelog heads → star result/decision notes → rail step/title words →
- * narration verdict lines → top member paths.
+ * narration verdict/process lines → top member paths.
  */
 export function deriveEpisodeSummary(
   input: {
@@ -1065,12 +1256,14 @@ export function deriveEpisodeSummary(
   if (input.railTitle && input.railTitle.trim().length > 0) {
     return truncateVerbatim(input.railTitle.trim(), capChars);
   }
-  const narrationLines = (input.annotations ?? []).filter((a) => a.kind.startsWith('narration'));
-  if (narrationLines.length > 0) {
+  const proseLines = (input.annotations ?? []).filter(
+    (a) => a.kind.startsWith('narration') || a.kind.startsWith('process:'),
+  );
+  if (proseLines.length > 0) {
     // Prefer the DECLARED line (hazard/verdict outrank untagged in
     // ANNOTATION_PRIORITY) so a commentary-only episode's headline is the
     // agent's declared conclusion, not whichever prose line happened first.
-    const best = [...narrationLines].sort(
+    const best = [...proseLines].sort(
       (a, b) => ANNOTATION_PRIORITY[a.kind] - ANNOTATION_PRIORITY[b.kind],
     )[0];
     const head = best.text.split('\n')[0].trim();
@@ -1174,6 +1367,10 @@ function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   if (annotation.kind.startsWith('star:')) return `  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}`;
   if (annotation.kind === 'changelog') return `  ✎${who}:"${text}"${at}`;
   if (annotation.kind.startsWith('narration')) return `  🗣${who}:"${text}"${at}`;
+  if (annotation.kind.startsWith('process:')) {
+    const category = annotation.kind.slice('process:'.length);
+    return `  🗣${who} [${category}]:"${text}"${at}`;
+  }
   if (annotation.kind === 'rail') return `  🛤${who}:"${text}"${at}`;
   return `  💬${who}:"${text}"${at}`;
 }
@@ -1202,8 +1399,18 @@ export function renderEpisodeVoiceLines(
 }
 
 function renderMembersLine(episode: Episode): string {
-  const rendered = episode.members.map((m) => (m.touchKind === 'edit' ? `${m.path}*` : m.path));
-  return `  members: ${rendered.join(', ')}`;
+  const ordered = [...episode.members].sort(
+    (a, b) => b.touchCount - a.touchCount
+      || TOUCH_KIND_RANK[b.touchKind] - TOUCH_KIND_RANK[a.touchKind]
+      || a.firstSeen - b.firstSeen
+      || comparePaths(a.path, b.path),
+  );
+  const visible = ordered.slice(0, 5).map((member) => {
+    const path = member.touchKind === 'edit' ? `${member.path}*` : member.path;
+    return member.touchCount > 1 ? `${path}×${member.touchCount}` : path;
+  });
+  const extra = ordered.length > visible.length ? ` (+${ordered.length - visible.length})` : '';
+  return `  members: ${visible.join(', ')}${extra}`;
 }
 
 /** Pointer into the full verbatim record — exactness is reachable, not resident. */
@@ -1246,6 +1453,73 @@ function fullPreviousChapterLines(episode: Episode, maxVoiceInlays: number, opts
   if (isForeignChapter(episode, opts)) lines.push(`  ↞ from ${voiceLabel} (peer lineage)`);
   lines.push(...renderChapterBody(episode, [], maxVoiceInlays, voiceLabel));
   return lines;
+}
+
+function cardLinePriority(line: string): number {
+  if (line.startsWith('  trace: ') && line.includes(' ⇢ ')) return 100;
+  if (line.startsWith('  ⭐gotcha:') || line.startsWith('  ⚠')) return 95;
+  if (line.startsWith('  ↞ origin ')) return 90;
+  if (line.startsWith('  ↳ ask:')) return 85;
+  if (line.startsWith('  members:')) return 80;
+  if (line.startsWith('  trace: ')) return 75;
+  if (/^  (?:⭐|✎|🗣|🛤|💬)/u.test(line)) return 70;
+  if (line.startsWith('  ↞ from ')) return 60;
+  return 40;
+}
+
+function truncateCardLine(line: string, capChars: number): string {
+  const cap = Math.max(0, Math.floor(capChars));
+  if (cap === 0) return '';
+  if (line.length <= cap) return line;
+  const tracePrefix = '  trace: ';
+  if (line.startsWith(tracePrefix) && cap > tracePrefix.length) {
+    return `${tracePrefix}${truncateEvidenceToken(line.slice(tracePrefix.length), cap - tracePrefix.length)}`;
+  }
+  return truncateVerbatim(line, cap);
+}
+
+/**
+ * Final hard-cap allocator shared by hot-chain and walk cards. Normal cards are
+ * byte-identical because callers invoke this only after their richer degradation
+ * ladders are exhausted. Under extreme pressure the header and exact pointer are
+ * retained first, then body lines compete by semantic value; decisive trace
+ * evidence outranks voice, intent, members, and structural-only trace detail.
+ */
+function fitCardToBudget(header: string, body: readonly string[], pointer: string, budgetChars: number): string {
+  const budget = Number.isFinite(budgetChars) ? Math.max(0, Math.floor(budgetChars)) : CHAIN_CARD_DEFAULT_BUDGET_CHARS;
+  if (budget === 0) return '';
+  if (pointer.length >= budget) return truncateCardLine(pointer, budget);
+
+  const headerRoom = budget - pointer.length - 1;
+  const fittedHeader = truncateCardLine(header, headerRoom);
+  const base = `${fittedHeader}\n${pointer}`;
+  let remaining = budget - base.length;
+  if (remaining <= 1 || body.length === 0) return base;
+
+  const selected = new Map<number, string>();
+  const candidates = body
+    .map((line, index) => ({ line, index, priority: cardLinePriority(line) }))
+    .sort((a, b) => b.priority - a.priority || a.index - b.index);
+  for (const candidate of candidates) {
+    if (remaining <= 1) break;
+    const fullCost = candidate.line.length + 1;
+    if (fullCost <= remaining) {
+      selected.set(candidate.index, candidate.line);
+      remaining -= fullCost;
+      continue;
+    }
+    const lineRoom = remaining - 1;
+    if (lineRoom < 8) continue;
+    const fitted = truncateCardLine(candidate.line, lineRoom);
+    if (fitted.length === 0) continue;
+    selected.set(candidate.index, fitted);
+    remaining -= fitted.length + 1;
+  }
+
+  const fittedBody = [...selected.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, line]) => line);
+  return [fittedHeader, ...fittedBody, pointer].join('\n');
 }
 
 /**
@@ -1343,14 +1617,7 @@ export function formatChainCard(
   }
   if (rendered.length <= budget) return rendered;
   if (state.bookends.length > 0) { state.bookends = []; rendered = assemble(state); if (rendered.length <= budget) return rendered; }
-  const traceIdx = state.body.findIndex((line) => line.startsWith('  trace: '));
-  if (traceIdx >= 0) {
-    const overhead = rendered.length - state.body[traceIdx].length;
-    const room = Math.max('  trace: '.length + 8, budget - overhead);
-    state.body[traceIdx] = truncateVerbatim(state.body[traceIdx], room);
-    rendered = assemble(state);
-  }
-  return rendered;
+  return fitCardToBudget(header, state.body, pointer, budget);
 }
 
 /**
@@ -1395,14 +1662,7 @@ export function formatWalkPromotionCard(
     rendered = assemble(state);
   }
   if (rendered.length <= budget) return rendered;
-  const traceIdx = state.findIndex((line) => line.startsWith('  trace: '));
-  if (traceIdx >= 0) {
-    const overhead = rendered.length - state[traceIdx].length;
-    const room = Math.max('  trace: '.length + 8, budget - overhead);
-    state[traceIdx] = truncateVerbatim(state[traceIdx], room);
-    rendered = assemble(state);
-  }
-  return rendered;
+  return fitCardToBudget(header, state, pointer, budget);
 }
 
 /**

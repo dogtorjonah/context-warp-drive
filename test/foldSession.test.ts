@@ -164,7 +164,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
     expect(hardEpoch.stats.epochReason).toBe('hard-epoch');
     expect(hardEpoch.messages).toHaveLength(1);
     const body = vaultJoin(hardEpoch.messages);
-    expect(body).toContain('[CONTEXT REBIRTH] You are the continuation of "predecessor".');
+    expect(body).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     expect(body).toContain(noteToken(5));
     expect(body).not.toContain(FOLD_TOMBSTONE_PREFIX);
     expect(session.telemetry.evictedTurnCount).toBe(0);
@@ -195,7 +195,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
     // The configured raw seed clamp applies before buildHardEpochSeedView appends
     // the live non-string user payload, so allow a small wrapper margin.
     expect(preparedText.length).toBeLessThan(12_000);
-    expect(preparedText).toContain('[CONTEXT REBIRTH] You are the continuation of "predecessor".');
+    expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     expect(preparedText).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
     // Stable closet properties, not a brittle exact deep-history literal:
     // nomination is newest-first, so the NEWEST touched path must always fit
@@ -208,7 +208,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
       .filter((line) => line.startsWith('- /home/jonah/context-warp-drive/src/file_'));
     expect(closetPathLines.length).toBeGreaterThan(0);
     for (const line of closetPathLines) {
-      expect(line).toMatch(/^- \/home\/jonah\/context-warp-drive\/src\/file_\d+\.ts$/);
+      expect(line).toMatch(/^- \/home\/jonah\/context-warp-drive\/src\/file_\d+\.ts/);
     }
     expect(preparedText).toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
   });
@@ -322,10 +322,9 @@ describe('FoldSession tail-epoch runway gate', () => {
 
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(liveObjectiveIndex).toBeGreaterThanOrEqual(0);
-    expect(joined).toContain('[Tail Epoch Seam — epoch #2 committed 1970-01-01T00:00:01.000Z]');
-    expect(joined).toContain('The band-0 hard-epoch seed above remains your intact continuity foundation.');
-    expect(joined).toContain(`live objective: "${liveObjective}"`);
-    expect(joined).not.toContain('your live working set with the current user request follows below');
+    expect(joined).toContain('[Chronological Provenance v1]');
+    expect(joined).toContain('artifact=tail-epoch#2');
+    expect(joined).toContain('live-objective="FIX THE CONTINUITY THRASHING NOW"');
     expect(appended.messages.slice(liveObjectiveIndex)).toEqual(grown.slice(first.length + 2));
   });
 
@@ -433,7 +432,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     const content = hardEpoch.messages[0]?.content;
     expect(typeof content).toBe('string');
     const body = content as string;
-    expect(body).toContain('[CONTEXT REBIRTH] You are the continuation of "predecessor".');
+    expect(body).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     expect(body).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
     expect(body.split(HARD_EPOCH_CONTINUITY_DIRECTIVE)).toHaveLength(2);
     expect(body).toContain('RAW_PRIOR_TRACE_MARKER');

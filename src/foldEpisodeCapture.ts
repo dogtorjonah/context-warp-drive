@@ -34,6 +34,7 @@ import {
   classifyMessageGlyph,
   DEFAULT_EPISODE_GROUPING,
   deriveEpisodeSummary,
+  extractProcessNarrationLines,
   extractNarrationLines,
   extractRationaleLines,
   groupTouchesIntoEpisodes,
@@ -42,6 +43,7 @@ import {
   truncateVerbatim,
   NARRATION_MAX_LINES,
   NARRATION_MAX_LINES_TAGGED,
+  PROCESS_MAX_LINES,
   VOICE_TEXT_CAP_CHARS,
   INTENT_TEXT_CAP_CHARS,
   type Episode,
@@ -60,7 +62,8 @@ const CHECK_TOOL_RE = /test|typecheck|tsc|vitest|build|lint/i;
 const CHAT_VOICE_TAGS = ['#decision', '#blocker', '#discovery'];
 const STAR_CATEGORIES = new Set(['decision', 'discovery', 'pivot', 'handoff', 'gotcha', 'result']);
 const RESULT_SCAN_AHEAD_MESSAGES = 6;
-const RESULT_HEAD_SCAN_CHARS = 400;
+const RESULT_HEAD_SCAN_CHARS = 1_600;
+const RESULT_DETAIL_CAP_CHARS = 120;
 const COMMIT_DETAIL_CAP_CHARS = 40;
 /**
  * Narration mining scans at most this many non-empty assistant texts per
@@ -198,10 +201,14 @@ function* iterToolCalls(messages: readonly FoldMessage[], startIndex: number): G
 function resultTextHead(content: unknown): string {
   if (typeof content === 'string') return content.slice(0, RESULT_HEAD_SCAN_CHARS);
   if (Array.isArray(content)) {
+    let text = '';
     for (const rawPart of content) {
       const part = asRecord(rawPart);
-      if (part && typeof part.text === 'string') return part.text.slice(0, RESULT_HEAD_SCAN_CHARS);
+      if (!part || typeof part.text !== 'string') continue;
+      text += `${text.length > 0 ? '\n' : ''}${part.text}`;
+      if (text.length >= RESULT_HEAD_SCAN_CHARS) break;
     }
+    return text.slice(0, RESULT_HEAD_SCAN_CHARS);
   }
   return '';
 }
@@ -210,31 +217,83 @@ function headLooksLikeError(head: string): boolean {
   return /^\s*(error|✗|failed|exception|traceback)/i.test(head);
 }
 
-/** Resolve a tool call's outcome from nearby result messages (both shapes). */
-function resolveOutcome(
+interface ResultEvidence {
+  text: string;
+  score: number;
+}
+
+interface ResolvedToolResult {
+  outcome?: 'ok' | 'error';
+  evidence?: ResultEvidence;
+}
+
+const RESULT_SIGNAL_RE = /\b(?:root cause|because|found|mismatch|expected|actual|failed|failure|error|exception|passed|verified|confirmed|discovery|regression|tests?[_ -](?:passed|failed)|type[_ -]errors?[_ -]found|error_count)\b/i;
+const RESULT_PATH_RE = /(?:^|\s)[^\s:]+\.(?:[cm]?[jt]sx?|json|md|py|rs|go|java|kt|swift|sql|sh)(?::\d+)?(?=[:\s]|$)/i;
+const RESULT_NOISE_RE = /^(?:\[(?:Codex|Forge) tool-result spool\]|\[Step compaction\]|Full raw output scheduled|path: |sha256: |chars: |bytes: |Script completed|Wall time|Process exited|Command exited|Output:)/i;
+const RESULT_META_RE = /^(?:\[(?:Completion reminder|Protocol Pack:|Task rail\b|Episodic recall\b|fold counters\b)|Acceptance criteria:|When (?:complete|finished),|Sprint ACK:)/i;
+const RESULT_GENERIC_RE = /^(?:ok|done|success|successful|committed|sent|pinned|claimed|released|updated|complete|completed|true|false|\[\])?[.!]?$/i;
+
+/**
+ * Pick one verbatim result line that can explain the next decision. The score
+ * favors explicit findings/errors, path-addressed evidence, and validation
+ * summaries while rejecting transport wrappers and acknowledgement-only noise.
+ */
+function selectResultEvidence(head: string, toolName: string, isError: boolean): ResultEvidence | undefined {
+  const lowerTool = toolName.toLowerCase();
+  const coordination = /claim|release|chatroom|tap_star|task_rail|atlas_commit/.test(lowerTool);
+  const investigative = /read|open|search|find|grep|rg|query|lookup|inspect|test|typecheck|tsc|vitest|build|lint/.test(lowerTool);
+  let best: ResultEvidence | undefined;
+  for (const rawLine of head.split(/\r?\n/)) {
+    const line = rawLine.replace(/\s+/g, ' ').trim();
+    if (line.length < 4 || RESULT_NOISE_RE.test(line) || RESULT_META_RE.test(line) || RESULT_GENERIC_RE.test(line)) continue;
+    let score = isError ? 80 : 0;
+    if (RESULT_SIGNAL_RE.test(line)) score += 35;
+    if (RESULT_PATH_RE.test(line)) score += 20;
+    if (investigative) score += 12;
+    if (coordination) score -= 25;
+    if (line.length >= 24) score += 5;
+    // An investigative tool name alone does not make an arbitrary source line
+    // decisive. Require a real finding/path/validation signal (or an error).
+    if (score < 25) continue;
+    const evidence = { text: truncateVerbatim(line, RESULT_DETAIL_CAP_CHARS), score };
+    if (!best || evidence.score > best.score) best = evidence;
+  }
+  return best;
+}
+
+function resolvedToolResult(content: unknown, toolName: string, explicitError = false): ResolvedToolResult {
+  const head = resultTextHead(content);
+  const isError = explicitError || headLooksLikeError(head);
+  const outcome = isError ? 'error' as const : CHECK_TOOL_RE.test(toolName) ? 'ok' as const : undefined;
+  const evidence = selectResultEvidence(head, toolName, isError);
+  return {
+    ...(outcome ? { outcome } : {}),
+    ...(evidence ? { evidence } : {}),
+  };
+}
+
+/** Resolve a tool call's outcome and one evidence candidate from nearby results. */
+function resolveToolResult(
   messages: readonly FoldMessage[],
   fromIndex: number,
   toolUseId: string | null,
   toolName: string,
-): 'ok' | 'error' | undefined {
-  if (!toolUseId) return undefined;
+): ResolvedToolResult {
+  if (!toolUseId) return {};
   const end = Math.min(messages.length, fromIndex + 1 + RESULT_SCAN_AHEAD_MESSAGES);
   for (let i = fromIndex + 1; i < end; i++) {
     const message = messages[i];
     if (message.role === 'tool' && message.tool_call_id === toolUseId) {
-      const isError = headLooksLikeError(resultTextHead(message.content));
-      if (isError) return 'error';
-      return CHECK_TOOL_RE.test(toolName) ? 'ok' : undefined;
+      return resolvedToolResult(message.content, toolName);
     }
     if (!Array.isArray(message.content)) continue;
     for (const rawBlock of message.content) {
       const block = asRecord(rawBlock);
       if (!block || block.type !== 'tool_result' || block.tool_use_id !== toolUseId) continue;
-      if (block.is_error === true || headLooksLikeError(resultTextHead(block.content))) return 'error';
-      return CHECK_TOOL_RE.test(toolName) ? 'ok' : undefined;
+      return resolvedToolResult(block.content, toolName, block.is_error === true);
     }
   }
-  return undefined;
+  return {};
 }
 
 function shortToolName(name: string): string {
@@ -541,6 +600,53 @@ function mineNarrationForGap(
   return [];
 }
 
+/**
+ * Preserve the process that led through a sealed tool burst without promoting
+ * it to a verdict. The shared extractor enforces shaped decision/discovery
+ * signals, a structural-tool floor, synthetic rejection, and a hard line cap;
+ * this layer only supplies the burst-local event/timestamp coordinates.
+ */
+function mineProcessNarrationForBurst(
+  messages: readonly FoldMessage[],
+  burstStart: number,
+  burstEnd: number,
+  timestamps: readonly (string | undefined)[] | undefined,
+  nowIso: string,
+  syntheticContext: SyntheticContextOptions,
+  toolStepCount: number,
+): { eventIndex: number; annotation: EpisodeAnnotation }[] {
+  const out: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
+  const seen = new Set<string>();
+  const start = Math.max(0, burstStart);
+  const end = Math.min(messages.length - 1, burstEnd);
+  for (let i = start; i <= end && out.length < PROCESS_MAX_LINES; i++) {
+    const text = assistantTextOf(messages[i]);
+    if (text.length === 0 || isSyntheticContextText(text, syntheticContext)) continue;
+    const candidates = extractProcessNarrationLines(
+      text,
+      classifyMessageGlyph(text),
+      (candidate) => isSyntheticContextText(candidate, syntheticContext),
+      toolStepCount,
+      PROCESS_MAX_LINES - out.length,
+    );
+    for (const candidate of candidates) {
+      const key = `${candidate.kind}\0${candidate.text.trim().toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        eventIndex: i,
+        annotation: {
+          ts: timestamps?.[i] ?? nowIso,
+          kind: candidate.kind,
+          text: candidate.text,
+        },
+      });
+      if (out.length >= PROCESS_MAX_LINES) break;
+    }
+  }
+  return out;
+}
+
 function structuralStep(call: ToolCallView, outcome: 'ok' | 'error' | undefined, touched: readonly string[]): TraceStep {
   const shortName = shortToolName(call.name);
   if (shortName.toLowerCase() === 'atlas_commit') {
@@ -614,7 +720,7 @@ export function deriveEpisodesFromMessages(
   const pivots: EpisodePivotMarker[] = [];
   const railSealEventIndexes: number[] = [];
   const annotated: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
-  const steps: { eventIndex: number; step: TraceStep }[] = [];
+  const steps: { eventIndex: number; step: TraceStep; evidence?: ResultEvidence }[] = [];
   const syntheticContext = options.syntheticContext ?? {};
 
   for (const call of iterToolCalls(messages, startIndex)) {
@@ -635,8 +741,12 @@ export function deriveEpisodesFromMessages(
       continue;
     }
 
-    const outcome = resolveOutcome(messages, call.eventIndex, call.id, call.name);
-    steps.push({ eventIndex: call.eventIndex, step: structuralStep(call, outcome, touched) });
+    const resolved = resolveToolResult(messages, call.eventIndex, call.id, call.name);
+    steps.push({
+      eventIndex: call.eventIndex,
+      step: structuralStep(call, resolved.outcome, touched),
+      ...(resolved.evidence ? { evidence: resolved.evidence } : {}),
+    });
   }
 
   // Voice floor: pass voice event indexes to grouping so bursts with zero
@@ -762,7 +872,29 @@ export function deriveEpisodesFromMessages(
       const gapEnd = i + 1 < sealed.length
         ? sealed[i + 1].startEventIndex
         : openBurst ? openBurst.startEventIndex : messages.length;
-      sealedAnnotated.push(...mineNarrationForGap(messages, scanStart, burstFinalTouch, gapEnd, options.timestamps, identity.nowIso, syntheticContext));
+      const narration = mineNarrationForGap(
+        messages,
+        scanStart,
+        burstFinalTouch,
+        gapEnd,
+        options.timestamps,
+        identity.nowIso,
+        syntheticContext,
+      );
+      const toolStepCount = steps.filter(
+        (step) => step.eventIndex >= scanStart && step.eventIndex <= burstFinalTouch,
+      ).length;
+      const narrationText = new Set(narration.map((item) => item.annotation.text.trim().toLowerCase()));
+      const process = mineProcessNarrationForBurst(
+        messages,
+        scanStart,
+        burstFinalTouch,
+        options.timestamps,
+        identity.nowIso,
+        syntheticContext,
+        toolStepCount,
+      ).filter((item) => !narrationText.has(item.annotation.text.trim().toLowerCase()));
+      sealedAnnotated.push(...narration, ...process);
     }
   }
   const annotationsPerBurst = assignAnnotationsToBursts(sealed, sealedAnnotated);
@@ -782,11 +914,27 @@ export function deriveEpisodesFromMessages(
   };
 
   const episodes: Episode[] = sealed.map((burst, index) => {
-    const burstSteps = steps
+    const burstStepEntries = steps
       .filter((s) => s.step.voice
         ? s.eventIndex < voiceHorizon && voiceBurstFor(s.eventIndex) === index
-        : s.eventIndex >= burst.startEventIndex && s.eventIndex <= burst.endEventIndex)
-      .map((s) => s.step);
+        : s.eventIndex >= burst.startEventIndex && s.eventIndex <= burst.endEventIndex);
+    // One result excerpt is enough to explain the decisive turn. Choose the
+    // strongest candidate (latest wins ties), then pin only that excerpt into
+    // the structural trace so enrichment stays inside the existing trace cap.
+    let keyResultIndex = -1;
+    let keyResultScore = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < burstStepEntries.length; i++) {
+      const evidence = burstStepEntries[i].evidence;
+      if (evidence && evidence.score >= keyResultScore) {
+        keyResultIndex = i;
+        keyResultScore = evidence.score;
+      }
+    }
+    const burstSteps = burstStepEntries.map((entry, entryIndex) =>
+      entryIndex === keyResultIndex && entry.evidence
+        ? { ...entry.step, result: entry.evidence.text }
+        : entry.step,
+    );
     const annotations = annotationsPerBurst[index];
     const railObjective = typeof identity.railObjective === 'string' && identity.railObjective.trim().length > 0
       ? truncateVerbatim(identity.railObjective.trim(), INTENT_TEXT_CAP_CHARS)
