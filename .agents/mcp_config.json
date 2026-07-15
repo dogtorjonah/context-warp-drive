@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "voxxo-swarm-bridge": {
+      "command": "/home/jonah/voxxo-swarm/node_modules/.bin/tsx",
+      "args": [
+        "/home/jonah/voxxo-swarm/relay/src/antigravityCliSession/mcpBootstrap.ts"
+      ]
+    }
+  }
+}
