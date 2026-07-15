@@ -1,0 +1,2478 @@
+/**
+ * Fold Recall — ambient page-in for folded context.
+ *
+ * The rolling fold pages content OUT of context (inter-turn turn skeletons,
+ * intra-turn folded tool results); this module pages it back IN when current
+ * activity proves it relevant again. Ambient-Atlas-style discipline applied
+ * to the fold: tiered relevance triggers, TTL'd residency dedupe, a
+ * context-pressure budget ladder, and deterministic rendering.
+ *
+ * ── Shape ──
+ * - The fold INDEX is the page table. It is rebuilt ONLY at fold-freeze epoch
+ *   commits (the only moments the folded view changes): inter-turn entries by
+ *   replaying the deterministic turn detection over raw history and reading
+ *   the folded-view fold blocks' "N turns folded" counts (summed in view order —
+ *   FC append-only tail epochs seal one fold block per band); intra-turn
+ *   entries by scanning the folded view for the fold's own
+ *   "[Folded: tool path — n,nnn chars | self-tap to recover]" markers, keyed
+ *   by provider tool ids (tool_use_id / tool_call_id) as recovery handles.
+ * - TRIGGERS (tool-boundary only): tier 0 = a tool call re-touches a folded
+ *   path; tier 1 = a file claim lands on a folded path. Tier 2 distinctive-term
+ *   overlap is default ON after rail-c63e326e A/B; disable with
+ *   WARP_FOLD_RECALL_TERMS=0|false|off|no.
+ * - INJECTION: the session appends rendered cards/hints to the tool result's
+ *   post-dispatch context (the same channel as tool-boundary mesh digest
+ *   deltas; payloads are body-only strings). Cards land durably in raw
+ *   history, APPEND-ONLY, riding the freeze tail — the frozen prefix stays
+ *   byte-identical, the provider prompt cache stays HOT, and recall never
+ *   forces an epoch.
+ * - PAGE-OUT-AGAIN: cards/hints carry RECALL_CARD_PREFIX / RECALL_HINT_PREFIX,
+ *   which rollingFold treats as synthetic (never a turn boundary); at the
+ *   next epoch the card's turn refolds and the body leaves the view again.
+ *   Fully cyclic: content breathes in and out of context on demand.
+ *
+ * Pure CPU, zero I/O, zero LLM calls, no clock reads. Deterministic by
+ * construction: identical inputs produce byte-identical output, and no
+ * Set/Map iteration order is observable in any rendered string (entries are
+ * explicitly ordered: tier asc, tier-2 relevance desc, recency desc, id asc).
+ *
+ * Kill switch: WARP_FOLD_RECALL=0. Recall only ever runs when fold mode is
+ * 'on' and the fold freeze is active — no fold, no index, no recall.
+ */
+import { ALWAYS_ON_FOLD_CONFIG, classifyTurn, countChars, DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS, detectTurns, extractAssistantText, extractPath, extractToolPathSet, isSyntheticContextText, nominateVerbatim, normalizeToolPath, RECALL_CARD_PREFIX, RECALL_HINT_PREFIX, stripSyntheticUserContextBlocks, } from './rollingFold.ts';
+import { extractDistinctiveTerms, idfFromDocumentFrequency, scoreTermOverlap } from './foldTerms.ts';
+import { foldMessageTimestampBounds, renderChronologicalProvenanceCompact, } from './chronologicalProvenance.ts';
+export const DEFAULT_FOLD_RECALL_CONFIG = {
+    enabled: true,
+    // Band-coupled: recall card budget grows inversely with the fold band (M).
+    // As M shrinks toward low-band, recall must do MORE paging-in work to keep
+    // the agent unblinded, so the default floor is 3, not 2. Full band-token
+    // coupling (maxCards scales with measured bandTokens) is deferred to the
+    // low-band phase; this raises the safe interim floor.
+    // Override: WARP_FOLD_RECALL_MAX_CARDS.
+    maxCards: 3,
+    maxTotalChars: 12_000,
+    maxCardChars: 6_000,
+    // Residency TTL: 4 passes, not 8. With activeWindowTurns=1, content scrolls
+    // out of the visible window after one turn; an 8-pass suppression created a
+    // 7-pass dead zone where the marker was present but the card couldn't
+    // re-show. 4 is the safer interim (tier-0 bypass also mitigates this now).
+    // Override: WARP_FOLD_RECALL_TTL_PASSES.
+    ttlPasses: 4,
+    termRecallEnabled: true,
+    verbatimRecallEnabled: true,
+    highlightsEnabled: true,
+    hazardsEnabled: true,
+    episodesEnabled: true,
+    atlasMetaEnabled: true,
+};
+/** Hints injected per pass never exceed this, regardless of pressure. */
+const MAX_HINTS_PER_PASS = 4;
+/** Minimum remaining char budget worth spending on a card; below this, downgrade to hint. */
+export const MIN_USEFUL_CARD_CHARS = 400;
+/** Bounded lowercased per-turn digest length (reserved for deferred tier-2 term matching). */
+const TURN_DIGEST_MAX_CHARS = 400;
+const TERM_RECALL_MIN_DISTINCTIVE_COUNT = 2;
+/**
+ * Reserved gap subtracted from the remaining pass budget before sizing a card
+ * body (see the bodyBudget computation in renderRecallPlan), so a rendered
+ * card's trailing punctuation/metadata never exactly exhausts the pass
+ * budget. Named + exported so validateFoldGeometry() shares the same source
+ * of truth as the render path instead of duplicating the literal.
+ */
+export const RECALL_BODY_RESERVED_GAP_CHARS = 200;
+/**
+ * Repeat-recall card shrink (rail-c63e326e s6). A path that has already been
+ * carded once or more this session and has NOT changed content since (see
+ * `RecallSourceDelta.stableSincePrior`, or no live-source info at all — the
+ * folded historical entry itself is fixed regardless of live source
+ * tracking) does not need the full body budget again: the agent has already
+ * seen it. Each repeat multiplies the available body budget by this ratio,
+ * floored at REPEAT_CARD_MIN_RATIO so a card never shrinks to uselessness —
+ * MIN_USEFUL_CARD_CHARS still governs the eventual card→hint downgrade.
+ */
+export const REPEAT_CARD_SHRINK_RATIO = 0.6;
+/** Floor on the cumulative shrink multiplier — never shrink a repeat card below 35% of its unshrunk budget. */
+export const REPEAT_CARD_MIN_RATIO = 0.35;
+/**
+ * Pure arithmetic: the body-budget multiplier for the (priorShowCount+1)-th
+ * card injection of the same path this session. priorShowCount=0 (first-ever
+ * card for this path) → 1 (no shrink). Deterministic, no I/O.
+ */
+export function repeatCardBudgetRatio(priorShowCount) {
+    if (priorShowCount <= 0)
+        return 1;
+    return Math.max(REPEAT_CARD_MIN_RATIO, REPEAT_CARD_SHRINK_RATIO ** priorShowCount);
+}
+function parsePositiveInt(raw) {
+    if (raw === undefined)
+        return undefined;
+    const n = Number.parseInt(raw.trim(), 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+// ══════════════════════════════════════════════════════════════════════
+// Fold geometry invariant checker (rail-c63e326e s2)
+// ══════════════════════════════════════════════════════════════════════
+/**
+ * Historical bug: ttlPasses=8 vs activeWindowTurns=1 (buffer=7) created a
+ * 7-pass recall dead zone where a folded marker was present but the card
+ * could not re-show (rail-ed5588b5, fixed 2026-06-24; refined further by
+ * rail-dccaa1a1 on 2026-07-02). The fix landed at ttlPasses=4 (buffer=3).
+ * Ceiling is set with headroom above the fixed value for legitimate tuning,
+ * while still catching a regression back toward the old buggy shape.
+ */
+export const MAX_TTL_DEADZONE_BUFFER_PASSES = 5;
+/**
+ * Pure cross-knob invariant checker for fold/recall geometry. Each rule
+ * encodes a specific interaction class that has previously shipped as a live
+ * dogfood regression (see file history for rail-ed5588b5 / rail-dccaa1a1)
+ * before being caught and fixed by hand. This does not prove the geometry is
+ * "correct" — it only catches a regression back toward a known-bad shape, or
+ * flags a genuinely new bad combination in the same families. Violations are
+ * data for the caller to log/assert on in dev/test; this function itself
+ * never throws or logs, keeping it pure and safe to call from any context.
+ */
+export function validateFoldGeometry(inputs) {
+    const violations = [];
+    const ttlDeadZoneBuffer = inputs.ttlPasses - inputs.activeWindowTurns;
+    if (ttlDeadZoneBuffer > MAX_TTL_DEADZONE_BUFFER_PASSES) {
+        violations.push({
+            rule: 'ttl-deadzone',
+            message: `ttlPasses (${inputs.ttlPasses}) exceeds activeWindowTurns (${inputs.activeWindowTurns}) by ` +
+                `${ttlDeadZoneBuffer} passes, beyond the ${MAX_TTL_DEADZONE_BUFFER_PASSES}-pass ceiling. This is the ` +
+                `rail-ed5588b5 dead-zone bug class: content scrolls out of the visible window after activeWindowTurns ` +
+                `but recall residency keeps suppressing re-injection for the rest of ttlPasses. Tier-0 path-touch bypass ` +
+                `(rail-dccaa1a1) only mitigates active-file cases; other tiers stay blinded for the full buffer.`,
+        });
+    }
+    if (inputs.recencyFloorTurns < inputs.activeWindowTurns) {
+        violations.push({
+            rule: 'recency-floor-below-window',
+            message: `recencyFloorTurns (${inputs.recencyFloorTurns}) is below activeWindowTurns (${inputs.activeWindowTurns}) ` +
+                `— the fidelity-value eviction floor would let turns evict before they even leave the ` +
+                `guaranteed-verbatim active window.`,
+        });
+    }
+    const autoCompactCharBudget = Math.min(800, inputs.maxTotalChars);
+    const tier0EffectiveBodyChars = Math.min(inputs.maxCardChars, autoCompactCharBudget - RECALL_BODY_RESERVED_GAP_CHARS);
+    if (tier0EffectiveBodyChars < MIN_USEFUL_CARD_CHARS) {
+        violations.push({
+            rule: 'auto-compact-card-too-small',
+            message: `Under auto_compact pressure, the tier-0 floor's effective per-card body budget ` +
+                `(min(maxCardChars=${inputs.maxCardChars}, autoCompactCharBudget=${autoCompactCharBudget} - ` +
+                `${RECALL_BODY_RESERVED_GAP_CHARS}) = ${tier0EffectiveBodyChars}) falls below MIN_USEFUL_CARD_CHARS ` +
+                `(${MIN_USEFUL_CARD_CHARS}). The one card recall reserves for the actively-edited path under maximum ` +
+                `pressure would downgrade to an unhelpfully small stub exactly when the agent needs it most.`,
+        });
+    }
+    return violations;
+}
+function foldGeometryInputsForRecallConfig(config) {
+    return {
+        ttlPasses: config.ttlPasses,
+        activeWindowTurns: ALWAYS_ON_FOLD_CONFIG.activeWindowTurns,
+        recencyFloorTurns: DEFAULT_FIDELITY_VALUE_RECENCY_FLOOR_TURNS,
+        maxTotalChars: config.maxTotalChars,
+        maxCardChars: config.maxCardChars,
+    };
+}
+function foldGeometryEnv(env) {
+    return env ?? (typeof process !== 'undefined' ? process.env : undefined);
+}
+function shouldWarnFoldGeometry(env) {
+    return (foldGeometryEnv(env)?.NODE_ENV ?? '') !== 'production';
+}
+const warnedFoldGeometryKeys = new Set();
+function warnFoldGeometryViolations(violations, env, source) {
+    if (violations.length === 0 || !shouldWarnFoldGeometry(env))
+        return;
+    for (const violation of violations) {
+        const key = `${source}:${violation.rule}:${violation.message}`;
+        if (warnedFoldGeometryKeys.has(key))
+            continue;
+        warnedFoldGeometryKeys.add(key);
+        // eslint-disable-next-line no-console
+        console.warn(`[fold-geometry:${source}] ${violation.rule}: ${violation.message}`);
+    }
+}
+/**
+ * Dev/test-only self-check of shipped defaults. Env-resolved config is checked
+ * inside resolveFoldRecallConfig(), so operator overrides cannot silently
+ * recreate a known-bad geometry. Both paths warn instead of throwing and are
+ * skipped in production.
+ */
+warnFoldGeometryViolations(validateFoldGeometry(foldGeometryInputsForRecallConfig(DEFAULT_FOLD_RECALL_CONFIG)), foldGeometryEnv(), 'defaults');
+/**
+ * Resolve config from environment. Default ON (recall is already gated on
+ * fold mode 'on' + an active fold-freeze index upstream).
+ *   WARP_FOLD_RECALL=0|false|off|no       → disable
+ *   WARP_FOLD_RECALL_MAX_CARDS=<n>        → cards per pass (default 3; band-coupled)
+ *   WARP_FOLD_RECALL_MAX_TOTAL_CHARS=<n>  → total chars per pass (default 12000)
+ *   WARP_FOLD_RECALL_MAX_CARD_CHARS=<n>   → chars per card body (default 6000)
+ *   WARP_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 4)
+ *   WARP_FOLD_RECALL_TERMS=0|false|off|no → disable tier-2 term matching (default ON)
+ *   WARP_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
+ *   WARP_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
+ *   WARP_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
+ *   WARP_FOLD_RECALL_EPISODES=0|false|off|no → disable episodic voice (default ON)
+ *   WARP_FOLD_RECALL_ATLAS_META=0|false|off|no → disable Atlas identity meta (default ON)
+ */
+export function resolveFoldRecallConfig(env = process.env) {
+    const raw = (env.WARP_FOLD_RECALL ?? '').trim().toLowerCase();
+    const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
+    const termRaw = (env.WARP_FOLD_RECALL_TERMS ?? '').trim().toLowerCase();
+    const verbatimRaw = (env.WARP_FOLD_RECALL_VERBATIM ?? '').trim().toLowerCase();
+    const highlightsRaw = (env.WARP_FOLD_RECALL_HIGHLIGHTS ?? '').trim().toLowerCase();
+    const hazardsRaw = (env.WARP_FOLD_RECALL_HAZARDS ?? '').trim().toLowerCase();
+    const episodesRaw = (env.WARP_FOLD_RECALL_EPISODES ?? '').trim().toLowerCase();
+    const atlasMetaRaw = (env.WARP_FOLD_RECALL_ATLAS_META ?? '').trim().toLowerCase();
+    const config = {
+        enabled,
+        maxCards: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARDS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
+        maxTotalChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_TOTAL_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
+        maxCardChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARD_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCardChars,
+        ttlPasses: parsePositiveInt(env.WARP_FOLD_RECALL_TTL_PASSES) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
+        // Tier-2 term recall passed rail-c63e326e A/B: default ON; only explicit
+        // disable values turn it off. Same default-on idiom as verbatim recall.
+        termRecallEnabled: termRaw === '' || (termRaw !== '0' && termRaw !== 'false' && termRaw !== 'off' && termRaw !== 'no'),
+        // Default ON (operator-blessed); only explicit disable values turn it off.
+        verbatimRecallEnabled: verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
+        // Curated Code Radar (operator-blessed, Jonah 2026-06-17): both default ON;
+        // only explicit 0/false/off/no disable. Same idiom as verbatimRecallEnabled.
+        highlightsEnabled: highlightsRaw === '' || (highlightsRaw !== '0' && highlightsRaw !== 'false' && highlightsRaw !== 'off' && highlightsRaw !== 'no'),
+        hazardsEnabled: hazardsRaw === '' || (hazardsRaw !== '0' && hazardsRaw !== 'false' && hazardsRaw !== 'off' && hazardsRaw !== 'no'),
+        // Episodic voice: default ON; only explicit 0/false/off/no disable.
+        episodesEnabled: episodesRaw === '' || (episodesRaw !== '0' && episodesRaw !== 'false' && episodesRaw !== 'off' && episodesRaw !== 'no'),
+        // Atlas identity meta: default ON; only explicit 0/false/off/no disable.
+        atlasMetaEnabled: atlasMetaRaw === '' || (atlasMetaRaw !== '0' && atlasMetaRaw !== 'false' && atlasMetaRaw !== 'off' && atlasMetaRaw !== 'no'),
+    };
+    warnFoldGeometryViolations(validateFoldGeometry(foldGeometryInputsForRecallConfig(config)), env, 'resolveFoldRecallConfig');
+    return config;
+}
+// ══════════════════════════════════════════════════════════════════════
+// Bash path extraction
+// ══════════════════════════════════════════════════════════════════════
+const BASH_TOOL_NAME_RE = /^(run_bash|bash)$/i;
+const COMPACT_TOOL_TRACE_RE = /⟨tool\s+(?!result\b)[^\s⟩]+(?:\s+([^⟩]+))?⟩/g;
+const COMPACT_TRACE_PATH_RE = /"(file_path|path|filePath|file)"\s*:\s*"((?:\\.|[^"\\])+)"/g;
+/** Quote-aware shell tokenizer. Honors '...' and "..." as single tokens. */
+function tokenizeShell(cmd) {
+    const tokens = [];
+    let i = 0;
+    while (i < cmd.length) {
+        while (i < cmd.length && (cmd[i] === ' ' || cmd[i] === '\t' || cmd[i] === '\n' || cmd[i] === '\r'))
+            i++;
+        if (i >= cmd.length)
+            break;
+        let token = '';
+        while (i < cmd.length && cmd[i] !== ' ' && cmd[i] !== '\t' && cmd[i] !== '\n' && cmd[i] !== '\r') {
+            const ch = cmd[i];
+            if (ch === "'") {
+                i++;
+                while (i < cmd.length && cmd[i] !== "'")
+                    token += cmd[i++];
+                if (i < cmd.length)
+                    i++;
+            }
+            else if (ch === '"') {
+                i++;
+                while (i < cmd.length && cmd[i] !== '"') {
+                    if (cmd[i] === '\\' && i + 1 < cmd.length)
+                        i++;
+                    token += cmd[i++];
+                }
+                if (i < cmd.length)
+                    i++;
+            }
+            else {
+                token += ch;
+                i++;
+            }
+        }
+        if (token)
+            tokens.push(token);
+    }
+    return tokens;
+}
+/**
+ * Extract file paths from a bash command string.
+ *
+ * Quote-aware tokenize; a token qualifies if: it contains '/', does not
+ * contain '://', does not start with '-', contains no shell redirect chars
+ * (`<`/`>`), is not a `/dev/...` device path, and length ≤ 256. Trailing
+ * punctuation (;:,)"') is stripped before qualifying. First-occurrence order,
+ * deduped, capped at 4 paths per command. Each result is normalized with
+ * normalizeToolPath — identical to structured-tool path normalization.
+ */
+export function extractPathsFromBashCommand(command) {
+    const tokens = tokenizeShell(command);
+    const seen = new Set();
+    const result = [];
+    for (const raw of tokens) {
+        if (result.length >= 4)
+            break;
+        const token = raw.replace(/[;:,)"']+$/, '');
+        if (!token)
+            continue;
+        if (!token.includes('/'))
+            continue;
+        if (token.includes('://'))
+            continue;
+        if (token.startsWith('-'))
+            continue;
+        if (/[<>]/.test(token))
+            continue;
+        if (token.length > 256)
+            continue;
+        const normalized = normalizeToolPath(token);
+        if (normalized === '/dev' || normalized.startsWith('/dev/'))
+            continue;
+        if (normalized && !seen.has(normalized)) {
+            seen.add(normalized);
+            result.push(normalized);
+        }
+    }
+    return result;
+}
+/** Collect normalized bash-command paths from tool_use blocks in a turn's messages. */
+function extractBashPathsFromMessages(messages) {
+    const paths = new Set();
+    for (const msg of messages) {
+        if (msg.role !== 'assistant')
+            continue;
+        if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (block?.type === 'tool_use' && typeof block.name === 'string' && BASH_TOOL_NAME_RE.test(block.name)) {
+                    const cmd = block.input?.command;
+                    if (typeof cmd === 'string') {
+                        for (const p of extractPathsFromBashCommand(cmd))
+                            paths.add(p);
+                    }
+                }
+            }
+        }
+        if (Array.isArray(msg.tool_calls)) {
+            for (const tc of msg.tool_calls) {
+                if (tc?.id && tc?.function?.name && BASH_TOOL_NAME_RE.test(tc.function.name)) {
+                    let args = {};
+                    try {
+                        args = JSON.parse(tc.function.arguments ?? '{}');
+                    }
+                    catch { /* skip */ }
+                    const cmd = args.command;
+                    if (typeof cmd === 'string') {
+                        for (const p of extractPathsFromBashCommand(cmd))
+                            paths.add(p);
+                    }
+                }
+            }
+        }
+    }
+    return Array.from(paths);
+}
+function unescapeJsonStringFragment(value) {
+    try {
+        return JSON.parse(`"${value}"`);
+    }
+    catch {
+        return value.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    }
+}
+/**
+ * Codex fold seed history inlines tool_use rows as compact text traces:
+ * `⟨tool Read {"file_path":"src/x.ts"}⟩`. Those are intentionally strings
+ * (Responses injection portability), so the FC structured-tool extractor cannot
+ * see their path arguments. Parse only the bounded trace wrapper emitted by
+ * foldBirthHydration; arbitrary prose remains ignored.
+ */
+function extractCompactToolTracePaths(messages) {
+    const paths = new Set();
+    const scan = (text) => {
+        COMPACT_TOOL_TRACE_RE.lastIndex = 0;
+        let trace;
+        while ((trace = COMPACT_TOOL_TRACE_RE.exec(text)) !== null) {
+            const payload = trace[1];
+            if (!payload)
+                continue;
+            COMPACT_TRACE_PATH_RE.lastIndex = 0;
+            let match;
+            while ((match = COMPACT_TRACE_PATH_RE.exec(payload)) !== null) {
+                const rawPath = unescapeJsonStringFragment(match[2]);
+                const normalized = normalizeToolPath(rawPath);
+                if (normalized)
+                    paths.add(normalized);
+            }
+        }
+    };
+    for (const msg of messages) {
+        if (msg.role !== 'assistant' && msg.role !== 'model')
+            continue;
+        if (typeof msg.content === 'string') {
+            scan(msg.content);
+        }
+        else if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (typeof block === 'string')
+                    scan(block);
+                else if (block?.type === 'text' && typeof block.text === 'string')
+                    scan(block.text);
+            }
+        }
+    }
+    return Array.from(paths).sort();
+}
+/** Provider-view text retained for literal information-residency checks. */
+export const FOLD_RECALL_POV_TEXT_MAX_CHARS = 96_000;
+/** Whitespace/quote-stable normalization for exact provider-POV containment. */
+export function normalizeFoldRecallPovText(text) {
+    const normalized = text
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/[\u201c\u201d]/g, '"')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return normalized ? ` ${normalized} ` : '';
+}
+/** Matches the folded view's fold-block header: "[Conversation Context — N turns folded, …". */
+const FOLD_BLOCK_COUNT_RE = /^\[Conversation Context — (\d+) turns folded,/;
+/** Whole-content intra-fold marker (generic replacement by foldSummaryText). */
+const INTRA_GENERIC_MARKER_RE = /^\[Folded: (\S+)(?: (.+?))? — ([\d,]+) chars \| self-tap to recover\]$/;
+/** Suffix intra-fold marker (atlas metadata-preserving variant). */
+const INTRA_ATLAS_MARKER_RE = /\n## Source \[Folded: (\S+)(?: (.+?))? — ([\d,]+) chars of source code \| self-tap to recover\]$/;
+function parseMarkerChars(raw) {
+    const n = Number.parseInt(raw.replace(/,/g, ''), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+/** Join an Anthropic tool_result block's content into plain text (mirrors rollingFold). */
+function blockContentText(content) {
+    if (typeof content === 'string')
+        return content;
+    if (Array.isArray(content)) {
+        return content.map((b) => (typeof b === 'string' ? b : b?.text ?? JSON.stringify(b))).join('\n');
+    }
+    return JSON.stringify(content ?? '');
+}
+/**
+ * Parse an intra-fold marker out of a folded tool result's content. Anchored
+ * matching (whole-content for the generic marker, suffix for the atlas
+ * variant) so markers merely QUOTED inside live tool output never index.
+ */
+function parseIntraMarker(content) {
+    const generic = INTRA_GENERIC_MARKER_RE.exec(content);
+    if (generic) {
+        return { tool: generic[1], path: normalizeToolPath(generic[2] ?? ''), chars: parseMarkerChars(generic[3]) };
+    }
+    const atlas = INTRA_ATLAS_MARKER_RE.exec(content);
+    if (atlas) {
+        return { tool: atlas[1], path: normalizeToolPath(atlas[2] ?? ''), chars: parseMarkerChars(atlas[3]) };
+    }
+    return null;
+}
+function collectRecallCardsFromText(text) {
+    if (!text.includes(RECALL_CARD_PREFIX))
+        return [];
+    const cards = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith(RECALL_CARD_PREFIX))
+            continue;
+        const block = [lines[i]];
+        i++;
+        while (i < lines.length && lines[i] !== '[End fold recall]') {
+            block.push(lines[i]);
+            i++;
+        }
+        if (i < lines.length && lines[i] === '[End fold recall]') {
+            block.push(lines[i]);
+            cards.push(block.join('\n'));
+        }
+    }
+    return cards;
+}
+function collectMessageTextFragments(msg) {
+    const out = [];
+    const content = msg.content;
+    if (typeof content === 'string') {
+        out.push(content);
+    }
+    else if (Array.isArray(content)) {
+        for (const block of content) {
+            if (typeof block === 'string')
+                out.push(block);
+            else if (block?.type === 'text' && typeof block.text === 'string')
+                out.push(block.text);
+            else if (block?.type === 'tool_result')
+                out.push(blockContentText(block.content));
+        }
+    }
+    if (Array.isArray(msg.parts)) {
+        for (const part of msg.parts) {
+            if (typeof part?.text === 'string')
+                out.push(part.text);
+        }
+    }
+    return out;
+}
+function collectVisibleRecallCards(messages) {
+    const cards = [];
+    const seen = new Set();
+    for (const msg of messages) {
+        for (const text of collectMessageTextFragments(msg)) {
+            for (const card of collectRecallCardsFromText(text)) {
+                if (seen.has(card))
+                    continue;
+                seen.add(card);
+                cards.push(card);
+            }
+        }
+    }
+    return cards;
+}
+function collectProviderViewText(messages) {
+    const fragments = [];
+    for (const message of messages)
+        fragments.push(...collectMessageTextFragments(message));
+    const joined = fragments.join('\n');
+    const bounded = joined.length > FOLD_RECALL_POV_TEXT_MAX_CHARS
+        ? joined.slice(joined.length - FOLD_RECALL_POV_TEXT_MAX_CHARS)
+        : joined;
+    return normalizeFoldRecallPovText(bounded);
+}
+/**
+ * Current provider-visible text: the last committed folded view plus the raw
+ * messages appended since that view/index was built. Pure and bounded; callers
+ * may pass null during pre-fold warmup.
+ */
+export function foldRecallProviderPovText(index, rawHistory) {
+    if (!index)
+        return rawHistory ? collectProviderViewText(rawHistory) : '';
+    const tail = rawHistory && rawHistory.length > index.rawCount
+        ? collectProviderViewText(rawHistory.slice(index.rawCount))
+        : '';
+    const combined = `${index.visiblePovText ?? ''}${tail}`;
+    return combined.length > FOLD_RECALL_POV_TEXT_MAX_CHARS
+        ? combined.slice(combined.length - FOLD_RECALL_POV_TEXT_MAX_CHARS)
+        : combined;
+}
+function buildTurnDigest(turnMessages, syntheticContext = {}) {
+    const parts = [];
+    const user = extractFirstUserText(turnMessages, syntheticContext);
+    if (user)
+        parts.push(user);
+    const assistant = extractAssistantText(turnMessages);
+    if (assistant)
+        parts.push(assistant);
+    return parts.join(' ').toLowerCase().slice(0, TURN_DIGEST_MAX_CHARS);
+}
+/** First REAL user text in a slice (synthetic fold/recall blocks excluded). */
+function extractFirstUserText(messages, syntheticContext = {}) {
+    for (const msg of messages) {
+        if (msg.role !== 'user')
+            continue;
+        if (typeof msg.content === 'string') {
+            const cleaned = stripSyntheticUserContextBlocks(msg.content, syntheticContext).trim();
+            if (cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext))
+                return cleaned;
+            continue;
+        }
+        if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (typeof block === 'string') {
+                    const cleaned = stripSyntheticUserContextBlocks(block, syntheticContext).trim();
+                    if (cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext))
+                        return cleaned;
+                    continue;
+                }
+                if (block?.type === 'text' && typeof block.text === 'string') {
+                    const cleaned = stripSyntheticUserContextBlocks(block.text, syntheticContext).trim();
+                    if (cleaned.length > 0 && !isSyntheticContextText(cleaned, syntheticContext))
+                        return cleaned;
+                }
+            }
+        }
+    }
+    return '';
+}
+/** Cap on the active-window query text fed to tier-2 term extraction — a few
+ *  turns of recent cognition; recency-favored when the unfolded tail exceeds it. */
+const ACTIVE_WINDOW_MAX_CHARS = 1600;
+/**
+ * Active-window text for tier-2 distinctive-term matching: the user- and
+ * assistant-authored text of the live, unfolded raw tail (messages added since
+ * the fold index was last built — raw.slice(foldedRawCount)). Mirrors
+ * buildTurnDigest's surface (first real user text + assistant text; tool results
+ * and synthetic recall/fold blocks excluded) so the query terms and the index's
+ * per-turn digest terms are drawn from the same vocabulary. Recency-favored cap
+ * keeps extraction cheap and focused on current cognition. Pure; returns ''
+ * when the unfolded tail is empty or when term recall is explicitly disabled.
+ */
+export function extractActiveWindowText(rawHistory, foldedRawCount, syntheticContext = {}) {
+    if (foldedRawCount < 0 || foldedRawCount >= rawHistory.length)
+        return '';
+    const tail = rawHistory.slice(foldedRawCount);
+    const user = extractFirstUserText(tail, syntheticContext);
+    const assistant = extractAssistantText(tail);
+    const combined = [user, assistant].filter((s) => s.length > 0).join(' ');
+    return combined.length > ACTIVE_WINDOW_MAX_CHARS
+        ? combined.slice(combined.length - ACTIVE_WINDOW_MAX_CHARS)
+        : combined;
+}
+/**
+ * Concatenate a turn's verbatim-bearing text (user text, assistant text, and
+ * tool-result bodies across Anthropic content[], OpenAI tool messages, and
+ * Gemini parts) for exact-token indexing. Pure; bounded by the turn's own size.
+ * Feeds nominateVerbatim so the indexed tokens are the same family the Verbatim
+ * Keep conserves.
+ */
+function extractTurnVerbatimText(turnMessages, syntheticContext = {}) {
+    const parts = [];
+    const pushText = (text, role) => {
+        if (!text)
+            return;
+        if (role === 'user') {
+            const cleaned = stripSyntheticUserContextBlocks(text, syntheticContext).trim();
+            if (cleaned && !isSyntheticContextText(cleaned, syntheticContext))
+                parts.push(cleaned);
+            return;
+        }
+        parts.push(text);
+    };
+    const pushBlockContent = (content) => {
+        if (typeof content === 'string') {
+            if (content)
+                parts.push(content);
+        }
+        else if (Array.isArray(content)) {
+            for (const b of content) {
+                if (typeof b === 'string')
+                    parts.push(b);
+                else if (b?.type === 'text' && typeof b.text === 'string')
+                    parts.push(b.text);
+            }
+        }
+    };
+    for (const msg of turnMessages) {
+        const content = msg.content;
+        if (typeof content === 'string') {
+            pushText(content, msg.role);
+        }
+        else if (Array.isArray(content)) {
+            for (const block of content) {
+                if (typeof block === 'string')
+                    pushText(block, msg.role);
+                else if (block?.type === 'text' && typeof block.text === 'string')
+                    pushText(block.text, msg.role);
+                else if (block?.type === 'tool_result')
+                    pushBlockContent(block.content);
+            }
+        }
+        // OpenAI role:'tool' string content is already captured by the string branch above.
+        if (Array.isArray(msg.parts)) {
+            for (const part of msg.parts) {
+                if (typeof part?.text === 'string' && part.text)
+                    pushText(part.text, msg.role);
+                const resp = part?.functionResponse?.response;
+                if (resp !== undefined) {
+                    try {
+                        parts.push(typeof resp === 'string' ? resp : JSON.stringify(resp));
+                    }
+                    catch {
+                        /* non-serializable response — skip */
+                    }
+                }
+            }
+        }
+    }
+    return parts.join('\n');
+}
+/**
+ * Build the episodic voice block for a recall card: pre-rendered voice lines
+ * from the caller's own-lineage episode chain for this path. Reads
+ * state.pathEpisodes safely; returns '' when empty, disabled, or missing.
+ * Does NOT parse annotation kinds — the worker already rendered/attribution.
+ */
+function buildEpisodeVoiceBlock(item, state, config, charBudget, suppressPaths) {
+    if (charBudget <= 0 || !config.episodesEnabled)
+        return '';
+    const path = item.matchedPath;
+    if (suppressPaths.has(path))
+        return '';
+    const voices = state.pathEpisodes?.get(path);
+    if (!voices || voices.length === 0)
+        return '';
+    const parts = ['🗣 Your lineage:'];
+    let used = parts[0].length + 1;
+    for (const ev of voices) {
+        if (used >= charBudget)
+            break;
+        // Intent (the operator ask) — strongest voice signal.
+        if (ev.intent && used + ev.intent.length + 10 < charBudget) {
+            const line = `  ask: "${ev.intent}"`;
+            parts.push(line);
+            used += line.length + 1;
+        }
+        // Pre-rendered voice lines from the episode chain.
+        for (const vl of ev.voiceLines) {
+            if (used >= charBudget)
+                break;
+            const line = `  ${vl}`;
+            parts.push(line);
+            used += line.length + 1;
+        }
+    }
+    // If only the header fits, return nothing.
+    if (parts.length <= 1)
+        return '';
+    return parts.join('\n');
+}
+/** Map of toolId → raw message index for every tool result present in raw history. */
+function buildToolResultPositions(rawHistory) {
+    const positions = new Map();
+    for (let i = 0; i < rawHistory.length; i++) {
+        const msg = rawHistory[i];
+        if (msg.role === 'user' && Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string' && !positions.has(block.tool_use_id)) {
+                    positions.set(block.tool_use_id, i);
+                }
+            }
+        }
+        if (msg.role === 'tool' && typeof msg.tool_call_id === 'string') {
+            const id = msg.tool_call_id;
+            if (!positions.has(id))
+                positions.set(id, i);
+        }
+    }
+    return positions;
+}
+export function buildFoldIndex(rawHistory, foldedView, precomputedTurns, syntheticContext = {}, options = {}) {
+    const entries = [];
+    const visibleRecallCards = collectVisibleRecallCards(foldedView);
+    // ── Inter-turn entries: replay turn detection over raw, count from the view's fold blocks ──
+    // FC append-only tail epochs seal one fold block PER BAND, so a folded view
+    // may carry several "[Conversation Context — N turns folded, …]" markers in
+    // chronological band order; the folded raw prefix is their SUM. First-match-
+    // wins pinned the page table to the oldest band forever (measured: permanent
+    // cards:0 recall on multi-band FC sessions while newer folded spans stayed
+    // unindexed). Single-block whole-view-rebuild views are unchanged by summing.
+    let interFoldedCount = 0;
+    for (const msg of foldedView) {
+        if (msg.role !== 'user' || typeof msg.content !== 'string')
+            continue;
+        const match = FOLD_BLOCK_COUNT_RE.exec(msg.content);
+        if (match) {
+            interFoldedCount += Number.parseInt(match[1], 10) || 0;
+        }
+    }
+    // Markerless hard-epoch seed (seedFoldsEntireRaw): the seed folded the whole
+    // pre-reset raw but carries no fold-block count, so derive the folded-turn
+    // count from the detected raw turns. The clamp below keeps the trailing live
+    // turn unfolded, exactly as the marker path does.
+    const seedFullFold = interFoldedCount === 0 && options.seedFoldsEntireRaw === true;
+    if (interFoldedCount > 0 || seedFullFold) {
+        const turns = precomputedTurns ?? detectTurns(rawHistory, syntheticContext);
+        // Marker-bearing folded views are authoritative: continuous folding can
+        // legitimately fold every detected turn, so indexing must not invent an
+        // unfolded live-tail clamp. Markerless hard-epoch seeds still keep the
+        // trailing live turn outside the page table.
+        const maxFoldedTurns = seedFullFold ? Math.max(0, turns.length - 1) : turns.length;
+        const count = Math.min(seedFullFold ? turns.length : interFoldedCount, maxFoldedTurns);
+        for (let j = 0; j < count; j++) {
+            const turn = turns[j];
+            const structuredPaths = Array.from(extractToolPathSet(turn.messages));
+            const bashPaths = extractBashPathsFromMessages(turn.messages);
+            const compactTracePaths = extractCompactToolTracePaths(turn.messages);
+            const paths = Array.from(new Set([...structuredPaths, ...bashPaths, ...compactTracePaths])).sort();
+            const verbatimTokens = nominateVerbatim(extractTurnVerbatimText(turn.messages, syntheticContext)).sort();
+            entries.push({
+                kind: 'turn',
+                id: `turn:${turn.startIndex}`,
+                rawStart: turn.startIndex,
+                rawEnd: turn.endIndex,
+                recency: turn.startIndex,
+                category: classifyTurn(turn.messages),
+                paths,
+                digest: buildTurnDigest(turn.messages, syntheticContext),
+                chars: countChars(turn.messages),
+                ...(verbatimTokens.length > 0 ? { verbatimTokens } : {}),
+            });
+        }
+    }
+    // ── Intra-turn entries: scan the view for fold markers, anchor to raw by tool id ──
+    const rawPositions = buildToolResultPositions(rawHistory);
+    for (const msg of foldedView) {
+        if (msg.role === 'user' && Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string')
+                    continue;
+                if (typeof block.content !== 'string')
+                    continue; // folded blocks always carry string content
+                const marker = parseIntraMarker(block.content);
+                if (!marker)
+                    continue;
+                const rawIndex = rawPositions.get(block.tool_use_id);
+                if (rawIndex === undefined)
+                    continue; // cannot recall what raw no longer holds
+                const id = `tool:${block.tool_use_id}`;
+                if (entries.some(e => e.id === id))
+                    continue;
+                entries.push({
+                    kind: 'tool',
+                    id,
+                    toolId: block.tool_use_id,
+                    tool: marker.tool,
+                    path: marker.path,
+                    recency: rawIndex,
+                    chars: marker.chars,
+                });
+            }
+        }
+        if (msg.role === 'tool' && typeof msg.tool_call_id === 'string' && typeof msg.content === 'string') {
+            const toolId = msg.tool_call_id;
+            const marker = parseIntraMarker(msg.content);
+            if (!marker)
+                continue;
+            const rawIndex = rawPositions.get(toolId);
+            if (rawIndex === undefined)
+                continue;
+            const id = `tool:${toolId}`;
+            if (entries.some(e => e.id === id))
+                continue;
+            entries.push({
+                kind: 'tool',
+                id,
+                toolId,
+                tool: marker.tool,
+                path: marker.path,
+                recency: rawIndex,
+                chars: marker.chars,
+            });
+        }
+    }
+    return {
+        rawCount: rawHistory.length,
+        entries,
+        visibleRecallCards,
+        visiblePovText: collectProviderViewText(foldedView),
+    };
+}
+export function createFoldRecallState() {
+    return {
+        index: null,
+        resident: new Map(),
+        pathCardShowCounts: new Map(),
+        residentPaths: new Map(),
+        pathHighlights: new Map(),
+        pathHazards: new Map(),
+        pathSourceDeltas: new Map(),
+        pathAffinity: new Map(),
+        pathEpisodes: new Map(),
+        pathAtlasMeta: new Map(),
+        passSeq: 0,
+        lastIndexSignature: null,
+        lastSuppressedManifestKey: null,
+        suppressedManifestQuietPasses: 0,
+        cardsInjected: 0,
+        hintsInjected: 0,
+        recallChars: 0,
+        suppressed: 0,
+    };
+}
+/**
+ * Leaf-normalize a dispatched tool name for Atlas-read matching. Mirrors the
+ * relay's normalizeAmbientAtlasToolName (kept local so this carve-out package
+ * stays relay-dependency-free): strips MCP server namespaces
+ * (mcp__server__atlas_query), provider prefixes (functions.atlas_query), and
+ * mcp_/mcp_to_ leaders, then lowercases the leaf.
+ */
+function normalizeAtlasReadToolLeaf(toolName) {
+    const raw = (toolName ?? '').trim();
+    if (!raw)
+        return '';
+    const doubleUnderscoreLeaf = raw.split('__').at(-1) ?? raw;
+    const dottedLeaf = doubleUnderscoreLeaf.split('.').at(-1) ?? doubleUnderscoreLeaf;
+    return dottedLeaf.replace(/^mcp_to_/, '').replace(/^mcp_/, '').trim().toLowerCase();
+}
+/**
+ * True when the just-dispatched tool is itself a highlight/hazard-rendering
+ * Atlas read of the touched path — atlas_lookup/atlas_brief/atlas_snippet, or
+ * atlas_query with action in {lookup,brief,snippet}. The agent is then already
+ * seeing that file's full source_highlights+hazards live, so the (compressed)
+ * Curated Code Radar would just parrot the tool output and is suppressed for
+ * those paths (the folded card BODY still pages in). The tool name is
+ * leaf-normalized so namespaced MCP forms (mcp__voxxo-swarm-bridge__atlas_query)
+ * and provider-prefixed forms match — not only bare names. search/history/graph/
+ * diff do NOT match: they do not render the curated per-file record.
+ */
+export function radarDuplicatesActiveAtlasRead(toolName, action) {
+    const leaf = normalizeAtlasReadToolLeaf(toolName);
+    if (leaf === 'atlas_lookup' || leaf === 'atlas_brief' || leaf === 'atlas_snippet')
+        return true;
+    if (leaf === 'atlas_query')
+        return action === 'lookup' || action === 'brief' || action === 'snippet';
+    return false;
+}
+/**
+ * True when the dispatched tool is an Atlas DISCOVERY read whose text output
+ * leads each result line with a workspace path: search (`atlas_search` or
+ * `atlas_query action=search`), catalog, and cluster. lookup/brief/snippet/
+ * history/graph/diff are excluded — they render per-file bodies or analytics,
+ * not a path-led result list. Gating here is what keeps arbitrary tool stdout
+ * (and non-discovery Atlas reads) from ever becoming a recall trigger source.
+ */
+export function isAtlasDiscoveryResultTool(toolName, action) {
+    const leaf = normalizeAtlasReadToolLeaf(toolName);
+    if (leaf === 'atlas_search')
+        return true;
+    return leaf === 'atlas_query' && (action === 'search' || action === 'catalog' || action === 'cluster');
+}
+// Leading list/tree markers Atlas discovery outputs prepend before a result
+// path: catalog uses "- ", cluster uses "📄 "/"📁 "/"📂 "; search has none.
+// Stripped (after trim) so search/catalog/cluster lines all normalize to a
+// path-led head before the path regex runs. Requires a space after a bullet so
+// a path that legitimately begins with "-" is never truncated.
+const ATLAS_RESULT_LINE_MARKER_RE = /^(?:[-*•]\s+)?(?:📄|📁|📂)?\s*/u;
+// A result path leads the (marker-stripped) line and is delimited by an Atlas
+// separator: search uses " — "/"match:"/"score:", catalog uses " [cluster]" or
+// " (NN LOC)", cluster uses " (NN LOC)". The (?:…/)+ requires at least one "/"
+// so bare root files and prose words never qualify, and the "^" anchor means
+// only a LEADING path is read (paths embedded in a blurb are ignored).
+const ATLAS_RESULT_PATH_RE = /^`?((?:\/?[A-Za-z0-9_.@+\-=]+\/)+[^\s`]+?)`?(?:\s+(?:[—–-]|match:|score:|\[|\()|\s*$)/;
+/**
+ * Extract bounded path anchors from Atlas discovery result text (search,
+ * catalog, cluster). Intentionally narrower than generic output parsing: only
+ * Atlas discovery tools qualify (isAtlasDiscoveryResultTool) and only leading
+ * result paths are accepted, so arbitrary tool stdout cannot become a recall
+ * trigger source. Bounded by construction: at most the first 200 lines are
+ * scanned and at most maxPaths anchors are returned.
+ */
+export function extractAtlasSearchResultPaths(toolName, action, output, maxPaths = 12) {
+    if (!output || !isAtlasDiscoveryResultTool(toolName, action))
+        return [];
+    const seen = new Set();
+    const paths = [];
+    for (const line of output.split('\n').slice(0, 200)) {
+        if (paths.length >= maxPaths)
+            break;
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.length > 512 || trimmed.includes('://'))
+            continue;
+        const body = trimmed.replace(ATLAS_RESULT_LINE_MARKER_RE, '');
+        const match = ATLAS_RESULT_PATH_RE.exec(body);
+        if (!match)
+            continue;
+        const candidate = match[1].replace(/[.,;:)\]}]+$/, '');
+        if (!candidate.includes('/') || candidate.length > 256)
+            continue;
+        const normalized = normalizeToolPath(candidate);
+        if (!normalized || seen.has(normalized))
+            continue;
+        seen.add(normalized);
+        paths.push(normalized);
+    }
+    return paths.sort();
+}
+/**
+ * Derive recall signals at a tool boundary from the just-executed tool call,
+ * the current global claims set, and optional active-window text for tier-2
+ * distinctive-term matching. The term tier is config-gated default OFF.
+ */
+export function extractRecallSignals(toolInput, claimedPaths, activeText = '') {
+    const touched = new Set();
+    if (toolInput) {
+        const primary = extractPath(toolInput);
+        if (primary)
+            touched.add(primary);
+        const multi = toolInput.paths;
+        if (Array.isArray(multi)) {
+            for (const p of multi) {
+                if (typeof p === 'string' && p.trim())
+                    touched.add(normalizeToolPath(p.trim()));
+            }
+        }
+        const cmd = toolInput.command;
+        if (typeof cmd === 'string') {
+            for (const p of extractPathsFromBashCommand(cmd))
+                touched.add(p);
+        }
+    }
+    const claimed = new Set();
+    for (const p of claimedPaths)
+        claimed.add(normalizeToolPath(p));
+    const termText = typeof activeText === 'string' ? activeText : activeText.join('\n');
+    const terms = extractDistinctiveTerms(termText);
+    return {
+        touchedPaths: Array.from(touched).sort(),
+        claimedPaths: Array.from(claimed).sort(),
+        ...(terms.length > 0 ? { terms } : {}),
+    };
+}
+/**
+ * Compose the tool-boundary recall query exactly as the live GET path consumes
+ * it: derive active-window terms ('' when term recall is explicitly off), build
+ * signals, and decide whether recall should proceed. `proceed` mirrors
+ * buildFoldRecallContext's internal admit guard — path-touch OR claim OR
+ * distinctive term signals — so pathless cognition is no longer short-circuited
+ * before terms are weighed.
+ * Pure; the single seam shared by the live caller and its wiring tests.
+ */
+export function deriveBoundaryRecallSignals(toolInput, claimedPaths, rawHistory, foldedRawCount, config, syntheticContext = {}) {
+    const needActive = config.termRecallEnabled || config.verbatimRecallEnabled;
+    const activeText = needActive ? extractActiveWindowText(rawHistory, foldedRawCount, syntheticContext) : '';
+    const signals = extractRecallSignals(toolInput, claimedPaths, activeText);
+    // extractRecallSignals always derives terms from activeText; but the verbatim
+    // tier also needs activeText, so when term recall is OFF keep terms OUT of the
+    // signal (planRecall ignores them anyway) — byte-identical term behavior.
+    if (!config.termRecallEnabled)
+        delete signals.terms;
+    // Exact verbatim-token signal: hashes/ids re-surfacing in the active window.
+    // Flag-gated; nominateVerbatim is bounded (cap 40), sorted for firstIntersection.
+    if (config.verbatimRecallEnabled && activeText) {
+        const tokens = nominateVerbatim(activeText).sort();
+        if (tokens.length > 0)
+            signals.verbatimTokens = tokens;
+    }
+    const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
+    const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
+    const proceed = signals.touchedPaths.length > 0 || signals.claimedPaths.length > 0 || hasTermSignals || hasVerbatimSignals;
+    return { signals, proceed };
+}
+function pressureBudget(level, config) {
+    switch (level) {
+        case 'healthy':
+            return { cardBudget: config.maxCards, charBudget: config.maxTotalChars };
+        case 'warning':
+            return { cardBudget: config.maxCards, charBudget: Math.floor(config.maxTotalChars / 2) };
+        case 'critical':
+            return { cardBudget: 1, charBudget: Math.floor(config.maxTotalChars / 4) };
+        case 'auto_compact':
+            return { cardBudget: 0, charBudget: Math.min(800, config.maxTotalChars) };
+    }
+}
+function entryPaths(entry) {
+    return entry.kind === 'turn' ? entry.paths : entry.path ? [entry.path] : [];
+}
+function isSyntheticRecallKey(matchedPath) {
+    return matchedPath.startsWith('verbatim:') || matchedPath.startsWith('term:');
+}
+/** Maximum number of zone paths that participate in enrichment (radar + source deltas). */
+const ZONE_ENRICHMENT_MAX_PATHS = 3;
+function dirSegments(p) {
+    const i = p.lastIndexOf('/');
+    return (i < 0 ? '' : p.slice(0, i)).split('/').filter(Boolean);
+}
+function sharedPrefix(a, b) {
+    let n = 0;
+    while (n < a.length && n < b.length && a[n] === b[n])
+        n++;
+    return n;
+}
+/**
+ * Order zone paths by directory proximity to the anchor: anchor first, then
+ * closest sibling dirs, cross-cluster paths last. Stable within ties.
+ * Pure string work — zero I/O. Used for enrichment ranking, not body collection.
+ */
+function orderZoneByProximity(anchor, paths) {
+    const aSegs = dirSegments(anchor);
+    return paths
+        .map((p, i) => ({ p, i, score: p === anchor ? Infinity : sharedPrefix(dirSegments(p), aSegs) }))
+        .sort((x, y) => y.score - x.score || x.i - y.i)
+        .map(z => z.p);
+}
+/**
+ * Composite key for the pairwise pathAffinity carrier. Null-byte separator
+ * avoids path collision (paths never contain \x00).
+ */
+function affinityKey(anchor, zonePath) {
+    return `${anchor}\x00${zonePath}`;
+}
+/**
+ * Order zone paths by behavioral co-activation affinity from the host-supplied
+ * pathAffinity carrier (tier-1): anchor first, then by descending affinity score.
+ * Directory proximity (tier-0) is the deterministic tie-breaker AND the per-anchor
+ * fallback: paths with equal or absent affinity keep proximity order, so a
+ * behaviorally-cold zone (this anchor has no affinity entries → every score -1)
+ * collapses to pure tier-0 proximity instead of arbitrary entry/insertion order —
+ * even when the carrier is non-empty for some OTHER anchor. An empty carrier
+ * short-circuits straight to proximity (byte-identical standalone behavior).
+ */
+function orderZoneByRelevance(anchor, paths, affinity) {
+    if (affinity.size === 0)
+        return orderZoneByProximity(anchor, paths);
+    // Proximity rank is the fallback ordering: it tie-breaks equal affinity scores
+    // and fully orders a zone whose anchor has no affinity keys (all score -1),
+    // preserving tier-0 proximity rather than collapsing to insertion order.
+    const proximityRank = new Map(orderZoneByProximity(anchor, paths).map((p, rank) => [p, rank]));
+    return paths
+        .map((p) => ({
+        p,
+        rank: proximityRank.get(p) ?? Number.MAX_SAFE_INTEGER,
+        score: p === anchor ? Infinity : (affinity.get(affinityKey(anchor, p)) ?? -1),
+    }))
+        .sort((x, y) => y.score - x.score || x.rank - y.rank)
+        .map((z) => z.p);
+}
+// ── Tier-1b booster math (BENCHED) ──────────────────────────────────────────
+// Pure import-graph-distance ranking helpers. BENCHED: nothing in the live
+// pipeline calls these. The host-side affinity worker computes behavioral-only
+// affinity — the import booster was demoted by its own thesis to a minority-case
+// tie-breaker, could not resolve the workspace root inside a worker thread
+// (process.chdir throws there), and had no relevance telemetry to justify it.
+// They live HERE, in the fold-engine package, because they are pure recall-ranking
+// math (the natural sibling of orderZoneByRelevance) so standalone and any host
+// share one source of truth. Revive only after measuring tier-1 lift AND threading
+// the impact-graph root explicitly (never via process.chdir). Kept unit-tested.
+const BEHAVIORAL_WEIGHT = 0.7;
+const IMPORT_BOOSTER_WEIGHT = 0.3;
+/**
+ * BENCHED (tier-1b). Convert import-graph distance to a 0-1 booster signal:
+ * distance 0 (same file / direct dependency) → 1.0; distance ∞ (cross-cluster) →
+ * 0 (no boost, NO penalty). Formula: max(0, 1 - distance / 6) — the 6-hop bound
+ * matches the host impact graph's max traversal depth.
+ */
+export function distanceToBooster(distance) {
+    if (!Number.isFinite(distance))
+        return 0; // cross-cluster → zero boost, no penalty
+    return Math.max(0, 1 - distance / 6);
+}
+/**
+ * BENCHED (tier-1b). Blend behavioral affinity with the import-graph booster.
+ * Booster-only invariant: the result is never below the behavioral baseline (import
+ * distance only RAISES a score, never penalizes). Cold-start (behavioral 0) falls
+ * back to the booster.
+ * finalScore = max(behavioral, behavioral*BEHAVIORAL_WEIGHT + importBooster*IMPORT_BOOSTER_WEIGHT)
+ */
+export function blendScores(behavioral, importBooster) {
+    const blended = behavioral * BEHAVIORAL_WEIGHT + importBooster * IMPORT_BOOSTER_WEIGHT;
+    // Booster-only invariant: never below behavioral baseline; clamp to [0,1].
+    return Math.max(behavioral, Math.max(0, Math.min(1, blended)));
+}
+/**
+ * Paths that share the same recall body/enrichment zone. A folded inter-turn
+ * entry is one temporal read burst, so touching any member path should recover
+ * the whole co-folded source context. Intra-tool entries stay exact-path.
+ *
+ * For real anchors (tier-0/1 path touches) the zone is relevance-ordered:
+ * tier-1 behavioral affinity when the carrier is populated, tier-0 directory
+ * proximity as fallback. Synthetic keys (verbatim:/term:) have no real anchor,
+ * so they keep entry order.
+ */
+function recallZonePaths(item, state) {
+    if (item.entry.kind === 'turn' || isSyntheticRecallKey(item.matchedPath)) {
+        if (isSyntheticRecallKey(item.matchedPath))
+            return entryPaths(item.entry);
+        const affinity = state?.pathAffinity;
+        return affinity
+            ? orderZoneByRelevance(item.matchedPath, entryPaths(item.entry), affinity)
+            : orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
+    }
+    return [item.matchedPath];
+}
+/** Smallest path present in both sorted lists, or null. Both inputs sorted. */
+function firstIntersection(sortedA, sortedB) {
+    let i = 0;
+    let j = 0;
+    while (i < sortedA.length && j < sortedB.length) {
+        if (sortedA[i] === sortedB[j])
+            return sortedA[i];
+        if (sortedA[i] < sortedB[j])
+            i++;
+        else
+            j++;
+    }
+    return null;
+}
+function turnTerms(entry) {
+    return entry.kind === 'turn' ? extractDistinctiveTerms(entry.digest) : [];
+}
+function idfForTurnDigests(entries, getTerms = turnTerms) {
+    const df = new Map();
+    let total = 0;
+    for (const entry of entries) {
+        if (entry.kind !== 'turn')
+            continue;
+        const terms = getTerms(entry);
+        if (terms.length === 0)
+            continue;
+        total++;
+        for (const term of new Set(terms)) {
+            df.set(term, (df.get(term) ?? 0) + 1);
+        }
+    }
+    return idfFromDocumentFrequency(df, total);
+}
+/**
+ * Plan which folded entries to page back in this pass. Pure — reads residency,
+ * never mutates. Ordering is fully deterministic: tier asc, tier-2 relevance
+ * desc, recency desc, id asc. Path tiers keep their recency ordering; only
+ * fuzzy/exact tier-2 matches spend card budget by relevance before falling
+ * back to recency. Residency: resident cards suppress (by entry id AND by
+ * content path — path residency survives index rebuilds); resident hints
+ * escalate to card-eligible on a fresh hard trigger (tiers 0-1 are both hard
+ * in v1) and suppress otherwise.
+ */
+export function planRecall(index, resident, residentPaths, passSeq, signals, utilization, config) {
+    const budget = pressureBudget(utilization, config);
+    const matched = [];
+    const suppressedResidencies = [];
+    const queryTerms = config.termRecallEnabled ? (signals.terms ?? []) : [];
+    const queryTokens = config.verbatimRecallEnabled ? (signals.verbatimTokens ?? []) : [];
+    // Memoize per-turn distinctive-term extraction for this pass: idfForTurnDigests
+    // and the tier-2 match loop below would otherwise tokenize each turn digest
+    // twice. Pure cache keyed by entry.id — identical content per entry, so plan
+    // output stays byte-identical.
+    const turnTermsCache = new Map();
+    const getTurnTerms = (entry) => {
+        let terms = turnTermsCache.get(entry.id);
+        if (terms === undefined) {
+            terms = turnTerms(entry);
+            turnTermsCache.set(entry.id, terms);
+        }
+        return terms;
+    };
+    const termIdf = queryTerms.length >= TERM_RECALL_MIN_DISTINCTIVE_COUNT
+        ? idfForTurnDigests(index.entries, getTurnTerms)
+        : null;
+    let suppressed = 0;
+    for (const entry of index.entries) {
+        const paths = entryPaths(entry);
+        // Exact verbatim-token re-surface: a single kept hash/id matching the active
+        // window pages this turn in. Stronger than fuzzy term overlap (evaluated
+        // first within tier 2), but path-touch/claim still outrank.
+        const tokenEligible = queryTokens.length > 0 && entry.kind === 'turn' && (entry.verbatimTokens?.length ?? 0) > 0;
+        const tokenHit = tokenEligible
+            ? firstIntersection(entry.verbatimTokens ?? [], queryTokens)
+            : null;
+        if (paths.length === 0 && (termIdf === null || entry.kind !== 'turn') && tokenHit === null)
+            continue;
+        let tier = null;
+        let matchedPath = null;
+        let trigger = null;
+        let relevanceScore = 0;
+        const touch = firstIntersection(paths, signals.touchedPaths);
+        if (touch !== null) {
+            tier = 0;
+            matchedPath = touch;
+            trigger = `path-touch ${matchedPath}`;
+        }
+        else {
+            const claim = firstIntersection(paths, signals.claimedPaths);
+            if (claim !== null) {
+                tier = 1;
+                matchedPath = claim;
+                trigger = `claim ${matchedPath}`;
+            }
+            else if (tokenHit !== null) {
+                tier = 2;
+                matchedPath = `verbatim:${tokenHit}`;
+                trigger = `verbatim-token ${tokenHit}`;
+                relevanceScore = Number.POSITIVE_INFINITY;
+            }
+            else if (termIdf !== null && entry.kind === 'turn') {
+                const overlap = scoreTermOverlap(queryTerms, getTurnTerms(entry), termIdf);
+                if (overlap.distinctiveCount >= TERM_RECALL_MIN_DISTINCTIVE_COUNT) {
+                    tier = 2;
+                    const matchedTerms = overlap.matched.map((m) => m.term);
+                    matchedPath = `term:${matchedTerms.join('+')}`;
+                    trigger = `term-overlap ${matchedTerms.join(', ')}`;
+                    relevanceScore = overlap.score;
+                }
+            }
+        }
+        if (tier === null || matchedPath === null || trigger === null)
+            continue;
+        // Content-level suppression operates on TWO independent residency maps:
+        //
+        // 1. PATH residency (residentPaths): coarse — "this path's content was
+        //    carded recently, possibly under a DIFFERENT entry id after a refold."
+        //    Tier-0 (active path-touch) BYPASSES this: post-refold the same logical
+        //    content reappears under a new entry id, and suppressing it would create
+        //    a dead zone where the marker is present but recall can't re-show it
+        //    (rail recall-derisk, 2026-06-24). This bypass MUST stay.
+        //
+        // 2. ENTRY-ID residency (resident): fine-grained — "this EXACT folded entry
+        //    was carded recently." Entry id is turn:<startIndex>, stable within an
+        //    index. A tier-0 path-touch that matches the SAME entry id is re-carding
+        //    byte-identical content shown one tool-boundary ago — pure repetition
+        //    tax. Tier-0 now RESPECTS entry-id card residency (rail-dccaa1a1): the
+        //    identical entry is suppressed for ttlPasses, while a genuinely different
+        //    entry for the same path (new content or post-refold new id) still cards.
+        const pathRecord = residentPaths.get(matchedPath);
+        const pathLive = pathRecord !== undefined && passSeq < pathRecord.expiresAtPass;
+        const record = resident.get(entry.id);
+        const entryLive = record !== undefined && passSeq < record.expiresAtPass;
+        if (pathLive && tier !== 0) {
+            suppressed++;
+            suppressedResidencies.push({
+                entryId: entry.id,
+                matchedPath,
+                refreshEntry: entryLive,
+                refreshPath: true,
+            });
+            continue;
+        }
+        let escalatedFromHint = false;
+        if (entryLive) {
+            if (record.level === 'card') {
+                // Exact-entry dedup: this identical entry was carded within ttlPasses.
+                // Applies to ALL tiers including tier-0 — an active path-touch does not
+                // justify re-injecting byte-identical content the agent saw one tool
+                // boundary ago. Path residency (above) still bypasses for tier-0 so a
+                // different/new entry for the same path can card.
+                suppressed++;
+                suppressedResidencies.push({
+                    entryId: entry.id,
+                    matchedPath,
+                    refreshEntry: true,
+                    refreshPath: false,
+                });
+                continue;
+            }
+            // Resident hint + fresh hard trigger → card-eligible escalation.
+            escalatedFromHint = true;
+        }
+        matched.push({
+            entry,
+            tier,
+            matchedPath,
+            trigger,
+            relevanceScore,
+            render: 'card',
+            escalatedFromHint,
+        });
+    }
+    matched.sort((a, b) => {
+        if (a.tier !== b.tier)
+            return a.tier - b.tier;
+        if (a.tier === 2 && b.tier === 2 && a.relevanceScore !== b.relevanceScore) {
+            return (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0);
+        }
+        if (a.entry.recency !== b.entry.recency)
+            return b.entry.recency - a.entry.recency;
+        return a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
+    });
+    // Assign planned render levels against the pressure card budget.
+    const items = [];
+    let cards = 0;
+    let hints = 0;
+    // Tier-0 pressure floor: under auto_compact (cardBudget: 0) the budget loop
+    // would downgrade everything to hints, blinding an agent on the path it is
+    // actively editing. Reserve one card for the highest-priority tier-0 item so
+    // a marker never becomes a dead end. matched[] is sorted tier-ascending, so
+    // matched[0] is the top item. Normal/critical/warning paths are unaffected
+    // (cardBudget >= 1 already covers tier-0 naturally).
+    const tier0Floor = budget.cardBudget === 0 && matched.length > 0 && matched[0].tier === 0 ? 1 : 0;
+    const effectiveCardBudget = budget.cardBudget + tier0Floor;
+    for (const item of matched) {
+        if (cards < effectiveCardBudget) {
+            items.push(item);
+            cards++;
+        }
+        else if (hints < MAX_HINTS_PER_PASS) {
+            items.push({ ...item, render: 'hint' });
+            hints++;
+        }
+        // Overflow beyond cards+hints is silently omitted (re-eligible next pass).
+    }
+    return { items, suppressed, suppressedResidencies };
+}
+// ══════════════════════════════════════════════════════════════════════
+// Rendering (deterministic, char-safe)
+// ══════════════════════════════════════════════════════════════════════
+function isLowSurrogate(code) {
+    return code >= 0xdc00 && code <= 0xdfff;
+}
+/** Slice that never splits a surrogate pair at either boundary. */
+function charSafeSlice(s, start, end) {
+    let a = start;
+    let b = end;
+    if (a > 0 && a < s.length && isLowSurrogate(s.charCodeAt(a)))
+        a++;
+    if (b > 0 && b < s.length && isLowSurrogate(s.charCodeAt(b)))
+        b--;
+    return s.slice(a, Math.max(a, b));
+}
+function formatChars(n) {
+    return n.toLocaleString('en-US');
+}
+/**
+ * Head+tail excerpt with an omission note, char-safe on multibyte content.
+ * Returns the input unchanged when it fits.
+ */
+export function excerptForRecall(text, maxChars) {
+    if (text.length <= maxChars)
+        return text;
+    const headLen = Math.floor(maxChars * 0.7);
+    const tailLen = Math.max(0, maxChars - headLen);
+    const omitted = text.length - headLen - tailLen;
+    const head = charSafeSlice(text, 0, headLen);
+    const tail = tailLen > 0 ? charSafeSlice(text, text.length - tailLen, text.length) : '';
+    return `${head}\n…[${formatChars(omitted)} chars omitted — self-tap for full content]…\n${tail}`;
+}
+/**
+ * Strip previously-injected recall blocks from text before re-recalling it.
+ * Feedback-loop guard: injected cards land inside tool results in raw
+ * history; when that turn later folds and is itself recalled, re-quoting the
+ * embedded card would nest stale copies and double-spend budget.
+ */
+export function stripRecallBlocks(text) {
+    if (!text.includes(RECALL_CARD_PREFIX) && !text.includes(RECALL_HINT_PREFIX))
+        return text;
+    const lines = text.split('\n');
+    const kept = [];
+    let inCard = false;
+    for (const line of lines) {
+        if (inCard) {
+            if (line === '[End fold recall]')
+                inCard = false;
+            continue;
+        }
+        if (line.startsWith(RECALL_CARD_PREFIX)) {
+            inCard = true;
+            continue;
+        }
+        if (line.startsWith(RECALL_HINT_PREFIX))
+            continue; // hints are single lines
+        kept.push(line);
+    }
+    while (kept.length > 0 && kept[kept.length - 1].trim() === '')
+        kept.pop();
+    return kept.join('\n');
+}
+/** Find the original (pre-fold) tool result text in raw history by tool id. */
+export function findToolResultText(rawHistory, toolId) {
+    for (const msg of rawHistory) {
+        if (msg.role === 'user' && Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (block?.type === 'tool_result' && block.tool_use_id === toolId) {
+                    return blockContentText(block.content);
+                }
+            }
+        }
+        if (msg.role === 'tool' && msg.tool_call_id === toolId) {
+            return typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+        }
+    }
+    return null;
+}
+/**
+ * Collect tool result texts within a turn slice whose tool-arg path matches any
+ * recall-zone path, each paired with the matched path. Tool-id encounter order
+ * and global dedup are identical to legacy single-text collection, so callers
+ * that ignore the path produce byte-identical output; the path lets a caller
+ * substitute current box source for an individually-changed path.
+ */
+function collectToolResultEntriesForPaths(slice, paths) {
+    if (paths.length === 0)
+        return [];
+    const wanted = new Set(paths);
+    const ids = [];
+    const idPath = new Map();
+    const seenIds = new Set();
+    const pushId = (id, matched) => {
+        if (seenIds.has(id))
+            return;
+        seenIds.add(id);
+        ids.push(id);
+        idPath.set(id, matched);
+    };
+    const firstWanted = (cmdPaths) => {
+        for (const p of cmdPaths)
+            if (wanted.has(p))
+                return p;
+        return null;
+    };
+    for (const msg of slice) {
+        if (msg.role !== 'assistant')
+            continue;
+        if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+                if (block?.type === 'tool_use' && typeof block.id === 'string') {
+                    const path = extractPath(block.input ?? {});
+                    if (path && wanted.has(path)) {
+                        pushId(block.id, path);
+                    }
+                    else if (typeof block.name === 'string' && BASH_TOOL_NAME_RE.test(block.name)) {
+                        const cmd = block.input?.command;
+                        const matched = typeof cmd === 'string' ? firstWanted(extractPathsFromBashCommand(cmd)) : null;
+                        if (matched)
+                            pushId(block.id, matched);
+                    }
+                }
+            }
+        }
+        if (Array.isArray(msg.tool_calls)) {
+            for (const tc of msg.tool_calls) {
+                if (tc?.id && tc?.function?.name) {
+                    let args = {};
+                    try {
+                        args = JSON.parse(tc.function.arguments ?? '{}');
+                    }
+                    catch { /* skip */ }
+                    const path = extractPath(args);
+                    if (path && wanted.has(path)) {
+                        pushId(tc.id, path);
+                    }
+                    else if (BASH_TOOL_NAME_RE.test(tc.function.name)) {
+                        const cmd = args.command;
+                        const matched = typeof cmd === 'string' ? firstWanted(extractPathsFromBashCommand(cmd)) : null;
+                        if (matched)
+                            pushId(tc.id, matched);
+                    }
+                }
+            }
+        }
+    }
+    const out = [];
+    for (const id of ids) {
+        const text = findToolResultText(slice, id);
+        if (text)
+            out.push({ path: idPath.get(id), text });
+    }
+    return out;
+}
+function describeEntry(entry) {
+    if (entry.kind === 'tool') {
+        return entry.path ? `${entry.tool} ${entry.path}` : entry.tool;
+    }
+    const preview = entry.paths.slice(0, 3).join(', ');
+    const more = entry.paths.length > 3 ? `, +${entry.paths.length - 3} more` : '';
+    return preview ? `${entry.category} turn (${preview}${more})` : `${entry.category} turn`;
+}
+function shortRecallToolName(name) {
+    const parts = name.split('__').filter(Boolean);
+    return parts[parts.length - 1] ?? name;
+}
+/** Ordered, counted tool-call labels for a recalled raw episode. */
+function recallEpisodeToolLabels(messages) {
+    const order = [];
+    const counts = new Map();
+    const add = (raw) => {
+        if (typeof raw !== 'string' || !raw.trim())
+            return;
+        const name = shortRecallToolName(raw.trim());
+        if (!counts.has(name))
+            order.push(name);
+        counts.set(name, (counts.get(name) ?? 0) + 1);
+    };
+    for (const message of messages) {
+        if (Array.isArray(message.content)) {
+            for (const block of message.content) {
+                if (block?.type === 'tool_use')
+                    add(block.name);
+            }
+        }
+        if (Array.isArray(message.tool_calls)) {
+            for (const call of message.tool_calls)
+                add(call?.function?.name);
+        }
+        if (Array.isArray(message.parts)) {
+            for (const part of message.parts)
+                add(part?.functionCall?.name);
+        }
+    }
+    return order.slice(0, 4).map((name) => {
+        const count = counts.get(name) ?? 1;
+        return count > 1 ? `${name} ×${count}` : name;
+    });
+}
+function renderHint(item) {
+    return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} folded earlier (${formatChars(item.entry.chars)} chars) | trigger: ${item.trigger} | self-tap to recover]`;
+}
+/**
+ * Body text for a recall card, sliced from in-memory raw history only. When a
+ * recalled path's CURRENT box source (worker-fetched liveSource) genuinely
+ * differs from the historical folded copy, the response is trigger-tier-aware:
+ * a claim-tier recall (`swapBodyToCurrent` — the agent is about to edit) swaps
+ * that path's body section to the current source; read/term-tier recalls keep
+ * the HISTORICAL folded copy and only record the delta so the notifier can flag
+ * the drift with a fresh-read pointer. A truncated snapshot whose change is
+ * beyond the window keeps the historical body but records a beyond-window flag.
+ * No carrier / no genuine change ⇒ byte-identical legacy body.
+ */
+function renderEntryBody(entry, recallPaths, rawHistory, syntheticContext, sourceDeltas, swapBodyToCurrent) {
+    const applied = [];
+    if (entry.kind === 'tool') {
+        const text = findToolResultText(rawHistory, entry.toolId);
+        if (text === null)
+            return null;
+        const historical = stripRecallBlocks(text);
+        const swap = entry.path ? swapPathToCurrentSource(entry.path, historical, sourceDeltas, swapBodyToCurrent) : null;
+        if (swap) {
+            applied.push(swap.applied);
+            return { body: swap.body ?? historical, applied };
+        }
+        return { body: historical, applied };
+    }
+    if (entry.rawStart < 0 || entry.rawEnd > rawHistory.length || entry.rawStart >= entry.rawEnd)
+        return null;
+    const slice = rawHistory.slice(entry.rawStart, entry.rawEnd);
+    const parts = [];
+    const user = extractFirstUserText(slice, syntheticContext);
+    if (user)
+        parts.push(`User asked: ${user.length > 300 ? charSafeSlice(user, 0, 299) + '…' : user}`);
+    const assistant = extractAssistantText(slice);
+    if (assistant)
+        parts.push(assistant);
+    if (recallPaths.length > 0) {
+        for (const { path, text } of collectToolResultEntriesForPaths(slice, recallPaths)) {
+            const historical = stripRecallBlocks(text);
+            const swap = swapPathToCurrentSource(path, historical, sourceDeltas, swapBodyToCurrent);
+            if (swap) {
+                parts.push(swap.body ?? historical);
+                applied.push(swap.applied);
+            }
+            else {
+                parts.push(historical);
+            }
+        }
+    }
+    const body = parts.join('\n\n');
+    return body.trim() ? { body, applied } : null;
+}
+// ── Curated Code Radar formatters (deterministic, bounded, char-safe) ──
+const RECALL_RADAR_MAX_LINES = 3;
+/** Deterministic line-range token: "L85" for a point, "L85–95" for a span. */
+function formatRadarLineRange(startLine, endLine) {
+    return startLine === endLine ? `L${startLine}` : `L${startLine}–${endLine}`;
+}
+/**
+ * Compact source-highlight radar — Atlas-curated guideposts to a touched file's
+ * key regions, rendered as `⌖ label (a–b)` lines. Deterministic (startLine asc),
+ * bounded by RECALL_RADAR_MAX_LINES and charBudget. Returns '' when nothing fits.
+ */
+export function formatHighlightsRadar(highlights, charBudget) {
+    if (highlights.length === 0 || charBudget <= 0)
+        return '';
+    const sorted = [...highlights].sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+    const lines = [];
+    let used = 0;
+    for (const h of sorted) {
+        if (lines.length >= RECALL_RADAR_MAX_LINES)
+            break;
+        const line = `⌖ ${h.label} (${formatRadarLineRange(h.startLine, h.endLine)})`;
+        if (used + line.length + 1 > charBudget)
+            break;
+        lines.push(line);
+        used += line.length + 1;
+    }
+    return lines.join('\n');
+}
+/**
+ * Compact hazard radar — `⚠️ text (L85)` / `⚠️ text (L85–95)` for ranged hazards,
+ * `⚠️ text` for file-level (null range). Ranged hazards sort by startLine asc;
+ * file-level hazards sort last. Deterministic, bounded. '' when nothing fits.
+ */
+export function formatHazardRadar(hazards, charBudget) {
+    if (hazards.length === 0 || charBudget <= 0)
+        return '';
+    const sorted = [...hazards].sort((a, b) => {
+        const aFile = a.startLine === null;
+        const bFile = b.startLine === null;
+        if (aFile !== bFile)
+            return aFile ? 1 : -1; // file-level hazards sort last
+        if (aFile && bFile)
+            return 0;
+        return a.startLine - b.startLine;
+    });
+    const lines = [];
+    let used = 0;
+    for (const hz of sorted) {
+        if (lines.length >= RECALL_RADAR_MAX_LINES)
+            break;
+        const range = hz.startLine === null ? '' : ` (${formatRadarLineRange(hz.startLine, hz.endLine ?? hz.startLine)})`;
+        const line = `⚠️ ${hz.text}${range}`;
+        if (used + line.length + 1 > charBudget)
+            break;
+        lines.push(line);
+        used += line.length + 1;
+    }
+    return lines.join('\n');
+}
+/**
+ * Resolve the curated enrichment for a plan item from FoldRecallState. Tier 0/1
+ * matched a real file path; tier 2 (verbatim/term) keys are synthetic, so fall
+ * back to the entry's own paths. Deduped across paths.
+ */
+function resolveItemEnrichment(item, state, suppressPaths) {
+    const keys = recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS);
+    const highlights = [];
+    const hazards = [];
+    const seenH = new Set();
+    const seenZ = new Set();
+    for (const key of keys) {
+        // Dedup vs an active Atlas read: the agent is seeing this file's full record
+        // live this turn, so its radar would duplicate the tool output — skip it.
+        if (suppressPaths.has(key))
+            continue;
+        for (const h of state.pathHighlights.get(key) ?? []) {
+            const sig = `${h.startLine}:${h.endLine}:${h.label}`;
+            if (seenH.has(sig))
+                continue;
+            seenH.add(sig);
+            highlights.push(h);
+        }
+        for (const hz of state.pathHazards.get(key) ?? []) {
+            const sig = `${hz.startLine}:${hz.endLine}:${hz.text}`;
+            if (seenZ.has(sig))
+                continue;
+            seenZ.add(sig);
+            hazards.push(hz);
+        }
+    }
+    return { highlights, hazards };
+}
+/**
+ * Build the Curated Code Radar block for a card: hazard radar first (higher
+ * urgency), then highlight radar — each flag-gated, the two sharing charBudget.
+ * Returns '' when both flags are off, nothing is resident, or nothing fits.
+ */
+function buildRadar(item, state, config, charBudget, suppressPaths) {
+    if (charBudget <= 0 || (!config.highlightsEnabled && !config.hazardsEnabled))
+        return '';
+    const { highlights, hazards } = resolveItemEnrichment(item, state, suppressPaths);
+    const parts = [];
+    let used = 0;
+    if (config.hazardsEnabled && hazards.length > 0) {
+        const block = formatHazardRadar(hazards, charBudget - used);
+        if (block) {
+            parts.push(block);
+            used += block.length + 1;
+        }
+    }
+    if (config.highlightsEnabled && highlights.length > 0) {
+        const block = formatHighlightsRadar(highlights, charBudget - used);
+        if (block) {
+            parts.push(block);
+            used += block.length + 1;
+        }
+    }
+    return parts.join('\n');
+}
+/**
+ * Build the Atlas identity metadata block for a recall card: purpose + tags
+ * from the Atlas record for this path. Compact, budget-bounded, and '' when
+ * empty or missing. Does NOT duplicate highlights/hazards.
+ *
+ * When both purpose and blurb exist, purpose takes precedence for brevity
+ * (purpose is the longer timeless description; blurb is the tweet-length
+ * fallback used when purpose is absent). Tags are always rendered separately.
+ */
+function buildAtlasMetaBlock(item, state, config, charBudget, _suppressPaths) {
+    if (!config.atlasMetaEnabled)
+        return '';
+    if (charBudget <= 0)
+        return '';
+    const meta = state.pathAtlasMeta?.get(item.matchedPath);
+    if (!meta)
+        return '';
+    const parts = [];
+    let used = 0;
+    const identity = meta.purpose ?? meta.blurb;
+    if (identity && used + identity.length + 5 < charBudget) {
+        const line = `  📌 ${identity}`;
+        parts.push(line);
+        used += line.length + 1;
+    }
+    if (meta.tags.length > 0) {
+        const tagLine = `  🏷 ${meta.tags.slice(0, 5).join(', ')}`;
+        if (used + tagLine.length + 1 < charBudget) {
+            parts.push(tagLine);
+            used += tagLine.length + 1;
+        }
+    }
+    if (parts.length === 0)
+        return '';
+    return parts.join('\n');
+}
+const DELTA_MAX_LINES = 14;
+const DELTA_LINE_MAX_CHARS = 200;
+const DELTA_NOTIFIER_BUDGET = 900;
+const SOURCE_GUTTER_RE = /^\s*\d+\t/;
+/**
+ * Strip the cat -n line-number gutter ("   123\tcode") that Read tool results
+ * carry, so a historical folded body is comparable to raw on-disk liveSource
+ * (which has no gutter) and removed-side diff lines read as code. No-op when no
+ * tab gutter is present.
+ */
+function stripSourceGutter(text) {
+    if (!text.includes('\t'))
+        return text;
+    return text.split('\n').map(line => line.replace(SOURCE_GUTTER_RE, '')).join('\n');
+}
+function splitNormalizedLines(text) {
+    return text.replace(/\r\n/g, '\n').split('\n').map(line => line.replace(/[ \t]+$/, ''));
+}
+/**
+ * Bounded, deterministic line delta between a historical folded body and the
+ * current box source. 'changed' carries the minimal "what changed" hunk; 'beyond'
+ * means a truncated snapshot showed no in-window divergence but the file extends
+ * past the char cap (real state unknown — flag, don't fabricate a deletion diff);
+ * null means identical (gutter-normalized) ⇒ no genuine change. For a truncated
+ * snapshot the partial final line and the historical tail beyond the window are
+ * dropped so comparison stays within the region both sides cover; common
+ * prefix/suffix are then trimmed to a minimal hunk.
+ *
+ * LIMITATION: the hunk is a single contiguous prefix/suffix block, not an LCS
+ * diff — scattered edits collapse into one coarse removed+added block. This only
+ * coarsens the NOTIFIER; on a claim-tier 'changed' result the card BODY still
+ * pages back the full current box source, so no current content is lost.
+ *
+ * CONTEXT FLOOR: a 'changed' verdict additionally requires the shared
+ * prefix+suffix (pre+post) to cover at least ~15% of the comparable region.
+ * A genuine edit of one document leaves unchanged context around the changed
+ * span; near-zero shared context means the two texts are different document
+ * *shapes* — an Atlas-lookup/metadata-shaped folded body, or a windowed
+ * mid-file read, compared against raw full-file source — not an edit.
+ * Rendering those as 'changed' produced misleading whole-file "edit" hunks,
+ * so they return null (historical body kept, no notifier). Cost, accepted: a
+ * zero-shared-context TOTAL rewrite is line-indistinguishable from a shape
+ * mismatch and is also suppressed; a fresh read still shows the real file.
+ */
+function computeSourceDelta(historicalBody, liveSource, truncated, budget) {
+    if (budget < 80)
+        return null;
+    const histFull = splitNormalizedLines(stripSourceGutter(historicalBody));
+    let liveLines = splitNormalizedLines(liveSource);
+    let histLines = histFull;
+    if (truncated) {
+        // The live snapshot is a char-capped prefix: its final line is a truncation
+        // artifact (a partial line, or a trailing empty from a boundary newline).
+        // Drop it and cap the historical side to the same window so the tail beyond
+        // the snapshot is never mistaken for a deletion.
+        liveLines = liveLines.slice(0, Math.max(0, liveLines.length - 1));
+        histLines = histFull.slice(0, liveLines.length);
+    }
+    let pre = 0;
+    const maxPre = Math.min(histLines.length, liveLines.length);
+    while (pre < maxPre && histLines[pre] === liveLines[pre])
+        pre++;
+    let post = 0;
+    const maxPost = Math.min(histLines.length - pre, liveLines.length - pre);
+    while (post < maxPost && histLines[histLines.length - 1 - post] === liveLines[liveLines.length - 1 - post])
+        post++;
+    const removed = histLines.slice(pre, histLines.length - post);
+    const added = liveLines.slice(pre, liveLines.length - post);
+    if (removed.length === 0 && added.length === 0) {
+        // Identical within the comparable region. For a truncated snapshot the real
+        // current state past the window is unknown ⇒ flag; else genuinely unchanged.
+        return truncated ? { kind: 'beyond' } : null;
+    }
+    // Context floor (see docblock): veto 'changed' when the shared prefix+suffix
+    // is too thin relative to the comparable region — different document shapes,
+    // not an edit. The floor is relative (not a fixed line count) so genuine
+    // small-file edits with proportionally substantial context still qualify.
+    const contextFloor = Math.max(1, Math.ceil(0.15 * Math.min(histLines.length, liveLines.length)));
+    if (pre + post < contextFloor)
+        return null;
+    const out = [`@@ ~line ${pre + 1} @@`];
+    let used = out[0].length + 1;
+    let shown = 0;
+    let omitted = 0;
+    const push = (marker, text) => {
+        if (shown >= DELTA_MAX_LINES) {
+            omitted++;
+            return;
+        }
+        const clipped = text.length > DELTA_LINE_MAX_CHARS ? `${charSafeSlice(text, 0, DELTA_LINE_MAX_CHARS - 1)}…` : text;
+        const line = `${marker} ${clipped}`;
+        if (used + line.length + 1 > budget) {
+            omitted++;
+            return;
+        }
+        out.push(line);
+        used += line.length + 1;
+        shown++;
+    };
+    for (const r of removed)
+        push('−', r);
+    for (const a of added)
+        push('+', a);
+    if (omitted > 0)
+        out.push(`…(±${omitted} more line${omitted === 1 ? '' : 's'} in this region — self-tap/fresh-read for full)`);
+    return { kind: 'changed', diff: out.join('\n') };
+}
+function currentSourceLabel(path, truncated) {
+    return truncated
+        ? `↻ CURRENT box source — ${path} (snapshot truncated; fresh-read for full file):`
+        : `↻ CURRENT box source — ${path}:`;
+}
+/**
+ * Decide how to render `path`'s worker-fetched live snapshot:
+ * - genuine visible change + `swapToCurrent` (claim-tier recall — the agent is
+ *   about to edit) ⇒ body becomes current box source + a recorded diff;
+ * - genuine visible change without `swapToCurrent` (read/term-tier recall — a
+ *   passive glance back) ⇒ body stays historical (null) + a recorded diff so
+ *   the notifier flags the drift with a fresh-read pointer;
+ * - truncated change beyond the window ⇒ body stays historical (null) + a
+ *   beyond-window flag so the notifier warns to fresh-read;
+ * - no carrier / no change ⇒ null (caller keeps historical, byte-identical legacy).
+ */
+function swapPathToCurrentSource(path, historical, sourceDeltas, swapToCurrent) {
+    const delta = sourceDeltas.get(path);
+    if (!delta || !delta.liveSource.trim())
+        return null;
+    const res = computeSourceDelta(historical, delta.liveSource, !!delta.truncated, DELTA_NOTIFIER_BUDGET);
+    if (res === null)
+        return null;
+    if (res.kind === 'beyond') {
+        // A truncated snapshot whose in-window region matched the historical body and
+        // whose full-file hash is unchanged since the prior epoch is not a fresh
+        // divergence — suppress the repeat fresh-read nudge and keep the historical
+        // body byte-identical. The first epoch a change appears (liveHash differs)
+        // still flags beyond-window.
+        if (delta.stableSincePrior)
+            return null;
+        return { body: null, applied: { path, liveHash: delta.liveHash, diff: '', truncated: true, beyond: true, swapped: false } };
+    }
+    if (!swapToCurrent) {
+        // Read/term-tier recall: the agent is remembering, not editing. Swapping
+        // the body under a passive glance replaced remembered context with
+        // unexpected current text — keep the historical folded copy and let the
+        // notifier carry the drift warning + hunk instead.
+        return { body: null, applied: { path, liveHash: delta.liveHash, diff: res.diff, truncated: !!delta.truncated, swapped: false } };
+    }
+    return {
+        body: `${currentSourceLabel(path, !!delta.truncated)}\n${delta.liveSource}`,
+        applied: { path, liveHash: delta.liveHash, diff: res.diff, truncated: !!delta.truncated, swapped: true },
+    };
+}
+/**
+ * True unless the relay has explicitly signaled a live-source change for this
+ * path (`stableSincePrior === false`). Absence of any source-delta signal is
+ * treated as "unchanged" because the folded historical entry itself is fixed
+ * content from rawHistory — it never changes on its own between recalls;
+ * only a live file diverging from that historical snapshot is a genuine
+ * change worth paying full card budget for again.
+ */
+function isPathContentUnchanged(matchedPath, state) {
+    const delta = state.pathSourceDeltas.get(matchedPath);
+    return !delta || delta.stableSincePrior !== false;
+}
+function resolveItemSourceDeltaMap(item, state) {
+    const map = new Map();
+    for (const key of recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS)) {
+        const delta = state.pathSourceDeltas.get(key);
+        if (delta && !map.has(delta.path))
+            map.set(delta.path, delta);
+    }
+    return map;
+}
+/**
+ * Notifier block, rendered before the body excerpt so it always survives body
+ * truncation. Heading is honest about what the body IS:
+ * - every changed path swapped (claim-tier) ⇒ announces the body is CURRENT
+ *   box source and lists each path's "what changed" hunk;
+ * - every changed path unswapped (read/term-tier) ⇒ announces the body is the
+ *   HISTORICAL folded copy, warns to fresh-read before relying on it, and
+ *   still lists the hunks;
+ * - mixed, or any beyond-window flag (truncated snapshot whose change lies
+ *   past the cap) ⇒ neutral heading with per-path body annotations.
+ * The heading never claims the body is CURRENT when it is not. '' when
+ * nothing was applied ⇒ byte-identical legacy.
+ */
+function formatDeltaNotifier(applied, budget) {
+    if (applied.length === 0 || budget < 80)
+        return '';
+    const allChanged = applied.every(a => !a.beyond);
+    const allSwapped = allChanged && applied.every(a => a.swapped);
+    const noneSwapped = applied.every(a => !a.swapped);
+    const heading = allSwapped
+        ? (applied.length === 1
+            ? 'Δ Source changed since fold — body below is CURRENT box source; what changed:'
+            : `Δ ${applied.length} sources changed since fold — bodies below are CURRENT box source; what changed:`)
+        : allChanged && noneSwapped
+            ? (applied.length === 1
+                ? 'Δ Source changed since fold — body below is the HISTORICAL folded copy; fresh-read before relying on it; what changed:'
+                : `Δ ${applied.length} sources changed since fold — bodies below are the HISTORICAL folded copies; fresh-read before relying on them; what changed:`)
+            : 'Δ Fold-recall live-source check:';
+    // Per-path body annotation, only where the heading does not already say it.
+    const uniformHeading = allSwapped || (allChanged && noneSwapped);
+    const out = [heading];
+    let used = heading.length + 1;
+    for (const a of applied) {
+        if (a.beyond) {
+            const head = `${a.path} (liveHash=${a.liveHash}) [snapshot truncated] — body may be stale beyond the shown prefix; fresh-read to verify current code`;
+            if (used + head.length + 1 > budget)
+                break;
+            out.push(head);
+            used += head.length + 1;
+        }
+        else {
+            const suffix = uniformHeading
+                ? ''
+                : a.swapped
+                    ? ' [body: CURRENT box source]'
+                    : ' [body: HISTORICAL folded copy — fresh-read before relying on it]';
+            const head = `${a.path} (liveHash=${a.liveHash})${suffix}`;
+            if (used + head.length + 1 > budget)
+                break;
+            out.push(head);
+            used += head.length + 1;
+            for (const line of a.diff.split('\n')) {
+                if (used + line.length + 1 > budget)
+                    break;
+                out.push(line);
+                used += line.length + 1;
+            }
+        }
+    }
+    return out.length > 1 ? out.join('\n') : '';
+}
+function renderRecallProvenance(item, rawHistory, rawTailStart) {
+    const sourceStart = item.entry.kind === 'turn' ? item.entry.rawStart : item.entry.recency;
+    const sourceEnd = item.entry.kind === 'turn' ? item.entry.rawEnd : item.entry.recency + 1;
+    const sourceTime = foldMessageTimestampBounds(rawHistory.slice(sourceStart, sourceEnd));
+    const rawTailCount = Math.max(0, rawHistory.length - rawTailStart);
+    const rendered = renderChronologicalProvenanceCompact({
+        artifact: `fold-recall#${item.entry.id}`,
+        contentClass: 'retrieved-history',
+        source: {
+            start: { unit: 'message', index: sourceStart, timestamp: sourceTime.firstTimestamp },
+            endExclusive: { unit: 'message', index: sourceEnd },
+            count: sourceEnd - sourceStart,
+            lastTimestamp: sourceTime.lastTimestamp,
+        },
+        transformedAt: { unit: 'message', index: rawHistory.length },
+        ...(rawTailCount > 0 ? { rawResumesAt: { unit: 'message', index: rawTailStart } } : {}),
+        authority: 'historical-background',
+        supersession: rawTailCount > 0 ? 'later-raw-wins' : 'none-known',
+        topology: {
+            host: 'dedicated-synthetic-message',
+            previous: 'raw-history',
+            next: rawTailCount > 0 ? 'raw-tail' : 'none',
+            representation: 'canonical',
+            rawTailCount,
+        },
+    });
+    if (!rendered)
+        return '';
+    const paths = entryPaths(item.entry).slice(0, 3);
+    const tools = recallEpisodeToolLabels(rawHistory.slice(sourceStart, sourceEnd));
+    const sourceBits = [
+        tools.length > 0 ? tools.join(' → ') : '',
+        paths.length > 0 ? paths.join(', ') : '',
+    ].filter(Boolean);
+    if (sourceBits.length === 0)
+        return rendered;
+    const episode = `↞ source episode: ${sourceBits.join(' · ')}`;
+    return `${rendered}\n${episode.length > 260 ? `${charSafeSlice(episode, 0, 259)}…` : episode}`;
+}
+function renderCard(item, body, bodyBudget, radar, applied, rawHistory, rawTailStart, episodeVoice = '', atlasMeta = '') {
+    // Radar (hazard + highlight guideposts), episodic voice, and the source-delta
+    // notifier all prepend the body excerpt and share the card budget. For a
+    // claim-tier recall the body is already swapped to CURRENT box source for
+    // changed paths (renderEntryBody); read/term-tier recalls keep the historical
+    // body and the notifier carries the drift warning. Empty carriers ⇒ byte-identical.
+    const radarBlock = radar ? `${radar}\n` : '';
+    const voiceBlock = episodeVoice ? `${episodeVoice}\n` : '';
+    const metaBlock = atlasMeta ? `${atlasMeta}\n` : '';
+    const provenance = renderRecallProvenance(item, rawHistory, rawTailStart);
+    const provenanceBlock = provenance ? `${provenance}\n` : '';
+    const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - metaBlock.length - provenanceBlock.length) / 2);
+    const notifier = formatDeltaNotifier(applied, notifierBudget);
+    const notifierBlock = notifier ? `${notifier}\n` : '';
+    const prefixBlock = `${provenanceBlock}${metaBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
+    const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - prefixBlock.length));
+    const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
+    return {
+        text: `${header}\n${prefixBlock}${excerpt}\n[End fold recall]`,
+        stats: {
+            bodyChars: excerpt.length,
+            notifierChars: notifier.length,
+            radarChars: radar.length,
+            episodeVoiceChars: episodeVoice.length,
+            atlasMetaChars: atlasMeta.length,
+            swappedPaths: applied.reduce((n, a) => n + (a.swapped ? 1 : 0), 0),
+        },
+    };
+}
+const EMPTY_OUTCOME = { text: null, cards: 0, hints: 0, chars: 0, suppressed: 0, triggers: [] };
+function hashVisibleCard(text) {
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+}
+function foldIndexSignature(index) {
+    const entries = index.entries;
+    const cards = index.visibleRecallCards;
+    const cardSig = cards === undefined
+        ? 'legacy'
+        : `${cards.length}:${cards.map(hashVisibleCard).join(',')}`;
+    return `${index.rawCount}|${entries[0]?.id ?? ''}|${entries[entries.length - 1]?.id ?? ''}|${cardSig}`;
+}
+function refreshResidency(map, key, expiresAtPass) {
+    const existing = map.get(key);
+    if (existing)
+        map.set(key, { ...existing, expiresAtPass });
+}
+function sweepPathResidencyByView(residentPaths, index, rawHistory, currentIndexSignature, passSeq, refreshedExpiresAtPass) {
+    const visibleCards = index.visibleRecallCards === undefined ? null : new Set(index.visibleRecallCards);
+    if (visibleCards !== null) {
+        const tailStart = Math.max(0, Math.min(index.rawCount, rawHistory.length));
+        for (const card of collectVisibleRecallCards(rawHistory.slice(tailStart))) {
+            visibleCards.add(card);
+        }
+    }
+    for (const [path, record] of residentPaths) {
+        const renderedCardVisible = record.renderedCard !== undefined && visibleCards?.has(record.renderedCard) === true;
+        const canCheckView = visibleCards !== null &&
+            record.level === 'card' &&
+            record.renderedCard !== undefined &&
+            record.indexSignature !== undefined &&
+            (record.indexSignature !== currentIndexSignature || renderedCardVisible);
+        if (canCheckView) {
+            if (renderedCardVisible) {
+                if (passSeq >= record.expiresAtPass) {
+                    residentPaths.set(path, { ...record, expiresAtPass: refreshedExpiresAtPass });
+                }
+            }
+            else {
+                residentPaths.delete(path);
+            }
+            continue;
+        }
+        if (passSeq >= record.expiresAtPass)
+            residentPaths.delete(path);
+    }
+}
+function makeResidencyRecord(level, expiresAtPass, renderedCard, indexSignature) {
+    return {
+        level,
+        expiresAtPass,
+        ...(renderedCard !== undefined ? { renderedCard } : {}),
+        ...(indexSignature !== undefined ? { indexSignature } : {}),
+    };
+}
+const SUPPRESSED_MANIFEST_MAX_ENTRIES = 6;
+const SUPPRESSED_MANIFEST_MAX_CHARS = 480;
+const SUPPRESSED_MANIFEST_REMINDER_PASSES = 6;
+function suppressedRecallCoordinate(entry, matchedPath) {
+    const paths = entryPaths(entry);
+    const fallbackPath = matchedPath.startsWith('term:') || matchedPath.startsWith('verbatim:')
+        ? []
+        : [matchedPath];
+    const source = entry.kind === 'turn'
+        ? `raw messages ${entry.rawStart + 1}–${entry.rawEnd}`
+        : `raw message ${entry.recency + 1}`;
+    return { paths: paths.length > 0 ? paths : fallbackPath, source };
+}
+function renderSuppressedRecallManifest(suppressed, coordinates) {
+    if (suppressed <= 0)
+        return '';
+    const header = `[Fold recall suppressed manifest — ${suppressed} matching bod${suppressed === 1 ? 'y' : 'ies'} withheld as already resident]`;
+    const rows = coordinates.slice(0, SUPPRESSED_MANIFEST_MAX_ENTRIES).map((coordinate) => {
+        const pathLabel = coordinate.paths.length > 0 ? coordinate.paths.slice(0, 3).join(', ') : 'path unavailable';
+        return `- ${pathLabel} @ ${coordinate.source}`;
+    });
+    if (rows.length === 0)
+        rows.push('- path/source coordinates unavailable');
+    if (coordinates.length > rows.length)
+        rows.push(`- …${coordinates.length - rows.length} more coordinate${coordinates.length - rows.length === 1 ? '' : 's'} elided`);
+    const fitted = [];
+    let used = header.length;
+    for (const row of rows) {
+        const boundedRow = row.length > 220 ? `${charSafeSlice(row, 0, 219)}…` : row;
+        if (used + boundedRow.length + 1 > SUPPRESSED_MANIFEST_MAX_CHARS)
+            break;
+        fitted.push(boundedRow);
+        used += boundedRow.length + 1;
+    }
+    return [header, ...fitted].join('\n');
+}
+/**
+ * Show a suppressed-body manifest on first sight, whenever its bounded
+ * composition changes, and occasionally while an identical suppression set
+ * persists. This keeps the visibility win without repeating the same block at
+ * every busy tool boundary.
+ */
+function takeSuppressedRecallManifest(state, suppressed, coordinates) {
+    const manifest = renderSuppressedRecallManifest(suppressed, coordinates);
+    if (!manifest) {
+        state.lastSuppressedManifestKey = null;
+        state.suppressedManifestQuietPasses = 0;
+        return '';
+    }
+    if (state.lastSuppressedManifestKey !== manifest) {
+        state.lastSuppressedManifestKey = manifest;
+        state.suppressedManifestQuietPasses = 0;
+        return manifest;
+    }
+    const quietPasses = (state.suppressedManifestQuietPasses ?? 0) + 1;
+    if (quietPasses >= SUPPRESSED_MANIFEST_REMINDER_PASSES) {
+        state.suppressedManifestQuietPasses = 0;
+        return manifest;
+    }
+    state.suppressedManifestQuietPasses = quietPasses;
+    return '';
+}
+function rawTailProviderPovText(index, rawHistory) {
+    const start = Math.max(0, Math.min(index.rawCount, rawHistory.length));
+    return collectProviderViewText(rawHistory.slice(start));
+}
+/**
+ * Remove exact, meaningful body paragraphs that are already visible in the
+ * unfolded raw tail. Novel paragraphs remain, so a partly redundant card can
+ * still recover unique tool output instead of being suppressed wholesale.
+ */
+function pruneRawTailResidentParagraphs(body, rawTailPovText) {
+    if (!rawTailPovText || !body.trim())
+        return body;
+    const paragraphs = body.split(/\n{2,}/);
+    const kept = paragraphs.filter((paragraph) => {
+        const normalized = normalizeFoldRecallPovText(paragraph);
+        return normalized.length < 82 || !rawTailPovText.includes(normalized);
+    });
+    return kept.join('\n\n').trim();
+}
+/**
+ * One recall pass at a tool boundary: plan against the index + residency,
+ * render measured cards/hints from in-memory raw history, update residency
+ * and telemetry. Mutates only `state`. Deterministic for identical inputs.
+ *
+ * Budget semantics: the pressure char budget caps the TOTAL rendered block;
+ * a card whose remaining budget is below MIN_USEFUL_CARD_CHARS downgrades to
+ * a hint (an escalated resident hint suppresses instead of re-hinting).
+ */
+export function buildFoldRecallContext(state, rawHistory, signals, utilization, config, syntheticContext = {}) {
+    if (!config.enabled || !state.index || state.index.entries.length === 0)
+        return EMPTY_OUTCOME;
+    // Staleness guard: a rewound history invalidates raw ranges; the next
+    // freeze epoch (history-rewound) rebuilds the index from current truth.
+    if (rawHistory.length < state.index.rawCount)
+        return EMPTY_OUTCOME;
+    // Index-change detection: a freeze epoch rebuilds the index, and entry ids
+    // (turn:<startIndex>) can collide across rebuilds even though the refolded
+    // entry is fresh. Clear entry-id residency on rebuild so the new entry can
+    // legitimately re-card. Path residency is content-keyed and intentionally
+    // survives refolds, so it is NOT cleared here.
+    const currentIndexSignature = foldIndexSignature(state.index);
+    if (state.lastIndexSignature != null && state.lastIndexSignature !== currentIndexSignature) {
+        state.resident.clear();
+    }
+    state.lastIndexSignature = currentIndexSignature;
+    const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
+    const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
+    if (signals.touchedPaths.length === 0 &&
+        signals.claimedPaths.length === 0 &&
+        !hasTermSignals &&
+        !hasVerbatimSignals) {
+        return EMPTY_OUTCOME;
+    }
+    state.passSeq += 1;
+    const passSeq = state.passSeq;
+    const refreshedExpiresAtPass = passSeq + config.ttlPasses;
+    // Deterministic sweep of expired/view-absent residency (bounds both maps).
+    for (const [id, record] of state.resident) {
+        if (passSeq >= record.expiresAtPass)
+            state.resident.delete(id);
+    }
+    sweepPathResidencyByView(state.residentPaths, state.index, rawHistory, currentIndexSignature, passSeq, refreshedExpiresAtPass);
+    const plan = planRecall(state.index, state.resident, state.residentPaths, passSeq, signals, utilization, config);
+    let suppressed = plan.suppressed;
+    const suppressedCoordinates = new Map();
+    const recordSuppressed = (entry, matchedPath) => {
+        const coordinate = suppressedRecallCoordinate(entry, matchedPath);
+        const key = `${coordinate.paths.join('\u0000')}\u0001${coordinate.source}`;
+        if (!suppressedCoordinates.has(key))
+            suppressedCoordinates.set(key, coordinate);
+    };
+    const entriesById = new Map(state.index.entries.map((entry) => [entry.id, entry]));
+    for (const residency of plan.suppressedResidencies) {
+        const entry = entriesById.get(residency.entryId);
+        if (entry)
+            recordSuppressed(entry, residency.matchedPath);
+        if (residency.refreshEntry)
+            refreshResidency(state.resident, residency.entryId, refreshedExpiresAtPass);
+        if (residency.refreshPath)
+            refreshResidency(state.residentPaths, residency.matchedPath, refreshedExpiresAtPass);
+    }
+    if (plan.items.length === 0) {
+        const suppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
+        state.suppressed += suppressed;
+        state.recallChars += suppressedManifest.length;
+        return {
+            ...EMPTY_OUTCOME,
+            text: suppressedManifest || null,
+            chars: suppressedManifest.length,
+            suppressed,
+            ...(suppressedManifest ? { suppressedManifest } : {}),
+        };
+    }
+    const budget = pressureBudget(utilization, config);
+    const providerPovText = foldRecallProviderPovText(state.index, rawHistory);
+    const rawTailPovText = rawTailProviderPovText(state.index, rawHistory);
+    const blocks = [];
+    const triggers = [];
+    const injected = [];
+    let charsUsed = 0;
+    let cards = 0;
+    let hints = 0;
+    let composition = null;
+    const emittedCardContentKeys = new Set();
+    // Radar dedup: paths the current Atlas-read tool already rendered live, whose
+    // radar would duplicate the tool output (empty set ⇒ byte-identical).
+    const radarSuppressPaths = new Set(signals.atlasReadPaths ?? []);
+    for (const item of plan.items) {
+        const remaining = budget.charBudget - charsUsed;
+        if (remaining <= 0)
+            break;
+        let level = item.render;
+        let rendered = null;
+        let cardStats = null;
+        let cardContentKey = null;
+        if (level === 'card') {
+            const uncappedBodyBudget = Math.min(config.maxCardChars, remaining - RECALL_BODY_RESERVED_GAP_CHARS);
+            // Repeat-recall shrink (rail-c63e326e s6): a path already carded earlier
+            // this session, with no signaled live-source change, needs less budget
+            // on each repeat — the agent has already seen it once.
+            const priorShowCount = state.pathCardShowCounts.get(item.matchedPath) ?? 0;
+            const shrinkRatio = isPathContentUnchanged(item.matchedPath, state)
+                ? repeatCardBudgetRatio(priorShowCount)
+                : 1;
+            const bodyBudget = shrinkRatio < 1 ? Math.floor(uncappedBodyBudget * shrinkRatio) : uncappedBodyBudget;
+            if (bodyBudget < MIN_USEFUL_CARD_CHARS) {
+                level = 'hint'; // measured budget overflow → card degrades to hint
+            }
+            else {
+                const recallPaths = recallZonePaths(item, state);
+                const sourceDeltas = resolveItemSourceDeltaMap(item, state);
+                // Body-swap is claim-tier only: a claim says "about to edit this file",
+                // where stale code is actively dangerous. Read/term-tier recalls are
+                // passive glances — they keep the historical body and rely on the
+                // notifier's drift warning instead.
+                const rb = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext, sourceDeltas, item.tier === 1);
+                if (rb === null)
+                    continue; // raw no longer recoverable — skip silently
+                // Curated Code Radar may take up to a third of the card body budget; the
+                // notifier + excerpt share the rest. '' (empty carriers / flags off) ⇒ byte-identical.
+                const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
+                const episodeVoice = buildEpisodeVoiceBlock(item, state, config, Math.floor(bodyBudget / 4), radarSuppressPaths);
+                const atlasMeta = buildAtlasMetaBlock(item, state, config, Math.floor(bodyBudget / 5), radarSuppressPaths);
+                // Information residency is broader than recall-card residency. Suppress
+                // only when the recovered body AND every rendered enrichment are already
+                // present. A source-delta notifier is always novel continuity evidence,
+                // so changed/beyond-source cards must still render even when their body
+                // is resident elsewhere in POV.
+                const residentPrunedBody = rb.applied.length === 0
+                    ? pruneRawTailResidentParagraphs(rb.body, rawTailPovText)
+                    : rb.body;
+                if (!residentPrunedBody) {
+                    suppressed++;
+                    recordSuppressed(item.entry, item.matchedPath);
+                    continue;
+                }
+                const povComponents = [residentPrunedBody, radar, episodeVoice, atlasMeta].filter((part) => part.length > 0);
+                cardContentKey = povComponents.map(normalizeFoldRecallPovText).join('\u0000');
+                const allComponentsResident = rb.applied.length === 0
+                    && povComponents.length > 0
+                    && povComponents.every((part) => {
+                        const normalized = normalizeFoldRecallPovText(part);
+                        return normalized.length >= 82 && providerPovText.includes(normalized);
+                    });
+                if (allComponentsResident) {
+                    suppressed++;
+                    recordSuppressed(item.entry, item.matchedPath);
+                    continue;
+                }
+                if (rb.applied.length === 0 && cardContentKey && emittedCardContentKeys.has(cardContentKey)) {
+                    suppressed++;
+                    recordSuppressed(item.entry, item.matchedPath);
+                    continue;
+                }
+                const rc = renderCard(item, residentPrunedBody, bodyBudget, radar, rb.applied, rawHistory, state.index?.rawCount ?? rawHistory.length, episodeVoice, atlasMeta);
+                rendered = rc.text;
+                if (rendered.length > remaining) {
+                    level = 'hint';
+                    rendered = null;
+                }
+                else {
+                    cardStats = rc.stats;
+                }
+            }
+        }
+        if (level === 'hint') {
+            if (item.escalatedFromHint) {
+                // Already hinted recently and we cannot afford the card — stay quiet.
+                suppressed++;
+                recordSuppressed(item.entry, item.matchedPath);
+                refreshResidency(state.resident, item.entry.id, refreshedExpiresAtPass);
+                continue;
+            }
+            if (hints >= MAX_HINTS_PER_PASS)
+                continue;
+            rendered ??= renderHint(item);
+            if (rendered.length > remaining)
+                continue;
+        }
+        if (rendered === null)
+            continue;
+        // Hints are single-line and have no path-level visible-card ledger. After
+        // an index rebuild their entry residency can reset while the exact hint is
+        // still in POV. The same literal check also closes any full-card seam not
+        // covered by body/enrichment component residency above.
+        const normalizedRendered = normalizeFoldRecallPovText(rendered);
+        if (normalizedRendered.length >= 42 && providerPovText.includes(normalizedRendered)) {
+            suppressed++;
+            recordSuppressed(item.entry, item.matchedPath);
+            continue;
+        }
+        blocks.push(rendered);
+        triggers.push(item.trigger);
+        injected.push({ id: item.entry.id, level });
+        if (level === 'card') {
+            if (cardContentKey)
+                emittedCardContentKeys.add(cardContentKey);
+            // Content-level residency: keep this path quiet across index rebuilds.
+            state.residentPaths.set(item.matchedPath, makeResidencyRecord('card', passSeq + config.ttlPasses, rendered, currentIndexSignature));
+            // Lifetime repeat counter (rail-c63e326e s6) — never expires/clears, unlike residency.
+            state.pathCardShowCounts.set(item.matchedPath, (state.pathCardShowCounts.get(item.matchedPath) ?? 0) + 1);
+        }
+        charsUsed += rendered.length;
+        if (level === 'card')
+            cards++;
+        else
+            hints++;
+        if (level === 'card' && cardStats !== null) {
+            composition = composition === null
+                ? { ...cardStats }
+                : {
+                    bodyChars: composition.bodyChars + cardStats.bodyChars,
+                    notifierChars: composition.notifierChars + cardStats.notifierChars,
+                    radarChars: composition.radarChars + cardStats.radarChars,
+                    episodeVoiceChars: composition.episodeVoiceChars + cardStats.episodeVoiceChars,
+                    atlasMetaChars: composition.atlasMetaChars + cardStats.atlasMetaChars,
+                    swappedPaths: composition.swappedPaths + cardStats.swappedPaths,
+                };
+        }
+    }
+    for (const { id, level } of injected) {
+        state.resident.set(id, makeResidencyRecord(level, passSeq + config.ttlPasses));
+    }
+    state.cardsInjected += cards;
+    state.hintsInjected += hints;
+    const suppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
+    if (suppressedManifest) {
+        blocks.push(suppressedManifest);
+        charsUsed += suppressedManifest.length;
+    }
+    state.recallChars += charsUsed;
+    state.suppressed += suppressed;
+    if (blocks.length === 0)
+        return { ...EMPTY_OUTCOME, suppressed };
+    return {
+        text: blocks.join('\n\n'),
+        cards,
+        hints,
+        chars: charsUsed,
+        suppressed,
+        ...(suppressedManifest ? { suppressedManifest } : {}),
+        triggers,
+        ...(composition !== null ? { composition } : {}),
+    };
+}
+//# sourceMappingURL=foldRecall.js.map
