@@ -968,7 +968,11 @@ function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLi
   const activeRequest = input.triggeringUserMessage;
   const rail = findResumeLine(input.resumePoint, '📋 ');
   const active = findResumeLine(input.resumePoint, '▶ Active:');
-  const next = findResumeLine(input.resumePoint, '⏭ Next:');
+  // Resume Point emits '⏭ Next action:' for the immediate next action; older
+  // persisted packages used '⏭ Next:'. Prefer the current label, fall back to
+  // legacy so the authoritative control block never blanks to 'unknown'.
+  const nextAction = findResumeLine(input.resumePoint, '⏭ Next action:');
+  const next = nextAction !== 'unknown' ? nextAction : findResumeLine(input.resumePoint, '⏭ Next:');
   const editOwnership = cleanString(input.activeEditDelta)
     ? 'Active Edit Delta below is authoritative; inherited/source edits are not owned unless explicitly re-claimed.'
     : 'no active edit delta supplied';

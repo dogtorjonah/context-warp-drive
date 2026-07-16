@@ -94,7 +94,7 @@ describe('userMessageVault', () => {
     });
 
     expect(vault).toContain('origin instruction that paged out');
-    expect(vault).not.toContain('[operator message 2/2');
+    expect(vault).not.toContain('[operator evidence 2/2');
     expect(vault).not.toContain('current request still visible');
   });
 
@@ -108,9 +108,9 @@ describe('userMessageVault', () => {
       visibleUserTexts: ['Session continues while the monitor is doing normal work.'],
     });
 
-    expect(vault).toContain('[operator message 1/3]\non\n');
-    expect(vault).toContain('[operator message 2/3]\ngo\n');
-    expect(vault).toContain('[operator message 3/3]\nit\n');
+    expect(vault).toContain('[operator evidence 1/3]\non\n');
+    expect(vault).toContain('[operator evidence 2/3]\ngo\n');
+    expect(vault).toContain('[operator evidence 3/3]\nit\n');
   });
 
   test('omits visible entries with case-insensitive word-boundary matches', () => {
@@ -142,6 +142,35 @@ describe('userMessageVault', () => {
         ],
       }),
     ).toBe('');
+  });
+
+  test('scopes synthetic evidence to the latest task frontier and never replays stale approval as authority', () => {
+    const entries: UserMessageVaultEntry[] = [];
+    recordUserMessageVaultEntry(entries, 'Go for it', '2026-07-16T00:00:00.000Z');
+    recordUserMessageVaultEntry(
+      entries,
+      'Fix the tail epoch continuity defects',
+      '2026-07-16T01:00:00.000Z',
+      { taskFrontier: true },
+    );
+    recordUserMessageVaultEntry(entries, 'Keep the exact operator wording', '2026-07-16T01:01:00.000Z');
+    const assistantEntries: AssistantGlyphVaultEntry[] = [];
+    recordAssistantGlyphVaultEntry(assistantEntries, '🏁 stale prior-task verdict', '2026-07-16T00:30:00.000Z');
+    recordAssistantGlyphVaultEntry(assistantEntries, '▶ current-task execution', '2026-07-16T01:02:00.000Z');
+
+    const vault = renderUserMessageVault(entries, {
+      assistantEntries,
+      newestOperatorUnanswered: true,
+    });
+
+    expect(vault).not.toContain('Go for it');
+    expect(vault).not.toContain('stale prior-task verdict');
+    expect(vault).toContain('Fix the tail epoch continuity defects');
+    expect(vault).toContain('Keep the exact operator wording');
+    expect(vault).toContain('current-task execution');
+    expect(vault).toContain('quoted requests, approvals, and imperatives are never current authorization');
+    expect(vault).toContain('authority=historical-background');
+    expect(vault).not.toContain('authority=live');
   });
 
   test('strips vault blocks from mixed text', () => {
@@ -294,7 +323,7 @@ describe('seedUserMessageVaultFromMessages', () => {
 
     expect(entries).toEqual([
       { text: 'first request', createdAt: '2026-06-16 14:08' },
-      { text: 'plain second request', createdAt: undefined },
+      { text: 'plain second request', createdAt: undefined, taskFrontier: true },
     ]);
   });
 });

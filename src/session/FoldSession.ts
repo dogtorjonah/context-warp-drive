@@ -550,7 +550,7 @@ export class FoldSession {
    */
   recordOperatorMessage(text: string, createdAt?: string): void {
     if (!this.vaultEnabled) return;
-    recordUserMessageVaultEntry(this.userMessageVaultEntries, text, createdAt);
+    recordUserMessageVaultEntry(this.userMessageVaultEntries, text, createdAt, { taskFrontier: true });
     this.newestOperatorUnanswered = true;
   }
 

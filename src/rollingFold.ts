@@ -657,6 +657,23 @@ export function formatFoldEpochStamp(epoch: number, detail: string): string {
  * foldRecall's buildFoldIndex parses. Full mechanics: docs/context-folding.md.
  */
 export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves closet items — ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
+
+/**
+ * Stable phrase identifying a SURVIVING full-preamble carrier (live fold block,
+ * frozen band fossil, or rebirth-package embed). Deliberately absent from
+ * FOLD_BLOCK_PREAMBLE_POINTER so a pointer never satisfies detection — if the
+ * last full carrier is later evicted, the next fold re-emits the full note
+ * (self-healing rather than a dangling pointer).
+ */
+export const FOLD_BLOCK_PREAMBLE_SIGNATURE = 'older turns were auto-folded into the skeletons below';
+
+/**
+ * One-line stand-in emitted when a surviving message already carries the full
+ * fold preamble. Without this, append-only band stacks restate the ~500-char
+ * mechanics note once per band (each tail-epoch band fossilizes its own copy
+ * while the live block carries another).
+ */
+export const FOLD_BLOCK_PREAMBLE_POINTER = '(Context note: turns below were compacted — closet/recall/claim mechanics per the full context note in the earliest surviving fold block above; docs/context-folding.md)';
 export const COORDINATE_CLOSET_MARKER = '⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖';
 const RAW_TRACE_COORDINATE_CLOSET_PREFIX = '── Raw Trace Coordinate Closet';
 
@@ -1308,7 +1325,16 @@ const VERBATIM_REF_RE = /(?:^|\s)(#\d{2,8})\b/g;
  * issue refs #1234). Collects in PATTERN-PRIORITY order — all UUIDs, then hex,
  * then short hex, paths, KVs, refs — source order within each pattern. Under a
  * budget this priority order is the carry policy: id-shaped values win over
- * KV pairs. Truncates each value to 200 chars, dedupes exactly, stops at cap.
+ * KV pairs. Dedupes exactly, stops at cap.
+ *
+ * A literal is either carried WHOLE or not at all — a mid-literal cut mints a
+ * phantom coordinate ('/home/jonah/voxxo-swarm/ap') that never existed, worse
+ * than absence because a successor will trust it. Three cut signals reject:
+ * oversized values (>200 chars — a blob, not a coordinate; the old behavior
+ * sliced these), matches running straight into a preview-truncation ellipsis
+ * ('…foo/chronologicalProvenan… [+67 chars]' — the SOURCE text was cut), and
+ * trailing ASCII dot-runs ('...' markers absorbed into the match by the
+ * path/KV charsets, the same cut in ASCII form).
  *
  * @param cap Max ENTRY COUNT, not characters.
  */
@@ -1316,11 +1342,13 @@ export function nominateVerbatim(text: string, cap = 40): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
 
-  const addMatch = (raw: string) => {
-    const truncated = raw.length > 200 ? raw.slice(0, 200) : raw;
-    if (!seen.has(truncated)) {
-      seen.add(truncated);
-      result.push(truncated);
+  const addMatch = (raw: string, endIndex: number) => {
+    if (raw.length > 200) return;
+    if (text[endIndex] === '…') return;
+    if (/\.{2,}$/.test(raw)) return;
+    if (!seen.has(raw)) {
+      seen.add(raw);
+      result.push(raw);
     }
   };
 
@@ -1336,7 +1364,9 @@ export function nominateVerbatim(text: string, cap = 40): string[] {
   for (const [re, group] of patterns) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
-      addMatch(m[group] ?? m[0]);
+      // Every pattern's capture ends where the full match ends (leading
+      // boundary chars sit at the START), so this is the literal's end offset.
+      addMatch(m[group] ?? m[0], m.index + m[0].length);
       if (result.length >= cap) return result;
     }
     if (result.length >= cap) return result;
@@ -2295,7 +2325,7 @@ export function foldContext(
   fidelityValue?: FoldFidelityValueInput,
 ): FoldResult {
   const originalChars = countChars(messages);
-  const foldBlockPreamble = config.foldBlockPreamble ?? FOLD_BLOCK_PREAMBLE;
+  let foldBlockPreamble = config.foldBlockPreamble ?? FOLD_BLOCK_PREAMBLE;
   const priorCoordinateCorpus = config.priorCoordinateCorpus
     || extractCoordinateConservationCorpus(messages);
 
@@ -2352,6 +2382,39 @@ export function foldContext(
   // System/developer messages in the fold zone — preserved verbatim
   const foldZone = messages.slice(prefixEnd, foldBoundary);
   const systemInFoldZone = foldZone.filter(m => m.role === 'system' || m.role === 'developer');
+
+  // Append-only preamble dedup: when a message that SURVIVES this fold —
+  // pinned prefix, retained active window, or re-emitted in-zone system row —
+  // already carries the full fold preamble, the new block emits the one-line
+  // pointer instead of restating the mechanics note. A carrier INSIDE the zone
+  // is being absorbed and does not count: when the only carrier is re-folded
+  // away, the new block must carry the full note itself. An explicit
+  // config.foldBlockPreamble always wins over detection.
+  if (config.foldBlockPreamble == null) {
+    const carriesSignature = (m: FoldMessage): boolean => {
+      const c: unknown = (m as { content?: unknown }).content;
+      if (typeof c === 'string') return c.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE);
+      if (Array.isArray(c)) {
+        for (const block of c) {
+          if (typeof block === 'string' && block.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE)) return true;
+          const blockText = (block as { text?: unknown } | null)?.text;
+          if (typeof blockText === 'string' && blockText.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE)) return true;
+        }
+      }
+      const parts: unknown = (m as { parts?: unknown }).parts;
+      if (Array.isArray(parts)) {
+        for (const part of parts) {
+          const partText = (part as { text?: unknown } | null)?.text;
+          if (typeof partText === 'string' && partText.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE)) return true;
+        }
+      }
+      return false;
+    };
+    const survivorCarriesPreamble = prefixMessages.some(carriesSignature)
+      || activeWindow.some(carriesSignature)
+      || systemInFoldZone.some(carriesSignature);
+    if (survivorCarriesPreamble) foldBlockPreamble = FOLD_BLOCK_PREAMBLE_POINTER;
+  }
 
   // Fold each turn with budget-based assistant text retention.
   // Budget allocates retention levels newest-first — turns closest to the
@@ -2550,10 +2613,18 @@ export function foldContext(
         if (closetItems && isConservedIn(closetItems, lit)) return;
         const sep = closetItems ? ' · ' : '';
         const label = extractVerbatimContextLabel(sourceText, lit);
+        // Unbound bare-number gate: a pure-digit run (epoch ms, byte counts)
+        // enters via the ≥12-hex lane, but with no derivable binding it is
+        // dead weight — '1782950000000' alone tells a successor nothing.
+        // Bound numbers survive as value ⟦source-label⟧ and must keep that
+        // binding even under budget pressure (labelled-or-skip: the bare
+        // fallback would re-mint the exact unbound literal this gate drops).
+        const isPureDigit = /^\d+$/.test(lit);
+        if (isPureDigit && !label) return;
         const labelled = label ? `${lit} ⟦${label}⟧` : lit;
         if (closetItems.length + sep.length + labelled.length <= ceiling) {
           closetItems += sep + labelled;
-        } else if (closetItems.length + sep.length + lit.length <= ceiling) {
+        } else if (!isPureDigit && closetItems.length + sep.length + lit.length <= ceiling) {
           closetItems += sep + lit;
         } else {
           return;

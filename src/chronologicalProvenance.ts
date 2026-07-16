@@ -20,6 +20,60 @@ export type ChronologicalContentClass =
 
 export type ChronologicalCoordinateUnit = 'event' | 'message' | 'row' | 'turn' | 'exchange';
 
+export type LiveObjectiveConfidence = 'high' | 'medium' | 'unknown';
+export type LiveObjectiveSource = 'operator-message' | 'mixed-transport-envelope' | 'active-rail' | 'none';
+
+export interface ClassifiedLiveObjective {
+  readonly text: string | null;
+  readonly confidence: LiveObjectiveConfidence;
+  readonly source: LiveObjectiveSource;
+}
+
+// These envelopes are relay/provider context, even when a transport serializes
+// them inside a user-role message. Strip only named product-owned wrappers; an
+// arbitrary XML block may be genuine operator content and must remain intact.
+const OPERATOR_TRANSPORT_ENVELOPE_RE = /<(environment_context|permissions instructions|skills_instructions|apps_instructions|recommended_plugins|multi_agent_mode|temporal_context)(?:\s[^>]*)?>[\s\S]*?<\/\1>/giu;
+const OPERATOR_AGENTS_ENVELOPE_RE = /# AGENTS\.md instructions for [^\n]*\n<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/giu;
+const OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE = /<(?:environment_context|permissions instructions|skills_instructions|apps_instructions|recommended_plugins|multi_agent_mode|temporal_context)(?:\s[^>]*)?>[\s\S]*$/giu;
+const SYNTHETIC_OBJECTIVE_ARTIFACT_RE = /(?:\[CONTEXT REBIRTH\]|\[Context band \d+\s+—\s+tail-epoch fold\]|\[Epoch Continuity Capsule\]|artifact=tail-epoch#|\[User Message Vault\]|\[System Note: Context pressure limits)/u;
+// Interrupt seam artifacts occupy an entire user row: the CLI's own
+// "[Request interrupted by user…]" texts and relay-authored bracketed
+// "[Relay note: …]" replacements. A row that is nothing but one of these
+// (before or after envelope stripping) is a fold/interrupt artifact, never
+// live operator intent — callers wanting the real ask must walk further back.
+const INTERRUPT_ARTIFACT_WHOLE_TEXT_RE = /^(?:\[Request interrupted by user(?: for tool use)?\]|\[Relay note:[\s\S]*\])$/u;
+
+/**
+ * Distinguish operator-authored objective text from user-role transport
+ * envelopes. A mixed row is usable at medium confidence after its known
+ * envelopes are removed; a plain row is high confidence; synthetic-only input
+ * stays explicitly unknown instead of being promoted into live intent.
+ */
+export function classifyOperatorAuthoredObjective(value: string | null | undefined): ClassifiedLiveObjective {
+  const raw = value?.trim() ?? '';
+  if (!raw) return { text: null, confidence: 'unknown', source: 'none' };
+  if (SYNTHETIC_OBJECTIVE_ARTIFACT_RE.test(raw)) {
+    return { text: null, confidence: 'unknown', source: 'none' };
+  }
+
+  let removedEnvelope = false;
+  const strip = (input: string, pattern: RegExp): string => input.replace(pattern, () => {
+    removedEnvelope = true;
+    return '';
+  });
+  let text = strip(raw, OPERATOR_AGENTS_ENVELOPE_RE);
+  text = strip(text, OPERATOR_TRANSPORT_ENVELOPE_RE);
+  text = strip(text, OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE).trim();
+  if (!text || /^(?:<[^>]+>\s*)+$/u.test(text) || INTERRUPT_ARTIFACT_WHOLE_TEXT_RE.test(text)) {
+    return { text: null, confidence: 'unknown', source: 'none' };
+  }
+  return {
+    text,
+    confidence: removedEnvelope ? 'medium' : 'high',
+    source: removedEnvelope ? 'mixed-transport-envelope' : 'operator-message',
+  };
+}
+
 export interface ChronologicalPoint {
   readonly traceId?: string;
   readonly unit: ChronologicalCoordinateUnit;
@@ -56,6 +110,14 @@ export interface ChronologicalProvenanceEnvelope {
   readonly supersededAt?: ChronologicalPoint;
   readonly topology: ChronologicalTopology;
   readonly liveObjective?: string;
+  readonly liveObjectiveConfidence?: LiveObjectiveConfidence;
+  readonly liveObjectiveSource?: LiveObjectiveSource;
+  /**
+   * Interrupted work at the seam: the in-flight tool + a brief argument
+   * preview sourced from the exact resume row, so post-fold resumption is
+   * zero-inference. Free-form bounded text; absent when nothing was pending.
+   */
+  readonly pendingIntent?: string;
 }
 
 export interface ChronologicalValidationResult {
@@ -106,6 +168,12 @@ export function validateChronologicalProvenance(
   if (envelope.topology.rawTailCount === 0 && envelope.rawResumesAt) errors.push('rawResumesAt.without-tail');
   if (envelope.supersession === 'explicit' && !envelope.supersededAt) errors.push('supersededAt.missing');
   if (envelope.supersededAt) validatePoint(envelope.supersededAt, 'supersededAt', errors);
+  if (envelope.liveObjectiveConfidence && envelope.liveObjectiveConfidence !== 'unknown' && !envelope.liveObjective?.trim()) {
+    errors.push('liveObjective.missing');
+  }
+  if (envelope.liveObjectiveSource && envelope.liveObjectiveSource !== 'none' && !envelope.liveObjective?.trim()) {
+    errors.push('liveObjective.source-without-objective');
+  }
   const end = envelope.source.endExclusive;
   const resume = envelope.rawResumesAt;
   if (end?.index !== undefined && resume?.index !== undefined
@@ -134,10 +202,10 @@ function sourceText(span: ChronologicalSpan): string {
   return `${start}..${end}${count}${time}`;
 }
 
-function boundedObjective(value: string | undefined): string | undefined {
+function boundedObjective(value: string | undefined, capChars = 300): string | undefined {
   const normalized = value?.replace(/\s+/g, ' ').trim();
   if (!normalized) return undefined;
-  const bounded = normalized.length > 300 ? `${normalized.slice(0, 300)}…` : normalized;
+  const bounded = normalized.length > capChars ? `${normalized.slice(0, capChars)}…` : normalized;
   return JSON.stringify(bounded);
 }
 
@@ -156,6 +224,10 @@ export function renderChronologicalProvenance(
   const validation = validateChronologicalProvenance(envelope);
   if (!validation.valid) return renderInvalidChronologicalProvenance(envelope, validation.errors);
   const objective = boundedObjective(envelope.liveObjective);
+  const pendingIntent = boundedObjective(envelope.pendingIntent, 220);
+  const objectiveAuthority = envelope.liveObjectiveConfidence
+    ? `objective-confidence=${envelope.liveObjectiveConfidence} objective-source=${envelope.liveObjectiveSource ?? (objective ? 'operator-message' : 'none')}`
+    : '';
   const rawFrontier = envelope.rawResumesAt
     ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)} (${envelope.topology.rawTailCount} exact)`
     : `none (0 exact)`;
@@ -169,7 +241,9 @@ export function renderChronologicalProvenance(
     `created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)}`,
     `topology=${envelope.topology.previous}>artifact>seam>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation}`,
     `raw-resumes=${rawFrontier}`,
+    objectiveAuthority,
     objective ? `live-objective=${objective}` : '',
+    pendingIntent ? `pending-intent=${pendingIntent}` : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -187,6 +261,12 @@ export function renderChronologicalProvenanceCompact(
 
 export interface TailEpochProvenanceInput {
   readonly traceId?: string;
+  /**
+   * Optional immutable coordinate frame for transports that rewrite/rebase
+   * their provider transcript after every band. Numeric rows are comparable
+   * only within this frame; canonical-history transports leave it unset.
+   */
+  readonly sourceFrameId?: string;
   readonly epoch: number;
   readonly unit: 'message' | 'row';
   readonly sourceStart: number;
@@ -199,6 +279,10 @@ export interface TailEpochProvenanceInput {
   readonly host: ChronologicalTopology['host'];
   readonly previous?: ChronologicalTopology['previous'];
   readonly liveObjective?: string;
+  readonly liveObjectiveConfidence?: LiveObjectiveConfidence;
+  readonly liveObjectiveSource?: LiveObjectiveSource;
+  /** Interrupted tool + brief arg preview from the exact resume row (seam intent). */
+  readonly pendingIntent?: string;
 }
 
 export interface TailEpochAliasProvenanceInput {
@@ -343,12 +427,14 @@ function renderTailEpochStackOrientation(input: TailEpochProvenanceInput): strin
   const raw = input.rawTailCount > 0
     ? `raw-tail@${input.unit}#${input.rawResumeIndex}(+${input.rawTailCount})`
     : 'raw-tail:none';
-  return `stack=${input.previous ?? 'frozen-prefix'}>tail-epoch#${input.epoch}[${input.unit}:${input.sourceStart}..${input.sourceEndExclusive})>seam@${input.committedAt}>${raw}`;
+  const frame = input.sourceFrameId ? ` frame=${input.sourceFrameId}` : '';
+  return `stack=${input.previous ?? 'frozen-prefix'}>tail-epoch#${input.epoch}[${input.unit}:${input.sourceStart}..${input.sourceEndExclusive})>seam@${input.committedAt}>${raw}${frame}`;
 }
 
 export function renderTailEpochProvenance(input: TailEpochProvenanceInput): string | null {
+  const sourceTraceId = input.sourceFrameId ?? input.traceId;
   const point = (index: number, timestamp?: string): ChronologicalPoint => ({
-    traceId: input.traceId,
+    traceId: sourceTraceId,
     unit: input.unit,
     index,
     timestamp,
@@ -376,11 +462,17 @@ export function renderTailEpochProvenance(input: TailEpochProvenanceInput): stri
       rawTailCount: input.rawTailCount,
     },
     liveObjective: input.liveObjective,
+    liveObjectiveConfidence: input.liveObjectiveConfidence,
+    liveObjectiveSource: input.liveObjectiveSource,
+    pendingIntent: input.pendingIntent,
   };
   const rendered = renderChronologicalProvenance(envelope);
   const stack = renderTailEpochStackOrientation(input);
   if (!rendered || !stack || !validateChronologicalProvenance(envelope).valid) return rendered;
-  return `${rendered}\n${stack}`;
+  const frame = input.sourceFrameId
+    ? `coordinate-frame=${input.sourceFrameId} scope=pre-fold-snapshot comparable-within-frame-only`
+    : '';
+  return [rendered, frame, stack].filter(Boolean).join('\n');
 }
 
 /** Measured message timestamp bounds; absent timestamps remain absent. */

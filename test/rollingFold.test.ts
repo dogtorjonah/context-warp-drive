@@ -52,6 +52,8 @@ import {
   resolveFoldConfigForBand,
   resolveColdFoldConfigForBand,
   FOLD_BLOCK_PREAMBLE,
+  FOLD_BLOCK_PREAMBLE_POINTER,
+  FOLD_BLOCK_PREAMBLE_SIGNATURE,
   FOLD_TOMBSTONE_PREFIX,
   ALWAYS_ON_FOLD_CONFIG,
   DEFAULT_FOLD_BAND_TOKENS,
@@ -516,6 +518,53 @@ describe('foldContext end-to-end', () => {
     // Preamble sits after header + blank, before the skeletons
     expect(blockLines[2]).toBe(FOLD_BLOCK_PREAMBLE);
     expect(FOLD_BLOCK_PREAMBLE.startsWith('[')).toBe(false);
+  });
+
+  test('preamble dedup: a surviving full-note carrier downgrades the new fold block to the pointer', () => {
+    const messages = buildConversation(10);
+    // An earlier fold artifact carrying the full mechanics note survives in the
+    // active window (frozen band fossil / live fold block / rebirth embed).
+    messages.push(userMsg(`[Context band 1 — tail-epoch fold]\n\n${FOLD_BLOCK_PREAMBLE}\n[user]\nolder skeleton`));
+    const result = foldContext(messages, 5);
+    const foldBlock = result.messages.find(m =>
+      typeof m.content === 'string' && m.content.includes('[Conversation Context'),
+    );
+    expect(foldBlock).toBeDefined();
+    const content = foldBlock!.content as string;
+    const blockLines = content.split('\n');
+    expect(blockLines[2]).toBe(FOLD_BLOCK_PREAMBLE_POINTER);
+    // The signature phrase lives only in the full note — a pointer must never
+    // satisfy carrier detection, and the block must not restate the note.
+    expect(FOLD_BLOCK_PREAMBLE_POINTER.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE)).toBe(false);
+    expect(content).not.toContain(FOLD_BLOCK_PREAMBLE);
+  });
+
+  test('preamble dedup self-heals: a carrier absorbed by this fold does not count as surviving', () => {
+    // The ONLY full-note carrier sits inside the fold zone — this fold absorbs
+    // it, so the new block must re-emit the full note itself rather than emit
+    // a pointer at a note that no longer survives.
+    const messages = [
+      userMsg(`[Context band 0 — stale fossil]\n\n${FOLD_BLOCK_PREAMBLE}\n[user]\nancient skeleton`),
+      ...buildConversation(10),
+    ];
+    const result = foldContext(messages, 5);
+    const foldBlock = result.messages.find(m =>
+      typeof m.content === 'string' && m.content.includes('[Conversation Context'),
+    );
+    expect(foldBlock).toBeDefined();
+    const blockLines = (foldBlock!.content as string).split('\n');
+    expect(blockLines[2]).toBe(FOLD_BLOCK_PREAMBLE);
+  });
+
+  test('preamble dedup: explicit config.foldBlockPreamble always wins over survivor detection', () => {
+    const messages = buildConversation(10);
+    messages.push(userMsg(`surviving fossil\n${FOLD_BLOCK_PREAMBLE}`));
+    const result = foldContext(messages, 5, { ...DEFAULT_FOLD_CONFIG, foldBlockPreamble: FOLD_BLOCK_PREAMBLE });
+    const foldBlock = result.messages.find(m =>
+      typeof m.content === 'string' && m.content.includes('[Conversation Context'),
+    );
+    expect(foldBlock).toBeDefined();
+    expect((foldBlock!.content as string).split('\n')[2]).toBe(FOLD_BLOCK_PREAMBLE);
   });
 
   test('fold summaries contain category info', () => {
@@ -1514,15 +1563,45 @@ describe('nominateVerbatim — pattern coverage (P1/s5)', () => {
     expect(lits.length).toBeLessThanOrEqual(40);
   });
 
-  test('verbatim value longer than 200 chars is truncated to 200 (deep absolute path)', () => {
+  test('verbatim value longer than 200 chars is dropped whole — never sliced mid-literal', () => {
     // Only the unbounded abs-path pattern can exceed 200 chars (KV values cap at
-    // 80, hex at 64) — a vacuous KV fixture here would never exercise truncation.
+    // 80, hex at 64). A sliced path is a phantom coordinate — carry whole or not at all.
     const deepPath = '/' + 'dir/'.repeat(60) + 'leaf.ts'; // 248 chars
     const lits = nominateVerbatim(`reading ${deepPath} done`);
-    expect(lits.some(l => l.length === 200)).toBe(true);
-    for (const l of lits) {
-      expect(l.length).toBeLessThanOrEqual(200);
-    }
+    expect(lits).toHaveLength(0);
+  });
+
+  test('literal abutting a preview-truncation ellipsis is rejected as cut', () => {
+    // Relay tool-call previews truncate with '… [+N chars]' — a path regex match
+    // running straight into the '…' was cut mid-value by the preview, not by us.
+    const lits = nominateVerbatim(
+      'checked /home/jonah/voxxo-swarm/packages/context-warp/src/chronologicalProvenan… [+67 chars]⟩ then /home/x/relay/src/ok.ts done',
+    );
+    expect(lits.some(l => l.endsWith('chronologicalProvenan'))).toBe(false);
+    expect(lits).toContain('/home/x/relay/src/ok.ts');
+  });
+
+  test('ellipsis after a boundary does not reject a completed literal', () => {
+    // '…' only signals a cut when it ABUTS the match — after a space the
+    // literal completed naturally and prose trailed off.
+    const lits = nominateVerbatim('reading /home/x/relay/src/ok.ts … more output');
+    expect(lits).toContain('/home/x/relay/src/ok.ts');
+  });
+
+  test('literal ending in an ASCII dot-run is rejected as cut', () => {
+    // '...' truncation markers are absorbed INTO path/KV matches by [\w.@-],
+    // so the cut shows up as a trailing dot-run on the literal itself.
+    const lits = nominateVerbatim('see /home/jonah/relay/src/foo... and also sha deadbeefcafe1234 here');
+    expect(lits.some(l => l.startsWith('/home/jonah/relay'))).toBe(false);
+    expect(lits).toContain('deadbeefcafe1234');
+  });
+
+  test('cut hex id abutting the ellipsis is rejected (fragment still regex-valid)', () => {
+    // A cut 16-char hash leaves a ≥12-char prefix that still matches the hex
+    // rule — only the '…'-abut check can tell it was truncated.
+    const lits = nominateVerbatim('hash deadbeefcafe1234… [+12 chars] and intact deadbeefcafe5678 ok');
+    expect(lits).not.toContain('deadbeefcafe1234');
+    expect(lits).toContain('deadbeefcafe5678');
   });
 
   test('short mixed hex (8-11, letters+digits) nominated — rail ids, short git SHAs', () => {
@@ -2566,6 +2645,59 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
     const closetLine = closetOf(msgs, cfg, 1);
     expect(closetLine).toBeDefined();
     expect(closetLine).toContain(`${hash} ⟦changelog_id⟧`);
+  });
+
+  test('unbound pure-digit literal (epoch ms) is dropped from the closet', () => {
+    // A 13-digit epoch-ms run enters nomination via the ≥12 hex lane, but at
+    // the start of the result text no preceding identifier exists → no binding
+    // → dead weight a successor cannot interpret.
+    const ts = '1782950000123';
+    const msgs: FoldMessage[] = [
+      userMsg('first'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_d1'),
+      anthropicToolResult('toolu_d1', `${ts} captured with no key context`),
+      assistantMsg('processed'),
+      userMsg('active'),
+      assistantMsg('active turn'),
+    ];
+    const cfg: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 4000 };
+    const closetLine = closetOf(msgs, cfg, 1);
+    expect(closetLine ?? '').not.toContain(ts);
+  });
+
+  test('bound pure-digit literal renders value ⟦label⟧', () => {
+    const ts = '1782950000456';
+    const msgs: FoldMessage[] = [
+      userMsg('first'),
+      anthropicToolUse('Read', { file_path: 'relay/src/b.ts' }, 'toolu_d2'),
+      anthropicToolResult('toolu_d2', `lineCount ${ts} recorded`),
+      assistantMsg('processed'),
+      userMsg('active'),
+      assistantMsg('active turn'),
+    ];
+    const cfg: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 4000 };
+    const closetLine = closetOf(msgs, cfg, 1);
+    expect(closetLine).toBeDefined();
+    expect(closetLine).toContain(`${ts} ⟦lineCount⟧`);
+  });
+
+  test('pure-digit literal under tight budget is skipped, never degraded to bare (labelled-or-skip)', () => {
+    const ts = '1782950000456';
+    const msgs: FoldMessage[] = [
+      userMsg('first'),
+      anthropicToolUse('Read', { file_path: 'relay/src/b.ts' }, 'toolu_d3'),
+      anthropicToolResult('toolu_d3', `lineCount ${ts} recorded`),
+      assistantMsg('processed'),
+      userMsg('active'),
+      assistantMsg('active turn'),
+    ];
+    // labelled form `1782950000456 ⟦lineCount⟧` is 25 chars; bare value is 13.
+    // The mixed-hex tight-budget test above keeps the bare value — numbers must
+    // NOT take that fallback, because a bare number is the unbound literal the
+    // admission gate exists to drop.
+    const cfg: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 15 };
+    const closetLine = closetOf(msgs, cfg, 1);
+    expect(closetLine ?? '').not.toContain(ts);
   });
 });
 

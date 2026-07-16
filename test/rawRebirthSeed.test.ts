@@ -71,6 +71,26 @@ describe('raw rebirth seed renderer', () => {
     expect(orientationIdx).toBeGreaterThan(activityIdx);
   });
 
+  test('renders the current Resume Point next action and preserves legacy fallback', () => {
+    const current = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      resumePoint: [
+        '📋 Task queue (continuity-state) — active — 3/5 (60%)',
+        '▶ Active: reconcile [active] — Reconcile authoritative state',
+        '⏭ Next action: Apply the exact active instruction',
+        '↪ After active step: queued [pending] — Run parity',
+      ].join('\n'),
+    });
+    expect(current).toContain('immediate next action: ⏭ Next action: Apply the exact active instruction');
+    expect(current).not.toContain('immediate next action: unknown');
+
+    const legacy = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      resumePoint: '⏭ Next: Continue from the legacy package',
+    });
+    expect(legacy).toContain('immediate next action: ⏭ Next: Continue from the legacy package');
+  });
+
   test('renders one authoritative active request body and suppresses lower-tier duplicates', () => {
     const activeRequest = 'Ship the rebirth package redesign now';
     const seed = renderRawRebirthSeed({
