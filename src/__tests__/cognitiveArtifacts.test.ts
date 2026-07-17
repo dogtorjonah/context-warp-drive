@@ -39,15 +39,33 @@ describe('cognitiveArtifacts', () => {
       expect(artifacts[0].register).toBe('blocked');
     });
 
-    it('does not extract in_progress or executing glyphs', () => {
+    it('admits short in_progress/executing narrations as transient flow notes by default', () => {
       const messages: FoldMessage[] = [
         { role: 'assistant', content: '🔍 investigating the fold code' },
         { role: 'assistant', content: '▶ applying fix now' },
         { role: 'assistant', content: '🏁 all done' },
       ];
       const artifacts = extractCognitiveArtifacts(messages);
+      expect(artifacts).toHaveLength(3);
+      expect(artifacts.map((a) => a.trust)).toEqual(['transient', 'transient', 'durable']);
+      expect(artifacts[0].register).toBe('in_progress');
+      expect(artifacts[0].glyph).toBe('🔍');
+      expect(artifacts[1].register).toBe('executing');
+      expect(artifacts[1].glyph).toBe('▶');
+      expect(artifacts[2].register).toBe('verdict');
+    });
+
+    it('excludes the transient lane entirely when includeFlowNotes is false', () => {
+      const messages: FoldMessage[] = [
+        { role: 'assistant', content: '🔍 investigating the fold code' },
+        { role: 'assistant', content: '▶ applying fix now' },
+        { role: 'assistant', content: 'Single mount, always embedded.' },
+        { role: 'assistant', content: '🏁 all done' },
+      ];
+      const artifacts = extractCognitiveArtifacts(messages, { includeFlowNotes: false });
       expect(artifacts).toHaveLength(1);
       expect(artifacts[0].register).toBe('verdict');
+      expect(artifacts[0].trust).toBe('durable');
     });
 
     it('skips user messages', () => {
@@ -137,8 +155,8 @@ describe('cognitiveArtifacts', () => {
   describe('renderCognitiveBlock', () => {
     it('renders artifacts as [cognitive] block with provenance', () => {
       const block = renderCognitiveBlock([
-        { register: 'verdict', glyph: '🏁', headline: 'PASS — suite complete', messageIndex: 2 },
-        { register: 'hazard', glyph: '⚠️', headline: 'sync I/O risk', messageIndex: 5 },
+        { register: 'verdict', glyph: '🏁', headline: 'PASS — suite complete', messageIndex: 2, trust: 'durable' },
+        { register: 'hazard', glyph: '⚠️', headline: 'sync I/O risk', messageIndex: 5, trust: 'durable' },
       ]);
       expect(block).toContain('[cognitive');
       expect(block).toContain('artifact=cognitive-waypoints class=synthesized-history');
@@ -149,6 +167,19 @@ describe('cognitiveArtifacts', () => {
       expect(block).toContain('🏁 PASS — suite complete');
       expect(block).toContain('↞ msg#5 · hazard');
       expect(block).toContain('⚠️ sync I/O risk');
+      expect(block).not.toContain('transient flow notes');
+    });
+
+    it('adds the unverified-caveat line when transient flow notes are present', () => {
+      const block = renderCognitiveBlock([
+        { register: 'verdict', glyph: '🏁', headline: 'PASS', messageIndex: 1, trust: 'durable' },
+        { register: 'untagged', glyph: '·', headline: 'Single mount, always embedded.', messageIndex: 3, trust: 'transient' },
+      ]);
+      expect(block).toContain(
+        '— 🔍/▶/· lines are transient flow notes: unverified mid-flow narration, not conclusions —',
+      );
+      expect(block).toContain('↞ msg#3 · untagged');
+      expect(block).toContain('· Single mount, always embedded.');
     });
 
     it('returns empty string for no artifacts', () => {
@@ -164,6 +195,7 @@ describe('cognitiveArtifacts', () => {
         glyph: '❓',
         headline: 'relay restart required',
         messageIndex: 7,
+        trust: 'durable',
       })).toBe('↞ msg#7 · blocked');
     });
   });
@@ -182,13 +214,25 @@ describe('cognitiveArtifacts', () => {
     });
 
     it('does not append anything when no artifacts found', () => {
-      const parts: string[] = ['[user]\nhello', '[assistant]\nworld'];
+      const parts: string[] = ['[user]\nhello', '[assistant]\n(api error)'];
       const rawMessages: FoldMessage[] = [
         { role: 'user', content: 'hello' },
-        { role: 'assistant', content: 'world' },
+        { role: 'assistant', content: 'API Error: 529 Overloaded' },
       ];
       enrichFoldedBandBody(parts, rawMessages);
       expect(parts.length).toBe(2);
+    });
+
+    it('forwards includeFlowNotes=false so a notes-only window appends no block', () => {
+      const parts: string[] = [];
+      const rawMessages: FoldMessage[] = [
+        { role: 'assistant', content: 'short untagged diagnosis line' },
+      ];
+      enrichFoldedBandBody(parts, rawMessages, { includeFlowNotes: false });
+      expect(parts.length).toBe(0);
+      enrichFoldedBandBody(parts, rawMessages);
+      expect(parts.length).toBe(1);
+      expect(parts[0]).toContain('· short untagged diagnosis line');
     });
 
     it('returns the same array reference', () => {
@@ -196,6 +240,70 @@ describe('cognitiveArtifacts', () => {
       const rawMessages: FoldMessage[] = [];
       const result = enrichFoldedBandBody(parts, rawMessages);
       expect(result).toBe(parts);
+    });
+  });
+
+  describe('transient flow-note lane', () => {
+    it('admits short untagged narration with the · glyph and untagged register', () => {
+      const messages: FoldMessage[] = [
+        { role: 'assistant', content: 'Single mount, always `embedded`. Checking the tab set:' },
+      ];
+      const artifacts = extractCognitiveArtifacts(messages);
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0].register).toBe('untagged');
+      expect(artifacts[0].glyph).toBe('·');
+      expect(artifacts[0].trust).toBe('transient');
+      expect(artifacts[0].headline).toContain('Single mount');
+    });
+
+    it('drops long transient narrations (> 240 source chars)', () => {
+      const messages: FoldMessage[] = [
+        { role: 'assistant', content: '🔍 ' + 'y'.repeat(300) },
+        { role: 'assistant', content: 'z'.repeat(300) },
+      ];
+      expect(extractCognitiveArtifacts(messages)).toHaveLength(0);
+    });
+
+    it('never admits card-glyph-opened text (echo-contamination guard)', () => {
+      const messages: FoldMessage[] = [
+        { role: 'assistant', content: '⌖ src/file.ts:20-45' },
+        { role: 'assistant', content: '↞ msg#4 · verdict' },
+        { role: 'assistant', content: '🗣 quoted moment from recall' },
+      ];
+      expect(extractCognitiveArtifacts(messages)).toHaveLength(0);
+    });
+
+    it('never admits host-synthetic error surrogates', () => {
+      const messages: FoldMessage[] = [
+        { role: 'assistant', content: 'API Error: 529 Overloaded. Try again in a moment.' },
+        { role: 'assistant', content: '[Request interrupted by user]' },
+      ];
+      expect(extractCognitiveArtifacts(messages)).toHaveLength(0);
+    });
+
+    it('never admits leading-whitespace or markdown-container text', () => {
+      const messages: FoldMessage[] = [
+        { role: 'assistant', content: '  indented quoted junk' },
+        { role: 'assistant', content: '> quoted block' },
+        { role: 'assistant', content: '# heading only' },
+      ];
+      expect(extractCognitiveArtifacts(messages)).toHaveLength(0);
+    });
+
+    it('caps flow notes at newest 6 without displacing durables', () => {
+      const messages: FoldMessage[] = [];
+      for (let i = 0; i < 10; i++) {
+        messages.push({ role: 'assistant', content: `🔍 note number ${i}` });
+      }
+      messages.push({ role: 'assistant', content: '🏁 final verdict' });
+      const artifacts = extractCognitiveArtifacts(messages);
+      expect(artifacts).toHaveLength(7);
+      const notes = artifacts.filter((a) => a.trust === 'transient');
+      expect(notes).toHaveLength(6);
+      expect(notes[0].headline).toContain('note number 4');
+      expect(notes[5].headline).toContain('note number 9');
+      expect(artifacts.filter((a) => a.trust === 'durable')).toHaveLength(1);
+      expect(artifacts.map((a) => a.messageIndex)).toEqual([4, 5, 6, 7, 8, 9, 10]);
     });
   });
 });

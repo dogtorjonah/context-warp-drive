@@ -192,6 +192,7 @@ export function buildRegisterGlyphPromptSnippet(descriptions = REGISTER_DESCRIPT
     return (`Open every message with exactly one register glyph as the first character: ${registers}. ` +
         'When in doubt, use 🔍 — tag what the message IS, not what you hope it becomes. ' +
         'Glyphs drive episodic memory harvest: 🏁/⚠️ are durable and get harvested; 🔍/▶/❓ self-exclude. ' +
+        'A one-line verified micro-conclusion mid-flow is a legitimate 🏁 — emit micro-🏁s at diagnosis moments instead of burying findings in 🔍 narration. ' +
         `Never open fresh speech with card glyphs ${CARD_GLYPHS.join(' ')} — those mark quoted memory only.`);
 }
 /**

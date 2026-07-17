@@ -14,6 +14,18 @@
  * epochs, smoothing the continuity gradient: dense recent context →
  * artifact-enriched tail bands → fully archived episodes via recall.
  *
+ * Transient flow-note lane (2026-07-17): live 7-band dogfood showed durable
+ * registers are RARE under real flow — a full engineering day can emit one
+ * 🏁 while every mid-flight diagnosis rides in short 🔍/▶ or untagged
+ * narration ("Single mount, always `embedded`"), so bands rendered empty
+ * [cognitive] blocks exactly when they were needed most. The extractor
+ * therefore also conserves a bounded lane of SHORT transient narrations
+ * (tagged 🔍/▶ or cleanly untagged), labeled trust='transient' and rendered
+ * under an explicit unverified-caveat line. Shortness (≤240 source chars)
+ * is the deterministic noise gate: diagnosis beats are short; speculative
+ * hypothesis dumps are long and stay excluded, honoring the original
+ * durable-only intent for long-form reasoning.
+ *
  * Pure, zero I/O, no side effects. Shared across all transports:
  * Claude CLI, Codex CLI, and FC engines (claude-api/OpenAI/Gemini/GLM/
  * Grok/Mistral/MiniMax).
@@ -21,6 +33,7 @@
 
 import {
   parseRegisterGlyph,
+  CARD_GLYPHS,
   type AssistantRegister,
 } from './glyphs.ts';
 import type { FoldMessage } from './rollingFold.ts';
@@ -36,28 +49,74 @@ import { renderEmbeddedContinuityArtifactProvenance } from './chronologicalProve
  * message index for chronological ordering.
  */
 export interface CognitiveArtifact {
-  /** The register type (verdict, hazard, blocked, executing, in_progress). */
-  register: AssistantRegister;
-  /** Glyph character for rendering. */
+  /**
+   * The register type, or 'untagged' for a short glyphless narration
+   * admitted through the transient flow-note lane.
+   */
+  register: AssistantRegister | 'untagged';
+  /** Glyph character for rendering ('·' for untagged flow notes). */
   glyph: string;
   /** First meaningful line(s) of the message body, truncated to maxHeadlineChars. */
   headline: string;
   /** Index in the source messages array (for chronological ordering). */
   messageIndex: number;
+  /**
+   * Trust class: 'durable' artifacts are settled verdicts/hazards/blockers;
+   * 'transient' artifacts are unverified mid-flow narration conserved for
+   * continuity only. Renderers must keep the distinction visible.
+   */
+  trust: 'durable' | 'transient';
 }
 
-/** Maximum number of artifacts to extract per band window. */
+/** Options for extractCognitiveArtifacts / enrichFoldedBandBody. */
+export interface ExtractCognitiveArtifactsOptions {
+  /**
+   * Admit the bounded transient flow-note lane (default true): short 🔍/▶
+   * narrations and short cleanly-untagged narrations that carry mid-flow
+   * micro-conclusions. Set false to restore durable-only extraction.
+   */
+  includeFlowNotes?: boolean;
+}
+
+/** Maximum number of durable artifacts to extract per band window. */
 const MAX_ARTIFACTS = 20;
 
 /** Maximum characters per artifact headline. */
 const MAX_HEADLINE_CHARS = 200;
 
-/** Registers worth extracting — exclude transient in_progress/executing. */
+/** Maximum number of transient flow notes conserved per band window. */
+const MAX_FLOW_NOTES = 6;
+
+/**
+ * Length gate for the transient lane: only SHORT assistant narrations
+ * qualify as flow notes. Shortness is the deterministic noise filter — a
+ * between-tool-calls diagnosis beat is short; a speculative multi-paragraph
+ * hypothesis dump is not, and stays excluded as the original design intended.
+ */
+const MAX_FLOW_NOTE_SOURCE_CHARS = 240;
+
+/** Registers that produce durable artifacts (settled outcomes). */
 const DURABLE_REGISTERS: ReadonlySet<AssistantRegister> = new Set([
   'verdict',
   'hazard',
   'blocked',
 ]);
+
+/** Registers admitted through the transient flow-note lane. */
+const TRANSIENT_REGISTERS: ReadonlySet<AssistantRegister> = new Set([
+  'in_progress',
+  'executing',
+]);
+
+/** Rendering glyph for untagged flow notes (neither a register nor a card glyph). */
+const UNTAGGED_GLYPH = '·';
+
+/**
+ * Host-synthetic assistant text that must never be conserved as a flow note.
+ * These are relay/CLI error surrogates injected into transcripts as
+ * assistant-role messages — noise, not narration.
+ */
+const SYNTHETIC_NOISE_PREFIXES = ['API Error', '[Request interrupted'] as const;
 
 // ══════════════════════════════════════════════════════════════════════
 // Helpers
@@ -171,17 +230,29 @@ function extractHeadline(body: string): string {
 // ══════════════════════════════════════════════════════════════════════
 
 /**
- * Scan a list of raw messages for durable cognitive artifacts — assistant
- * turns that start with a verdict (🏁), hazard (⚠️), or blocked (❓) glyph.
- * Returns artifacts in chronological order (by message index), capped at
- * MAX_ARTIFACTS. Pure function — no side effects, no I/O.
+ * Scan a list of raw messages for cognitive artifacts.
+ *
+ * Durable lane: assistant turns that start with a verdict (🏁), hazard (⚠️),
+ * or blocked (❓) glyph — capped at MAX_ARTIFACTS, never displaced by notes.
+ *
+ * Transient flow-note lane (default on, see module docstring): SHORT
+ * assistant narrations — tagged 🔍/▶, or cleanly untagged (parse failure
+ * reason 'missing_register' only, never card-glyph-opened text, never
+ * host-synthetic error surrogates) — capped at MAX_FLOW_NOTES, newest kept.
+ *
+ * Returns all artifacts merged in chronological order (by message index).
+ * Pure function — no side effects, no I/O.
  *
  * @param messages Raw messages from the fold window (before skeletonization)
+ * @param options  Lane control; omit for default durable+flow-note behavior
  */
 export function extractCognitiveArtifacts(
   messages: readonly FoldMessage[],
+  options: ExtractCognitiveArtifactsOptions = {},
 ): CognitiveArtifact[] {
-  const artifacts: CognitiveArtifact[] = [];
+  const includeFlowNotes = options.includeFlowNotes !== false;
+  const durable: CognitiveArtifact[] = [];
+  const flowNotes: CognitiveArtifact[] = [];
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -193,20 +264,59 @@ export function extractCognitiveArtifacts(
     if (!text) continue;
 
     const parseResult = parseRegisterGlyph(text);
-    if (!parseResult.ok) continue;
-    if (!DURABLE_REGISTERS.has(parseResult.register)) continue;
+    if (parseResult.ok && DURABLE_REGISTERS.has(parseResult.register)) {
+      durable.push({
+        register: parseResult.register,
+        glyph: REGISTER_GLYPHS[parseResult.register],
+        headline: extractHeadline(parseResult.body),
+        messageIndex: i,
+        trust: 'durable',
+      });
+      continue;
+    }
 
-    artifacts.push({
-      register: parseResult.register,
-      glyph: REGISTER_GLYPHS[parseResult.register],
-      headline: extractHeadline(parseResult.body),
-      messageIndex: i,
-    });
+    if (!includeFlowNotes) continue;
+    if (text.length > MAX_FLOW_NOTE_SOURCE_CHARS) continue;
+
+    if (parseResult.ok && TRANSIENT_REGISTERS.has(parseResult.register)) {
+      flowNotes.push({
+        register: parseResult.register,
+        glyph: REGISTER_GLYPHS[parseResult.register],
+        headline: extractHeadline(parseResult.body),
+        messageIndex: i,
+        trust: 'transient',
+      });
+      continue;
+    }
+
+    // Untagged short narration: admit ONLY the clean missing_register case.
+    // Card-glyph-opened text is quoted folded memory and must never re-enter
+    // a band as fresh narration (echo-contamination guard); leading
+    // whitespace, markdown containers, and duplicate-register text stay out.
+    if (
+      !parseResult.ok &&
+      parseResult.reason === 'missing_register' &&
+      !CARD_GLYPHS.some((cardGlyph) => text.startsWith(cardGlyph)) &&
+      !SYNTHETIC_NOISE_PREFIXES.some((prefix) => text.startsWith(prefix))
+    ) {
+      flowNotes.push({
+        register: 'untagged',
+        glyph: UNTAGGED_GLYPH,
+        headline: extractHeadline(text),
+        messageIndex: i,
+        trust: 'transient',
+      });
+    }
   }
 
-  return artifacts.length > MAX_ARTIFACTS
-    ? artifacts.slice(-MAX_ARTIFACTS)
-    : artifacts;
+  const cappedDurable =
+    durable.length > MAX_ARTIFACTS ? durable.slice(-MAX_ARTIFACTS) : durable;
+  const cappedFlowNotes =
+    flowNotes.length > MAX_FLOW_NOTES ? flowNotes.slice(-MAX_FLOW_NOTES) : flowNotes;
+
+  return [...cappedDurable, ...cappedFlowNotes].sort(
+    (a, b) => a.messageIndex - b.messageIndex,
+  );
 }
 
 /**
@@ -243,8 +353,12 @@ export function renderCognitiveBlock(
   const lines = artifacts.flatMap(
     (a) => [formatCognitiveArtifactProvenance(a), `${a.glyph} ${a.headline}`],
   );
+  const hasFlowNotes = artifacts.some((a) => a.trust === 'transient');
   return [
     '[cognitive — historical waypoints from the folded window, NOT your current state]',
+    ...(hasFlowNotes
+      ? ['— 🔍/▶/· lines are transient flow notes: unverified mid-flow narration, not conclusions —']
+      : []),
     provenance,
     ...lines,
   ].filter(Boolean).join('\n');
@@ -271,13 +385,15 @@ export function formatCognitiveArtifactProvenance(
  *
  * @param parts The bandBodyParts array being assembled (mutated in place)
  * @param rawMessages The raw messages from the fold window
+ * @param options Lane control forwarded to extractCognitiveArtifacts
  * @returns The same parts array, with cognitive block appended if artifacts found
  */
 export function enrichFoldedBandBody(
   parts: string[],
   rawMessages: readonly FoldMessage[],
+  options?: ExtractCognitiveArtifactsOptions,
 ): string[] {
-  const artifacts = extractCognitiveArtifacts(rawMessages);
+  const artifacts = extractCognitiveArtifacts(rawMessages, options);
   const block = renderCognitiveBlock(artifacts);
   if (block) {
     parts.push(block);

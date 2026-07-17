@@ -68,10 +68,10 @@ describe('emit contract (REGISTER_GLYPH_PROMPT_SNIPPET)', () => {
     // collide with register glyphs, so split-count is exact.
     const count = (glyph: string) => REGISTER_GLYPH_PROMPT_SNIPPET.split(glyph).length - 1;
     expect(count(REGISTER_GLYPHS.executing), 'executing ▶: list + self-exclude').toBe(2);
-    expect(count(REGISTER_GLYPHS.verdict), 'verdict 🏁: list + harvest guidance').toBe(2);
+    expect(count(REGISTER_GLYPHS.verdict), 'verdict 🏁: list + harvest guidance + micro-🏁 blessing ×2').toBe(4);
     expect(count(REGISTER_GLYPHS.hazard), 'hazard ⚠️: list + harvest guidance').toBe(2);
     expect(count(REGISTER_GLYPHS.blocked), 'blocked ❓: list + self-exclude').toBe(2);
-    expect(count(REGISTER_GLYPHS.in_progress), 'in_progress 🔍: list + fallback + self-exclude').toBe(3);
+    expect(count(REGISTER_GLYPHS.in_progress), 'in_progress 🔍: list + fallback + self-exclude + micro-🏁 contrast').toBe(4);
   });
 
   it('mentions every card glyph exactly once as forbidden openers', () => {

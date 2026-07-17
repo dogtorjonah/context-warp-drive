@@ -14,6 +14,18 @@
  * epochs, smoothing the continuity gradient: dense recent context →
  * artifact-enriched tail bands → fully archived episodes via recall.
  *
+ * Transient flow-note lane (2026-07-17): live 7-band dogfood showed durable
+ * registers are RARE under real flow — a full engineering day can emit one
+ * 🏁 while every mid-flight diagnosis rides in short 🔍/▶ or untagged
+ * narration ("Single mount, always `embedded`"), so bands rendered empty
+ * [cognitive] blocks exactly when they were needed most. The extractor
+ * therefore also conserves a bounded lane of SHORT transient narrations
+ * (tagged 🔍/▶ or cleanly untagged), labeled trust='transient' and rendered
+ * under an explicit unverified-caveat line. Shortness (≤240 source chars)
+ * is the deterministic noise gate: diagnosis beats are short; speculative
+ * hypothesis dumps are long and stay excluded, honoring the original
+ * durable-only intent for long-form reasoning.
+ *
  * Pure, zero I/O, no side effects. Shared across all transports:
  * Claude CLI, Codex CLI, and FC engines (claude-api/OpenAI/Gemini/GLM/
  * Grok/Mistral/MiniMax).
@@ -26,14 +38,32 @@ import type { FoldMessage } from './rollingFold.ts';
  * message index for chronological ordering.
  */
 export interface CognitiveArtifact {
-    /** The register type (verdict, hazard, blocked, executing, in_progress). */
-    register: AssistantRegister;
-    /** Glyph character for rendering. */
+    /**
+     * The register type, or 'untagged' for a short glyphless narration
+     * admitted through the transient flow-note lane.
+     */
+    register: AssistantRegister | 'untagged';
+    /** Glyph character for rendering ('·' for untagged flow notes). */
     glyph: string;
     /** First meaningful line(s) of the message body, truncated to maxHeadlineChars. */
     headline: string;
     /** Index in the source messages array (for chronological ordering). */
     messageIndex: number;
+    /**
+     * Trust class: 'durable' artifacts are settled verdicts/hazards/blockers;
+     * 'transient' artifacts are unverified mid-flow narration conserved for
+     * continuity only. Renderers must keep the distinction visible.
+     */
+    trust: 'durable' | 'transient';
+}
+/** Options for extractCognitiveArtifacts / enrichFoldedBandBody. */
+export interface ExtractCognitiveArtifactsOptions {
+    /**
+     * Admit the bounded transient flow-note lane (default true): short 🔍/▶
+     * narrations and short cleanly-untagged narrations that carry mid-flow
+     * micro-conclusions. Set false to restore durable-only extraction.
+     */
+    includeFlowNotes?: boolean;
 }
 /**
  * Public flattener for FoldMessage content across all transport shapes
@@ -43,14 +73,23 @@ export interface CognitiveArtifact {
  */
 export declare function flattenFoldMessageText(content: FoldMessage['content'], parts?: unknown): string;
 /**
- * Scan a list of raw messages for durable cognitive artifacts — assistant
- * turns that start with a verdict (🏁), hazard (⚠️), or blocked (❓) glyph.
- * Returns artifacts in chronological order (by message index), capped at
- * MAX_ARTIFACTS. Pure function — no side effects, no I/O.
+ * Scan a list of raw messages for cognitive artifacts.
+ *
+ * Durable lane: assistant turns that start with a verdict (🏁), hazard (⚠️),
+ * or blocked (❓) glyph — capped at MAX_ARTIFACTS, never displaced by notes.
+ *
+ * Transient flow-note lane (default on, see module docstring): SHORT
+ * assistant narrations — tagged 🔍/▶, or cleanly untagged (parse failure
+ * reason 'missing_register' only, never card-glyph-opened text, never
+ * host-synthetic error surrogates) — capped at MAX_FLOW_NOTES, newest kept.
+ *
+ * Returns all artifacts merged in chronological order (by message index).
+ * Pure function — no side effects, no I/O.
  *
  * @param messages Raw messages from the fold window (before skeletonization)
+ * @param options  Lane control; omit for default durable+flow-note behavior
  */
-export declare function extractCognitiveArtifacts(messages: readonly FoldMessage[]): CognitiveArtifact[];
+export declare function extractCognitiveArtifacts(messages: readonly FoldMessage[], options?: ExtractCognitiveArtifactsOptions): CognitiveArtifact[];
 /**
  * Render a list of cognitive artifacts into a compact [cognitive] block
  * suitable for appending to a tail-epoch band body. Each artifact is one
@@ -84,9 +123,10 @@ export declare function formatCognitiveArtifactProvenance(artifact: CognitiveArt
  *
  * @param parts The bandBodyParts array being assembled (mutated in place)
  * @param rawMessages The raw messages from the fold window
+ * @param options Lane control forwarded to extractCognitiveArtifacts
  * @returns The same parts array, with cognitive block appended if artifacts found
  */
-export declare function enrichFoldedBandBody(parts: string[], rawMessages: readonly FoldMessage[]): string[];
+export declare function enrichFoldedBandBody(parts: string[], rawMessages: readonly FoldMessage[], options?: ExtractCognitiveArtifactsOptions): string[];
 /**
  * Merge a rendered enrichment block ([cognitive] / [micro-seed]) into the LAST
  * message of a folded view WITHOUT appending a new message.
