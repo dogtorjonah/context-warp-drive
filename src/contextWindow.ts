@@ -141,6 +141,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'deepseek-v4-flash': 1_000_000,
 
   // ── Moonshot / Kimi models ──
+  'kimi-k3': 1_000_000,
   'kimi-k2.7-code': 256_000,
   'kimi-k2.7-code-highspeed': 256_000,
   'kimi-k2.6': 256_000,
