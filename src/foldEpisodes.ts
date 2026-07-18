@@ -140,7 +140,7 @@ export interface Episode {
   trace: string;
   annotations: EpisodeAnnotation[];
   /**
-   * Worker-derived distinctive terms (summary + annotations), capped and stored
+   * Worker-derived distinctive terms (summary + annotations), stored in full
    * for tier-2 pathless recall. Optional before persistence and on legacy rows.
    */
   terms?: string[];
@@ -2902,14 +2902,16 @@ export function renderEpisodicBoundaryBlock(
  * cards ride user-role tool results, so the matcher never reads its own
  * output); isSyntheticLine strips any quoted card/fold lines as defense in
  * depth. Tokens must look like files (final-segment extension) and pass the
- * membership predicate; the cap bounds worker lookup cost — unknown paths are
- * harmless store misses, so prose noise like "Node.js" costs one indexed miss.
+ * membership predicate. Every discovered path remains eligible by default;
+ * callers may request an explicit output limit after the full prose scan.
  */
 export function extractEpisodeMentionPaths(
   texts: readonly string[],
   isSyntheticLine: (line: string) => boolean,
-  cap = 8,
+  cap?: number,
 ): string[] {
+  const outputLimit = cap === undefined ? undefined : Math.max(0, Math.floor(cap));
+  if (outputLimit === 0) return [];
   const tokenPattern = /(?:\/|~\/)?(?:[\w.()[\]-]+\/)*[\w()[\]-]+(?:\.[\w-]+)+/g;
   const found = new Set<string>();
   for (const text of texts) {
@@ -2920,8 +2922,8 @@ export function extractEpisodeMentionPaths(
         if (token.startsWith('./')) token = token.slice(2);
         if (isEpisodeMemberPath(token)) found.add(token);
       }
-      if (found.size >= cap * 4) break;
     }
   }
-  return Array.from(found).sort().slice(0, cap);
+  const paths = Array.from(found).sort();
+  return outputLimit === undefined ? paths : paths.slice(0, outputLimit);
 }

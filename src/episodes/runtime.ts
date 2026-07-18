@@ -22,7 +22,7 @@
 import {
   deriveEpisodesFromMessages,
   recordEpisodes,
-  recallEpisodeCardsWithState,
+  recallEpisodeCards,
   createEpisodeRecallState,
   normalizeTouchPath,
   type EpisodeDatabase,
@@ -31,7 +31,6 @@ import {
   type EpisodeRecallState,
   type PortableEpisode,
   type PortableMessage,
-  type EpisodeRecallStateResult,
   type RecordEpisodesResult,
   type DeriveEpisodesOptions,
 } from './episodeStore.ts';
@@ -47,7 +46,7 @@ export interface EpisodeRuntimeOptions {
   readonly rebirthEpochId?: string;
   /** Cross-session recall: when true, recall searches all sessions, not just this one. */
   readonly crossSession?: boolean;
-  /** Maximum episodes to coalesce into a single recall card (default 5). */
+  /** Optional rendered-card count. Omitted leaves cardinality to maxChars/the caller. */
   readonly maxCoalescedChapters?: number;
 }
 
@@ -84,7 +83,7 @@ export class EpisodeRuntime {
   private readonly foldEpochId?: string;
   private readonly rebirthEpochId?: string;
   private readonly crossSession: boolean;
-  private readonly maxCoalescedChapters: number;
+  private readonly maxCoalescedChapters?: number;
   private recallState: EpisodeRecallState;
 
   constructor(db: EpisodeDatabase, options: EpisodeRuntimeOptions = {}) {
@@ -94,7 +93,7 @@ export class EpisodeRuntime {
     this.foldEpochId = options.foldEpochId;
     this.rebirthEpochId = options.rebirthEpochId;
     this.crossSession = options.crossSession ?? false;
-    this.maxCoalescedChapters = options.maxCoalescedChapters ?? 5;
+    this.maxCoalescedChapters = options.maxCoalescedChapters;
     this.recallState = createEpisodeRecallState();
   }
 
@@ -136,19 +135,26 @@ export class EpisodeRuntime {
       return { cards: [], state: this.recallState };
     }
 
-    // Use the portable recall with state for dedup.
-    const result = recallEpisodeCardsWithState(this.db, this.recallState, {
+    // Load every unserved candidate first. Ranking must see the complete pool;
+    // rendered-card limits and maxChars are applied only after chainScore.
+    const candidates = recallEpisodeCards(this.db, {
       paths: normalized,
-      limit: options.limit ?? this.maxCoalescedChapters,
-      maxChars: options.maxChars,
+      excludeEpisodeIds: this.recallState.servedEpisodeIds,
     });
+    const ranked = this.applyChainScore(candidates, normalized);
+    const cards = selectRenderedCards(
+      ranked,
+      options.maxChars,
+      options.limit ?? this.maxCoalescedChapters,
+    );
+    this.recallState = {
+      servedEpisodeIds: [...new Set([
+        ...this.recallState.servedEpisodeIds,
+        ...cards.map((card) => card.episodeId),
+      ])],
+    };
 
-    this.recallState = result.state;
-
-    // chainScore ranking: boost episodes matching more query paths.
-    const ranked = this.applyChainScore(result.cards, normalized);
-
-    return { cards: ranked, state: this.recallState };
+    return { cards, state: this.recallState };
   }
 
   /**
@@ -186,4 +192,22 @@ export class EpisodeRuntime {
       .sort((a, b) => b.specificity - a.specificity)
       .map((entry) => entry.card);
   }
+}
+
+function selectRenderedCards(
+  cards: readonly EpisodeRecallCard[],
+  maxChars: number | undefined,
+  limit: number | undefined,
+): readonly EpisodeRecallCard[] {
+  const renderedLimit = limit === undefined ? undefined : Math.max(0, Math.floor(limit));
+  const selected: EpisodeRecallCard[] = [];
+  let usedChars = 0;
+  for (const card of cards) {
+    if (renderedLimit !== undefined && selected.length >= renderedLimit) break;
+    const nextChars = usedChars + card.text.length;
+    if (maxChars !== undefined && nextChars > maxChars) break;
+    selected.push(card);
+    usedChars = nextChars;
+  }
+  return selected;
 }

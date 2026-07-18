@@ -99,6 +99,7 @@ export interface RecordEpisodesResult {
 
 export interface EpisodeRecallOptions {
   readonly paths: readonly string[];
+  /** Optional rendered-card count. Candidate generation always examines every eligible episode. */
   readonly limit?: number;
   readonly maxChars?: number;
   readonly excludeEpisodeIds?: readonly string[];
@@ -149,6 +150,7 @@ interface MutableBurst {
 }
 
 const DEFAULT_SESSION_ID = 'default';
+const SQLITE_BIND_BATCH_SIZE = 400;
 const SUPERSEDES_REF_RE = /(?:↺|\bsupersedes\b)[:\s]+(episode-[0-9a-f]{8,64})/giu;
 const SUPERSESSION_TABLE_DDL = `
   CREATE TABLE IF NOT EXISTS episode_supersessions (
@@ -376,39 +378,59 @@ export function recallEpisodeCards(
   const normalizedPaths = options.paths.map((item) => normalizeTouchPath(item)).filter((item) => item !== null);
   if (normalizedPaths.length === 0) return [];
 
-  const excludedIds = options.excludeEpisodeIds ?? [];
-  const pathPlaceholders = normalizedPaths.map(() => '?').join(', ');
-  const excludeClause = excludedIds.length > 0
-    ? `AND e.id NOT IN (${excludedIds.map(() => '?').join(', ')})`
-    : '';
+  const excludedIds = new Set(options.excludeEpisodeIds ?? []);
   const supersededClause = hasSupersessionTable(db)
     ? 'AND e.id NOT IN (SELECT episode_id FROM episode_supersessions)'
     : '';
-  const rows = db.prepare(`
-    SELECT
-      e.id,
-      e.summary,
-      e.ended_at AS endedAt,
-      e.metadata_json AS metadataJson,
-      GROUP_CONCAT(DISTINCT em.path) AS matchedPaths
-    FROM episodes e
-    JOIN episode_members em ON em.episode_id = e.id
-    WHERE em.path IN (${pathPlaceholders})
-      ${excludeClause}
-      ${supersededClause}
-    GROUP BY e.id
-    ORDER BY e.ended_at DESC
-    LIMIT ?
-  `).all(...normalizedPaths, ...excludedIds, options.limit ?? 5) as Array<{
+  const rowsById = new Map<string, {
     id: string;
     summary: string;
     endedAt: string;
     metadataJson: string;
-    matchedPaths: string | null;
-  }>;
+    matchedPaths: Set<string>;
+  }>();
+  for (let offset = 0; offset < normalizedPaths.length; offset += SQLITE_BIND_BATCH_SIZE) {
+    const batch = normalizedPaths.slice(offset, offset + SQLITE_BIND_BATCH_SIZE);
+    const rows = db.prepare(`
+      SELECT
+        e.id,
+        e.summary,
+        e.ended_at AS endedAt,
+        e.metadata_json AS metadataJson,
+        GROUP_CONCAT(DISTINCT em.path) AS matchedPaths
+      FROM episodes e
+      JOIN episode_members em ON em.episode_id = e.id
+      WHERE em.path IN (${batch.map(() => '?').join(', ')})
+        ${supersededClause}
+      GROUP BY e.id
+    `).all(...batch) as Array<{
+      id: string;
+      summary: string;
+      endedAt: string;
+      metadataJson: string;
+      matchedPaths: string | null;
+    }>;
+    for (const row of rows) {
+      if (excludedIds.has(row.id)) continue;
+      const existing = rowsById.get(row.id);
+      if (existing) {
+        for (const matchedPath of row.matchedPaths?.split(',').filter(Boolean) ?? []) {
+          existing.matchedPaths.add(matchedPath);
+        }
+      } else {
+        rowsById.set(row.id, {
+          ...row,
+          matchedPaths: new Set(row.matchedPaths?.split(',').filter(Boolean) ?? []),
+        });
+      }
+    }
+  }
+  const rows = [...rowsById.values()].sort(
+    (left, right) => right.endedAt.localeCompare(left.endedAt) || right.id.localeCompare(left.id),
+  );
 
   const cards = rows.map((row) => {
-    const matchedPaths = row.matchedPaths?.split(',').filter(Boolean) ?? [];
+    const matchedPaths = [...row.matchedPaths].sort();
     return {
       episodeId: row.id,
       matchedPaths,
@@ -421,7 +443,7 @@ export function recallEpisodeCards(
       }),
     };
   });
-  return applyRecallBudget(cards, options.maxChars);
+  return applyRecallBudget(cards, options.maxChars, options.limit);
 }
 
 export function createEpisodeRecallState(): EpisodeRecallState {
@@ -611,13 +633,15 @@ function readClosedBy(metadataJson: string | undefined): string {
 function applyRecallBudget(
   cards: readonly EpisodeRecallCard[],
   maxChars: number | undefined,
+  limit: number | undefined,
 ): readonly EpisodeRecallCard[] {
-  if (maxChars === undefined) return cards;
+  const renderedLimit = limit === undefined ? undefined : Math.max(0, Math.floor(limit));
   const kept: EpisodeRecallCard[] = [];
   let used = 0;
   for (const card of cards) {
+    if (renderedLimit !== undefined && kept.length >= renderedLimit) break;
     const nextUsed = used + card.text.length;
-    if (nextUsed > maxChars) break;
+    if (maxChars !== undefined && nextUsed > maxChars) break;
     kept.push(card);
     used = nextUsed;
   }

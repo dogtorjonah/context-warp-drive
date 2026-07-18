@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  createEpisodeRecallState,
   deriveEpisodesFromMessages,
   extractSupersededEpisodeIds,
   hasSupersessionTable,
   recallEpisodeCards,
+  recallEpisodeCardsWithState,
   recordEpisodes,
   supersedeEpisodes,
   SUPERSEDES_MARKER,
@@ -99,6 +101,41 @@ describe('verdict supersession', () => {
       expect(supersedeEpisodes(db, [{ episodeId: episode!.id, reason: 'manual' }])).toBe(0);
 
       expect(recallEpisodeCards(db, { paths: ['src/legacy.ts'] })).toHaveLength(0);
+    } finally {
+      closeEpisodeStore(db);
+    }
+  });
+
+  test.runIf(sqliteAvailable)('loads the complete candidate population before optional render limits', async () => {
+    const db = await createEpisodeStore();
+    try {
+      const episodes = Array.from({ length: 12 }, (_, index) => deriveEpisodesFromMessages(
+        verdictBurst(
+          'src/evergreen.ts',
+          `evergreen checkpoint ${index}`,
+          new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
+        ),
+        { sessionId: 'lifetime' },
+      )[0]!).filter(Boolean);
+      expect(recordEpisodes(db, episodes)).toEqual({ inserted: 12, skipped: 0 });
+
+      const all = recallEpisodeCards(db, { paths: ['src/evergreen.ts'] });
+      expect(all).toHaveLength(12);
+      expect(all[0]?.text).toContain('evergreen checkpoint 11');
+      expect(all[11]?.text).toContain('evergreen checkpoint 0');
+
+      const first = recallEpisodeCardsWithState(db, createEpisodeRecallState(), {
+        paths: ['src/evergreen.ts'],
+        limit: 3,
+      });
+      expect(first.cards).toHaveLength(3);
+      expect(first.cards[0]?.text).toContain('evergreen checkpoint 11');
+      const second = recallEpisodeCardsWithState(db, first.state, {
+        paths: ['src/evergreen.ts'],
+        limit: 3,
+      });
+      expect(second.cards).toHaveLength(3);
+      expect(second.cards[0]?.text).toContain('evergreen checkpoint 8');
     } finally {
       closeEpisodeStore(db);
     }

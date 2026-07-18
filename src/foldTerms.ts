@@ -142,13 +142,6 @@ export function stem(token: string): string {
 let synonymMap: ReadonlyMap<string, ReadonlySet<string>> = new Map();
 
 /**
- * Synonym expansion cap. Each distinctive query stem expands to at most this
- * many synonym stems, preventing noise explosion on common-but-distinctive
- * terms. Default 3.
- */
-const SYNONYM_EXPANSION_CAP = 3;
-
-/**
  * Load a pre-computed synonym map at init time. Keys and values must be stems
  * (not surface forms) — the build script normalizes via the same stem()
  * function. Pass an empty map to disable synonym expansion.
@@ -158,7 +151,7 @@ export function setSynonymMap(
 ): void {
   const out = new Map<string, ReadonlySet<string>>();
   for (const [key, syns] of map) {
-    out.set(key, new Set(syns.slice(0, SYNONYM_EXPANSION_CAP)));
+    out.set(key, new Set(syns));
   }
   synonymMap = out;
 }
@@ -171,11 +164,10 @@ export function isSynonymMapLoaded(): boolean {
 }
 
 /**
- * Expand a set of query stems through the synonym map. Returns a NEW set
- * containing all original stems plus up to SYNONYM_EXPANSION_CAP synonyms per
- * stem. Pure — does not mutate the input.
+ * Expand a set of query stems through the complete synonym map. Returns a NEW
+ * set and never truncates a recall cue. Pure — does not mutate the input.
  */
-function expandWithSynonyms(
+export function expandTermStemsWithSynonyms(
   stems: ReadonlySet<string>,
 ): Set<string> {
   if (synonymMap.size === 0) return new Set(stems);
@@ -184,7 +176,6 @@ function expandWithSynonyms(
     const syns = synonymMap.get(s);
     if (syns === undefined) continue;
     for (const syn of syns) {
-      if (expanded.size >= stems.size * (1 + SYNONYM_EXPANSION_CAP)) break;
       expanded.add(syn);
     }
   }
@@ -246,7 +237,7 @@ const CODE_STOPWORDS: ReadonlySet<string> = new Set([
 ]);
 
 export interface ExtractOpts {
-  /** Max terms to retain — bounded for storage + match cost. Default 64. */
+  /** Optional caller-selected output limit. Omitted retains every distinctive term. */
   cap?: number;
   /**
    * Min token length kept (sparseVector.tokenize already drops length<2; this
@@ -256,17 +247,17 @@ export interface ExtractOpts {
 }
 
 /**
- * Extract a bounded, deduped set of candidate terms from text. Distinctiveness
+ * Extract a deduped set of candidate terms from text. Distinctiveness
  * (rarity) is applied LATER at match time via IDF — here we only strip
  * grammatical stopwords and short tokens, then dedupe. Order is first-seen
- * (deterministic) for stable storage and reproducible matching. Truncation at
- * `cap` is a storage bound; a v2 could rank by local TF before truncating, but
- * first-seen keeps v1 deterministic and cheap.
+ * (deterministic) for stable storage and reproducible matching. An explicit
+ * `cap` is honored as a caller output choice; there is no implicit storage or
+ * recall-candidate ceiling.
  */
 export function extractDistinctiveTerms(text: string, opts: ExtractOpts = {}): string[] {
-  const cap = opts.cap ?? 64;
+  const cap = opts.cap === undefined ? undefined : Math.max(0, Math.floor(opts.cap));
   const minLen = opts.minLen ?? 3;
-  if (!text) return [];
+  if (!text || cap === 0) return [];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const tok of tokenize(text)) {
@@ -276,7 +267,7 @@ export function extractDistinctiveTerms(text: string, opts: ExtractOpts = {}): s
     if (seen.has(s)) continue;
     seen.add(s);
     out.push(s);
-    if (out.length >= cap) break;
+    if (cap !== undefined && out.length >= cap) break;
   }
   return out;
 }
@@ -345,7 +336,7 @@ export function scoreTermOverlap(
   // Stem query terms, then expand through synonym map if loaded.
   const queryStems = new Set<string>();
   for (const t of queryTerms) queryStems.add(stem(t));
-  const expanded = expandWithSynonyms(queryStems);
+  const expanded = expandTermStemsWithSynonyms(queryStems);
   let score = 0;
   let distinctiveCount = 0;
   const matched: OverlapMatch[] = [];
