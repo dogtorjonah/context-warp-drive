@@ -47,6 +47,12 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).toContain('topology=raw-history>artifact>seam>none host=continuity-package');
     expect(seed).toContain('raw-resumes=none (0 exact)');
     expect(seed).toContain('── Rebirth Control (AUTHORITATIVE) ──');
+    expect(seed).toContain(
+      'authority horizon: authoritative at package creation; later unanswered operator messages, current live Task Rail state, and newer tail bands supersede conflicting fields without mutating this frozen block',
+    );
+    expect(seed).toContain(
+      'truth order after creation: later unanswered operator message > current live Task Rail state > newest tail band > this frozen control snapshot',
+    );
     expect(seed).toContain('── Runtime Model ──');
     expect(seed).toContain('Predecessor trace: 42 events');
 
@@ -106,6 +112,25 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).toContain('raw-resumes=source-agent:event#live-frontier (1 exact)');
     expect(seed).toContain('active request (verbatim; sole authoritative body):');
     expect(seed).not.toContain('── Last User + AI Messages (READ FIRST) ──');
+  });
+
+  test('keeps a hazard-only predecessor remainder separate from assistant speech', () => {
+    const activeRequest = 'Resume the failed provider turn safely.';
+    const providerError = 'API Error: 529 Overloaded';
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      triggeringUserMessage: activeRequest,
+      lastUserAiMessages: [
+        `👤 LAST USER MESSAGE (active request):\n${activeRequest}`,
+        `[06:00 PM] ⚠️ UNRESOLVED PROVIDER/RUNTIME ERROR (not assistant speech):\n${providerError}`,
+      ].join('\n\n'),
+      userMessageTriggered: true,
+    });
+
+    expect(seed).toContain('── Unresolved Provider/Runtime Error (READ FIRST) ──');
+    expect(seed).toContain(providerError);
+    expect(seed).not.toContain('── Last AI Message (READ FIRST) ──');
+    expect(seed.match(new RegExp(activeRequest, 'g'))).toHaveLength(1);
   });
 
   test('keeps a mid-length active request byte-complete under the verbatim label', () => {

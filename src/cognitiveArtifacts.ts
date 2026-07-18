@@ -26,6 +26,12 @@
  * hypothesis dumps are long and stay excluded, honoring the original
  * durable-only intent for long-form reasoning.
  *
+ * Tool-only turns have no assistant text to register-tag. When a window has no
+ * waypoint-bearing assistant speech, the extractor therefore falls back to a
+ * bounded set_thought/tap_star payload rendered as a transient 💭 waypoint.
+ * Generic tool traces are transport echoes and are discarded. Any real speech
+ * artifact wins over the fallback so explicit glyph semantics stay authoritative.
+ *
  * Pure, zero I/O, no side effects. Shared across all transports:
  * Claude CLI, Codex CLI, and FC engines (claude-api/OpenAI/Gemini/GLM/
  * Grok/Mistral/MiniMax).
@@ -54,7 +60,7 @@ export interface CognitiveArtifact {
    * admitted through the transient flow-note lane.
    */
   register: AssistantRegister | 'untagged';
-  /** Glyph character for rendering ('·' for untagged flow notes). */
+  /** Glyph character for rendering ('·' for untagged speech, '💭' for thought fallback). */
   glyph: string;
   /** First meaningful line(s) of the message body, truncated to maxHeadlineChars. */
   headline: string;
@@ -66,6 +72,13 @@ export interface CognitiveArtifact {
    * continuity only. Renderers must keep the distinction visible.
    */
   trust: 'durable' | 'transient';
+  /**
+   * Set when a durable waypoint (🏁/⚠️/❓) at a later message index settles
+   * the work this transient note was narrating. The renderer keeps the note
+   * visible as an audit trail but marks it ⊘ so an obsolete working
+   * hypothesis cannot masquerade as current guidance.
+   */
+  supersededByMessageIndex?: number;
 }
 
 /** Options for extractCognitiveArtifacts / enrichFoldedBandBody. */
@@ -110,6 +123,23 @@ const TRANSIENT_REGISTERS: ReadonlySet<AssistantRegister> = new Set([
 
 /** Rendering glyph for untagged flow notes (neither a register nor a card glyph). */
 const UNTAGGED_GLYPH = '·';
+
+/** A visibly lower-trust waypoint recovered from an explicit thought tool. */
+const THOUGHT_BUBBLE_GLYPH = '💭';
+
+/** Glyph for a transient note superseded by a later durable waypoint. */
+const SUPERSEDED_GLYPH = '⊘';
+
+/**
+ * Stable substring of the transient-lane disclaimer line. Elder-band
+ * supersession detectors search frozen band text for this marker instead of
+ * re-parsing artifacts — keep it byte-identical with the rendered disclaimer.
+ */
+export const TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER =
+  'lines are transient flow notes';
+
+/** Compact tool trace emitted by birth/CLI transcript hydration. */
+const TOOL_TRACE_SEGMENT_RE = /^⟨tool\s+(\S+?)(?:\s+([\s\S]*))?⟩$/;
 
 /**
  * Host-synthetic assistant text that must never be conserved as a flow note.
@@ -203,6 +233,94 @@ export function flattenFoldMessageText(
   return flattenContent(content, parts);
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function parseToolArguments(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string') {
+    try {
+      return asRecord(JSON.parse(value));
+    } catch {
+      return null;
+    }
+  }
+  return asRecord(value);
+}
+
+function normalizeThoughtToolName(name: string): 'set_thought' | 'tap_star' | null {
+  const leaf = name.split('__').at(-1)?.split('.').at(-1);
+  return leaf === 'set_thought' || leaf === 'tap_star' ? leaf : null;
+}
+
+function extractThoughtToolText(name: unknown, rawArguments: unknown): string | null {
+  if (typeof name !== 'string') return null;
+  const tool = normalizeThoughtToolName(name);
+  if (!tool) return null;
+  const args = parseToolArguments(rawArguments);
+  if (!args) return null;
+  const value = tool === 'set_thought' ? args.thought : args.note;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.length > MAX_FLOW_NOTE_SOURCE_CHARS) return null;
+  if (CARD_GLYPHS.some((glyph) => text.startsWith(glyph))) return null;
+  if (SYNTHETIC_NOISE_PREFIXES.some((prefix) => text.startsWith(prefix))) return null;
+  return text;
+}
+
+function extractThoughtFromToolRecord(value: unknown): string | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const direct = extractThoughtToolText(
+    record.name,
+    record.input ?? record.arguments ?? record.args,
+  );
+  if (direct) return direct;
+  const fn = asRecord(record.function);
+  if (fn) {
+    const fromFunction = extractThoughtToolText(fn.name, fn.arguments ?? fn.args);
+    if (fromFunction) return fromFunction;
+  }
+  const functionCall = asRecord(record.functionCall);
+  return functionCall
+    ? extractThoughtToolText(functionCall.name, functionCall.args ?? functionCall.arguments)
+    : null;
+}
+
+function extractStructuredThoughts(message: FoldMessage): string[] {
+  const rawMessage = message as FoldMessage & { parts?: unknown };
+  const candidates = [message.content, message.tool_calls, rawMessage.parts];
+  const thoughts: string[] = [];
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate)) continue;
+    for (const entry of candidate) {
+      const thought = extractThoughtFromToolRecord(entry);
+      if (thought) thoughts.push(thought);
+    }
+  }
+  return thoughts;
+}
+
+function splitCompactToolTraces(text: string): { speech: string; thoughts: string[] } {
+  if (!text) return { speech: '', thoughts: [] };
+  const speech: string[] = [];
+  const thoughts: string[] = [];
+  for (const segment of text.split('\n')) {
+    const trimmed = segment.trim();
+    const match = TOOL_TRACE_SEGMENT_RE.exec(trimmed);
+    if (!match) {
+      speech.push(segment);
+      continue;
+    }
+    const thought = extractThoughtToolText(match[1], match[2]);
+    if (thought) thoughts.push(thought);
+    // All compact tool traces are transport echoes, never assistant speech.
+  }
+  return { speech: speech.join('\n'), thoughts };
+}
+
 /**
  * Extract a headline from the glyph body — the first non-empty line,
  * truncated to MAX_HEADLINE_CHARS. Skips leading markdown headers
@@ -239,6 +357,8 @@ function extractHeadline(body: string): string {
  * assistant narrations — tagged 🔍/▶, or cleanly untagged (parse failure
  * reason 'missing_register' only, never card-glyph-opened text, never
  * host-synthetic error surrogates) — capped at MAX_FLOW_NOTES, newest kept.
+ * A tool-only window may instead contribute bounded explicit thought payloads;
+ * they are used only when neither the durable nor speech flow-note lane emits.
  *
  * Returns all artifacts merged in chronological order (by message index).
  * Pure function — no side effects, no I/O.
@@ -253,6 +373,7 @@ export function extractCognitiveArtifacts(
   const includeFlowNotes = options.includeFlowNotes !== false;
   const durable: CognitiveArtifact[] = [];
   const flowNotes: CognitiveArtifact[] = [];
+  const thoughtFallbacks: CognitiveArtifact[] = [];
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -260,7 +381,24 @@ export function extractCognitiveArtifacts(
 
     // Handle Gemini raw message shape: { role: 'model', parts: [...] }
     const rawMsg = msg as FoldMessage & { parts?: unknown };
-    const text = flattenContent(msg.content, rawMsg.parts);
+    const rawText = flattenContent(msg.content, rawMsg.parts);
+    const compact = splitCompactToolTraces(rawText);
+    const thoughtTexts = [
+      ...extractStructuredThoughts(msg),
+      ...compact.thoughts,
+    ];
+    if (includeFlowNotes) {
+      for (const thought of new Set(thoughtTexts)) {
+        thoughtFallbacks.push({
+          register: 'untagged',
+          glyph: THOUGHT_BUBBLE_GLYPH,
+          headline: extractHeadline(thought),
+          messageIndex: i,
+          trust: 'transient',
+        });
+      }
+    }
+    const text = compact.speech;
     if (!text) continue;
 
     const parseResult = parseRegisterGlyph(text);
@@ -314,9 +452,64 @@ export function extractCognitiveArtifacts(
   const cappedFlowNotes =
     flowNotes.length > MAX_FLOW_NOTES ? flowNotes.slice(-MAX_FLOW_NOTES) : flowNotes;
 
-  return [...cappedDurable, ...cappedFlowNotes].sort(
+  const speechArtifacts = [...cappedDurable, ...cappedFlowNotes].sort(
     (a, b) => a.messageIndex - b.messageIndex,
   );
+  if (speechArtifacts.length > 0) return markSupersededFlowNotes(speechArtifacts);
+
+  // A thought tool is a fallback for windows with no waypoint-bearing assistant
+  // speech. Keep the newest occurrence of repeated tool calls and never render
+  // the serialized ⟨tool …⟩ wrapper itself.
+  const newestByHeadline = new Map<string, CognitiveArtifact>();
+  for (const artifact of thoughtFallbacks) {
+    newestByHeadline.set(artifact.headline, artifact);
+  }
+  const dedupedThoughts = [...newestByHeadline.values()].sort(
+    (a, b) => a.messageIndex - b.messageIndex,
+  );
+  return dedupedThoughts.length > MAX_FLOW_NOTES
+    ? dedupedThoughts.slice(-MAX_FLOW_NOTES)
+    : dedupedThoughts;
+}
+
+/**
+ * Within-window supersession: a transient flow note (🔍/▶/·) is working
+ * narration, not a conclusion. When a durable waypoint lands later in the
+ * same fold window, the note is settled — mark it so renderers can show the
+ * supersession instead of letting a stale hypothesis read as live guidance.
+ * Thought-fallback-only windows contain no durable waypoint by construction,
+ * so they pass through unchanged (their supersession is the cross-epoch
+ * elder-band case handled by the render option below).
+ */
+function markSupersededFlowNotes(
+  artifacts: readonly CognitiveArtifact[],
+): CognitiveArtifact[] {
+  const marked = new Array<CognitiveArtifact>(artifacts.length);
+  let nextDurableIndex = -1;
+  for (let i = artifacts.length - 1; i >= 0; i--) {
+    const artifact = artifacts[i];
+    if (artifact.trust === 'durable') {
+      nextDurableIndex = artifact.messageIndex;
+      marked[i] = artifact;
+      continue;
+    }
+    marked[i] =
+      nextDurableIndex >= 0
+        ? { ...artifact, supersededByMessageIndex: nextDurableIndex }
+        : artifact;
+  }
+  return marked;
+}
+
+/** Options for renderCognitiveBlock. */
+export interface RenderCognitiveBlockOptions {
+  /**
+   * Set when the frozen elder bands ahead of this one carry transient flow
+   * notes. With at least one durable waypoint in the current window, the
+   * block declares those elder notes superseded (elder bytes stay immutable;
+   * the supersession is stated additively in the newest band).
+   */
+  supersedesElderTransientNotes?: boolean;
 }
 
 /**
@@ -337,6 +530,7 @@ export function extractCognitiveArtifacts(
  */
 export function renderCognitiveBlock(
   artifacts: readonly CognitiveArtifact[],
+  options: RenderCognitiveBlockOptions = {},
 ): string {
   if (artifacts.length === 0) return '';
   const firstMessageIndex = artifacts[0].messageIndex;
@@ -350,14 +544,23 @@ export function renderCognitiveBlock(
     sourceEndExclusive: lastMessageIndex + 1,
     authority: 'historical-background',
   });
-  const lines = artifacts.flatMap(
-    (a) => [formatCognitiveArtifactProvenance(a), `${a.glyph} ${a.headline}`],
-  );
+  const lines = artifacts.flatMap((a) => [
+    formatCognitiveArtifactProvenance(a),
+    `${a.supersededByMessageIndex != null ? SUPERSEDED_GLYPH : a.glyph} ${a.headline}`,
+  ]);
   const hasFlowNotes = artifacts.some((a) => a.trust === 'transient');
+  const hasDurable = artifacts.some((a) => a.trust === 'durable');
   return [
     '[cognitive — historical waypoints from the folded window, NOT your current state]',
     ...(hasFlowNotes
-      ? ['— 🔍/▶/· lines are transient flow notes: unverified mid-flow narration, not conclusions —']
+      ? [`— 🔍/▶/·/💭 ${TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER}: unverified mid-flow narration, not conclusions —`]
+      : []),
+    // Cross-epoch supersession: elder bands are immutable, so the newest band
+    // declares their transient narration replaced. Only a genuine durable
+    // waypoint in THIS window can supersede — without one, elder flow notes
+    // remain the freshest (still transient) working state.
+    ...(options.supersedesElderTransientNotes && hasDurable
+      ? ['— durable waypoints below supersede transient flow notes frozen in elder band(s); elder 🔍/▶/·/💭 narration is replaced working state, not live guidance —']
       : []),
     provenance,
     ...lines,
@@ -374,7 +577,11 @@ export function renderCognitiveBlock(
 export function formatCognitiveArtifactProvenance(
   artifact: CognitiveArtifact,
 ): string {
-  return `↞ msg#${artifact.messageIndex} · ${artifact.register}`;
+  const supersession =
+    artifact.supersededByMessageIndex != null
+      ? ` · superseded-by msg#${artifact.supersededByMessageIndex}`
+      : '';
+  return `↞ msg#${artifact.messageIndex} · ${artifact.register}${supersession}`;
 }
 
 /**
@@ -392,9 +599,10 @@ export function enrichFoldedBandBody(
   parts: string[],
   rawMessages: readonly FoldMessage[],
   options?: ExtractCognitiveArtifactsOptions,
+  renderOptions?: RenderCognitiveBlockOptions,
 ): string[] {
   const artifacts = extractCognitiveArtifacts(rawMessages, options);
-  const block = renderCognitiveBlock(artifacts);
+  const block = renderCognitiveBlock(artifacts, renderOptions);
   if (block) {
     parts.push(block);
   }

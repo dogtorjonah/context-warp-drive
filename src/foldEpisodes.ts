@@ -2080,6 +2080,16 @@ export interface EpisodicInjectionState {
   episodicRateHeld: number;
   /** Stash cards dropped by the one-new-card-per-open-boundary serve cap. */
   episodicRateTrimmed: number;
+  /**
+   * Once-per-epoch automatic-serve registry: targetPath → the exact card
+   * signature last auto-injected and the fold epoch it was served in. An
+   * automatic recall card whose signature is unchanged since its last serve in
+   * the SAME epoch is suppressed (see filterEpisodicCardsServedThisEpoch) — a
+   * repeated touch must not re-paste an identical body. A changed signature
+   * (new chapter walked, advanced zone head) or a new epoch re-allows serving.
+   * Explicit lanes (active-path pins, self-tap recall) never consult this map.
+   */
+  servedPathCardSignatures: Map<string, { epoch: number; signature: string }>;
 }
 
 export function createEpisodicInjectionState(): EpisodicInjectionState {
@@ -2102,6 +2112,7 @@ export function createEpisodicInjectionState(): EpisodicInjectionState {
     episodicGatedBoundariesSinceServe: 0,
     episodicRateHeld: 0,
     episodicRateTrimmed: 0,
+    servedPathCardSignatures: new Map(),
   };
 }
 
@@ -2177,6 +2188,7 @@ function zoneMatchesTouchedPath(targetPath: string, touched: ReadonlySet<string>
 export function consumeEpisodicStash(
   state: EpisodicInjectionState,
   maxAgeBoundaries: number = EPISODIC_STASH_MAX_AGE_BOUNDARIES,
+  skipVisibleHeaderDedupe: boolean = false,
 ): EpisodicRecallCardLike[] | null {
   const stash = state.stash;
   if (!stash) return null;
@@ -2185,6 +2197,7 @@ export function consumeEpisodicStash(
     state.episodicSuppressed += stash.cards.length;
     return null;
   }
+  if (skipVisibleHeaderDedupe) return stash.cards.length > 0 ? [...stash.cards] : null;
   const unseen = stash.cards.filter((card) => !state.visibleCardHeaders.has(episodicCardHeaderLine(card)));
   state.episodicSuppressed += stash.cards.length - unseen.length;
   return unseen.length > 0 ? unseen : null;
@@ -2247,6 +2260,13 @@ export interface EpisodicStashRateGateOptions {
   maxAgeBoundaries?: number;
   /** Provider-visible text used to reject duplicate candidates before spending the gated allowance. */
   providerPovText?: string;
+  /**
+   * Skip the header-line dedupe inside consumeEpisodicStash. Used when the
+   * caller applies the stronger epoch-signature registry downstream: the
+   * header-line filter would otherwise suppress CHANGED cards (new chapters,
+   * longer body) that merely share a header with a served one.
+   */
+  skipVisibleHeaderDedupe?: boolean;
 }
 
 /**
@@ -2269,7 +2289,7 @@ export function consumeEpisodicStashRateGated(
 ): EpisodicRecallCardLike[] | null {
   const rate = Math.floor(options.rateBoundaries);
   if (rate <= 0 || classifyEpisodicBoundaryTool(options.toolName) !== 'gated') {
-    return consumeEpisodicStash(state, options.maxAgeBoundaries);
+    return consumeEpisodicStash(state, options.maxAgeBoundaries, options.skipVisibleHeaderDedupe === true);
   }
   state.episodicGatedBoundariesSinceServe++;
   if (state.episodicGatedBoundariesSinceServe < rate) {
@@ -2278,10 +2298,10 @@ export function consumeEpisodicStashRateGated(
   }
   const cards = suppressEpisodicCardsAlreadyInPov(
     state,
-    consumeEpisodicStash(state, options.maxAgeBoundaries),
+    consumeEpisodicStash(state, options.maxAgeBoundaries, options.skipVisibleHeaderDedupe === true),
     options.providerPovText ?? '',
   );
-  if (!cards || cards.length === 0) return cards;
+  if (!cards || cards.length === 0) return cards ? [...cards] : null;
   state.episodicGatedBoundariesSinceServe = 0;
   if (cards.length > 1) {
     state.episodicRateTrimmed += cards.length - 1;
@@ -2361,14 +2381,52 @@ export function suppressEpisodicCardsAlreadyInPov(
  * and the breathing ledger tallies by tier (chain-grade = chain/walk/pointer,
  * episode-grade = mention).
  */
+/**
+ * Stable content signature for the once-per-epoch automatic-serve registry:
+ * kind + walked chapters + body length + bounded body head. Two serves of the
+ * same zone whose cards advanced (new chapter, longer walk, fresh head) differ;
+ * a byte-identical re-serve does not. Deliberately not a full-body store — the
+ * registry keeps a bounded string per live path, not a second copy of every card.
+ */
+export function episodicCardSignature(card: EpisodicRecallCardLike): string {
+  return `${card.kind}:${card.chapterIds.join(',')}:${card.renderedCard.length}:${card.renderedCard.slice(0, 200)}`;
+}
+
+/**
+ * Once-per-epoch automatic-serve filter: drop cards whose targetPath was
+ * already auto-injected this epoch with an identical signature. Changed cards
+ * (walk advanced, zone head moved) and cards from prior epochs pass through.
+ * Registration happens in noteEpisodicInjection — this function is read-only.
+ * Returns null when nothing survives so callers keep their null = no-block flow.
+ */
+export function filterEpisodicCardsServedThisEpoch(
+  state: EpisodicInjectionState,
+  cards: readonly EpisodicRecallCardLike[] | null,
+  epoch: number,
+): EpisodicRecallCardLike[] | null {
+  if (!cards || cards.length === 0) return cards ? [...cards] : null;
+  const kept = cards.filter((card) => {
+    const served = state.servedPathCardSignatures.get(card.targetPath);
+    return !(served && served.epoch === epoch && served.signature === episodicCardSignature(card));
+  });
+  return kept.length > 0 ? kept : null;
+}
+
 export function noteEpisodicInjection(
   state: EpisodicInjectionState,
   cards: readonly EpisodicRecallCardLike[],
   ttlBoundaries: number = EPISODIC_ZONE_TTL_BOUNDARIES,
   valueOptions?: EpisodicValueLedgerOptions,
+  epoch?: number,
 ): void {
   const config = valueOptions?.config;
   for (const card of cards) {
+    if (epoch !== undefined) {
+      state.servedPathCardSignatures.set(card.targetPath, {
+        epoch,
+        signature: episodicCardSignature(card),
+      });
+    }
     const existing = state.zones.get(card.targetPath);
     const merged = new Set(existing ? existing.chapterIds : []);
     for (const id of card.chapterIds) merged.add(id);
@@ -2580,6 +2638,7 @@ export const EPISODIC_BOOKKEEPING_TOOLS: ReadonlySet<string> = new Set<string>([
   'partner_release_file',
   'partner_file_claims',
   'atlas_commit',
+  'atlas_commit_batch',
   'chatroom',
   'tap_star',
   'raw_signal',

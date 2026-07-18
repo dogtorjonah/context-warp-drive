@@ -1376,6 +1376,122 @@ export function nominateVerbatim(text: string, cap = 40): string[] {
 }
 
 /**
+ * Closet admission scans farther than the public nomination helper's ordinary
+ * 40-entry belt cap. Tool-result spool receipts can contain dozens of request
+ * ids before the first durable path/rail coordinate; ranking only the first 40
+ * would make recoverable transport exhaust crowd semantic state out before the
+ * character budget gets a vote. The widened pool remains bounded and is used
+ * only by foldContext's final closet admission pass.
+ */
+const CLOSET_NOMINATION_SCAN_CAP = 256;
+
+interface RankedCoordinateNomination {
+  lit: string;
+  sourceText: string;
+  order: number;
+  score: number;
+}
+
+const RECOVERABLE_TOOL_SPOOL_CONTEXT_RE = /(?:tool-result spool|tool-result-spool|full raw output scheduled|(?:codex|forge)-mcp[_-]tool-exec|codex-bash-exec|tool-host-|forge-mcp_|\bspool:|\bsha256:|\.voxxo-focused-tc-|\/tmp\/)/i;
+const SEMANTIC_COORDINATE_CONTEXT_RE = /\b(?:active[- ]rail|rail|active[- ]step|step|file_path|target|workspace|cwd|source|trace|session|instance|commit|changelog)\b/i;
+
+function coordinateOccurrenceContexts(sourceText: string, lit: string): string[] {
+  const contexts: string[] = [];
+  let from = 0;
+  while (from <= sourceText.length && contexts.length < 8) {
+    const index = sourceText.indexOf(lit, from);
+    if (index < 0) break;
+    contexts.push(sourceText.slice(Math.max(0, index - 120), Math.min(sourceText.length, index + lit.length + 120)));
+    from = index + Math.max(1, lit.length);
+  }
+  return contexts;
+}
+
+function coordinateNominationScore(lit: string, sourceText: string, preferredRoots: readonly string[]): number {
+  let score = 0;
+  const contexts = coordinateOccurrenceContexts(sourceText, lit);
+  const onlyRecoverableSpoolOccurrences = contexts.length > 0
+    && contexts.every(context => RECOVERABLE_TOOL_SPOOL_CONTEXT_RE.test(context));
+  if (onlyRecoverableSpoolOccurrences) score -= 200;
+
+  if (lit.startsWith('/')) score += 40;
+  const preferredRootIndex = preferredRoots.findIndex(root => lit === root || lit.startsWith(`${root}/`));
+  if (preferredRootIndex >= 0) score += Math.max(60, 120 - preferredRootIndex * 10);
+  if (contexts.some(context => SEMANTIC_COORDINATE_CONTEXT_RE.test(context))) score += 30;
+  return score;
+}
+
+function rankCoordinateNominations(
+  sources: readonly string[],
+  preferredRoots: readonly string[],
+): RankedCoordinateNomination[] {
+  const candidates: RankedCoordinateNomination[] = [];
+  let order = 0;
+  for (const sourceText of sources) {
+    for (const lit of nominateVerbatim(sourceText, CLOSET_NOMINATION_SCAN_CAP)) {
+      candidates.push({
+        lit,
+        sourceText,
+        order: order++,
+        score: coordinateNominationScore(lit, sourceText, preferredRoots),
+      });
+    }
+  }
+  return candidates.sort((left, right) => right.score - left.score || left.order - right.order);
+}
+
+function foldMessageTextForCoordinateRoots(message: FoldMessage): string {
+  if (typeof message.content === 'string') return message.content;
+  const texts: string[] = [];
+  if (Array.isArray(message.content)) {
+    for (const block of message.content) {
+      if (typeof block === 'string') texts.push(block);
+      else if (block && typeof block === 'object' && 'text' in block
+        && typeof (block as { text?: unknown }).text === 'string') {
+        texts.push((block as { text: string }).text);
+      }
+    }
+  }
+  const parts = (message as FoldMessage & { parts?: unknown }).parts;
+  if (Array.isArray(parts)) {
+    for (const part of parts) {
+      if (part && typeof part === 'object' && 'text' in part
+        && typeof (part as { text?: unknown }).text === 'string') {
+        texts.push((part as { text: string }).text);
+      }
+    }
+  }
+  return texts.join('\n');
+}
+
+/**
+ * Read only explicit boundary/workspace markers from the resident prefix and
+ * raw active window. Newest roots rank first. Historical fold-zone paths never
+ * nominate themselves as the destination, so a fork/workspace change favors
+ * coordinates under the receiving workspace without host I/O or a new render
+ * field.
+ */
+function extractPreferredCoordinateRoots(messages: readonly FoldMessage[]): string[] {
+  const roots: string[] = [];
+  const patterns = [
+    /<cwd>\s*(\/[^<\r\n]+?)\s*<\/cwd>/gi,
+    /(?:^|\n)(?:Current cwd\/worktree|Current cwd|Destination workspace(?: root)?|Workspace root):\s*(\/[^\s<>'"]+)/gim,
+  ];
+  for (const message of messages) {
+    const text = foldMessageTextForCoordinateRoots(message);
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(text)) !== null) {
+        const root = match[1].trim().replace(/[),.;]+$/, '').replace(/\/$/, '');
+        if (root.startsWith('/')) roots.push(root);
+      }
+    }
+  }
+  return [...new Set(roots.reverse())];
+}
+
+/**
  * Normalize a numeric string for conservation matching.
  * Makes `1.0000` ≡ `1.0` ≡ `1` via Number() coercion.
  */
@@ -2378,6 +2494,7 @@ export function foldContext(
 
   // Active window — everything from foldBoundary onward, untouched
   const activeWindow = messages.slice(foldBoundary);
+  const preferredCoordinateRoots = extractPreferredCoordinateRoots([...prefixMessages, ...activeWindow]);
 
   // System/developer messages in the fold zone — preserved verbatim
   const foldZone = messages.slice(prefixEnd, foldBoundary);
@@ -2631,10 +2748,12 @@ export function foldContext(
         }
         closetSet.add(lit);
       };
-      for (const built of survivors) {
-        for (const lit of nominateVerbatim(built.nominationText)) {
-          admit(lit, built.nominationText, closetBudget);
-        }
+      const mainNominations = rankCoordinateNominations(
+        survivors.map(built => built.nominationText),
+        preferredCoordinateRoots,
+      );
+      for (const candidate of mainNominations) {
+        admit(candidate.lit, candidate.sourceText, closetBudget);
       }
       // P1b user-verbatim lane: AFTER the main lane has claimed its identifiers
       // at full budget, conserve operator-pasted ids/paths/ports too — but only
@@ -2647,11 +2766,12 @@ export function foldContext(
         closetBudget,
         closetItems.length + Math.floor(closetBudget * USER_VERBATIM_LANE_RATIO),
       );
-      for (const built of survivors) {
-        if (!built.userNominationText) continue;
-        for (const lit of nominateVerbatim(built.userNominationText)) {
-          admit(lit, built.userNominationText, userLaneCeiling);
-        }
+      const userNominations = rankCoordinateNominations(
+        survivors.map(built => built.userNominationText).filter(Boolean),
+        preferredCoordinateRoots,
+      );
+      for (const candidate of userNominations) {
+        admit(candidate.lit, candidate.sourceText, userLaneCeiling);
       }
     }
     const closetLine = closetItems

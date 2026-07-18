@@ -19,6 +19,14 @@ import {
 import { classifyMessageGlyph } from './foldEpisodes.ts';
 import { DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS } from './contextBudget.ts';
 import { renderContinuityPackageProvenance } from './chronologicalProvenance.ts';
+import {
+  continuityReceiptFromProse,
+  isContinuityReceipt,
+  renderContinuityReceiptControl,
+  resolveContinuityBoundary,
+  type ContinuityReceipt,
+  type ContinuityReceiptBoundary,
+} from './continuityReceipt.ts';
 
 /**
  * Build a portable lineage glyph log from the message trace: scan assistant
@@ -183,12 +191,7 @@ export interface RawRebirthForkContext {
   readonly isFreshFork?: boolean;
 }
 
-export type RawRebirthLifecycleBoundary =
-  | 'same_instance_hard_epoch'
-  | 'continuation'
-  | 'fresh_fork'
-  | 'resurrection'
-  | 'brain_merge';
+export type RawRebirthLifecycleBoundary = ContinuityReceiptBoundary;
 
 export interface RawRebirthWorkspaceContext {
   readonly currentCwd: string;
@@ -271,6 +274,13 @@ export interface RawRebirthSeedInput {
   readonly traceNeighborhoods?: string;
   readonly activeEditDelta?: string;
   readonly taskRailContext?: string;
+  /**
+   * Versioned typed continuity receipt. When present and valid, the Rebirth
+   * Control block renders from it and prose sections are never re-parsed;
+   * when absent (legacy callers), the receipt is synthesized from the prose
+   * sections below and rendered through the same canonical renderer.
+   */
+  readonly continuityReceipt?: ContinuityReceipt;
   // Resume Point — pre-rendered by the relay builder.
   readonly resumePoint?: string;
   readonly episodicCrossRef?: string;
@@ -318,6 +328,8 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly workspaceContext?: RawRebirthWorkspaceContext | string;
   readonly activeEditDelta?: string;
   readonly taskRailContext?: string;
+  /** Typed continuity receipt — see RawRebirthSeedInput.continuityReceipt. */
+  readonly continuityReceipt?: ContinuityReceipt;
   // pre-rendered Resume Point string.
   readonly resumePoint?: string;
   readonly predecessorStatus?: string;
@@ -784,7 +796,8 @@ function extractLastAiOnlyBlock(lastUserAiMessages: string | null | undefined): 
   const text = lastUserAiMessages?.trim();
   if (!text) return '';
   const markers = [...text.matchAll(/^(?:\[[^\n\]]*\]\s*)?🤖 LAST AI MESSAGE(?:\s+⟦m\d+⟧)?:\s*$/gmu)];
-  const marker = markers.at(-1);
+  const errorMarkers = [...text.matchAll(/^(?:\[[^\n\]]*\]\s*)?⚠️ UNRESOLVED PROVIDER\/RUNTIME ERROR(?:\s+⟦m\d+⟧)?\s+\(not assistant speech\):\s*$/gmu)];
+  const marker = markers.at(-1) ?? errorMarkers.at(-1);
   if (!marker) return '';
   return text.slice(marker.index).trim();
 }
@@ -906,25 +919,11 @@ function pushSection(
 }
 
 function resolveLifecycleBoundary(input: RawRebirthSeedInput): RawRebirthLifecycleBoundary {
-  if (input.lifecycleBoundary) return input.lifecycleBoundary;
-  if (input.forkContext && input.forkContext.isFreshFork !== false) return 'fresh_fork';
-  if ((input.mergedFromLineages?.length ?? 0) > 0) return 'brain_merge';
-  return 'continuation';
-}
-
-function formatLifecycleIdentity(boundary: RawRebirthLifecycleBoundary, predecessorName: string): string {
-  switch (boundary) {
-    case 'same_instance_hard_epoch':
-      return `same running instance "${predecessorName}"; provider context reseeded, not a handoff`;
-    case 'fresh_fork':
-      return `new independent fork; "${predecessorName}" is the source identity, not this instance`;
-    case 'resurrection':
-      return `resumed durable instance "${predecessorName}" from its archived state`;
-    case 'brain_merge':
-      return `same receiving instance "${predecessorName}" with donor memories absorbed and attributed`;
-    case 'continuation':
-      return `same durable instance "${predecessorName}" across a session or model boundary`;
-  }
+  return resolveContinuityBoundary({
+    lifecycleBoundary: input.lifecycleBoundary,
+    isFreshFork: input.forkContext ? input.forkContext.isFreshFork !== false : undefined,
+    mergedLineageCount: input.mergedFromLineages?.length ?? 0,
+  });
 }
 
 function formatLifecycleHeader(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
@@ -941,10 +940,6 @@ function formatLifecycleHeader(input: RawRebirthSeedInput, boundary: RawRebirthL
     return `[CONTEXT REBIRTH] Lifecycle boundary: brain_merge for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
   }
   return `[CONTEXT REBIRTH] Lifecycle boundary: continuation for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
-}
-
-function findResumeLine(resumePoint: string | undefined, prefix: string): string {
-  return resumePoint?.split('\n').find((line) => line.startsWith(prefix))?.trim() ?? 'unknown';
 }
 
 /**
@@ -965,30 +960,24 @@ function formatControlActiveRequest(activeRequest: string): string {
 }
 
 function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
-  const activeRequest = input.triggeringUserMessage;
-  const rail = findResumeLine(input.resumePoint, '📋 ');
-  const active = findResumeLine(input.resumePoint, '▶ Active:');
-  // Resume Point emits '⏭ Next action:' for the immediate next action; older
-  // persisted packages used '⏭ Next:'. Prefer the current label, fall back to
-  // legacy so the authoritative control block never blanks to 'unknown'.
-  const nextAction = findResumeLine(input.resumePoint, '⏭ Next action:');
-  const next = nextAction !== 'unknown' ? nextAction : findResumeLine(input.resumePoint, '⏭ Next:');
-  const editOwnership = cleanString(input.activeEditDelta)
-    ? 'Active Edit Delta below is authoritative; inherited/source edits are not owned unless explicitly re-claimed.'
-    : 'no active edit delta supplied';
-  return [
-    '── Rebirth Control (AUTHORITATIVE) ──',
-    `boundary: ${boundary}`,
-    `identity: ${formatLifecycleIdentity(boundary, input.predecessorName)}`,
-    `source status: ${cleanString(input.predecessorStatus) ?? 'unknown'}`,
-    `rail: ${rail}`,
-    `current objective: ${active}`,
-    `immediate next action: ${next}`,
-    `edit ownership: ${editOwnership}`,
-    'validation state: unknown unless stated in Current Thread or Task Rail Context',
-    'truth order: this control block > active request > Active Edit Delta > Task Rail Context > recent dialogue > historical evidence',
-    activeRequest?.trim() ? formatControlActiveRequest(activeRequest) : 'active request: none bundled',
-  ].join('\n');
+  // Newer typed state mechanically outranks historical synthetic prose: a
+  // valid bundled receipt renders directly; otherwise the receipt is
+  // synthesized from the prose sections and rendered through the same
+  // canonical renderer, so every control surface shares one authority view.
+  const receipt = isContinuityReceipt(input.continuityReceipt)
+    ? input.continuityReceipt
+    : continuityReceiptFromProse({
+        boundary,
+        predecessorName: input.predecessorName,
+        sourceStatus: cleanString(input.predecessorStatus),
+        resumePoint: input.resumePoint,
+        taskRailContext: input.taskRailContext,
+        activeEditDelta: input.activeEditDelta,
+        currentThread: input.currentThread,
+        lastUserAiMessages: input.lastUserAiMessages,
+        activeRequestText: input.triggeringUserMessage?.trim() ? input.triggeringUserMessage : undefined,
+      });
+  return renderContinuityReceiptControl(receipt, { formatActiveRequest: formatControlActiveRequest });
 }
 
 export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
@@ -1037,7 +1026,11 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
       // sole copy of the freshest assistant state when Current Thread is empty.
       const aiOnly = combined ? extractLastAiOnlyBlock(combined) : '';
       if (aiOnly) {
-        return `\n── Last AI Message (READ FIRST) ──\n***READ THIS FIRST. This is the freshest AI message available at rebirth; the freshest user message is the active request in Rebirth Control.***\n\n${aiOnly}${resumeSuffix}`;
+        const errorOnly = aiOnly.includes('⚠️ UNRESOLVED PROVIDER/RUNTIME ERROR')
+          && !aiOnly.includes('🤖 LAST AI MESSAGE');
+        return errorOnly
+          ? `\n── Unresolved Provider/Runtime Error (READ FIRST) ──\n***READ THIS FIRST. No genuine assistant remainder followed the active request; this provider/runtime failure was unresolved at the package boundary.***\n\n${aiOnly}${resumeSuffix}`
+          : `\n── Last AI Message (READ FIRST) ──\n***READ THIS FIRST. This is the freshest AI message available at rebirth; the freshest user message is the active request in Rebirth Control.***\n\n${aiOnly}${resumeSuffix}`;
       }
       return input.resumePoint?.trim() ? `\n${input.resumePoint.trim()}` : undefined;
     })(),
@@ -1809,6 +1802,7 @@ export function buildRawRebirthSeedFromMessages(
     traceNeighborhoods,
     activeEditDelta: options.activeEditDelta,
     taskRailContext: options.taskRailContext,
+    continuityReceipt: options.continuityReceipt,
     resumePoint: options.resumePoint,
     workspaceContext: options.workspaceContext,
     episodicCrossRef: options.episodicCrossRef,

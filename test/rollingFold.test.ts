@@ -1838,6 +1838,45 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     expect(content).not.toContain(uuid2);
   });
 
+  test('case-zero replay favors destination-workspace semantics over recoverable spool receipts', () => {
+    const spoolIds = Array.from({ length: 48 }, (_, i) =>
+      `${i.toString(16).padStart(8, '0')}-1111-4222-8333-${i.toString(16).padStart(12, '0')}`,
+    );
+    const spoolReceipts = spoolIds.map(id =>
+      `[Codex tool-result spool] Full raw output scheduled for internal spool: codex-mcp_tool-exec-${id}`,
+    );
+    const destinationPath = '/home/jonah/voxxo-swarm/packages/context-warp/src/rollingFold.ts';
+    const foreignPath = '/home/jonah/other-repo/src/legacy.ts';
+    const msgs: FoldMessage[] = [
+      {
+        role: 'developer',
+        content: '<environment_context>\n<cwd>/home/jonah/voxxo-swarm</cwd>\n</environment_context>',
+      },
+      userMsg('inspect the first boundary'),
+      anthropicToolUse('Read', { file_path: 'relay/src/input.ts' }, 'toolu_case_zero'),
+      anthropicToolResult(
+        'toolu_case_zero',
+        `${spoolReceipts.join('\n')}\nHistorical target ${foreignPath}\nActive rail rail-9e2b1075 target ${destinationPath}`,
+      ),
+      assistantMsg('processed the boundary evidence'),
+      userMsg('active turn'),
+      assistantMsg('continue'),
+    ];
+    const cfg: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 95 };
+    const result = foldContext(msgs, 1, cfg);
+    const closetLine = ((result.messages.find(m =>
+      typeof m.content === 'string' && m.content.includes('[Conversation Context'),
+    )!.content) as string).split('\n').find(line => line.startsWith('⌖⌖⌖ COORDINATE CLOSET'));
+
+    expect(closetLine).toBeDefined();
+    expect(closetLine).toContain(destinationPath);
+    expect(closetLine).toContain('9e2b1075');
+    expect(closetLine).not.toContain(foreignPath);
+    for (const id of spoolIds) expect(closetLine).not.toContain(id);
+    expect(closetLine).toMatch(/^⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖ conserved verbatim ids\/paths\/values from folded turns — trust before re-reading files: /);
+    expect(closetLine).not.toContain('score=');
+  });
+
   // ── P1b user-verbatim lane ────────────────────────────────────────────
   // User-authored text is body-invisible (skeletons/retained render only tool
   // skeletons + assistant text), so an operator-pasted id's ONLY carry path is

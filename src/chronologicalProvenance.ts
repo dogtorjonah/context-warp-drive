@@ -33,7 +33,8 @@ export interface ClassifiedLiveObjective {
 // them inside a user-role message. Strip only named product-owned wrappers; an
 // arbitrary XML block may be genuine operator content and must remain intact.
 const OPERATOR_TRANSPORT_ENVELOPE_RE = /<(environment_context|permissions instructions|skills_instructions|apps_instructions|recommended_plugins|multi_agent_mode|temporal_context)(?:\s[^>]*)?>[\s\S]*?<\/\1>/giu;
-const OPERATOR_AGENTS_ENVELOPE_RE = /# AGENTS\.md instructions for [^\n]*\n<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/giu;
+const OPERATOR_AGENTS_ENVELOPE_RE = /# AGENTS\.md instructions for [^\n]*\r?\n\s*<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/giu;
+const OPERATOR_INCOMPLETE_AGENTS_ENVELOPE_RE = /# AGENTS\.md instructions for [^\n]*\r?\n\s*<INSTRUCTIONS>[\s\S]*$/giu;
 const OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE = /<(?:environment_context|permissions instructions|skills_instructions|apps_instructions|recommended_plugins|multi_agent_mode|temporal_context)(?:\s[^>]*)?>[\s\S]*$/giu;
 const SYNTHETIC_OBJECTIVE_ARTIFACT_RE = /(?:\[CONTEXT REBIRTH\]|\[Context band \d+\s+—\s+tail-epoch fold\]|\[Epoch Continuity Capsule\]|artifact=tail-epoch#|\[User Message Vault\]|\[System Note: Context pressure limits)/u;
 // Interrupt seam artifacts occupy an entire user row: the CLI's own
@@ -63,6 +64,7 @@ export function classifyOperatorAuthoredObjective(value: string | null | undefin
   });
   let text = strip(raw, OPERATOR_AGENTS_ENVELOPE_RE);
   text = strip(text, OPERATOR_TRANSPORT_ENVELOPE_RE);
+  text = strip(text, OPERATOR_INCOMPLETE_AGENTS_ENVELOPE_RE);
   text = strip(text, OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE).trim();
   if (!text || /^(?:<[^>]+>\s*)+$/u.test(text) || INTERRUPT_ARTIFACT_WHOLE_TEXT_RE.test(text)) {
     return { text: null, confidence: 'unknown', source: 'none' };
@@ -112,6 +114,12 @@ export interface ChronologicalProvenanceEnvelope {
   readonly liveObjective?: string;
   readonly liveObjectiveConfidence?: LiveObjectiveConfidence;
   readonly liveObjectiveSource?: LiveObjectiveSource;
+  /** Live executable rail identity captured at the artifact boundary. */
+  readonly activeRailId?: string;
+  /** Rail objective is distinct from a newer operator redirect, when both exist. */
+  readonly activeRailObjective?: string;
+  /** Current blocking/active rail step, when one exists. */
+  readonly activeRailStep?: string;
   /**
    * Interrupted work at the seam: the in-flight tool + a brief argument
    * preview sourced from the exact resume row, so post-fold resumption is
@@ -119,6 +127,17 @@ export interface ChronologicalProvenanceEnvelope {
    */
   readonly pendingIntent?: string;
 }
+
+/**
+ * Rebirth Control is authoritative only at the package frontier that created
+ * it. Later live state must be able to overrule conflicting frozen fields
+ * without rewriting the package bytes already resident in provider context.
+ */
+export const REBIRTH_CONTROL_AUTHORITY_HORIZON =
+  'authority horizon: authoritative at package creation; later unanswered operator messages, current live Task Rail state, and newer tail bands supersede conflicting fields without mutating this frozen block';
+
+export const REBIRTH_CONTROL_DYNAMIC_TRUTH_ORDER =
+  'truth order after creation: later unanswered operator message > current live Task Rail state > newest tail band > this frozen control snapshot > Active Edit Delta > Task Rail Context > recent dialogue > historical evidence';
 
 export interface ChronologicalValidationResult {
   readonly valid: boolean;
@@ -174,6 +193,10 @@ export function validateChronologicalProvenance(
   if (envelope.liveObjectiveSource && envelope.liveObjectiveSource !== 'none' && !envelope.liveObjective?.trim()) {
     errors.push('liveObjective.source-without-objective');
   }
+  if (envelope.activeRailId !== undefined && !envelope.activeRailId.trim()) errors.push('activeRailId');
+  if ((envelope.activeRailObjective?.trim() || envelope.activeRailStep?.trim()) && !envelope.activeRailId?.trim()) {
+    errors.push('activeRailId.missing');
+  }
   const end = envelope.source.endExclusive;
   const resume = envelope.rawResumesAt;
   if (end?.index !== undefined && resume?.index !== undefined
@@ -224,6 +247,9 @@ export function renderChronologicalProvenance(
   const validation = validateChronologicalProvenance(envelope);
   if (!validation.valid) return renderInvalidChronologicalProvenance(envelope, validation.errors);
   const objective = boundedObjective(envelope.liveObjective);
+  const activeRailId = boundedObjective(envelope.activeRailId, 120);
+  const activeRailObjective = boundedObjective(envelope.activeRailObjective);
+  const activeRailStep = boundedObjective(envelope.activeRailStep, 120);
   const pendingIntent = boundedObjective(envelope.pendingIntent, 220);
   const objectiveAuthority = envelope.liveObjectiveConfidence
     ? `objective-confidence=${envelope.liveObjectiveConfidence} objective-source=${envelope.liveObjectiveSource ?? (objective ? 'operator-message' : 'none')}`
@@ -243,6 +269,9 @@ export function renderChronologicalProvenance(
     `raw-resumes=${rawFrontier}`,
     objectiveAuthority,
     objective ? `live-objective=${objective}` : '',
+    activeRailId
+      ? `active-rail=${activeRailId}${activeRailStep ? ` active-step=${activeRailStep}` : ''}${activeRailObjective ? ` rail-objective=${activeRailObjective}` : ''}`
+      : '',
     pendingIntent ? `pending-intent=${pendingIntent}` : '',
   ].filter(Boolean).join('\n');
 }
@@ -268,12 +297,21 @@ export interface TailEpochProvenanceInput {
    */
   readonly sourceFrameId?: string;
   readonly epoch: number;
-  readonly unit: 'message' | 'row';
+  readonly unit: 'event' | 'message' | 'row';
   readonly sourceStart: number;
   readonly sourceEndExclusive: number;
   readonly sourceFirstTimestamp?: string;
   readonly sourceLastTimestamp?: string;
   readonly committedAt: string;
+  /**
+   * Exact coordinate the new band will occupy once committed (preallocated at
+   * composition time): for event-unit writers the seam frontier
+   * (sourceEndExclusive); for message-unit writers the provenance message's
+   * own index in the committed view. Commit paths only persist on success, so
+   * a preallocated coordinate never outlives a declined band. Omitted by
+   * legacy callers — `created=` then keeps the visible `#?` unknown marker.
+   */
+  readonly committedIndex?: number;
   readonly rawTailCount: number;
   readonly rawResumeIndex?: number;
   readonly host: ChronologicalTopology['host'];
@@ -281,8 +319,23 @@ export interface TailEpochProvenanceInput {
   readonly liveObjective?: string;
   readonly liveObjectiveConfidence?: LiveObjectiveConfidence;
   readonly liveObjectiveSource?: LiveObjectiveSource;
+  readonly activeRailId?: string;
+  readonly activeRailObjective?: string;
+  readonly activeRailStep?: string;
+  /**
+   * Absolute, hard-epoch-local source ranges for every surviving tail band,
+   * oldest first. When present, entries must tile from zero through this
+   * band's sourceEndExclusive; the renderer emits the whole immutable stack.
+   */
+  readonly bandStack?: readonly TailEpochBandStackEntry[];
   /** Interrupted tool + brief arg preview from the exact resume row (seam intent). */
   readonly pendingIntent?: string;
+}
+
+export interface TailEpochBandStackEntry {
+  readonly epoch: number;
+  readonly sourceStart: number;
+  readonly sourceEndExclusive: number;
 }
 
 export interface TailEpochAliasProvenanceInput {
@@ -412,6 +465,20 @@ export function renderContinuityPackageProvenance(
   });
 }
 
+/**
+ * Bounded stack rendering: only the newest bands get explicit entries. Elder
+ * bands collapse into one cumulative span (`tail-epoch#1..#M[unit:0..S)`), so
+ * the stack line stays constant-width as sessions accumulate epochs instead of
+ * growing one clause per band. Integrity is NOT weakened for display: the full
+ * stack is validated (complete 0-tiling, monotonic epochs) before bounding,
+ * and the collapsed span preserves cumulative coverage — per-band elder ranges
+ * remain byte-pinned in the immutable ledger the bandStack was built from.
+ */
+export const TAIL_EPOCH_STACK_EXPLICIT_BANDS = 3;
+
+/** Newest elder bands named explicitly in the conflict-authority chain. */
+export const TAIL_EPOCH_AUTHORITY_EXPLICIT_ELDERS = 2;
+
 function renderTailEpochStackOrientation(input: TailEpochProvenanceInput): string | null {
   if (!Number.isInteger(input.epoch) || input.epoch < 0
     || !Number.isInteger(input.sourceStart) || input.sourceStart < 0
@@ -428,7 +495,67 @@ function renderTailEpochStackOrientation(input: TailEpochProvenanceInput): strin
     ? `raw-tail@${input.unit}#${input.rawResumeIndex}(+${input.rawTailCount})`
     : 'raw-tail:none';
   const frame = input.sourceFrameId ? ` frame=${input.sourceFrameId}` : '';
-  return `stack=${input.previous ?? 'frozen-prefix'}>tail-epoch#${input.epoch}[${input.unit}:${input.sourceStart}..${input.sourceEndExclusive})>seam@${input.committedAt}>${raw}${frame}`;
+  const stackEntries = input.bandStack ?? [{
+    epoch: input.epoch,
+    sourceStart: input.sourceStart,
+    sourceEndExclusive: input.sourceEndExclusive,
+  }];
+  if (stackEntries.length === 0) return null;
+  for (let index = 0; index < stackEntries.length; index += 1) {
+    const entry = stackEntries[index];
+    if (!Number.isInteger(entry.epoch) || entry.epoch < 0
+      || !Number.isInteger(entry.sourceStart) || entry.sourceStart < 0
+      || !Number.isInteger(entry.sourceEndExclusive)
+      || entry.sourceEndExclusive <= entry.sourceStart
+      || (input.bandStack && index === 0 && entry.sourceStart !== 0)
+      || (index > 0 && (entry.sourceStart !== stackEntries[index - 1].sourceEndExclusive
+        || entry.epoch <= stackEntries[index - 1].epoch))) {
+      return null;
+    }
+  }
+  const newest = stackEntries[stackEntries.length - 1];
+  if (newest.epoch !== input.epoch
+    || newest.sourceStart !== input.sourceStart
+    || newest.sourceEndExclusive !== input.sourceEndExclusive) {
+    return null;
+  }
+  const explicitCount = Math.min(TAIL_EPOCH_STACK_EXPLICIT_BANDS, stackEntries.length);
+  const collapsed = stackEntries.slice(0, stackEntries.length - explicitCount);
+  const explicitEntries = stackEntries.slice(stackEntries.length - explicitCount);
+  const bandParts: string[] = [];
+  if (collapsed.length > 0) {
+    const first = collapsed[0];
+    const last = collapsed[collapsed.length - 1];
+    bandParts.push(
+      `tail-epoch#${first.epoch}..#${last.epoch}[${input.unit}:${first.sourceStart}..${last.sourceEndExclusive})`,
+    );
+  }
+  for (const entry of explicitEntries) {
+    bandParts.push(`tail-epoch#${entry.epoch}[${input.unit}:${entry.sourceStart}..${entry.sourceEndExclusive})`);
+  }
+  const bands = bandParts.join('>');
+  return `stack=${input.previous ?? 'frozen-prefix'}>${bands}>seam@${input.committedAt}>${raw}${frame}`;
+}
+
+function renderTailEpochAuthorityOrder(input: TailEpochProvenanceInput): string {
+  const elders = (input.bandStack ?? []).slice(0, -1);
+  const explicitElders = elders
+    .slice(-TAIL_EPOCH_AUTHORITY_EXPLICIT_ELDERS)
+    .reverse()
+    .map((entry) => `tail-epoch#${entry.epoch}`);
+  const collapsedElders = elders.slice(0, Math.max(0, elders.length - TAIL_EPOCH_AUTHORITY_EXPLICIT_ELDERS));
+  const rollup = collapsedElders.length > 0
+    ? [`tail-epoch#${collapsedElders[0].epoch}..#${collapsedElders[collapsedElders.length - 1].epoch}(older)`]
+    : [];
+  return [
+    'authority-order-on-conflict=later-unanswered-operator',
+    'current-live-task-rail',
+    'newer-tail-band',
+    `tail-epoch#${input.epoch}`,
+    ...explicitElders,
+    ...rollup,
+    'frozen-rebirth-control-if-present',
+  ].join('>');
 }
 
 export function renderTailEpochProvenance(input: TailEpochProvenanceInput): string | null {
@@ -448,7 +575,14 @@ export function renderTailEpochProvenance(input: TailEpochProvenanceInput): stri
       count: input.sourceEndExclusive - input.sourceStart,
       lastTimestamp: input.sourceLastTimestamp,
     },
-    transformedAt: { traceId: input.traceId, unit: input.unit, timestamp: input.committedAt },
+    transformedAt: {
+      traceId: input.traceId,
+      unit: input.unit,
+      ...(Number.isInteger(input.committedIndex) && (input.committedIndex ?? 0) >= 0
+        ? { index: input.committedIndex }
+        : {}),
+      timestamp: input.committedAt,
+    },
     ...(input.rawTailCount > 0 && input.rawResumeIndex !== undefined
       ? { rawResumesAt: point(input.rawResumeIndex) }
       : {}),
@@ -464,15 +598,19 @@ export function renderTailEpochProvenance(input: TailEpochProvenanceInput): stri
     liveObjective: input.liveObjective,
     liveObjectiveConfidence: input.liveObjectiveConfidence,
     liveObjectiveSource: input.liveObjectiveSource,
+    activeRailId: input.activeRailId,
+    activeRailObjective: input.activeRailObjective,
+    activeRailStep: input.activeRailStep,
     pendingIntent: input.pendingIntent,
   };
   const rendered = renderChronologicalProvenance(envelope);
   const stack = renderTailEpochStackOrientation(input);
-  if (!rendered || !stack || !validateChronologicalProvenance(envelope).valid) return rendered;
+  if (!rendered || !stack || !validateChronologicalProvenance(envelope).valid) return null;
+  const authorityOrder = renderTailEpochAuthorityOrder(input);
   const frame = input.sourceFrameId
     ? `coordinate-frame=${input.sourceFrameId} scope=pre-fold-snapshot comparable-within-frame-only`
     : '';
-  return [rendered, frame, stack].filter(Boolean).join('\n');
+  return [rendered, frame, stack, authorityOrder].filter(Boolean).join('\n');
 }
 
 /** Measured message timestamp bounds; absent timestamps remain absent. */

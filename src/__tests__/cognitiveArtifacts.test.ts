@@ -55,6 +55,74 @@ describe('cognitiveArtifacts', () => {
       expect(artifacts[2].register).toBe('verdict');
     });
 
+    it('uses set_thought text as a clean fallback for a tool-only window', () => {
+      const messages: FoldMessage[] = [
+        { role: 'assistant', content: '⟨tool set_thought {"thought":"Checking ledger immutability before the next fold"}⟩' },
+        { role: 'assistant', content: '⟨tool result set_thought: accepted⟩' },
+        { role: 'assistant', content: '⟨tool mcp__voxxo-core__atlas_query {"action":"lookup"}⟩' },
+      ];
+      const artifacts = extractCognitiveArtifacts(messages);
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0]).toMatchObject({
+        register: 'untagged',
+        glyph: '💭',
+        headline: 'Checking ledger immutability before the next fold',
+        messageIndex: 0,
+        trust: 'transient',
+      });
+      expect(artifacts[0].headline).not.toContain('⟨tool');
+    });
+
+    it('reads thought tools from structured provider shapes and dedupes repeats', () => {
+      const messages = [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'set_thought', input: { thought: 'Tracing the live caller' } }],
+        },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ function: { name: 'set_thought', arguments: '{"thought":"Tracing the live caller"}' } }],
+        },
+        {
+          role: 'model',
+          parts: [{ functionCall: { name: 'tap_star', args: { note: 'Checking Gemini parity' } } }],
+          content: null,
+        },
+      ] as unknown as FoldMessage[];
+      const artifacts = extractCognitiveArtifacts(messages);
+      expect(artifacts.map((artifact) => artifact.headline)).toEqual([
+        'Tracing the live caller',
+        'Checking Gemini parity',
+      ]);
+      expect(artifacts.map((artifact) => artifact.messageIndex)).toEqual([1, 2]);
+      expect(artifacts.every((artifact) => artifact.glyph === '💭')).toBe(true);
+    });
+
+    it('prefers genuine glyph speech over a thought-tool fallback', () => {
+      const messages: FoldMessage[] = [{
+        role: 'assistant',
+        content: [
+          { type: 'text', text: '🏁 Verified against the live ledger' },
+          { type: 'tool_use', name: 'set_thought', input: { thought: 'Older working note' } },
+        ],
+      }];
+      const artifacts = extractCognitiveArtifacts(messages);
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0].register).toBe('verdict');
+      expect(artifacts[0].headline).toContain('Verified against the live ledger');
+    });
+
+    it('drops generic compact tool echoes instead of treating them as narration', () => {
+      const messages: FoldMessage[] = [
+        {
+          role: 'assistant',
+          content: '⟨tool mcp__voxxo-core__atlas_query {"action":"lookup"}⟩\n⟨tool result atlas_query: source text⟩',
+        },
+      ];
+      expect(extractCognitiveArtifacts(messages)).toHaveLength(0);
+    });
+
     it('excludes the transient lane entirely when includeFlowNotes is false', () => {
       const messages: FoldMessage[] = [
         { role: 'assistant', content: '🔍 investigating the fold code' },
@@ -66,6 +134,9 @@ describe('cognitiveArtifacts', () => {
       expect(artifacts).toHaveLength(1);
       expect(artifacts[0].register).toBe('verdict');
       expect(artifacts[0].trust).toBe('durable');
+      expect(extractCognitiveArtifacts([
+        { role: 'assistant', content: '⟨tool set_thought {"thought":"transient only"}⟩' },
+      ], { includeFlowNotes: false })).toHaveLength(0);
     });
 
     it('skips user messages', () => {
@@ -176,7 +247,7 @@ describe('cognitiveArtifacts', () => {
         { register: 'untagged', glyph: '·', headline: 'Single mount, always embedded.', messageIndex: 3, trust: 'transient' },
       ]);
       expect(block).toContain(
-        '— 🔍/▶/· lines are transient flow notes: unverified mid-flow narration, not conclusions —',
+        '— 🔍/▶/·/💭 lines are transient flow notes: unverified mid-flow narration, not conclusions —',
       );
       expect(block).toContain('↞ msg#3 · untagged');
       expect(block).toContain('· Single mount, always embedded.');

@@ -1334,6 +1334,10 @@ export class FoldSession {
         sourceFirstTimestamp: sourceTime.firstTimestamp,
         sourceLastTimestamp: sourceTime.lastTimestamp,
         committedAt: new Date(now).toISOString(),
+        // Preallocated exact coordinate: the provenance message is appended
+        // last into tailView and the commit places tailView directly after the
+        // frozen view — its committed-view index is known at composition time.
+        committedIndex: (this.freezeState.frozenView?.length ?? 0) + enrichedTail.length,
         rawTailCount: survivingRawTail.length,
         rawResumeIndex: hasKeptRaw ? frozenCount + keptRawSplitIndex : undefined,
         host: 'dedicated-synthetic-message',
