@@ -435,6 +435,7 @@ export const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSecti
 
 const PATH_MENTION_RE = /(?<![\w./-])\/?(?:[\w.-]+\/)+[\w./@+-]+\b/g;
 const RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE = 24_000;
+const RAW_TRACE_CLOSET_HEADER = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact identifiers, file paths, and values when the raw package body omits the middle.';
 const RAW_TRACE_CLOSET_ID_MENTION_RE =
   /\b(?:toolu[-_][A-Za-z0-9_.:-]{1,}|(?:rail|sig|msg|inst|task|thread|summon|fork|group|epoch|tool|call)[-_][A-Za-z0-9][A-Za-z0-9_.:-]{5,})\b/g;
 
@@ -1198,10 +1199,54 @@ interface RawTraceCoordinate {
   readonly sourceRole: string | null;
 }
 
+interface FittedRawTraceCoordinates {
+  readonly coordinates: RawTraceCoordinate[];
+  readonly lines: string[];
+  readonly elided: number;
+}
+
 function rawTraceCoordinateOrigin(coordinate: RawTraceCoordinate): string {
   return coordinate.sourceIndex === null
     ? 'source=unknown'
     : `source=${coordinate.sourceRole ?? 'unknown-role'} message ${coordinate.sourceIndex + 1}`;
+}
+
+function fitRawTraceCoordinates(
+  coordinates: readonly RawTraceCoordinate[],
+  maxChars: number,
+): FittedRawTraceCoordinates {
+  const entries = coordinates.map((coordinate) => ({
+    coordinate,
+    line: `- ${coordinate.labelled} @ ${rawTraceCoordinateOrigin(coordinate)}`,
+  }));
+  const fitted: typeof entries = [];
+  let usedChars = countStringChars(RAW_TRACE_CLOSET_HEADER);
+  for (const entry of entries) {
+    const nextChars = usedChars + countStringChars(entry.line) + 1;
+    if (fitted.length === 0 || nextChars <= maxChars) {
+      fitted.push(entry);
+      usedChars = nextChars;
+    }
+  }
+
+  let elided = entries.length - fitted.length;
+  if (elided > 0) {
+    let tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
+    while (fitted.length > 1 && usedChars + countStringChars(tail) + 1 > maxChars) {
+      const removed = fitted.pop();
+      if (removed) {
+        usedChars -= countStringChars(removed.line) + 1;
+        elided += 1;
+        tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
+      }
+    }
+  }
+
+  return {
+    coordinates: fitted.map((entry) => entry.coordinate),
+    lines: fitted.map((entry) => entry.line),
+    elided,
+  };
 }
 
 function prepareVisibleTraceMessages(
@@ -1286,34 +1331,14 @@ export function buildRawTraceCoordinateCloset(
   const coordinates = collectRawTraceCoordinates(prepareVisibleTraceMessages(visibleMessages));
   if (coordinates.length === 0) return '';
 
-  const header = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact identifiers, file paths, and values when the raw package body omits the middle.';
-  const lines = coordinates.map((coordinate) => `- ${coordinate.labelled} @ ${rawTraceCoordinateOrigin(coordinate)}`);
-
-  const fittedLines: string[] = [];
-  let usedChars = countStringChars(header);
-  for (const line of lines) {
-    const nextChars = usedChars + countStringChars(line) + 1;
-    if (fittedLines.length === 0 || nextChars <= maxChars) {
-      fittedLines.push(line);
-      usedChars = nextChars;
-    }
-  }
-  let elided = lines.length - fittedLines.length;
-  if (elided > 0) {
-    let tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
-    while (fittedLines.length > 1 && usedChars + countStringChars(tail) + 1 > maxChars) {
-      const removed = fittedLines.pop();
-      if (removed) {
-        usedChars -= countStringChars(removed) + 1;
-        elided += 1;
-        tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
-      }
-    }
-    fittedLines.push(tail);
+  const fitted = fitRawTraceCoordinates(coordinates, maxChars);
+  const fittedLines = [...fitted.lines];
+  if (fitted.elided > 0) {
+    fittedLines.push(`- …${fitted.elided} more coordinates elided — recover via fold recall or self-tap`);
   }
 
   if (fittedLines.length === 0) return '';
-  return [header, ...fittedLines].join('\n');
+  return [RAW_TRACE_CLOSET_HEADER, ...fittedLines].join('\n');
 }
 
 export interface LiteralTraceNeighborhoodOptions {
@@ -1327,6 +1352,8 @@ export interface LiteralTraceNeighborhoodOptions {
   readonly perMessageChars?: number;
   /** Sections already visible to the successor; matching coordinates are skipped. */
   readonly excludeTexts?: readonly string[];
+  /** Candidate budget shared with the Coordinate Closet; elided literals are not scored. */
+  readonly coordinateClosetMaxChars?: number;
 }
 
 function traceLiteralKind(literal: string): { label: string; score: number } {
@@ -1448,7 +1475,16 @@ export function buildLiteralTraceNeighborhoods(
     : 650;
   const excluded = (options.excludeTexts ?? []).filter((text) => text.trim().length > 0);
   const prepared = prepareVisibleTraceMessages(visibleMessages);
-  const coordinates = collectRawTraceCoordinates(prepared);
+  const requestedCoordinateChars = options.coordinateClosetMaxChars
+    ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset;
+  const coordinateClosetMaxChars = Number.isFinite(requestedCoordinateChars)
+    ? Math.floor(requestedCoordinateChars)
+    : DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset;
+  if (coordinateClosetMaxChars <= 0) return '';
+  const coordinates = fitRawTraceCoordinates(
+    collectRawTraceCoordinates(prepared),
+    coordinateClosetMaxChars,
+  ).coordinates;
   if (prepared.length === 0 || coordinates.length === 0) return '';
 
   const ranked = coordinates.flatMap((coordinate) => {
