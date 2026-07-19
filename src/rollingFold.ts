@@ -656,7 +656,15 @@ export function formatFoldEpochStamp(epoch: number, detail: string): string {
  * recall prefix — the block's FIRST line stays the FOLD_MARKER header that
  * foldRecall's buildFoldIndex parses. Full mechanics: docs/context-folding.md.
  */
-export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves closet items — ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
+export const FOLD_BLOCK_PREAMBLE = '(Context note: older turns were auto-folded into the skeletons below. Conserved closet items — ids/paths/values from folded turns — ride inline as ⌖ suffixes on the turn skeleton that dropped them; trust them before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
+
+/**
+ * Legacy layout variant, restored by the VOXXO_REBIRTH_FLAT_CLOSET kill-switch:
+ * conserved literals move from inline ⌖ suffixes back into a flat block-tail
+ * list, so the note reverts to describing that block. Keeps the same
+ * FOLD_BLOCK_PREAMBLE_SIGNATURE prefix so carrier detection is layout-blind.
+ */
+export const FOLD_BLOCK_PREAMBLE_FLAT_CLOSET = '(Context note: older turns were auto-folded into the skeletons below. The ⌖ COORDINATE CLOSET block below conserves closet items — ids/paths/values from folded turns — trust it before re-reading files. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Claiming a file you already touched triggers a re-fold that unfolds it — claim deliberately. Mechanics: docs/context-folding.md)';
 
 /**
  * Stable phrase identifying a SURVIVING full-preamble carrier (live fold block,
@@ -702,6 +710,27 @@ export function extractCoordinateConservationCorpus(messages: readonly FoldMessa
         sawRawTraceLiteral = false;
         continue;
       }
+      // Inline placement (flat closet dissolved): skeleton lines carry
+      // conserved literals as ` ⌖ item · item` suffix segments, and a
+      // collapse-merged line can hold several (`… ⌖ a → … ⌖ b`). Collect
+      // every segment item so cross-band admission sees prior-band inline
+      // coordinates; the ⟦label⟧ form keeps its bare value recoverable.
+      // The context-note preamble mentions the glyph in prose — skip it.
+      if (!line.startsWith('(Context note')) {
+        let searchFrom = 0;
+        for (;;) {
+          const glyphIndex = line.indexOf(' ⌖ ', searchFrom);
+          if (glyphIndex < 0) break;
+          // ' ⌖ ' is 3 UTF-16 units (space, U+2316, space) — items start at +3.
+          const segmentEnd = line.indexOf(' → ', glyphIndex + 3);
+          const segment = line.slice(glyphIndex + 3, segmentEnd < 0 ? undefined : segmentEnd);
+          for (const item of segment.split(' · ')) {
+            const bare = item.replace(/\s+⟦[^⟧]*⟧$/u, '').trim();
+            if (bare) conserved.push(bare);
+          }
+          searchFrom = glyphIndex + 3;
+        }
+      }
       if (!inRawTraceCloset) continue;
       if (line.startsWith('── ') || (sawRawTraceLiteral && line.length === 0)) {
         inRawTraceCloset = false;
@@ -723,12 +752,42 @@ export function extractCoordinateConservationCorpus(messages: readonly FoldMessa
  * band before they acquire the live frozen-prefix bytes (Codex/Claude CLI).
  */
 export function dedupeCoordinateClosetText(text: string, priorCoordinateCorpus: string): string {
-  if (!text.includes(COORDINATE_CLOSET_MARKER) || !priorCoordinateCorpus) return text;
+  if (!priorCoordinateCorpus) return text;
+  if (!text.includes(COORDINATE_CLOSET_MARKER) && !text.includes(' ⌖ ')) return text;
   return text
     .split('\n')
     .map((line) => {
       const markerIndex = line.indexOf(COORDINATE_CLOSET_MARKER);
-      if (markerIndex < 0) return line;
+      if (markerIndex < 0) {
+        // Inline placement layout: filter ` ⌖ item · item` suffix segments
+        // per skeleton line. Collapse merge arrows (` → `) delimit segments
+        // and are never consumed, so emptied segments drop cleanly.
+        if (line.startsWith('(Context note') || !line.includes(' ⌖ ')) return line;
+        let rebuilt = '';
+        let cursor = 0;
+        for (;;) {
+          const glyphIndex = line.indexOf(' ⌖ ', cursor);
+          if (glyphIndex < 0) {
+            rebuilt += line.slice(cursor);
+            break;
+          }
+          // ' ⌖ ' is 3 UTF-16 units (space, U+2316, space) — items start at +3.
+          const segmentStart = glyphIndex + 3;
+          const arrowIndex = line.indexOf(' → ', segmentStart);
+          const segmentEnd = arrowIndex < 0 ? line.length : arrowIndex;
+          const kept = line
+            .slice(segmentStart, segmentEnd)
+            .split(' · ')
+            .filter(Boolean)
+            .filter((item) => {
+              const bare = item.replace(/\s+⟦[^⟧]*⟧$/u, '').trim();
+              return !isConservedIn(priorCoordinateCorpus, bare);
+            });
+          rebuilt += line.slice(cursor, glyphIndex) + (kept.length > 0 ? ` ⌖ ${kept.join(' · ')}` : '');
+          cursor = segmentEnd;
+        }
+        return rebuilt;
+      }
       const itemsIndex = line.indexOf(': ', markerIndex + COORDINATE_CLOSET_MARKER.length);
       if (itemsIndex < 0) return line;
       const kept = line
@@ -1790,6 +1849,20 @@ function beltVerbatim(text: string, max = 2): string {
   return picked.join(', ');
 }
 
+/**
+ * Kill-switch restoring the pre-dissolve flat Coordinate Closet. Default OFF
+ * (flat box eliminated): set VOXXO_REBIRTH_FLAT_CLOSET=1 to restore the legacy
+ * flat literal list for A/B comparison or emergency fallback. Lives in this
+ * leaf module so BOTH closet builders (fold-block assembleBlock here and the
+ * rebirth-seed builder in rawRebirthSeed.ts) share one switch without a
+ * circular import.
+ */
+export function flatCoordinateClosetEnabled(): boolean {
+  if (typeof process === 'undefined' || !process.env) return false;
+  const raw = (process.env.VOXXO_REBIRTH_FLAT_CLOSET ?? '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes';
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Turn classifier
 // ══════════════════════════════════════════════════════════════════════
@@ -2441,7 +2514,8 @@ export function foldContext(
   fidelityValue?: FoldFidelityValueInput,
 ): FoldResult {
   const originalChars = countChars(messages);
-  let foldBlockPreamble = config.foldBlockPreamble ?? FOLD_BLOCK_PREAMBLE;
+  let foldBlockPreamble = config.foldBlockPreamble
+    ?? (flatCoordinateClosetEnabled() ? FOLD_BLOCK_PREAMBLE_FLAT_CLOSET : FOLD_BLOCK_PREAMBLE);
   const priorCoordinateCorpus = config.priorCoordinateCorpus
     || extractCoordinateConservationCorpus(messages);
 
@@ -2710,6 +2784,11 @@ export function foldContext(
       .map(ft => (ft.retained ? `${ft.skeleton}\n${ft.retained}` : ft.skeleton))
       .join('\n');
     let closetItems = '';
+    // Every literal admit() actually accepted, with the exact rendered form
+    // (labelled preferred, bare under budget pressure). Drives the inline
+    // per-turn coordinate placement below; closetItems stays the budget
+    // pacing ledger either way.
+    const admittedCoords: { lit: string; rendered: string }[] = [];
     if (closetBudget > 0) {
       const closetSet = new Set<string>();
       // Admit a nominated literal under a char ceiling. De-dup is on the BARE
@@ -2741,8 +2820,10 @@ export function foldContext(
         const labelled = label ? `${lit} ⟦${label}⟧` : lit;
         if (closetItems.length + sep.length + labelled.length <= ceiling) {
           closetItems += sep + labelled;
+          admittedCoords.push({ lit, rendered: labelled });
         } else if (!isPureDigit && closetItems.length + sep.length + lit.length <= ceiling) {
           closetItems += sep + lit;
+          admittedCoords.push({ lit, rendered: lit });
         } else {
           return;
         }
@@ -2774,17 +2855,55 @@ export function foldContext(
         admit(candidate.lit, candidate.sourceText, userLaneCeiling);
       }
     }
-    const closetLine = closetItems
-      ? `${COORDINATE_CLOSET_MARKER} conserved verbatim ids/paths/values from folded turns — trust before re-reading files: ${closetItems}`
-      : undefined;
+    // Coordinate placement — the flat-closet dissolve. Each admitted literal
+    // is attached to its EARLIEST nominating survivor turn — the artifact
+    // whose skeleton dropped it — and rendered as a ` ⌖ ` suffix on that
+    // turn's skeleton line. The suffix rides through collapseSequences, so a
+    // conserved literal renders inline with its causal turn (its blast
+    // radius) instead of in a flat block-tail list. Mapping (never mutating
+    // builtTurns) keeps eviction re-runs of assembleBlock idempotent.
+    // Kill-switch VOXXO_REBIRTH_FLAT_CLOSET=1 restores the legacy flat
+    // closetLine for A/B or emergency fallback.
+    let renderedCollapsed = collapsed;
+    let closetLine: string | undefined;
+    if (flatCoordinateClosetEnabled()) {
+      closetLine = closetItems
+        ? `${COORDINATE_CLOSET_MARKER} conserved verbatim ids/paths/values from folded turns — trust before re-reading files: ${closetItems}`
+        : undefined;
+    } else if (admittedCoords.length > 0) {
+      const coordsByOrdinal = new Map<number, string[]>();
+      for (const { lit, rendered } of admittedCoords) {
+        let home: number | undefined;
+        for (const built of survivors) {
+          if (built.nominationText.includes(lit) || built.userNominationText.includes(lit)) {
+            home = built.ordinal;
+            break; // survivors ascend in raw order: earliest origin is the artifact of record.
+          }
+        }
+        // Fallback: the freshest surviving artifact. Nominations are drawn
+        // from the survivors themselves, so a missing home should not occur;
+        // attach rather than drop so every admitted literal is placed once.
+        const ordinal = home ?? survivors[survivors.length - 1]!.ordinal;
+        const list = coordsByOrdinal.get(ordinal) ?? [];
+        list.push(rendered);
+        coordsByOrdinal.set(ordinal, list);
+      }
+      renderedCollapsed = collapseSequences(
+        survivors.map((built) => {
+          const coords = coordsByOrdinal.get(built.ordinal);
+          if (!coords || coords.length === 0) return built.folded;
+          return { ...built.folded, skeleton: `${built.folded.skeleton} ⌖ ${coords.join(' · ')}` };
+        }),
+      );
+    }
 
     // Tombstones count into blockChars like other lines.
     const blockChars =
-      collapsed.reduce((s, ft) => s + ft.skeleton.length + (ft.retained?.length ?? 0), 0) +
+      renderedCollapsed.reduce((s, ft) => s + ft.skeleton.length + (ft.retained?.length ?? 0), 0) +
       (closetLine?.length ?? 0) +
       foldBlockPreamble.length +
       tombstoneLines.reduce((s, line) => s + line.length, 0);
-    return { collapsed, closetLine, blockChars, tombstoneLines };
+    return { collapsed: renderedCollapsed, closetLine, blockChars, tombstoneLines };
   };
 
   // ── E10 eviction.

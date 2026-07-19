@@ -10,12 +10,16 @@ import {
   admitClosetLiteral,
   CHRONOLOGICAL_PROVENANCE_PREFIX,
   extractVerbatimContextLabel,
+  flatCoordinateClosetEnabled,
   isConservedIn,
   isClosetNoiseLiteral,
   isUnlabeledOpaqueClosetLiteral,
   nominateVerbatim,
   type FoldMessage,
 } from './rollingFold.ts';
+// Re-exported so relay callers (rebirthPackageBuilder) share the single
+// kill-switch defined in the rollingFold leaf module.
+export { flatCoordinateClosetEnabled };
 import { classifyMessageGlyph } from './foldEpisodes.ts';
 import { DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS } from './contextBudget.ts';
 import { renderContinuityPackageProvenance } from './chronologicalProvenance.ts';
@@ -1110,7 +1114,7 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     input,
     'traceNeighborhoods',
     input.traceNeighborhoods?.trim()
-      ? `\n── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──\n${input.traceNeighborhoods.trim()}`
+      ? `\n── Coordinate Blast Radius (harvested literals live with their cognitive artifacts; orphan literals get deterministic exact-match source excerpts, never LLM summaries) ──\n${input.traceNeighborhoods.trim()}`
       : undefined,
   );
   pushSection(budgetedSections, input, 'activeEditDelta', input.activeEditDelta ? `\n── Active Edit Delta ──\n${input.activeEditDelta}` : undefined);
@@ -1373,6 +1377,34 @@ function collectRawTraceCoordinates(
   });
 }
 
+/**
+ * Coordinate placement partition — the flat-closet dissolver.
+ *
+ * A harvested literal whose exact text already lives inside another package
+ * artifact (rail context, star reel, glyph log, activity trail, current
+ * thread, …) is CONSERVED: the artifact stream already carries it inline with
+ * its cognitive neighborhood, so re-listing it in a flat box is pure
+ * duplication. Literals with no artifact home are ORPHANS: they route to the
+ * attributed neighborhood expansion (buildLiteralTraceNeighborhoods with
+ * excludeTexts = the same artifact corpus), and whatever the neighborhood
+ * budget cannot fit is elided with a recovery pointer — never re-listed flat.
+ *
+ * Pure + deterministic: exact containment only, no I/O, no harvest changes.
+ */
+export function partitionRawTraceCoordinates(
+  coordinates: readonly RawTraceCoordinate[],
+  artifactTexts: readonly string[],
+): { conserved: RawTraceCoordinate[]; orphans: RawTraceCoordinate[] } {
+  const corpus = artifactTexts.filter((text) => text.trim().length > 0);
+  const conserved: RawTraceCoordinate[] = [];
+  const orphans: RawTraceCoordinate[] = [];
+  for (const coordinate of coordinates) {
+    if (corpus.some((text) => isConservedIn(text, coordinate.literal))) conserved.push(coordinate);
+    else orphans.push(coordinate);
+  }
+  return { conserved, orphans };
+}
+
 export function buildRawTraceCoordinateCloset(
   visibleMessages: readonly VisibleTraceMessage[],
   maxChars = DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset,
@@ -1560,7 +1592,7 @@ export function buildLiteralTraceNeighborhoods(
     || left.coordinate.literal.localeCompare(right.coordinate.literal)
   ));
 
-  const header = 'Deterministic exact-match neighborhoods around Coordinate Closet literals; source excerpts are whitespace-compacted, never LLM-summarized.';
+  const header = 'Deterministic exact-match blast radius around harvested coordinate literals not already conserved inline by an artifact section; source excerpts are whitespace-compacted, never LLM-summarized.';
   const selectedRanges: Array<{ start: number; end: number }> = [];
   const blocks: string[] = [];
   let usedChars = countStringChars(header);
@@ -1857,19 +1889,47 @@ export function buildRawRebirthSeedFromMessages(
   );
   const lastUserAiMessages = buildLastUserAiMessagesFromMessages(messages, traceEnd, excluded);
   const visibleTraceMessages = visibleTraceMessagesFromFoldMessages(messages, includeTrailingUserTurn);
-  const rawTraceCoordinateCloset = buildRawTraceCoordinateClosetFromMessages(messages, {
-    includeTrailingUserTurn,
-    rawTraceCoordinateClosetChars: options.rawTraceCoordinateClosetChars,
-  });
+  // Coordinate placement: build the artifact sections FIRST so every harvested
+  // literal can be checked against the corpus it would live in. Conserved
+  // literals stay inline with their artifact; only orphans spend neighborhood
+  // budget on an attributed expansion. The flat closet renders only behind
+  // the VOXXO_REBIRTH_FLAT_CLOSET kill-switch.
+  const starredMoments = options.starredMoments === undefined
+    ? buildStarredMomentsFromMessages(
+        messages,
+        options.sectionMaxChars?.starredMoments
+          ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.starredMoments,
+      )
+    : options.starredMoments;
+  const openQuestions = options.openQuestions ?? buildOpenQuestionsFromMessages(messages);
+  const thinkingTrail = buildActivityLogFromMessages(
+    messages,
+    traceEnd,
+    Math.max(200, Math.floor(options.activityMessageChars ?? 1_000)),
+    excluded,
+  );
+  const artifactCorpus = [
+    currentThread,
+    lastUserAiMessages,
+    options.activeEditDelta ?? '',
+    options.taskRailContext ?? '',
+    options.episodicCrossRef ?? '',
+    options.lineageGlyphLog ?? '',
+    starredMoments,
+    openQuestions,
+    thinkingTrail,
+    options.resumePoint ?? '',
+  ];
+  const rawTraceCoordinateCloset = flatCoordinateClosetEnabled()
+    ? buildRawTraceCoordinateClosetFromMessages(messages, {
+        includeTrailingUserTurn,
+        rawTraceCoordinateClosetChars: options.rawTraceCoordinateClosetChars,
+      })
+    : '';
   const traceNeighborhoods = options.traceNeighborhoods === undefined
     ? buildLiteralTraceNeighborhoods(visibleTraceMessages, {
         maxChars: options.traceNeighborhoodChars,
-        excludeTexts: [
-          currentThread,
-          lastUserAiMessages,
-          options.activeEditDelta ?? '',
-          options.taskRailContext ?? '',
-        ],
+        excludeTexts: artifactCorpus,
       })
     : options.traceNeighborhoods;
   return renderRawRebirthSeed({
@@ -1893,20 +1953,9 @@ export function buildRawRebirthSeedFromMessages(
     workspaceContext: options.workspaceContext,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
-    starredMoments: options.starredMoments === undefined
-      ? buildStarredMomentsFromMessages(
-          messages,
-          options.sectionMaxChars?.starredMoments
-            ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.starredMoments,
-        )
-      : options.starredMoments,
-    openQuestions: options.openQuestions ?? buildOpenQuestionsFromMessages(messages),
-    thinkingTrail: buildActivityLogFromMessages(
-      messages,
-      traceEnd,
-      Math.max(200, Math.floor(options.activityMessageChars ?? 1_000)),
-      excluded,
-    ),
+    starredMoments,
+    openQuestions,
+    thinkingTrail,
     predecessorStatus: options.predecessorStatus,
     lifecycleBoundary: options.lifecycleBoundary,
     userMessageTriggered: options.userMessageTriggered,
