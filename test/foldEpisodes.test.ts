@@ -15,6 +15,7 @@ import {
   isEpisodicBookkeepingTool,
   noteEpisodicInjection,
   reconcileVisibleEpisodicHeaders,
+  UNKNOWN_EPISODE_TIME,
   type Episode,
   type EpisodeAnnotation,
   type EpisodicRecallCardLike,
@@ -459,6 +460,43 @@ Make your fixes`;
     const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
     expect(episodes).toHaveLength(1);
     expect(episodes[0].intent).toBeUndefined();
+  });
+
+  it('uses FoldMessage.tsMs as source time without aligned timestamp options', () => {
+    const sourceTime = '2026-06-18T19:30:00.000Z';
+    const messages: FoldMessage[] = [
+      { ...editCall('t1', 'src/source-time.ts'), tsMs: Date.parse(sourceTime) },
+      toolResult('t1'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].startedAt).toBe(sourceTime);
+    expect(episodes[0].endedAt).toBe(sourceTime);
+    expect(episodes[0].endedAt).not.toBe(identity.nowIso);
+  });
+
+  it('renders missing source time explicitly instead of substituting nowIso', () => {
+    const messages: FoldMessage[] = [editCall('t1', 'src/timeless.ts'), toolResult('t1')];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].startedAt).toBe(UNKNOWN_EPISODE_TIME);
+    expect(episodes[0].endedAt).toBe(UNKNOWN_EPISODE_TIME);
+    const rendered = formatChainCard(episodes, 'src/timeless.ts', []);
+    expect(rendered).toContain('time unknown');
+    expect(rendered).not.toContain(identity.nowIso);
+  });
+
+  it('does not copy a known start timestamp into an unknown burst endpoint', () => {
+    const sourceTime = '2026-06-18T19:30:00.000Z';
+    const messages: FoldMessage[] = [
+      { ...editCall('t1', 'src/partial.ts'), tsMs: Date.parse(sourceTime) },
+      toolResult('t1'),
+      editCall('t2', 'src/partial.ts'),
+      toolResult('t2'),
+    ];
+    const { episodes } = deriveEpisodesFromMessages(messages, 0, identity, { sealTrailing: true });
+    expect(episodes[0].startedAt).toBe(sourceTime);
+    expect(episodes[0].endedAt).toBe(UNKNOWN_EPISODE_TIME);
   });
 
   it('strips host resume wrappers before choosing the operator intent when supplied', () => {

@@ -40,6 +40,13 @@ export type EpisodeTouchKind = 'edit' | 'read' | 'mention';
 
 export type EpisodeClosedBy = 'epoch' | 'rebirth' | 'release' | 'idle' | 'backfill';
 
+/**
+ * Durable, non-date marker for episodes whose source messages carried no
+ * creation timestamp. Never replace this with a capture/ingestion clock: that
+ * would turn unknown chronology into a fabricated fact.
+ */
+export const UNKNOWN_EPISODE_TIME = 'unknown';
+
 export type EpisodeAnnotationKind =
   | 'star:decision'
   | 'star:discovery'
@@ -77,8 +84,8 @@ export type EpisodeAnnotationKind =
   | 'narration';
 
 export interface EpisodeAnnotation {
-  /** ISO-8601 timestamp of the moment the agent wrote this. */
-  ts: string;
+  /** ISO-8601 source-message timestamp; absent when the source carried none. */
+  ts?: string;
   kind: EpisodeAnnotationKind;
   /** VERBATIM agent-authored text, ≤ VOICE_TEXT_CAP_CHARS at write time. */
   text: string;
@@ -108,7 +115,9 @@ export interface Episode {
    * rendering falls back to lineageRoot/instanceId when absent.
    */
   authorName?: string;
+  /** ISO source time, or UNKNOWN_EPISODE_TIME when no source timestamp exists. */
   startedAt: string;
+  /** ISO source time, or UNKNOWN_EPISODE_TIME when no source timestamp exists. */
   endedAt: string;
   closedBy: EpisodeClosedBy;
   /** One-line header; see deriveEpisodeSummary fallback chain. */
@@ -745,9 +754,26 @@ function comparePaths(a: string, b: string): number {
 }
 
 /** ISO timestamp → compact deterministic display form (YYYY-MM-DD HH:mm). */
-export function formatEpisodeDate(iso: string): string {
+export function formatEpisodeDate(iso: string | undefined): string {
+  if (iso === undefined || iso === UNKNOWN_EPISODE_TIME) return 'time unknown';
   if (iso.length >= 16 && iso.charAt(10) === 'T') return `${iso.slice(0, 10)} ${iso.slice(11, 16)}`;
   return iso.slice(0, 16);
+}
+
+/**
+ * Chronological comparator with an explicit partial-order policy: unknown
+ * source times sort before known times, then retain stable input order. This
+ * prevents an `unknown` marker from winning the hot/latest slot merely because
+ * its text happens to collate after an ISO timestamp.
+ */
+export function compareEpisodeTimeAscending(left: string, right: string): number {
+  const leftKnown = left !== UNKNOWN_EPISODE_TIME && Number.isFinite(Date.parse(left));
+  const rightKnown = right !== UNKNOWN_EPISODE_TIME && Number.isFinite(Date.parse(right));
+  if (leftKnown !== rightKnown) return leftKnown ? 1 : -1;
+  if (!leftKnown) return 0;
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  return leftMs < rightMs ? -1 : leftMs > rightMs ? 1 : 0;
 }
 
 function episodeEventRange(episode: Episode): { first: number; last: number } {
@@ -980,7 +1006,7 @@ function assembleBurst(burstTouches: readonly EpisodeTouch[], memberCap: number)
   const first = burstTouches[0];
   const last = burstTouches[burstTouches.length - 1];
   const startedAt = first?.ts;
-  const endedAt = last?.ts ?? startedAt;
+  const endedAt = last?.ts;
   return {
     startEventIndex: first?.eventIndex ?? 0,
     endEventIndex: last?.eventIndex ?? 0,
@@ -1296,25 +1322,28 @@ export function selectVoiceInlays(
     .sort(
       (a, b) =>
         ANNOTATION_PRIORITY[a.kind] - ANNOTATION_PRIORITY[b.kind]
-        || (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)
+        || compareEpisodeTimeAscending(a.ts ?? UNKNOWN_EPISODE_TIME, b.ts ?? UNKNOWN_EPISODE_TIME)
         || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0),
     )
     .slice(0, Math.max(0, max));
-  chosen.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  chosen.sort((a, b) => compareEpisodeTimeAscending(
+    a.ts ?? UNKNOWN_EPISODE_TIME,
+    b.ts ?? UNKNOWN_EPISODE_TIME,
+  ));
   return chosen;
 }
 
 /**
- * Per-line timestamp for a voice line. Every annotation carries its own `ts`
- * (the moment the agent wrote it), so a card's voice lines form a real
- * intra-episode timeline instead of all inheriting the header's endedAt — a
- * gotcha said near the start of a burst is stamped earlier than the changelog
- * that closed it. The stamp is a SUFFIX, never a prefix: the card glyph must
+ * Per-line timestamp for a voice line. When the source annotation carries its
+ * own `ts`, a card's voice lines form a real intra-episode timeline instead of
+ * all inheriting the header's endedAt — a gotcha said near the start of a burst
+ * is stamped earlier than the changelog that closed it. Unknown source time
+ * renders with no suffix. The stamp is a SUFFIX, never a prefix: the card glyph must
  * stay line-leading so NARRATION_QUOTED_VOICE_RE (which rejects only lines that
  * OPEN with a card glyph) keeps catching recalled voice as quoted memory — a
  * leading date would defeat that self-excitation guard. formatEpisodeDate is a
- * pure deterministic slice, so byte-identical output is preserved; legacy rows
- * with an absent/unparseable ts simply render with no suffix.
+ * pure deterministic slice, so byte-identical output is preserved; rows with
+ * an absent/unparseable ts simply render with no suffix.
  */
 function voiceTimeSuffix(annotation: EpisodeAnnotation): string {
   const stamp = annotation.ts ? formatEpisodeDate(annotation.ts) : '';
@@ -1545,7 +1574,7 @@ export function formatChainCard(
   const warmCount = Math.max(0, Math.floor(opts.warmCount ?? 2));
   const fullPreviousCount = Math.max(0, Math.floor(opts.fullPreviousCount ?? 0));
 
-  const ordered = visibleChapters.sort((a, b) => (a.endedAt < b.endedAt ? -1 : a.endedAt > b.endedAt ? 1 : 0));
+  const ordered = visibleChapters.sort((a, b) => compareEpisodeTimeAscending(a.endedAt, b.endedAt));
   const hot = ordered[ordered.length - 1];
   const fullPreviousStart = Math.max(0, ordered.length - 1 - fullPreviousCount);
   const fullPrevious = ordered.slice(fullPreviousStart, ordered.length - 1).reverse();

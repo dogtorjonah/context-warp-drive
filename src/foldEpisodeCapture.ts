@@ -25,8 +25,9 @@
  * seals, the cursor parks, and all of its voice is dropped (the 2026-06-13 15:04
  * regression). The exception is symmetric with inter-burst splitting.
  *
- * Pure CPU: no I/O, no ambient reads except none — `nowIso` arrives from the
- * caller. Safe for the epoch-commit path (zero awaits) and for tests.
+ * Pure CPU: no I/O and no ambient clock reads. Source time comes only from the
+ * messages/options; `nowIso` is caller-supplied solely for trailing-burst
+ * settlement. Safe for the epoch-commit path (zero awaits) and for tests.
  */
 import {
   assignAnnotationsToBursts,
@@ -44,6 +45,7 @@ import {
   NARRATION_MAX_LINES,
   NARRATION_MAX_LINES_TAGGED,
   PROCESS_MAX_LINES,
+  UNKNOWN_EPISODE_TIME,
   VOICE_TEXT_CAP_CHARS,
   INTENT_TEXT_CAP_CHARS,
   type Episode,
@@ -74,12 +76,37 @@ const COMMIT_DETAIL_CAP_CHARS = 40;
  */
 const NARRATION_SCAN_MAX_MESSAGES = 3;
 
+function validSourceTimestamp(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return undefined;
+  return value;
+}
+
+function sourceTimestampFromMs(value: unknown): string | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+/**
+ * Resolve one SOURCE timestamp. Explicit aligned timestamps win;
+ * FoldMessage.tsMs is the live-provider path; neither falls back to the
+ * capture clock. Indexed lookup keeps computeOpenBurst's per-tool hot path from
+ * allocating/scanning the whole history.
+ */
+function sourceTimestampAt(
+  messages: readonly FoldMessage[],
+  explicit: readonly (string | undefined)[] | undefined,
+  index: number,
+): string | undefined {
+  return validSourceTimestamp(explicit?.[index]) ?? sourceTimestampFromMs(messages[index]?.tsMs);
+}
+
 export interface EpisodeCaptureIdentity {
   workspace: string;
   instanceId: string;
   lineageRoot?: string;
   closedBy: Episode['closedBy'];
-  /** Caller-supplied clock (keeps this module pure and testable). */
+  /** Caller-supplied capture clock, used only to decide whether a trailing burst settled. */
   nowIso: string;
   railId?: string;
   railStep?: string;
@@ -107,10 +134,10 @@ export interface EpisodeCaptureOptions {
    */
   sealTrailing?: boolean;
   /**
-   * Per-message ISO timestamps aligned by message index. When provided,
-   * touches carry real time (enabling the 20-minute burst gap), episodes get
-   * honest startedAt/endedAt, and — critically — re-derivation produces
-   * IDENTICAL dedupe keys, making backfill re-runs idempotent.
+   * Optional per-message ISO source timestamps aligned by message index.
+   * These override FoldMessage.tsMs, which live provider histories supply
+   * automatically. If neither source exists, capture records explicit unknown
+   * episode time and leaves annotation time absent; it never uses nowIso.
    */
   timestamps?: readonly (string | undefined)[];
   /**
@@ -476,8 +503,7 @@ function mineNarrationForGap(
   scanStart: number,
   burstFinalTouch: number,
   gapEndExclusive: number,
-  timestamps: readonly (string | undefined)[] | undefined,
-  nowIso: string,
+  timestampAt: (index: number) => string | undefined,
   syntheticContext: SyntheticContextOptions,
 ): { eventIndex: number; annotation: EpisodeAnnotation }[] {
   const start = Math.max(0, scanStart);
@@ -504,12 +530,15 @@ function mineNarrationForGap(
       NARRATION_MAX_LINES_TAGGED,
       { requireVerdictShape: false },
     );
-    const ts = timestamps?.[i] ?? nowIso;
+    const ts = timestampAt(i);
     for (const line of lines) {
       const key = line.trim().toLowerCase();
       if (seen.has(key)) continue; // within-burst exact-text dedup (hygiene, not a cap)
       seen.add(key);
-      deliberate.push({ eventIndex: i, annotation: { ts, kind, text: line } });
+      deliberate.push({
+        eventIndex: i,
+        annotation: { ...(ts !== undefined ? { ts } : {}), kind, text: line },
+      });
     }
   }
   // Rationale (the "why") is captured ADDITIVELY below, so a burst that BOTH
@@ -553,10 +582,10 @@ function mineNarrationForGap(
         const cap = kind === 'narration' ? NARRATION_MAX_LINES : NARRATION_MAX_LINES_TAGGED;
         const lines = extractNarrationLines(text, isSynthetic, cap);
         if (lines.length > 0) {
-          const ts = timestamps?.[i] ?? nowIso;
+          const ts = timestampAt(i);
           verdictResult = lines.map((line) => ({
             eventIndex: i,
-            annotation: { ts, kind, text: line },
+            annotation: { ...(ts !== undefined ? { ts } : {}), kind, text: line },
           }));
         }
       }
@@ -567,8 +596,11 @@ function mineNarrationForGap(
         const rationaleLines = extractRationaleLines(text, isSynthetic, 1);
         const pick = rationaleLines.find((line) => !seen.has(line.trim().toLowerCase()));
         if (pick) {
-          const ts = timestamps?.[i] ?? nowIso;
-          rationale = { eventIndex: i, annotation: { ts, kind: 'narration', text: pick } };
+          const ts = timestampAt(i);
+          rationale = {
+            eventIndex: i,
+            annotation: { ...(ts !== undefined ? { ts } : {}), kind: 'narration', text: pick },
+          };
         }
       }
       // Both surfaces filled (or deliberate already holds the primary): stop.
@@ -610,8 +642,7 @@ function mineProcessNarrationForBurst(
   messages: readonly FoldMessage[],
   burstStart: number,
   burstEnd: number,
-  timestamps: readonly (string | undefined)[] | undefined,
-  nowIso: string,
+  timestampAt: (index: number) => string | undefined,
   syntheticContext: SyntheticContextOptions,
   toolStepCount: number,
 ): { eventIndex: number; annotation: EpisodeAnnotation }[] {
@@ -633,10 +664,11 @@ function mineProcessNarrationForBurst(
       const key = `${candidate.kind}\0${candidate.text.trim().toLowerCase()}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const ts = timestampAt(i);
       out.push({
         eventIndex: i,
         annotation: {
-          ts: timestamps?.[i] ?? nowIso,
+          ...(ts !== undefined ? { ts } : {}),
           kind: candidate.kind,
           text: candidate.text,
         },
@@ -722,19 +754,21 @@ export function deriveEpisodesFromMessages(
   const annotated: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
   const steps: { eventIndex: number; step: TraceStep; evidence?: ResultEvidence }[] = [];
   const syntheticContext = options.syntheticContext ?? {};
+  const timestampAt = (index: number): string | undefined =>
+    sourceTimestampAt(messages, options.timestamps, index);
 
   for (const call of iterToolCalls(messages, startIndex)) {
     if (isTaskRailLifecycleBoundary(call)) railSealEventIndexes.push(call.eventIndex);
     const touched = extractTouchPaths(call.input, options.canon);
     const kind = isEditTool(call.name) ? 'edit' as const : 'read' as const;
-    const ts = options.timestamps?.[call.eventIndex];
+    const ts = timestampAt(call.eventIndex);
     for (const p of touched) {
       touches.push({ eventIndex: call.eventIndex, path: p, kind, ...(ts !== undefined ? { ts } : {}) });
     }
 
     const voice = mineVoice(call);
     if (voice) {
-      const stamped: EpisodeAnnotation = { ...voice, ts: ts ?? identity.nowIso };
+      const stamped: EpisodeAnnotation = { ...voice, ...(ts !== undefined ? { ts } : {}) };
       annotated.push({ eventIndex: call.eventIndex, annotation: stamped });
       if (stamped.kind === 'star:pivot') pivots.push({ eventIndex: call.eventIndex });
       steps.push({ eventIndex: call.eventIndex, step: { tool: shortToolName(call.name), voice: stamped } });
@@ -877,8 +911,7 @@ export function deriveEpisodesFromMessages(
         scanStart,
         burstFinalTouch,
         gapEnd,
-        options.timestamps,
-        identity.nowIso,
+        timestampAt,
         syntheticContext,
       );
       const toolStepCount = steps.filter(
@@ -889,8 +922,7 @@ export function deriveEpisodesFromMessages(
         messages,
         scanStart,
         burstFinalTouch,
-        options.timestamps,
-        identity.nowIso,
+        timestampAt,
         syntheticContext,
         toolStepCount,
       ).filter((item) => !narrationText.has(item.annotation.text.trim().toLowerCase()));
@@ -955,8 +987,8 @@ export function deriveEpisodesFromMessages(
       instanceId: identity.instanceId,
       ...(identity.lineageRoot !== undefined ? { lineageRoot: identity.lineageRoot } : {}),
       ...(identity.siloed === true ? { siloed: true } : {}),
-      startedAt: burst.startedAt ?? identity.nowIso,
-      endedAt: burst.endedAt ?? identity.nowIso,
+      startedAt: burst.startedAt ?? UNKNOWN_EPISODE_TIME,
+      endedAt: burst.endedAt ?? UNKNOWN_EPISODE_TIME,
       closedBy: identity.closedBy,
       summary: deriveEpisodeSummary({ annotations, members: burst.members }),
       ...(intent !== undefined ? { intent } : {}),
@@ -1019,8 +1051,8 @@ export interface OpenBurstResult {
  * deliberately (rather than refactoring load-bearing, byte-parity-mirrored capture
  * code) — keep the two in lockstep. Pinned by test/foldEpisodeCapture.openBurst.test.ts.
  *
- * Called WITHOUT timestamps/nowIso (the FoldSession default), the seal is pure
- * event-count (`trailingEventGap > gapEvents`) — the work-time basis, not wall-clock.
+ * Called without nowIso (the FoldSession default), trailing settlement is pure
+ * event-count. Burst grouping still consumes FoldMessage.tsMs when available.
  * Pivots are not mined here (that needs voice mining); pass them only for exact
  * parity testing. task_rail lifecycle boundaries are structural and cheap, so
  * they are mined here too to keep ACK-sealed bursts from being over-held by the
@@ -1041,7 +1073,7 @@ export function computeOpenBurst(
     if (isTaskRailLifecycleBoundary(call)) railSealEventIndexes.push(call.eventIndex);
     const touched = extractTouchPaths(call.input, options.canon);
     const kind = isEditTool(call.name) ? 'edit' as const : 'read' as const;
-    const ts = options.timestamps?.[call.eventIndex];
+    const ts = sourceTimestampAt(messages, options.timestamps, call.eventIndex);
     for (const p of touched) {
       touches.push({ eventIndex: call.eventIndex, path: p, kind, ...(ts !== undefined ? { ts } : {}) });
     }

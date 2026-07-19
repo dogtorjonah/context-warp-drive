@@ -24,6 +24,14 @@
 export interface BirthFoldSeedMessage {
   role: 'user' | 'assistant';
   content: string;
+  /**
+   * Epoch-millisecond creation time of the FIRST transcript row that
+   * contributed to this message. Absent when no contributing row carried a
+   * valid timestamp — never substituted with conversion/wall-clock time, so
+   * downstream fold and episodic capture can keep unknown source time
+   * distinguishable from processing time (chronological provenance).
+   */
+  tsMs?: number;
 }
 
 /** Structural subset of persistence LocalMessage — deliberately no import. */
@@ -181,6 +189,17 @@ function shortTs(ts: string | undefined): string {
   return ts.slice(0, 16).replace('T', ' ');
 }
 
+/**
+ * Parse a source row's ISO timestamp to epoch-ms. Returns undefined when the
+ * row carries no usable timestamp — never falls back to the conversion clock,
+ * so unknown source time stays unknown all the way into episodic capture.
+ */
+function sourceRowTsMs(row: BirthFoldSourceRow): number | undefined {
+  if (typeof row.ts !== 'string' || row.ts.length === 0) return undefined;
+  const ms = Date.parse(row.ts);
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
 function mergeConsecutiveRoles(messages: BirthFoldSeedMessage[]): BirthFoldSeedMessage[] {
   const out: BirthFoldSeedMessage[] = [];
   for (const m of messages) {
@@ -242,15 +261,15 @@ export function convertLocalMessagesToSeedHistory(
     }
   }
 
-  interface MutableBlock { role: 'user' | 'assistant'; parts: string[] }
+  interface MutableBlock { role: 'user' | 'assistant'; parts: string[]; tsMs?: number }
   const blocks: MutableBlock[] = [];
   let usedRows = 0;
 
-  const append = (role: 'user' | 'assistant', part: string): void => {
+  const append = (role: 'user' | 'assistant', part: string, tsMs: number | undefined): void => {
     if (!part.trim()) return;
     const last = blocks[blocks.length - 1];
     if (last && last.role === role) last.parts.push(part);
-    else blocks.push({ role, parts: [part] });
+    else blocks.push({ role, parts: [part], ...(tsMs !== undefined ? { tsMs } : {}) });
     usedRows += 1;
   };
 
@@ -258,12 +277,13 @@ export function convertLocalMessagesToSeedHistory(
   for (const row of sourceRows) {
     const part = renderRowPart(row, renderBudgets);
     if (!part) continue;
-    append(part.role, part.text);
+    append(part.role, part.text, sourceRowTsMs(row));
   }
 
   const rendered: BirthFoldSeedMessage[] = blocks.map((b) => ({
     role: b.role,
     content: b.parts.join('\n\n'),
+    ...(b.tsMs !== undefined ? { tsMs: b.tsMs } : {}),
   }));
 
   // Per-block ceiling. Retention below never cuts the newest block (dropping
@@ -288,7 +308,7 @@ export function convertLocalMessagesToSeedHistory(
       const tokens = extractBirthFoldTokens(elidedText);
       const tokenStr = tokens.length > 0 ? ` — write any token to recall: ${tokens.join(', ')}` : '';
       rendered[i] = {
-        role: rendered[i].role,
+        ...rendered[i],
         content: `${BIRTH_FOLD_TAG} (oversized block: ${elided} chars elided${tokenStr}; newest tail kept)\n\n…${content.slice(-keep)}`,
       };
       clippedBlocks += 1;
@@ -327,7 +347,7 @@ export function convertLocalMessagesToSeedHistory(
       : `${preTrimmedRows} older transcript row(s)`;
     const note = `${BIRTH_FOLD_TAG} Inherited transcript truncated: ${omitted} omitted. Episodic memory can still recall that era on file touch.`;
     if (kept[0].role === 'user') {
-      kept[0] = { role: 'user', content: `${note}\n\n${kept[0].content}` };
+      kept[0] = { ...kept[0], content: `${note}\n\n${kept[0].content}` };
     } else {
       kept = [{ role: 'user', content: note }, ...kept];
     }
@@ -477,7 +497,8 @@ export function convertLocalMessagesToTraceMessages(
   for (const row of sourceRows) {
     const part = renderRowPart(row, budgets);
     if (!part) continue;
-    rendered.push({ role: part.role, content: part.text });
+    const tsMs = sourceRowTsMs(row);
+    rendered.push({ role: part.role, content: part.text, ...(tsMs !== undefined ? { tsMs } : {}) });
   }
 
   // Newest-first retention over whole messages; the newest message always survives.
@@ -498,7 +519,7 @@ export function convertLocalMessagesToTraceMessages(
     const keep = Math.max(1, maxChars - 160);
     const elided = kept[0].content.length - keep;
     kept = [{
-      role: kept[0].role,
+      ...kept[0],
       content: `${BIRTH_FOLD_TAG} (oversized message: ${elided} chars elided; newest tail kept)\n\n…${kept[0].content.slice(-keep)}`,
     }];
   }
