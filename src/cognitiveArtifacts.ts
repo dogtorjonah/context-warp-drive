@@ -26,11 +26,11 @@
  * hypothesis dumps are long and stay excluded, honoring the original
  * durable-only intent for long-form reasoning.
  *
- * Tool-only turns have no assistant text to register-tag. When a window has no
- * waypoint-bearing assistant speech, the extractor therefore falls back to a
- * bounded set_thought/tap_star payload rendered as a transient 💭 waypoint.
- * Generic tool traces are transport echoes and are discarded. Any real speech
- * artifact wins over the fallback so explicit glyph semantics stay authoritative.
+ * Tool-only turns have no assistant text to register-tag. Categorized tap_star
+ * pin calls are intentional continuity decisions, so they enter the durable
+ * lane as ⭐ waypoints even when ordinary assistant speech exists. Ambient
+ * uncategorized tap_star calls and set_thought remain bounded transient 💭
+ * fallbacks. Generic tool traces are transport echoes and are discarded.
  *
  * Pure, zero I/O, no side effects. Shared across all transports:
  * Claude CLI, Codex CLI, and FC engines (claude-api/OpenAI/Gemini/GLM/
@@ -59,7 +59,7 @@ export interface CognitiveArtifact {
    * The register type, or 'untagged' for a short glyphless narration
    * admitted through the transient flow-note lane.
    */
-  register: AssistantRegister | 'untagged';
+  register: AssistantRegister | 'untagged' | 'tap_star';
   /** Glyph character for rendering ('·' for untagged speech, '💭' for thought fallback). */
   glyph: string;
   /** First meaningful line(s) of the message body, truncated to maxHeadlineChars. */
@@ -72,6 +72,12 @@ export interface CognitiveArtifact {
    * continuity only. Renderers must keep the distinction visible.
    */
   trust: 'durable' | 'transient';
+  /** Declared category for a durable tap_star waypoint. */
+  tapStarCategory?: TapStarCategory;
+  /** Authoritative source time copied from FoldMessage.tsMs, when available. */
+  sourceTimestamp?: string;
+  /** Stable provider call id when supplied; missing identity stays unknown. */
+  sourceIdentity?: string;
   /**
    * Set when a durable waypoint (🏁/⚠️/❓) at a later message index settles
    * the work this transient note was narrating. The renderer keeps the note
@@ -80,6 +86,17 @@ export interface CognitiveArtifact {
    */
   supersededByMessageIndex?: number;
 }
+
+export const TAP_STAR_CATEGORIES = [
+  'decision',
+  'discovery',
+  'pivot',
+  'handoff',
+  'gotcha',
+  'result',
+] as const;
+
+export type TapStarCategory = typeof TAP_STAR_CATEGORIES[number];
 
 /** Options for extractCognitiveArtifacts / enrichFoldedBandBody. */
 export interface ExtractCognitiveArtifactsOptions {
@@ -126,6 +143,15 @@ const UNTAGGED_GLYPH = '·';
 
 /** A visibly lower-trust waypoint recovered from an explicit thought tool. */
 const THOUGHT_BUBBLE_GLYPH = '💭';
+
+/** A categorized tap_star is an intentional durable continuity waypoint. */
+const TAP_STAR_GLYPH = '⭐';
+
+/** Matches the relay tap_star long-note persistence ceiling. */
+const MAX_LONG_TAP_STAR_CHARS = 4_000;
+
+/** Matches the relay tap_star compact-note persistence ceiling. */
+const MAX_TAP_STAR_NOTE_CHARS = 200;
 
 /** Glyph for a transient note superseded by a later durable waypoint. */
 const SUPERSEDED_GLYPH = '⊘';
@@ -250,63 +276,133 @@ function parseToolArguments(value: unknown): Record<string, unknown> | null {
   return asRecord(value);
 }
 
-function normalizeThoughtToolName(name: string): 'set_thought' | 'tap_star' | null {
+type ThoughtToolName = 'set_thought' | 'tap_star';
+
+interface ExtractedToolWaypoint {
+  tool: ThoughtToolName;
+  text: string;
+  category?: TapStarCategory;
+  preserveVerbatim: boolean;
+  sourceIdentity?: string;
+}
+
+function normalizeThoughtToolName(name: string): ThoughtToolName | null {
   const leaf = name.split('__').at(-1)?.split('.').at(-1);
   return leaf === 'set_thought' || leaf === 'tap_star' ? leaf : null;
 }
 
-function extractThoughtToolText(name: unknown, rawArguments: unknown): string | null {
+function parseTapStarCategory(value: unknown): TapStarCategory | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  return (TAP_STAR_CATEGORIES as readonly string[]).includes(normalized)
+    ? normalized as TapStarCategory
+    : undefined;
+}
+
+function normalizeSourceIdentity(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function sourceIdentityFromRecord(record: Record<string, unknown>): string | undefined {
+  return normalizeSourceIdentity(record.id)
+    ?? normalizeSourceIdentity(record.call_id)
+    ?? normalizeSourceIdentity(record.callId);
+}
+
+function extractToolWaypoint(
+  name: unknown,
+  rawArguments: unknown,
+  sourceIdentity?: string,
+): ExtractedToolWaypoint | null {
   if (typeof name !== 'string') return null;
   const tool = normalizeThoughtToolName(name);
   if (!tool) return null;
   const args = parseToolArguments(rawArguments);
   if (!args) return null;
+  if (tool === 'tap_star') {
+    if (args.harvest === true) return null;
+    if (typeof args.action === 'string' && args.action.trim().toLowerCase() !== 'pin') return null;
+  }
   const value = tool === 'set_thought' ? args.thought : args.note;
   if (typeof value !== 'string') return null;
   const text = value.trim();
-  if (!text || text.length > MAX_FLOW_NOTE_SOURCE_CHARS) return null;
-  if (CARD_GLYPHS.some((glyph) => text.startsWith(glyph))) return null;
-  if (SYNTHETIC_NOISE_PREFIXES.some((prefix) => text.startsWith(prefix))) return null;
-  return text;
+  if (!text) return null;
+
+  const category = tool === 'tap_star' ? parseTapStarCategory(args.category) : undefined;
+  if (tool === 'tap_star' && args.category !== undefined && category === undefined) return null;
+  const preserveVerbatim = tool === 'tap_star' && category !== undefined && args.long === true;
+  const maxChars = preserveVerbatim
+    ? MAX_LONG_TAP_STAR_CHARS
+    : tool === 'tap_star' && category !== undefined
+      ? MAX_TAP_STAR_NOTE_CHARS
+      : MAX_FLOW_NOTE_SOURCE_CHARS;
+  if (text.length > maxChars) return null;
+
+  // Durable categorized stars may intentionally quote glyph/card/error text.
+  // Transient thought/status fallbacks keep the original noise guards.
+  if (category === undefined) {
+    if (CARD_GLYPHS.some((glyph) => text.startsWith(glyph))) return null;
+    if (SYNTHETIC_NOISE_PREFIXES.some((prefix) => text.startsWith(prefix))) return null;
+  }
+
+  return {
+    tool,
+    text,
+    category,
+    preserveVerbatim,
+    sourceIdentity,
+  };
 }
 
-function extractThoughtFromToolRecord(value: unknown): string | null {
+function extractWaypointFromToolRecord(value: unknown): ExtractedToolWaypoint | null {
   const record = asRecord(value);
   if (!record) return null;
-  const direct = extractThoughtToolText(
+  const outerIdentity = sourceIdentityFromRecord(record);
+  const direct = extractToolWaypoint(
     record.name,
     record.input ?? record.arguments ?? record.args,
+    outerIdentity,
   );
   if (direct) return direct;
   const fn = asRecord(record.function);
   if (fn) {
-    const fromFunction = extractThoughtToolText(fn.name, fn.arguments ?? fn.args);
+    const fromFunction = extractToolWaypoint(
+      fn.name,
+      fn.arguments ?? fn.args,
+      outerIdentity ?? sourceIdentityFromRecord(fn),
+    );
     if (fromFunction) return fromFunction;
   }
   const functionCall = asRecord(record.functionCall);
   return functionCall
-    ? extractThoughtToolText(functionCall.name, functionCall.args ?? functionCall.arguments)
+    ? extractToolWaypoint(
+        functionCall.name,
+        functionCall.args ?? functionCall.arguments,
+        outerIdentity ?? sourceIdentityFromRecord(functionCall),
+      )
     : null;
 }
 
-function extractStructuredThoughts(message: FoldMessage): string[] {
+function extractStructuredToolWaypoints(message: FoldMessage): ExtractedToolWaypoint[] {
   const rawMessage = message as FoldMessage & { parts?: unknown };
   const candidates = [message.content, message.tool_calls, rawMessage.parts];
-  const thoughts: string[] = [];
+  const waypoints: ExtractedToolWaypoint[] = [];
   for (const candidate of candidates) {
     if (!Array.isArray(candidate)) continue;
     for (const entry of candidate) {
-      const thought = extractThoughtFromToolRecord(entry);
-      if (thought) thoughts.push(thought);
+      const waypoint = extractWaypointFromToolRecord(entry);
+      if (waypoint) waypoints.push(waypoint);
     }
   }
-  return thoughts;
+  return waypoints;
 }
 
-function splitCompactToolTraces(text: string): { speech: string; thoughts: string[] } {
-  if (!text) return { speech: '', thoughts: [] };
+function splitCompactToolTraces(text: string): { speech: string; waypoints: ExtractedToolWaypoint[] } {
+  if (!text) return { speech: '', waypoints: [] };
   const speech: string[] = [];
-  const thoughts: string[] = [];
+  const waypoints: ExtractedToolWaypoint[] = [];
   for (const segment of text.split('\n')) {
     const trimmed = segment.trim();
     const match = TOOL_TRACE_SEGMENT_RE.exec(trimmed);
@@ -314,11 +410,17 @@ function splitCompactToolTraces(text: string): { speech: string; thoughts: strin
       speech.push(segment);
       continue;
     }
-    const thought = extractThoughtToolText(match[1], match[2]);
-    if (thought) thoughts.push(thought);
+    const waypoint = extractToolWaypoint(match[1], match[2]);
+    if (waypoint) waypoints.push(waypoint);
     // All compact tool traces are transport echoes, never assistant speech.
   }
-  return { speech: speech.join('\n'), thoughts };
+  return { speech: speech.join('\n'), waypoints };
+}
+
+function sourceTimestampFromMessage(message: FoldMessage): string | undefined {
+  if (typeof message.tsMs !== 'number' || !Number.isFinite(message.tsMs)) return undefined;
+  const date = new Date(message.tsMs);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 /**
@@ -357,8 +459,10 @@ function extractHeadline(body: string): string {
  * assistant narrations — tagged 🔍/▶, or cleanly untagged (parse failure
  * reason 'missing_register' only, never card-glyph-opened text, never
  * host-synthetic error surrogates) — capped at MAX_FLOW_NOTES, newest kept.
- * A tool-only window may instead contribute bounded explicit thought payloads;
- * they are used only when neither the durable nor speech flow-note lane emits.
+ * Categorized tap_star pin calls join the durable lane even when speech exists.
+ * A tool-only window may also contribute bounded ambient tap_star/set_thought
+ * payloads; those transient fallbacks are used only when no durable or speech
+ * flow-note artifact exists.
  *
  * Returns all artifacts merged in chronological order (by message index).
  * Pure function — no side effects, no I/O.
@@ -383,16 +487,37 @@ export function extractCognitiveArtifacts(
     const rawMsg = msg as FoldMessage & { parts?: unknown };
     const rawText = flattenContent(msg.content, rawMsg.parts);
     const compact = splitCompactToolTraces(rawText);
-    const thoughtTexts = [
-      ...extractStructuredThoughts(msg),
-      ...compact.thoughts,
-    ];
-    if (includeFlowNotes) {
-      for (const thought of new Set(thoughtTexts)) {
+    const uniqueToolWaypoints = new Map<string, ExtractedToolWaypoint>();
+    for (const waypoint of [
+      ...extractStructuredToolWaypoints(msg),
+      ...compact.waypoints,
+    ]) {
+      const key = `${waypoint.tool}\u0000${waypoint.category ?? ''}\u0000${waypoint.text}`;
+      const prior = uniqueToolWaypoints.get(key);
+      if (!prior || (!prior.sourceIdentity && waypoint.sourceIdentity)) {
+        uniqueToolWaypoints.set(key, waypoint);
+      }
+    }
+    const sourceTimestamp = sourceTimestampFromMessage(msg);
+    for (const waypoint of uniqueToolWaypoints.values()) {
+      if (waypoint.tool === 'tap_star' && waypoint.category) {
+        durable.push({
+          register: 'tap_star',
+          glyph: TAP_STAR_GLYPH,
+          headline: waypoint.preserveVerbatim
+            ? waypoint.text
+            : extractHeadline(waypoint.text),
+          messageIndex: i,
+          trust: 'durable',
+          tapStarCategory: waypoint.category,
+          sourceTimestamp,
+          sourceIdentity: waypoint.sourceIdentity,
+        });
+      } else if (includeFlowNotes) {
         thoughtFallbacks.push({
           register: 'untagged',
           glyph: THOUGHT_BUBBLE_GLYPH,
-          headline: extractHeadline(thought),
+          headline: extractHeadline(waypoint.text),
           messageIndex: i,
           trust: 'transient',
         });
@@ -546,7 +671,9 @@ export function renderCognitiveBlock(
   });
   const lines = artifacts.flatMap((a) => [
     formatCognitiveArtifactProvenance(a),
-    `${a.supersededByMessageIndex != null ? SUPERSEDED_GLYPH : a.glyph} ${a.headline}`,
+    `${a.supersededByMessageIndex != null ? SUPERSEDED_GLYPH : a.glyph} ${
+      a.register === 'tap_star' ? `[${a.tapStarCategory ?? 'unknown'}] ` : ''
+    }${a.headline}`,
   ]);
   const hasFlowNotes = artifacts.some((a) => a.trust === 'transient');
   const hasDurable = artifacts.some((a) => a.trust === 'durable');
@@ -581,6 +708,14 @@ export function formatCognitiveArtifactProvenance(
     artifact.supersededByMessageIndex != null
       ? ` · superseded-by msg#${artifact.supersededByMessageIndex}`
       : '';
+  if (artifact.register === 'tap_star') {
+    return [
+      `↞ msg#${artifact.messageIndex}`,
+      `tap_star:${artifact.tapStarCategory ?? 'unknown'}`,
+      `source-time=${artifact.sourceTimestamp ?? 'unknown'}`,
+      `source-id=${artifact.sourceIdentity ?? 'unknown'}`,
+    ].join(' · ') + supersession;
+  }
   return `↞ msg#${artifact.messageIndex} · ${artifact.register}${supersession}`;
 }
 

@@ -16,6 +16,17 @@ Every assistant message opens with exactly one register glyph:
 
 When in doubt, a message is `in_progress` (🔍). Tag what the message **is**, not what you hope it becomes.
 
+## Tap stars — an independent salience axis
+
+A host may also expose `tap_star` as an intentional continuity control. Register glyphs and tap stars belong together operationally, but they answer different questions:
+
+- The register glyph says what epistemic state a message is in and how much trust downstream memory should place in it.
+- A tap star says whether this moment is intentionally salient enough to carry forward.
+
+Neither axis implies the other. A verified 🏁 message need not be starred; an important unfinished pivot or blocker may be starred without pretending it is verified; a star may contain no glyph at all. If a waypoint originated as a glyph-bearing thought, preserve its glyph and wording in the tap note. Do not manufacture a glyph merely because a thought is being starred.
+
+Use categorized stars frequently at meaningful state transitions: load-bearing decisions, discoveries that change the working model, pivots, dangerous invariants, coherent task-step results, user corrections, and lifecycle handoffs. Use an uncategorized star only for transient focus that should update the live digest without becoming durable. Skip routine narration, repeated facts, duplicate pins, and low-information “still working” updates.
+
 ## Parsing — `parseRegisterGlyph(text, options?)`
 
 Strict, deterministic, first-character parse:

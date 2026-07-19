@@ -99,6 +99,74 @@ describe('cognitiveArtifacts', () => {
       expect(artifacts.every((artifact) => artifact.glyph === '💭')).toBe(true);
     });
 
+    it('keeps categorized tap_star calls as durable waypoints even beside assistant speech', () => {
+      const tsMs = Date.parse('2026-07-18T20:29:00.000Z');
+      const messages = [{
+        role: 'assistant',
+        tsMs,
+        content: [
+          { type: 'text', text: '▶ continuing the implementation' },
+          {
+            type: 'tool_use',
+            id: 'call_star_decision_1',
+            name: 'mcp__voxxo_swarm_bridge__tap_star',
+            input: {
+              action: 'pin',
+              category: 'decision',
+              note: 'Use the portable fold extractor as the integration seam.',
+            },
+          },
+        ],
+      }] as unknown as FoldMessage[];
+
+      const artifacts = extractCognitiveArtifacts(messages);
+      const star = artifacts.find((artifact) => artifact.register === 'tap_star');
+      expect(star).toMatchObject({
+        glyph: '⭐',
+        headline: 'Use the portable fold extractor as the integration seam.',
+        messageIndex: 0,
+        trust: 'durable',
+        tapStarCategory: 'decision',
+        sourceTimestamp: '2026-07-18T20:29:00.000Z',
+        sourceIdentity: 'call_star_decision_1',
+      });
+      expect(artifacts.some((artifact) => artifact.register === 'executing')).toBe(true);
+    });
+
+    it('preserves long categorized tap_star notes verbatim and ignores harvest calls', () => {
+      const longNote = `Decision body\n${'detail '.repeat(70).trim()}`;
+      const messages = [
+        {
+          role: 'assistant',
+          content: [{
+            type: 'tool_use',
+            name: 'tap_star',
+            input: { category: 'result', note: longNote, long: true },
+          }],
+        },
+        {
+          role: 'assistant',
+          content: [{
+            type: 'tool_use',
+            name: 'tap_star',
+            input: { action: 'harvest', note: 'must not become a waypoint' },
+          }],
+        },
+      ] as unknown as FoldMessage[];
+
+      const artifacts = extractCognitiveArtifacts(messages);
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0]).toMatchObject({
+        register: 'tap_star',
+        tapStarCategory: 'result',
+        headline: longNote,
+        trust: 'durable',
+        sourceTimestamp: undefined,
+        sourceIdentity: undefined,
+      });
+      expect(renderCognitiveBlock(artifacts)).toContain('source-time=unknown · source-id=unknown');
+    });
+
     it('prefers genuine glyph speech over a thought-tool fallback', () => {
       const messages: FoldMessage[] = [{
         role: 'assistant',
@@ -238,6 +306,24 @@ describe('cognitiveArtifacts', () => {
       expect(block).toContain('🏁 PASS — suite complete');
       expect(block).toContain('↞ msg#5 · hazard');
       expect(block).toContain('⚠️ sync I/O risk');
+      expect(block).not.toContain('transient flow notes');
+    });
+
+    it('renders categorized tap_star source chronology and stable identity', () => {
+      const block = renderCognitiveBlock([{
+        register: 'tap_star',
+        glyph: '⭐',
+        headline: 'The broker decision survives the fold.',
+        messageIndex: 4,
+        trust: 'durable',
+        tapStarCategory: 'decision',
+        sourceTimestamp: '2026-07-18T20:29:00.000Z',
+        sourceIdentity: 'call_star_4',
+      }]);
+      expect(block).toContain(
+        '↞ msg#4 · tap_star:decision · source-time=2026-07-18T20:29:00.000Z · source-id=call_star_4',
+      );
+      expect(block).toContain('⭐ [decision] The broker decision survives the fold.');
       expect(block).not.toContain('transient flow notes');
     });
 

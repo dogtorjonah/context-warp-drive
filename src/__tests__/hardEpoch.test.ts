@@ -158,6 +158,36 @@ describe('FoldSession hard-epoch consume', () => {
     expect(content).toContain('LIVE CURRENT QUESTION');
   });
 
+  it('freezes categorized tap_star waypoints into a local raw hard-epoch seed', () => {
+    const messages = [
+      { role: 'user', content: 'Choose the continuity seam.' },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'call_hard_epoch_star',
+          name: 'tap_star',
+          input: {
+            category: 'decision',
+            note: 'Freeze intentional waypoints into raw hard epochs.',
+          },
+        }],
+        tsMs: Date.parse('2026-07-18T20:29:00.000Z'),
+      },
+      { role: 'user', content: 'LIVE STARRED QUESTION' },
+    ] as unknown as FoldMessage[];
+
+    const out = ceilingSession().prepare(messages, { measuredInputTokens: 80_000 });
+    expect(out.stats.epochReason).toBe('hard-epoch');
+    const content = out.messages[0].content as string;
+    expect(content).toContain('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
+    expect(content).toContain('⭐ [decision] Freeze intentional waypoints into raw hard epochs.');
+    expect(content).toContain(
+      'source-time=2026-07-18T20:29:00.000Z · source-id=call_hard_epoch_star',
+    );
+    expect(content).toContain('LIVE STARRED QUESTION');
+  });
+
   it('does NOT hard-epoch below the ceiling even when a seed is present (seed waits)', () => {
     const out = ceilingSession().prepare(bigHistory(), {
       measuredInputTokens: 1_000,

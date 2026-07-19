@@ -27,6 +27,10 @@ import {
   type ContinuityReceipt,
   type ContinuityReceiptBoundary,
 } from './continuityReceipt.ts';
+import {
+  extractCognitiveArtifacts,
+  formatCognitiveArtifactProvenance,
+} from './cognitiveArtifacts.ts';
 
 /**
  * Build a portable lineage glyph log from the message trace: scan assistant
@@ -145,6 +149,47 @@ export function buildOpenQuestionsFromMessages(
     return `${header}\n${truncate(body, maxChars)}`;
   }
   return `${header}\n${body}`;
+}
+
+/**
+ * Build the portable starred-waypoint reel directly from categorized tap_star
+ * calls in provider messages. This is the raw/standalone counterpart to the
+ * relay's persisted star harvest: it is pure, chronological, and preserves the
+ * tool call's source time/id when the provider supplied them.
+ */
+export function buildStarredMomentsFromMessages(
+  messages: readonly FoldMessage[],
+  maxChars = DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.starredMoments,
+): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return '';
+  const stars = extractCognitiveArtifacts(messages, { includeFlowNotes: false })
+    .filter((artifact) => artifact.register === 'tap_star');
+  if (stars.length === 0) return '';
+  // Never infer the position of an unknown timestamp among known source times.
+  // When every row is authoritative, sort by source time with trace order as
+  // the deterministic tie; otherwise preserve the provider trace order.
+  if (stars.every((star) => star.sourceTimestamp !== undefined)) {
+    stars.sort((a, b) => {
+      const bySourceTime = a.sourceTimestamp!.localeCompare(b.sourceTimestamp!);
+      return bySourceTime || a.messageIndex - b.messageIndex;
+    });
+  }
+
+  const entries = stars.map((star) => [
+    formatCognitiveArtifactProvenance(star),
+    `⭐ [${star.tapStarCategory ?? 'unknown'}] ${star.headline}`,
+  ].join('\n'));
+  const headerPrefix = '⭐ Starred Waypoints';
+  const kept: string[] = [];
+  let rendered = '';
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const candidate = [entries[index], ...kept];
+    const candidateRendered = `${headerPrefix} (${candidate.length} of ${stars.length} trace-captured; chronological):\n${candidate.join('\n')}`;
+    if (candidateRendered.length > maxChars) break;
+    kept.splice(0, kept.length, ...candidate);
+    rendered = candidateRendered;
+  }
+  return rendered;
 }
 
 export type RawRebirthSeedSectionId =
@@ -345,6 +390,11 @@ export interface RawRebirthSeedFromMessagesOptions {
   /** Lineage glyph log text — chronological verdict/hazard register trail (portable-mode memory section). */
   readonly lineageGlyphLog?: string;
   /**
+   * Curated tap_star waypoint reel. Undefined derives it from the provider
+   * trace; an empty string explicitly suppresses the portable star section.
+   */
+  readonly starredMoments?: string;
+  /**
    * Open-questions ledger — chronological ❓ blocked-register trail. When
    * omitted, buildRawRebirthSeedFromMessages auto-builds it from the message
    * trace via buildOpenQuestionsFromMessages; pass '' to suppress.
@@ -394,16 +444,16 @@ export const DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS: Record<RawRebirthSeedSe
 export const DEFAULT_RAW_REBIRTH_SEED_SECTION_PRIORITY: Record<RawRebirthSeedSectionId, number> = {
   lastUserAiMessages: 0,
   currentThread: 1,
-  rawTraceCoordinateCloset: 2,
-  activeEditDelta: 3,
-  taskRailContext: 4,
-  traceNeighborhoods: 5,
-  episodicCrossRef: 6,
-  lineageGlyphLog: 7,
-  openQuestions: 8,
-  atlasCrossRef: 9,
-  workspaceContext: 10,
-  starredMoments: 11,
+  starredMoments: 2,
+  rawTraceCoordinateCloset: 3,
+  activeEditDelta: 4,
+  taskRailContext: 5,
+  traceNeighborhoods: 6,
+  episodicCrossRef: 7,
+  lineageGlyphLog: 8,
+  openQuestions: 9,
+  atlasCrossRef: 10,
+  workspaceContext: 11,
   thinkingTrail: 12,
   lifetimeChangelogArc: 13,
   chatroomMembership: 14,
@@ -415,6 +465,7 @@ export const DEFAULT_RAW_REBIRTH_SEED_SECTION_PRIORITY: Record<RawRebirthSeedSec
 export const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSectionId[] = [
   'lastUserAiMessages',
   'currentThread',
+  'starredMoments',
   'rawTraceCoordinateCloset',
   'traceNeighborhoods',
   'activeEditDelta',
@@ -424,7 +475,6 @@ export const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSecti
   'openQuestions',
   'atlasCrossRef',
   'workspaceContext',
-  'starredMoments',
   'thinkingTrail',
   'lifetimeChangelogArc',
   'chatroomMembership',
@@ -1843,6 +1893,13 @@ export function buildRawRebirthSeedFromMessages(
     workspaceContext: options.workspaceContext,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
+    starredMoments: options.starredMoments === undefined
+      ? buildStarredMomentsFromMessages(
+          messages,
+          options.sectionMaxChars?.starredMoments
+            ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.starredMoments,
+        )
+      : options.starredMoments,
     openQuestions: options.openQuestions ?? buildOpenQuestionsFromMessages(messages),
     thinkingTrail: buildActivityLogFromMessages(
       messages,

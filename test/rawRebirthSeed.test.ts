@@ -6,6 +6,7 @@ import {
   buildRawRebirthSeedFromMessages,
   buildRawTraceCoordinateCloset,
   buildRawTraceCoordinateClosetFromMessages,
+  buildStarredMomentsFromMessages,
   DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS,
   DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS,
   findRawRebirthSeedTraceEnd,
@@ -30,6 +31,7 @@ describe('raw rebirth seed renderer', () => {
       traceEventCount: 42,
       lastUserAiMessages: '[11:44 PM] user\nOk go',
       currentThread: '[11:44 PM] user\nOk go\n\n[11:48 PM] assistant\nWorking',
+      starredMoments: '⭐ Starred Waypoints (1 of 1 trace-captured; chronological):\n⭐ [decision] Keep this waypoint.',
       rawTraceCoordinateCloset: 'Conserved high-value literals nominated newest-first from the predecessor trace.\n- rail-raw-seed-123456',
       traceNeighborhoods: '⌖ literal: rail-raw-seed-123456\n[trace messages 1–2 of 4]',
       activeEditDelta: 'Files claimed for editing: src/rawRebirthSeed.ts',
@@ -58,6 +60,7 @@ describe('raw rebirth seed renderer', () => {
 
     const lastIdx = seed.indexOf('── Last User + AI Messages (READ FIRST) ──');
     const threadIdx = seed.indexOf('── Current Thread ──');
+    const starIdx = seed.indexOf('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
     const closetIdx = seed.indexOf('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
     const neighborhoodsIdx = seed.indexOf('── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──');
     const editIdx = seed.indexOf('── Active Edit Delta ──');
@@ -68,7 +71,8 @@ describe('raw rebirth seed renderer', () => {
 
     expect(lastIdx).toBeGreaterThan(0);
     expect(threadIdx).toBeGreaterThan(lastIdx);
-    expect(closetIdx).toBeGreaterThan(threadIdx);
+    expect(starIdx).toBeGreaterThan(threadIdx);
+    expect(closetIdx).toBeGreaterThan(starIdx);
     expect(neighborhoodsIdx).toBeGreaterThan(closetIdx);
     expect(editIdx).toBeGreaterThan(neighborhoodsIdx);
     expect(railIdx).toBeGreaterThan(editIdx);
@@ -409,6 +413,71 @@ describe('raw rebirth seed renderer', () => {
       packageBudget: 30_000,
     });
     expect(suppressed).not.toContain('── Trace Neighborhoods');
+  });
+
+  test('auto-builds categorized tap_star waypoints with source chronology and stable provenance', () => {
+    const messages = [
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'call_raw_star_1',
+          name: 'tap_star',
+          input: {
+            category: 'handoff',
+            note: 'Carry this handoff into raw and hard-epoch continuity.',
+          },
+        }],
+        tsMs: Date.parse('2026-07-18T20:31:00.000Z'),
+      },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'call_raw_star_0',
+          name: 'tap_star',
+          input: {
+            category: 'decision',
+            note: 'Earlier source-time decision despite later trace position.',
+          },
+        }],
+        tsMs: Date.parse('2026-07-18T20:30:00.000Z'),
+      },
+    ] as unknown as FoldMessage[];
+
+    const reel = buildStarredMomentsFromMessages(messages);
+    expect(reel).toContain('⭐ Starred Waypoints (2 of 2 trace-captured; chronological):');
+    expect(reel).toContain(
+      '↞ msg#0 · tap_star:handoff · source-time=2026-07-18T20:31:00.000Z · source-id=call_raw_star_1',
+    );
+    expect(reel).toContain('⭐ [handoff] Carry this handoff into raw and hard-epoch continuity.');
+    expect(reel.indexOf('source-id=call_raw_star_0'))
+      .toBeLessThan(reel.indexOf('source-id=call_raw_star_1'));
+
+    const seed = buildRawRebirthSeedFromMessages(messages);
+    expect(seed).toContain('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
+    expect(seed.indexOf('── Starred Moments')).toBeGreaterThan(seed.indexOf('── Current Thread'));
+    expect(seed).toContain('source-id=call_raw_star_1');
+  });
+
+  test('keeps no-star raw rebirth output unchanged and allows explicit suppression', () => {
+    const noStars: FoldMessage[] = [
+      { role: 'user', content: 'ordinary request' },
+      { role: 'assistant', content: 'ordinary answer' },
+    ];
+    expect(buildStarredMomentsFromMessages(noStars)).toBe('');
+    expect(buildRawRebirthSeedFromMessages(noStars)).not.toContain('── Starred Moments');
+
+    const withStar = [{
+      role: 'assistant',
+      content: [{
+        type: 'tool_use',
+        name: 'tap_star',
+        input: { category: 'result', note: 'suppressible result' },
+      }],
+    }] as unknown as FoldMessage[];
+    expect(buildRawRebirthSeedFromMessages(withStar, { starredMoments: '' }))
+      .not.toContain('── Starred Moments');
   });
 
   test('collapses slash/no-slash duplicate path candidates and keeps the leading slash spelling', () => {
