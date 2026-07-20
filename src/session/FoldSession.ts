@@ -1070,6 +1070,7 @@ export class FoldSession {
       this.activeFidelity = desiredFidelity;
       const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
         maxChars: this.rawHardEpochSeedMaxChars,
+        capturedAt: new Date(now).toISOString(),
       });
       return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, pressureCeilingTriggered);
     }
@@ -1308,6 +1309,7 @@ export class FoldSession {
       )) {
         const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
           maxChars: this.rawHardEpochSeedMaxChars,
+          capturedAt: new Date(now).toISOString(),
         });
         return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, false, 'tail-yield-gate+hard-epoch');
       }
@@ -1421,6 +1423,7 @@ export class FoldSession {
       // instead of the legacy recompute.
       const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
         maxChars: this.rawHardEpochSeedMaxChars,
+        capturedAt: new Date(now).toISOString(),
       });
       return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, false, 'tail-runway-gate+hard-epoch');
     }

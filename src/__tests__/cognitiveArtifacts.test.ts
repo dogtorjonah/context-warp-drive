@@ -4,7 +4,24 @@ import {
   renderCognitiveBlock,
   enrichFoldedBandBody,
 } from '../cognitiveArtifacts.ts';
+import type { CognitiveArtifact } from '../cognitiveArtifacts.ts';
 import type { FoldMessage } from '../rollingFold.ts';
+
+function artifact(overrides: Partial<CognitiveArtifact>): CognitiveArtifact {
+  const messageIndex = overrides.messageIndex ?? 0;
+  return {
+    register: 'verdict',
+    glyph: '🏁',
+    headline: 'settled',
+    messageIndex,
+    trust: 'durable',
+    sourceIdentity: `fold-window:message:${messageIndex}`,
+    authorityClass: 'historical_observation',
+    completionSupport: 'insufficient_alone',
+    currentStatus: 'unresolved',
+    ...overrides,
+  };
+}
 
 describe('cognitiveArtifacts', () => {
   describe('extractCognitiveArtifacts', () => {
@@ -162,9 +179,14 @@ describe('cognitiveArtifacts', () => {
         headline: longNote,
         trust: 'durable',
         sourceTimestamp: undefined,
-        sourceIdentity: undefined,
+        sourceIdentity: expect.stringContaining('fold-window:message:0/tap_star:result/'),
+        authorityClass: 'pointer',
+        completionSupport: 'insufficient_alone',
+        currentStatus: 'unresolved',
       });
-      expect(renderCognitiveBlock(artifacts)).toContain('source-time=unknown · source-id=unknown');
+      expect(renderCognitiveBlock(artifacts)).toContain(
+        'authority=pointer · completion=insufficient_alone · source-time=unknown · source-id=fold-window:message:0/tap_star:result/',
+      );
     });
 
     it('prefers genuine glyph speech over a thought-tool fallback', () => {
@@ -294,8 +316,8 @@ describe('cognitiveArtifacts', () => {
   describe('renderCognitiveBlock', () => {
     it('renders artifacts as [cognitive] block with provenance', () => {
       const block = renderCognitiveBlock([
-        { register: 'verdict', glyph: '🏁', headline: 'PASS — suite complete', messageIndex: 2, trust: 'durable' },
-        { register: 'hazard', glyph: '⚠️', headline: 'sync I/O risk', messageIndex: 5, trust: 'durable' },
+        artifact({ register: 'verdict', glyph: '🏁', headline: 'PASS — suite complete', messageIndex: 2, trust: 'durable' }),
+        artifact({ register: 'hazard', glyph: '⚠️', headline: 'sync I/O risk', messageIndex: 5, trust: 'durable' }),
       ]);
       expect(block).toContain('[cognitive');
       expect(block).toContain('artifact=cognitive-waypoints class=synthesized-history');
@@ -310,7 +332,7 @@ describe('cognitiveArtifacts', () => {
     });
 
     it('renders categorized tap_star source chronology and stable identity', () => {
-      const block = renderCognitiveBlock([{
+      const block = renderCognitiveBlock([artifact({
         register: 'tap_star',
         glyph: '⭐',
         headline: 'The broker decision survives the fold.',
@@ -319,9 +341,10 @@ describe('cognitiveArtifacts', () => {
         tapStarCategory: 'decision',
         sourceTimestamp: '2026-07-18T20:29:00.000Z',
         sourceIdentity: 'call_star_4',
-      }]);
+        authorityClass: 'pointer',
+      })]);
       expect(block).toContain(
-        '↞ msg#4 · tap_star:decision · source-time=2026-07-18T20:29:00.000Z · source-id=call_star_4',
+        '↞ msg#4 · tap_star:decision · authority=pointer · completion=insufficient_alone · source-time=2026-07-18T20:29:00.000Z · source-id=call_star_4',
       );
       expect(block).toContain('⭐ [decision] The broker decision survives the fold.');
       expect(block).not.toContain('transient flow notes');
@@ -329,8 +352,8 @@ describe('cognitiveArtifacts', () => {
 
     it('adds the unverified-caveat line when transient flow notes are present', () => {
       const block = renderCognitiveBlock([
-        { register: 'verdict', glyph: '🏁', headline: 'PASS', messageIndex: 1, trust: 'durable' },
-        { register: 'untagged', glyph: '·', headline: 'Single mount, always embedded.', messageIndex: 3, trust: 'transient' },
+        artifact({ register: 'verdict', glyph: '🏁', headline: 'PASS', messageIndex: 1, trust: 'durable' }),
+        artifact({ register: 'untagged', glyph: '·', headline: 'Single mount, always embedded.', messageIndex: 3, trust: 'transient' }),
       ]);
       expect(block).toContain(
         '— 🔍/▶/·/💭 lines are transient flow notes: unverified mid-flow narration, not conclusions —',
@@ -347,13 +370,15 @@ describe('cognitiveArtifacts', () => {
   describe('formatCognitiveArtifactProvenance', () => {
     it('renders source message index and register', async () => {
       const { formatCognitiveArtifactProvenance } = await import('../cognitiveArtifacts.ts');
-      expect(formatCognitiveArtifactProvenance({
+      expect(formatCognitiveArtifactProvenance(artifact({
         register: 'blocked',
         glyph: '❓',
         headline: 'relay restart required',
         messageIndex: 7,
         trust: 'durable',
-      })).toBe('↞ msg#7 · blocked');
+      }))).toBe(
+        '↞ msg#7 · blocked · authority=historical_observation · completion=insufficient_alone · source-time=unknown · source-id=fold-window:message:7',
+      );
     });
   });
 

@@ -147,4 +147,37 @@ describe('verdict supersession', () => {
     const [episode] = deriveEpisodesFromMessages(messages, { sessionId: 's' });
     expect(episode?.supersedes ?? []).not.toContain(episode?.id);
   });
+
+  test.runIf(sqliteAvailable)('supersession records separate source and ingestion time', async () => {
+    const db = await createEpisodeStore();
+    try {
+      const beforeWrite = Date.now();
+      expect(supersedeEpisodes(db, [
+        { episodeId: 'episode-with-time', at: '2026-07-02T10:00:00Z', reason: 'explicit' },
+        { episodeId: 'episode-without-time' },
+      ])).toBe(2);
+      expect(supersedeEpisodes(db, [{
+        episodeId: 'episode-without-time',
+        at: '2026-07-02T11:00:00Z',
+        reason: 'later semantic rewrite is ignored',
+      }])).toBe(1);
+      expect(supersedeEpisodes(db, [{ episodeId: 'episode-without-time' }])).toBe(0);
+      expect(supersedeEpisodes(db, [{ episodeId: 'episode-without-time', at: '2026-07-02T11:00:00Z' }])).toBe(0);
+      expect(supersedeEpisodes(db, [{ episodeId: 'episode-with-time' }])).toBe(0);
+      const rows = db.prepare(
+        'SELECT episode_id, reason, created_at, source_at FROM episode_supersessions ORDER BY episode_id',
+      ).all() as Array<{ episode_id: string; reason: string | null; created_at: string; source_at: string | null }>;
+      expect(rows).toHaveLength(2);
+      const withoutTime = rows.find((row) => row.episode_id === 'episode-without-time');
+      const withTime = rows.find((row) => row.episode_id === 'episode-with-time');
+      // A later known replay enriches NULL while keeping first-write semantics.
+      expect(withoutTime?.source_at).toBe('2026-07-02T11:00:00Z');
+      expect(withoutTime?.reason).toBeNull();
+      expect(Date.parse(withoutTime!.created_at)).toBeGreaterThanOrEqual(beforeWrite);
+      // An omitted replay cannot erase a known source time.
+      expect(withTime?.source_at).toBe('2026-07-02T10:00:00Z');
+    } finally {
+      closeEpisodeStore(db);
+    }
+  });
 });

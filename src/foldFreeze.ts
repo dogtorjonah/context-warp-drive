@@ -91,6 +91,7 @@ import {
   DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS,
   findRawRebirthSeedTraceEnd,
 } from './rawRebirthSeed.ts';
+import { LIVE_CONTINUITY_STATE_HEADER } from './continuityReceipt.ts';
 
 // ══════════════════════════════════════════════════════════════════════
 // Config
@@ -412,6 +413,8 @@ export interface RawHardEpochSeedOptions {
   readonly closetChars?: number;
   /** Name rendered in the raw rebirth header. */
   readonly predecessorName?: string;
+  /** Boundary capture time; omitted remains explicitly unknown in live-state provenance. */
+  readonly capturedAt?: string;
   /**
    * Helper-level API for direct buildRawHardEpochSeed callers that need a complete
    * raw trace seed without calling buildHardEpochSeedView afterward. FoldSession
@@ -464,6 +467,7 @@ export function buildRawHardEpochSeed(
     includeTrailingUserTurn: options.includeTrailingUserTurn === true,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
+    capturedAt: options.capturedAt,
     lifecycleBoundary: 'same_instance_hard_epoch',
   });
 }
@@ -489,7 +493,9 @@ export function buildHardEpochSeedView(
   const traceEnd = findRawHardEpochTraceEnd(messages);
   const liveTurnText = extractTrailingUserTurnText(messages, traceEnd);
   const seedBody = ensureHardEpochContinuityDirective(seedPrompt);
-  const content = liveTurnText
+  const liveRequestAlreadyBundled = seedBody.includes(LIVE_CONTINUITY_STATE_HEADER)
+    && seedBody.includes('active request (');
+  const content = liveTurnText && !liveRequestAlreadyBundled
     ? `${seedBody}\n\n${HARD_EPOCH_LIVE_TURN_HEADER}\n${liveTurnText}`
     : seedBody;
   return [{ role: 'user', content }];

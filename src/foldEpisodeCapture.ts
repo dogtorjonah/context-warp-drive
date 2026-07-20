@@ -39,6 +39,7 @@ import {
   extractNarrationLines,
   extractRationaleLines,
   groupTouchesIntoEpisodes,
+  isNarrationVerdictText,
   isNarrationEligibleGlyph,
   narrationKindForGlyph,
   truncateVerbatim,
@@ -50,6 +51,7 @@ import {
   INTENT_TEXT_CAP_CHARS,
   type Episode,
   type EpisodeAnnotation,
+  type EpisodeEvidenceRef,
   type EpisodeAnnotationKind,
   type EpisodePivotMarker,
   type EpisodeTouch,
@@ -105,6 +107,14 @@ export interface EpisodeCaptureIdentity {
   workspace: string;
   instanceId: string;
   lineageRoot?: string;
+  forkGroupId?: string;
+  parentInstanceId?: string;
+  /**
+   * Authoring agent's stable display name at capture time (e.g. "recall-cartographer").
+   * Stamped onto every derived episode so attribution survives even when the
+   * rotating instanceId is later reused; blank values are omitted.
+   */
+  authorName?: string;
   closedBy: Episode['closedBy'];
   /** Caller-supplied capture clock, used only to decide whether a trailing burst settled. */
   nowIso: string;
@@ -112,6 +122,8 @@ export interface EpisodeCaptureIdentity {
   railStep?: string;
   /** Active task-rail objective, when the host can supply it cheaply. */
   railObjective?: string;
+  /** Active task-rail title, used as a summary fallback only inside the rail window. */
+  railTitle?: string;
   /**
    * When TRUE, derived episodes inherit the siloed tag — recall gate keeps
    * them invisible to unsealed callers. Capture-but-quarantine, not
@@ -244,9 +256,14 @@ function headLooksLikeError(head: string): boolean {
   return /^\s*(error|✗|failed|exception|traceback)/i.test(head);
 }
 
-interface ResultEvidence {
+interface ScoredResultEvidence {
   text: string;
   score: number;
+}
+
+interface ResultEvidence extends ScoredResultEvidence {
+  eventIndex: number;
+  sourceId: string;
 }
 
 interface ResolvedToolResult {
@@ -265,11 +282,11 @@ const RESULT_GENERIC_RE = /^(?:ok|done|success|successful|committed|sent|pinned|
  * favors explicit findings/errors, path-addressed evidence, and validation
  * summaries while rejecting transport wrappers and acknowledgement-only noise.
  */
-function selectResultEvidence(head: string, toolName: string, isError: boolean): ResultEvidence | undefined {
+function selectResultEvidence(head: string, toolName: string, isError: boolean): ScoredResultEvidence | undefined {
   const lowerTool = toolName.toLowerCase();
   const coordination = /claim|release|chatroom|tap_star|task_rail|atlas_commit/.test(lowerTool);
   const investigative = /read|open|search|find|grep|rg|query|lookup|inspect|test|typecheck|tsc|vitest|build|lint/.test(lowerTool);
-  let best: ResultEvidence | undefined;
+  let best: ScoredResultEvidence | undefined;
   for (const rawLine of head.split(/\r?\n/)) {
     const line = rawLine.replace(/\s+/g, ' ').trim();
     if (line.length < 4 || RESULT_NOISE_RE.test(line) || RESULT_META_RE.test(line) || RESULT_GENERIC_RE.test(line)) continue;
@@ -288,11 +305,18 @@ function selectResultEvidence(head: string, toolName: string, isError: boolean):
   return best;
 }
 
-function resolvedToolResult(content: unknown, toolName: string, explicitError = false): ResolvedToolResult {
+function resolvedToolResult(
+  content: unknown,
+  toolName: string,
+  explicitError = false,
+  eventIndex: number,
+  sourceId: string,
+): ResolvedToolResult {
   const head = resultTextHead(content);
   const isError = explicitError || headLooksLikeError(head);
   const outcome = isError ? 'error' as const : CHECK_TOOL_RE.test(toolName) ? 'ok' as const : undefined;
-  const evidence = selectResultEvidence(head, toolName, isError);
+  const selected = selectResultEvidence(head, toolName, isError);
+  const evidence: ResultEvidence | undefined = selected ? { ...selected, eventIndex, sourceId } : undefined;
   return {
     ...(outcome ? { outcome } : {}),
     ...(evidence ? { evidence } : {}),
@@ -311,16 +335,101 @@ function resolveToolResult(
   for (let i = fromIndex + 1; i < end; i++) {
     const message = messages[i];
     if (message.role === 'tool' && message.tool_call_id === toolUseId) {
-      return resolvedToolResult(message.content, toolName);
+      return resolvedToolResult(message.content, toolName, false, i, toolUseId);
     }
     if (!Array.isArray(message.content)) continue;
     for (const rawBlock of message.content) {
       const block = asRecord(rawBlock);
       if (!block || block.type !== 'tool_result' || block.tool_use_id !== toolUseId) continue;
-      return resolvedToolResult(block.content, toolName, block.is_error === true);
+      return resolvedToolResult(block.content, toolName, block.is_error === true, i, toolUseId);
     }
   }
   return {};
+}
+
+function isEpistemicClaimAnnotation(annotation: EpisodeAnnotation): boolean {
+  return annotation.kind === 'narration:verdict'
+    || annotation.kind === 'narration:hazard'
+    || (annotation.kind === 'narration' && isNarrationVerdictText(annotation.text));
+}
+
+interface CaptureStepEntry {
+  eventIndex: number;
+  step: TraceStep;
+  evidence?: ResultEvidence;
+}
+
+interface ClaimEvidenceCandidate {
+  entryIndex: number;
+  entry: CaptureStepEntry & { evidence: ResultEvidence };
+}
+
+const CLAIM_EVIDENCE_STOP_WORDS = new Set([
+  'about', 'after', 'again', 'also', 'because', 'been', 'being', 'done', 'fixed',
+  'from', 'have', 'into', 'issue', 'problem', 'result', 'that', 'their', 'there',
+  'these', 'this', 'those', 'through', 'verified', 'with', 'without',
+]);
+
+function evidenceTerms(text: string): Set<string> {
+  const terms = text.toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) ?? [];
+  return new Set(terms.filter((term) => !CLAIM_EVIDENCE_STOP_WORDS.has(term)));
+}
+
+function claimEvidenceCandidate(
+  annotation: EpisodeAnnotation,
+  annotationEventIndex: number | undefined,
+  candidates: readonly ClaimEvidenceCandidate[],
+): ClaimEvidenceCandidate | undefined {
+  if (annotationEventIndex === undefined) return undefined;
+  const claimTerms = evidenceTerms(annotation.text);
+  let best: ClaimEvidenceCandidate | undefined;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  for (const candidate of candidates) {
+    const evidence = candidate.entry.evidence;
+    if (evidence.eventIndex > annotationEventIndex) continue;
+    const candidateTerms = evidenceTerms([
+      evidence.text,
+      candidate.entry.step.target ?? '',
+      candidate.entry.step.tool,
+    ].join(' '));
+    let overlap = 0;
+    for (const term of claimTerms) if (candidateTerms.has(term)) overlap += 1;
+    // Temporal proximity is only a tie-breaker. A preceding result must share
+    // at least one meaningful claim term or the honest answer is evidence:none.
+    if (overlap === 0) continue;
+    const score = overlap * 10_000 + evidence.score * 10 - (annotationEventIndex - evidence.eventIndex);
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function attachEvidenceRefs(
+  annotations: readonly EpisodeAnnotation[],
+  eventIndexByAnnotation: ReadonlyMap<EpisodeAnnotation, number>,
+  candidates: readonly ClaimEvidenceCandidate[],
+  timestampAt: (index: number) => string | undefined,
+): { annotations: EpisodeAnnotation[]; selectedEntryIndexes: Set<number> } {
+  const selectedEntryIndexes = new Set<number>();
+  const attached = annotations.map((annotation) => {
+    if (!isEpistemicClaimAnnotation(annotation) || annotation.evidence !== undefined) return annotation;
+    const candidate = claimEvidenceCandidate(annotation, eventIndexByAnnotation.get(annotation), candidates);
+    if (!candidate) return { ...annotation, evidence: { kind: 'none' as const } };
+    selectedEntryIndexes.add(candidate.entryIndex);
+    const evidence = candidate.entry.evidence;
+    const ts = timestampAt(evidence.eventIndex);
+    const ref: EpisodeEvidenceRef = {
+      kind: 'tool-result',
+      tool: candidate.entry.step.tool,
+      sourceId: evidence.sourceId,
+      eventIndex: evidence.eventIndex,
+      ...(ts !== undefined ? { ts } : {}),
+    };
+    return { ...annotation, evidence: ref };
+  });
+  return { annotations: attached, selectedEntryIndexes };
 }
 
 function shortToolName(name: string): string {
@@ -752,7 +861,7 @@ export function deriveEpisodesFromMessages(
   const pivots: EpisodePivotMarker[] = [];
   const railSealEventIndexes: number[] = [];
   const annotated: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
-  const steps: { eventIndex: number; step: TraceStep; evidence?: ResultEvidence }[] = [];
+  const steps: CaptureStepEntry[] = [];
   const syntheticContext = options.syntheticContext ?? {};
   const timestampAt = (index: number): string | undefined =>
     sourceTimestampAt(messages, options.timestamps, index);
@@ -929,6 +1038,9 @@ export function deriveEpisodesFromMessages(
       sealedAnnotated.push(...narration, ...process);
     }
   }
+  const annotationEventIndexes = new Map(
+    sealedAnnotated.map(({ eventIndex, annotation }) => [annotation, eventIndex] as const),
+  );
   const annotationsPerBurst = assignAnnotationsToBursts(sealed, sealedAnnotated);
 
   // Voice steps follow the SAME burst-assignment rule as annotations (gap →
@@ -962,12 +1074,23 @@ export function deriveEpisodesFromMessages(
         keyResultScore = evidence.score;
       }
     }
+    const evidenceCandidates: ClaimEvidenceCandidate[] = burstStepEntries.flatMap((entry, entryIndex) =>
+      entry.evidence ? [{ entryIndex, entry: entry as CaptureStepEntry & { evidence: ResultEvidence } }] : [],
+    );
+    const attached = attachEvidenceRefs(
+      annotationsPerBurst[index],
+      annotationEventIndexes,
+      evidenceCandidates,
+      timestampAt,
+    );
+    const resultEntryIndexes = attached.selectedEntryIndexes;
+    if (keyResultIndex >= 0) resultEntryIndexes.add(keyResultIndex);
     const burstSteps = burstStepEntries.map((entry, entryIndex) =>
-      entryIndex === keyResultIndex && entry.evidence
+      resultEntryIndexes.has(entryIndex) && entry.evidence
         ? { ...entry.step, result: entry.evidence.text }
         : entry.step,
     );
-    const annotations = annotationsPerBurst[index];
+    const annotations = attached.annotations;
     const railObjective = typeof identity.railObjective === 'string' && identity.railObjective.trim().length > 0
       ? truncateVerbatim(identity.railObjective.trim(), INTENT_TEXT_CAP_CHARS)
       : undefined;
@@ -982,15 +1105,24 @@ export function deriveEpisodesFromMessages(
         || (index === sealed.length - 1 && idx > burst.endEventIndex));
     const intent = (burstInRailWindow ? railObjective : undefined)
       ?? mineIntentForBurst(messages, burst.startEventIndex, syntheticContext);
+    const railTitle = burstInRailWindow
+      && typeof identity.railTitle === 'string'
+      && identity.railTitle.trim().length > 0
+      ? identity.railTitle.trim()
+      : undefined;
     return {
       workspace: identity.workspace,
       instanceId: identity.instanceId,
       ...(identity.lineageRoot !== undefined ? { lineageRoot: identity.lineageRoot } : {}),
+      ...(identity.forkGroupId !== undefined ? { forkGroupId: identity.forkGroupId } : {}),
+      ...(identity.parentInstanceId !== undefined ? { parentInstanceId: identity.parentInstanceId } : {}),
+      ...(identity.authorName !== undefined && identity.authorName.trim() !== ''
+        ? { authorName: identity.authorName.trim() } : {}),
       ...(identity.siloed === true ? { siloed: true } : {}),
       startedAt: burst.startedAt ?? UNKNOWN_EPISODE_TIME,
       endedAt: burst.endedAt ?? UNKNOWN_EPISODE_TIME,
       closedBy: identity.closedBy,
-      summary: deriveEpisodeSummary({ annotations, members: burst.members }),
+      summary: deriveEpisodeSummary({ annotations, railTitle, members: burst.members }),
       ...(intent !== undefined ? { intent } : {}),
       ...(identity.railId !== undefined ? { railId: identity.railId } : {}),
       ...(identity.railStep !== undefined ? { railStep: identity.railStep } : {}),

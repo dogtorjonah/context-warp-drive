@@ -36,6 +36,8 @@ export interface BirthFoldSeedMessage {
 
 /** Structural subset of persistence LocalMessage — deliberately no import. */
 export interface BirthFoldSourceRow {
+  /** Stable transcript row identity when available. Tool-use rows normally use the provider call id. */
+  id?: string;
   /** Row type: user, assistant_text, tool_use, tool_result, system_reminder, reasoning. */
   ty: string;
   /** Text content. */
@@ -44,10 +46,29 @@ export interface BirthFoldSourceRow {
   tn?: string | null;
   /** Tool input (tool_use rows). */
   ti?: unknown;
+  /** Explicit provider tool-use identity for tool-result rows when it is not encoded in id/ti. */
+  toolUseId?: string;
+  /** Provider-reported tool failure state. */
+  isError?: boolean;
   /** ISO timestamp. */
   ts?: string;
   /** Streaming-in-progress flag — such rows are transient duplicates. */
   sg?: boolean;
+}
+
+export type BirthFoldEpisodeContentBlock =
+  | { type: 'tool_use'; id: string; name: string; input: unknown }
+  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean };
+
+/**
+ * Capture-only message projection. Unlike BirthFoldSeedMessage, tool traffic
+ * remains structured so episodic capture never has to parse provider-visible
+ * marker prose back into authoritative tool calls.
+ */
+export interface BirthFoldEpisodeMessage {
+  role: 'user' | 'assistant';
+  content: string | BirthFoldEpisodeContentBlock[];
+  tsMs?: number;
 }
 
 export interface BirthFoldConversionStats {
@@ -211,6 +232,114 @@ function mergeConsecutiveRoles(messages: BirthFoldSeedMessage[]): BirthFoldSeedM
     }
   }
   return out;
+}
+
+function sourceRowToolUseId(row: BirthFoldSourceRow): string | undefined {
+  if (typeof row.toolUseId === 'string' && row.toolUseId.trim()) return row.toolUseId.trim();
+  if (row.ti && typeof row.ti === 'object' && !Array.isArray(row.ti)) {
+    const input = row.ti as Record<string, unknown>;
+    for (const key of ['toolUseId', 'tool_use_id', 'toolUseID'] as const) {
+      const value = input[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+  }
+  if (typeof row.id !== 'string' || !row.id.trim()) return undefined;
+  return row.ty === 'tool_result' && row.id.endsWith(':result')
+    ? row.id.slice(0, -':result'.length)
+    : row.id;
+}
+
+function episodeRowWeight(row: BirthFoldSourceRow, maxMessageChars: number): number {
+  const textChars = typeof row.tx === 'string' ? Math.min(row.tx.length, maxMessageChars) : 0;
+  const inputChars = row.ty === 'tool_use'
+    ? safeJsonPreview(row.ti, maxMessageChars).length
+    : 0;
+  return Math.max(32, textChars + inputChars + 32);
+}
+
+function findOpenToolIndex(
+  tools: readonly { id: string; name: string }[],
+  predicate: (tool: { id: string; name: string }) => boolean,
+): number {
+  for (let index = tools.length - 1; index >= 0; index -= 1) {
+    if (predicate(tools[index])) return index;
+  }
+  return -1;
+}
+
+/**
+ * Build a bounded, per-row structured view solely for episode capture.
+ * Provider fold seeds intentionally remain string-marker based because Codex
+ * step segmentation depends on that representation; this parallel view keeps
+ * the original tool semantics and source times without reparsing those markers.
+ */
+export function convertLocalMessagesToEpisodeMessages(
+  rows: readonly BirthFoldSourceRow[],
+  options?: Pick<BirthFoldConversionOptions, 'maxChars' | 'maxMessageChars'>,
+): BirthFoldEpisodeMessage[] {
+  const maxChars = Math.max(1, options?.maxChars ?? DEFAULT_BIRTH_FOLD_MAX_CHARS);
+  const maxMessageChars = Math.max(1, options?.maxMessageChars ?? DEFAULT_MESSAGE_CHARS);
+
+  let cutStart = rows.length;
+  let retainedChars = 0;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const weight = episodeRowWeight(rows[index], maxMessageChars);
+    if (cutStart < rows.length && retainedChars + weight > maxChars) break;
+    retainedChars += weight;
+    cutStart = index;
+  }
+
+  const messages: BirthFoldEpisodeMessage[] = [];
+  const openTools: Array<{ id: string; name: string }> = [];
+  const retained = rows.slice(cutStart);
+  for (let index = 0; index < retained.length; index += 1) {
+    const row = retained[index];
+    if (row.sg === true) continue;
+    const tsMs = sourceRowTsMs(row);
+    const stamp = tsMs !== undefined ? { tsMs } : {};
+
+    if (row.ty === 'user' || row.ty === 'assistant_text') {
+      const text = typeof row.tx === 'string' ? clip(row.tx, maxMessageChars) : '';
+      if (!text.trim()) continue;
+      messages.push({ role: row.ty === 'user' ? 'user' : 'assistant', content: text, ...stamp });
+      continue;
+    }
+
+    if (row.ty === 'tool_use') {
+      const name = typeof row.tn === 'string' && row.tn.trim() ? row.tn.trim() : 'tool';
+      const id = sourceRowToolUseId(row) ?? `birth-fold-tool-${cutStart + index}`;
+      openTools.push({ id, name });
+      messages.push({
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name, input: row.ti ?? {} }],
+        ...stamp,
+      });
+      continue;
+    }
+
+    if (row.ty === 'tool_result') {
+      const content = typeof row.tx === 'string' ? clip(row.tx, maxMessageChars) : '';
+      if (!content.trim()) continue;
+      const explicitId = sourceRowToolUseId(row);
+      const name = typeof row.tn === 'string' && row.tn.trim() ? row.tn.trim() : undefined;
+      let matchIndex = explicitId ? findOpenToolIndex(openTools, (tool) => tool.id === explicitId) : -1;
+      if (matchIndex < 0 && name) matchIndex = findOpenToolIndex(openTools, (tool) => tool.name === name);
+      if (matchIndex < 0) matchIndex = openTools.length - 1;
+      const matched = matchIndex >= 0 ? openTools.splice(matchIndex, 1)[0] : undefined;
+      const toolUseId = explicitId ?? matched?.id ?? `birth-fold-tool-result-${cutStart + index}`;
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content,
+          ...(row.isError === true ? { is_error: true } : {}),
+        }],
+        ...stamp,
+      });
+    }
+  }
+  return messages;
 }
 
 // ── Conversion ──

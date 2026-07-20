@@ -49,6 +49,9 @@ import { renderEmbeddedContinuityArtifactProvenance } from './chronologicalProve
 // Types
 // ══════════════════════════════════════════════════════════════════════
 
+export type CognitiveArtifactAuthorityClass = 'pointer' | 'historical_observation';
+export type CognitiveArtifactCurrentStatus = 'current' | 'superseded' | 'unresolved';
+
 /**
  * A single cognitive artifact extracted from an assistant message in the
  * fold window. Captures the register glyph, a headline summary, and the
@@ -76,8 +79,16 @@ export interface CognitiveArtifact {
   tapStarCategory?: TapStarCategory;
   /** Authoritative source time copied from FoldMessage.tsMs, when available. */
   sourceTimestamp?: string;
-  /** Stable provider call id when supplied; missing identity stays unknown. */
-  sourceIdentity?: string;
+  /** Stable provider call id or deterministic fold-window coordinate. */
+  sourceIdentity: string;
+  /** Whether this is a pointer or an observation; neither proves completion. */
+  authorityClass: CognitiveArtifactAuthorityClass;
+  /** A single cognitive waypoint cannot establish completion on its own. */
+  completionSupport: 'insufficient_alone';
+  /** Current only when a deterministic replacement chain is known. */
+  currentStatus: CognitiveArtifactCurrentStatus;
+  /** Stable identity of the immutable replacement when superseded. */
+  supersededByIdentity?: string;
   /**
    * Set when a durable waypoint (🏁/⚠️/❓) at a later message index settles
    * the work this transient note was narrating. The renderer keeps the note
@@ -155,6 +166,28 @@ const MAX_TAP_STAR_NOTE_CHARS = 200;
 
 /** Glyph for a transient note superseded by a later durable waypoint. */
 const SUPERSEDED_GLYPH = '⊘';
+
+function foldArtifactContract(
+  messageIndex: number,
+  authorityClass: CognitiveArtifactAuthorityClass,
+  sourceTimestamp?: string,
+  sourceIdentity?: string,
+): Pick<
+  CognitiveArtifact,
+  | 'sourceIdentity'
+  | 'sourceTimestamp'
+  | 'authorityClass'
+  | 'completionSupport'
+  | 'currentStatus'
+> {
+  return {
+    sourceIdentity: sourceIdentity ?? `fold-window:message:${messageIndex}`,
+    sourceTimestamp,
+    authorityClass,
+    completionSupport: 'insufficient_alone',
+    currentStatus: 'unresolved',
+  };
+}
 
 /**
  * Stable substring of the transient-lane disclaimer line. Elder-band
@@ -501,23 +534,37 @@ export function extractCognitiveArtifacts(
     const sourceTimestamp = sourceTimestampFromMessage(msg);
     for (const waypoint of uniqueToolWaypoints.values()) {
       if (waypoint.tool === 'tap_star' && waypoint.category) {
+        const headline = waypoint.preserveVerbatim
+          ? waypoint.text
+          : extractHeadline(waypoint.text);
         durable.push({
+          ...foldArtifactContract(
+            i,
+            'pointer',
+            sourceTimestamp,
+            waypoint.sourceIdentity
+              ?? `fold-window:message:${i}/tap_star:${waypoint.category}/${encodeURIComponent(headline)}`,
+          ),
           register: 'tap_star',
           glyph: TAP_STAR_GLYPH,
-          headline: waypoint.preserveVerbatim
-            ? waypoint.text
-            : extractHeadline(waypoint.text),
+          headline,
           messageIndex: i,
           trust: 'durable',
           tapStarCategory: waypoint.category,
-          sourceTimestamp,
-          sourceIdentity: waypoint.sourceIdentity,
         });
       } else if (includeFlowNotes) {
+        const headline = extractHeadline(waypoint.text);
         thoughtFallbacks.push({
+          ...foldArtifactContract(
+            i,
+            'historical_observation',
+            sourceTimestamp,
+            waypoint.sourceIdentity
+              ?? `fold-window:message:${i}/${waypoint.tool}/${encodeURIComponent(headline)}`,
+          ),
           register: 'untagged',
           glyph: THOUGHT_BUBBLE_GLYPH,
-          headline: extractHeadline(waypoint.text),
+          headline,
           messageIndex: i,
           trust: 'transient',
         });
@@ -528,10 +575,12 @@ export function extractCognitiveArtifacts(
 
     const parseResult = parseRegisterGlyph(text);
     if (parseResult.ok && DURABLE_REGISTERS.has(parseResult.register)) {
+      const headline = extractHeadline(parseResult.body);
       durable.push({
+        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp),
         register: parseResult.register,
         glyph: REGISTER_GLYPHS[parseResult.register],
-        headline: extractHeadline(parseResult.body),
+        headline,
         messageIndex: i,
         trust: 'durable',
       });
@@ -542,10 +591,12 @@ export function extractCognitiveArtifacts(
     if (text.length > MAX_FLOW_NOTE_SOURCE_CHARS) continue;
 
     if (parseResult.ok && TRANSIENT_REGISTERS.has(parseResult.register)) {
+      const headline = extractHeadline(parseResult.body);
       flowNotes.push({
+        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp),
         register: parseResult.register,
         glyph: REGISTER_GLYPHS[parseResult.register],
-        headline: extractHeadline(parseResult.body),
+        headline,
         messageIndex: i,
         trust: 'transient',
       });
@@ -562,10 +613,12 @@ export function extractCognitiveArtifacts(
       !CARD_GLYPHS.some((cardGlyph) => text.startsWith(cardGlyph)) &&
       !SYNTHETIC_NOISE_PREFIXES.some((prefix) => text.startsWith(prefix))
     ) {
+      const headline = extractHeadline(text);
       flowNotes.push({
+        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp),
         register: 'untagged',
         glyph: UNTAGGED_GLYPH,
-        headline: extractHeadline(text),
+        headline,
         messageIndex: i,
         trust: 'transient',
       });
@@ -611,17 +664,33 @@ function markSupersededFlowNotes(
 ): CognitiveArtifact[] {
   const marked = new Array<CognitiveArtifact>(artifacts.length);
   let nextDurableIndex = -1;
+  let nextDurableIdentity: string | undefined;
+  const replacementIdentities = new Set<string>();
   for (let i = artifacts.length - 1; i >= 0; i--) {
     const artifact = artifacts[i];
     if (artifact.trust === 'durable') {
       nextDurableIndex = artifact.messageIndex;
+      nextDurableIdentity = artifact.sourceIdentity;
       marked[i] = artifact;
       continue;
     }
     marked[i] =
-      nextDurableIndex >= 0
-        ? { ...artifact, supersededByMessageIndex: nextDurableIndex }
+      nextDurableIndex >= 0 && nextDurableIdentity
+        ? {
+            ...artifact,
+            currentStatus: 'superseded',
+            supersededByMessageIndex: nextDurableIndex,
+            supersededByIdentity: nextDurableIdentity,
+          }
         : artifact;
+    if (nextDurableIndex >= 0 && nextDurableIdentity) {
+      replacementIdentities.add(nextDurableIdentity);
+    }
+  }
+  for (let i = 0; i < marked.length; i += 1) {
+    if (replacementIdentities.has(marked[i].sourceIdentity)) {
+      marked[i] = { ...marked[i], currentStatus: 'current' };
+    }
   }
   return marked;
 }
@@ -679,6 +748,7 @@ export function renderCognitiveBlock(
   const hasDurable = artifacts.some((a) => a.trust === 'durable');
   return [
     '[cognitive — historical waypoints from the folded window, NOT your current state]',
+    '— authority is per artifact; completion=insufficient_alone for every waypoint —',
     ...(hasFlowNotes
       ? [`— 🔍/▶/·/💭 ${TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER}: unverified mid-flow narration, not conclusions —`]
       : []),
@@ -704,19 +774,29 @@ export function renderCognitiveBlock(
 export function formatCognitiveArtifactProvenance(
   artifact: CognitiveArtifact,
 ): string {
+  const sourceIdentity = artifact.sourceIdentity ?? `fold-window:message:${artifact.messageIndex}`;
+  const authorityClass = artifact.authorityClass
+    ?? (artifact.register === 'tap_star' ? 'pointer' : 'historical_observation');
+  const completionSupport = artifact.completionSupport ?? 'insufficient_alone';
+  const currentStatus = artifact.currentStatus ?? 'unresolved';
   const supersession =
     artifact.supersededByMessageIndex != null
-      ? ` · superseded-by msg#${artifact.supersededByMessageIndex}`
+      ? ` · superseded-by=${artifact.supersededByIdentity ?? `fold-window:message:${artifact.supersededByMessageIndex}`} (msg#${artifact.supersededByMessageIndex})`
       : '';
-  if (artifact.register === 'tap_star') {
-    return [
-      `↞ msg#${artifact.messageIndex}`,
-      `tap_star:${artifact.tapStarCategory ?? 'unknown'}`,
-      `source-time=${artifact.sourceTimestamp ?? 'unknown'}`,
-      `source-id=${artifact.sourceIdentity ?? 'unknown'}`,
-    ].join(' · ') + supersession;
-  }
-  return `↞ msg#${artifact.messageIndex} · ${artifact.register}${supersession}`;
+  const register = artifact.register === 'tap_star'
+    ? `tap_star:${artifact.tapStarCategory ?? 'unknown'}`
+    : artifact.register;
+  const current = currentStatus === 'unresolved'
+    ? ''
+    : ` · current=${currentStatus}`;
+  return [
+    `↞ msg#${artifact.messageIndex}`,
+    register,
+    `authority=${authorityClass}`,
+    `completion=${completionSupport}`,
+    `source-time=${artifact.sourceTimestamp ?? 'unknown'}`,
+    `source-id=${sourceIdentity}`,
+  ].join(' · ') + current + supersession;
 }
 
 /**

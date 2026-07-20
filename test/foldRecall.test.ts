@@ -210,10 +210,10 @@ describe('buildFoldIndex', () => {
     expect(index.entries.filter(e => e.kind === 'turn')).toHaveLength(0);
   });
 
-  test('closet-bearing fold block parses cleanly (count from header; closet adds no entries)', () => {
-    // A value-rich folded turn makes the view's fold block carry a Coordinate Closet
-    // line. buildFoldIndex must read ONLY the "N turns folded" header
-    // count and never derive entries/paths from closet text.
+  test('inline-coordinate fold block parses cleanly (count from header; suffix adds no entries)', () => {
+    // A value-rich folded turn makes the view's fold block carry an inline
+    // coordinate suffix. buildFoldIndex must read ONLY the "N turns folded"
+    // header count and never derive entries/paths from suffix text.
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
     const raw: FoldMessage[] = [
       userMsg('look up the job id'),
@@ -227,7 +227,8 @@ describe('buildFoldIndex', () => {
 
     const block = view.find(m => typeof m.content === 'string' && m.content.includes('[Conversation Context'));
     expect(block).toBeDefined();
-    expect(block!.content as string).toContain('COORDINATE CLOSET');
+    expect(block!.content as string).not.toContain('COORDINATE CLOSET');
+    expect(block!.content as string).toContain(' ⌖ ');
     expect(block!.content as string).toContain(uuid);
 
     const index = buildFoldIndex(raw, view);

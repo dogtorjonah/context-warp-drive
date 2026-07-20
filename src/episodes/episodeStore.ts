@@ -61,7 +61,9 @@ export interface PortableEpisode {
   readonly runId?: string;
   readonly foldEpochId?: string;
   readonly rebirthEpochId?: string;
+  /** ISO source time of the first contributing message, or UNKNOWN_EPISODE_TIME ('unknown') when none carried a timestamp. */
   readonly startedAt: string;
+  /** ISO source time of the last contributing message, or UNKNOWN_EPISODE_TIME ('unknown') when none carried a timestamp. */
   readonly endedAt: string;
   readonly closedBy: EpisodeClosedBy;
   readonly register: AssistantRegister | null;
@@ -84,6 +86,11 @@ export interface DeriveEpisodesOptions {
   readonly runId?: string;
   readonly foldEpochId?: string;
   readonly rebirthEpochId?: string;
+  /**
+   * @deprecated Ignored. Missing message timestamps no longer fall back to
+   * any clock — unknown source time stays unknown through the sealed episode.
+   * Retained for API compatibility.
+   */
   readonly now?: string;
   readonly closeOpenBurst?: boolean;
 }
@@ -136,18 +143,29 @@ export interface EpisodeSupersession {
   /** Episode (or free-form id) that replaces it, when known. */
   readonly supersededBy?: string;
   readonly reason?: string;
-  /** ISO timestamp; defaults to now. */
+  /**
+   * ISO source time of the supersession event; persisted as source_at (NULL
+   * when omitted — never the writer's clock). created_at is pure ingestion.
+   */
   readonly at?: string;
 }
 
 interface MutableBurst {
-  startedAt: string;
-  endedAt: string;
+  startedAt: string | undefined;
+  endedAt: string | undefined;
   annotations: EpisodeAnnotation[];
   pathOrder: string[];
   pathRoles: Map<string, EpisodeMember['role']>;
   trace: string[];
 }
+
+/**
+ * Explicit unknown-time marker for portable episode endpoints — the same
+ * sentinel value the canonical fold-episodes engine uses. Sealed when no
+ * contributing message carried a timestamp; the derivation clock is NEVER
+ * substituted (chronological provenance).
+ */
+export const UNKNOWN_EPISODE_TIME = 'unknown';
 
 const DEFAULT_SESSION_ID = 'default';
 const SQLITE_BIND_BATCH_SIZE = 400;
@@ -157,7 +175,8 @@ const SUPERSESSION_TABLE_DDL = `
     episode_id TEXT PRIMARY KEY,
     superseded_by TEXT,
     reason TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    source_at TEXT
   )
 `;
 const PATH_LIKE_RE = /(?:^|[\s"'`(])((?:\.{1,2}\/|\/|[A-Za-z0-9_.-]+\/)[A-Za-z0-9_./:@+-]+\.[A-Za-z0-9]+(?::\d+)?)/gu;
@@ -169,19 +188,20 @@ export function deriveEpisodesFromMessages(
   options: DeriveEpisodesOptions = {},
 ): readonly PortableEpisode[] {
   const sessionId = options.sessionId ?? DEFAULT_SESSION_ID;
-  const now = options.now ?? new Date().toISOString();
   const episodes: PortableEpisode[] = [];
   let burst: MutableBurst | null = null;
 
   messages.forEach((message, index) => {
-    const timestamp = message.timestamp ?? now;
+    // Missing or malformed provider time stays unknown; valid source text is
+    // retained byte-for-byte rather than normalized through a writer clock.
+    const timestamp = validSourceTimestamp(message.timestamp);
     const text = messageToText(message.content);
     const touches = extractMessageTouchedPaths(message);
     const parsed = message.role === 'assistant' ? parseRegisterGlyph(text) : null;
 
     if (touches.length > 0 || parsed?.ok) {
       burst ??= createBurst(timestamp);
-      burst.endedAt = timestamp;
+      if (timestamp !== undefined) burst.endedAt = timestamp;
     }
 
     if (burst && touches.length > 0) {
@@ -257,17 +277,19 @@ export function recordEpisodes(db: EpisodeDatabase, episodes: readonly PortableE
     let inserted = 0;
     let skipped = 0;
     for (const episode of items) {
+      const startedAt = sourceTimestampOrUnknown(episode.startedAt);
+      const endedAt = sourceTimestampOrUnknown(episode.endedAt);
       insertSession.run(
         episode.sessionId,
-        episode.startedAt,
-        episode.endedAt,
+        startedAt,
+        endedAt,
         JSON.stringify({ source: 'episode_record' }),
       );
       const result = insertEpisode.run(
         episode.id,
         episode.sessionId,
-        episode.startedAt,
-        episode.endedAt,
+        startedAt,
+        endedAt,
         episode.register,
         episode.trust,
         episode.summary,
@@ -330,8 +352,9 @@ export function extractSupersededEpisodeIds(text: string): readonly string[] {
 /**
  * Record supersessions: retire the named episodes from future recall. Creates
  * the additive `episode_supersessions` sidecar table on demand, so it works
- * against legacy stores opened before the table existed. Idempotent
- * (INSERT OR IGNORE — first retirement wins). Returns rows newly recorded.
+ * against legacy stores opened before the table existed. Semantic fields are
+ * first-write-wins; a later replay may only enrich missing source time. Returns
+ * rows newly recorded or provenance-enriched.
  */
 export function supersedeEpisodes(
   db: EpisodeDatabase,
@@ -339,9 +362,20 @@ export function supersedeEpisodes(
 ): number {
   if (entries.length === 0) return 0;
   db.prepare(SUPERSESSION_TABLE_DDL).run();
+  // Pre-provenance sidecar tables gain the nullable source_at column on demand.
+  const supersessionColumns = db.prepare("PRAGMA table_info(episode_supersessions)").all() as Array<{ name: string }>;
+  if (!supersessionColumns.some((column) => column.name === 'source_at')) {
+    try {
+      db.prepare('ALTER TABLE episode_supersessions ADD COLUMN source_at TEXT').run();
+    } catch {
+      /* best-effort: a concurrent writer already added it */
+    }
+  }
   const insert = db.prepare(`
-    INSERT OR IGNORE INTO episode_supersessions (episode_id, superseded_by, reason, created_at)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO episode_supersessions (episode_id, superseded_by, reason, created_at, source_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(episode_id) DO UPDATE SET source_at = excluded.source_at
+    WHERE episode_supersessions.source_at IS NULL AND excluded.source_at IS NOT NULL
   `);
   let recorded = 0;
   const applyAll = db.transaction((items: readonly EpisodeSupersession[]) => {
@@ -350,7 +384,10 @@ export function supersedeEpisodes(
         entry.episodeId,
         entry.supersededBy ?? null,
         entry.reason ?? null,
-        entry.at ?? new Date().toISOString(),
+        // created_at is pure row ingestion time; the supersession event's
+        // source time lives in source_at (NULL when the caller omitted it).
+        new Date().toISOString(),
+        entry.at ?? null,
       );
       if ((result.changes ?? 0) > 0) recorded += 1;
     }
@@ -425,9 +462,17 @@ export function recallEpisodeCards(
       }
     }
   }
-  const rows = [...rowsById.values()].sort(
-    (left, right) => right.endedAt.localeCompare(left.endedAt) || right.id.localeCompare(left.id),
-  );
+  // Known source time first; unknown and legacy malformed values never
+  // outrank real time. The id tie-break is identity, not chronology.
+  const rows = [...rowsById.values()].sort((left, right) => {
+    const leftTime = sourceTimestampMs(left.endedAt);
+    const rightTime = sourceTimestampMs(right.endedAt);
+    if (leftTime === undefined || rightTime === undefined) {
+      if (leftTime !== rightTime) return leftTime === undefined ? 1 : -1;
+      return right.id.localeCompare(left.id);
+    }
+    return rightTime - leftTime || right.id.localeCompare(left.id);
+  });
 
   const cards = rows.map((row) => {
     const matchedPaths = [...row.matchedPaths].sort();
@@ -520,7 +565,7 @@ function collectPathsFromText(text: string, found: Set<string>, options: TouchEx
   }
 }
 
-function createBurst(timestamp: string): MutableBurst {
+function createBurst(timestamp: string | undefined): MutableBurst {
   return {
     startedAt: timestamp,
     endedAt: timestamp,
@@ -559,7 +604,11 @@ function sealBurst(
   }));
   const register = representative?.register ?? null;
   const trust = representative?.classification.trust ?? 'low_trust';
-  const id = stableEpisodeId(sessionId, burst.startedAt, burst.endedAt, summary, members);
+  // Endpoints stay independently unknown: neither is copied from the other
+  // and no clock is synthesized (mirrors the canonical engine's contract).
+  const startedAt = burst.startedAt ?? UNKNOWN_EPISODE_TIME;
+  const endedAt = burst.endedAt ?? UNKNOWN_EPISODE_TIME;
+  const id = stableEpisodeId(sessionId, startedAt, endedAt, summary, members);
   const supersedes = [
     ...new Set(
       burst.annotations
@@ -575,8 +624,8 @@ function sealBurst(
     runId,
     foldEpochId,
     rebirthEpochId,
-    startedAt: burst.startedAt,
-    endedAt: burst.endedAt,
+    startedAt,
+    endedAt,
     closedBy,
     register,
     trust,
@@ -650,4 +699,21 @@ function applyRecallBudget(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validSourceTimestamp(value: string | undefined): string | undefined {
+  return value !== undefined
+    && value !== UNKNOWN_EPISODE_TIME
+    && Number.isFinite(Date.parse(value))
+    ? value
+    : undefined;
+}
+
+function sourceTimestampOrUnknown(value: string | undefined): string {
+  return validSourceTimestamp(value) ?? UNKNOWN_EPISODE_TIME;
+}
+
+function sourceTimestampMs(value: string | undefined): number | undefined {
+  const valid = validSourceTimestamp(value);
+  return valid === undefined ? undefined : Date.parse(valid);
 }

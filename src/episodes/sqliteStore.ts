@@ -63,7 +63,8 @@ export const EPISODE_SCHEMA = `
     episode_id TEXT PRIMARY KEY,
     superseded_by TEXT,
     reason TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    source_at TEXT
   );
 `;
 
@@ -93,6 +94,13 @@ export async function createEpisodeStore(
   }
   db.pragma('foreign_keys = ON');
   db.exec(EPISODE_SCHEMA);
+  // Provenance migration for stores created before source_at existed.
+  const supersessionColumns = db
+    .prepare("PRAGMA table_info(episode_supersessions)")
+    .all() as Array<{ name: string }>;
+  if (!supersessionColumns.some((column) => column.name === 'source_at')) {
+    db.exec('ALTER TABLE episode_supersessions ADD COLUMN source_at TEXT');
+  }
   return db as unknown as EpisodeDatabase;
 }
 

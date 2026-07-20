@@ -100,9 +100,29 @@ describe('buildContinuityReceipt (typed assembly)', () => {
     const receipt = buildContinuityReceipt({
       boundary: 'continuation',
       predecessorName: 'agent',
+      capturedAt: '2026-07-20T03:00:00.000Z',
+      captureSourceId: 'capture-1',
       activeRequestText: '  Do the thing.  ',
+      activeRequestSourceId: 'message-42',
+      activeRequestSourceCoordinate: 'event:message-42',
+      activeRequestSourceTimestamp: '2026-07-20T02:59:59.000Z',
+      claimsAreLive: false,
+      claims: ['src/a.ts'],
+      hasActiveEditDelta: true,
     });
     expect(receipt.activeRequest).toEqual({ text: '  Do the thing.  ', totalChars: 17 });
+    expect(receipt.liveState?.request.source).toEqual({
+      kind: 'operator-message',
+      id: 'message-42',
+      coordinate: 'event:message-42',
+      sourceTimestamp: '2026-07-20T02:59:59.000Z',
+      capturedAt: '2026-07-20T03:00:00.000Z',
+    });
+    expect(receipt.liveState?.claims.source).toMatchObject({
+      kind: 'bundled-active-edit-delta',
+      id: 'capture-1',
+    });
+    expect(receipt.liveState?.edits.status).toBe('current');
   });
 
   test('edit/claim supplied defaults from claims and edits, or explicit flag', () => {

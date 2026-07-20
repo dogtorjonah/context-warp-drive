@@ -89,6 +89,86 @@ describe('computeOpenBurst — read-burst fold-guard boundary', () => {
     expect(guard.openBurstStartIndex).toBe(cap.openBurstStartIndex);
   });
 
+  test('capture stamps authorName and uses railTitle as an in-window summary fallback', () => {
+    const messages: FoldMessage[] = [
+      userMsg('wire dormant capture metadata'),
+      toolUse('Edit', { file_path: '/repo/src/card.ts' }, 't1'),
+      toolResult('t1', 'ok'),
+      toolUse('task_rail', {
+        mode: 'shoot',
+        acks: [{ step_id: 'metadata-step', ack_status: 'done' }],
+      }, 't2'),
+      toolResult('t2', 'ack'),
+    ];
+    const result = deriveEpisodesFromMessages(messages, 0, {
+      ...ID,
+      authorName: 'recall-cartographer',
+      railId: 'rail-fixture',
+      railStep: 'metadata-step',
+      railObjective: 'Populate dormant metadata',
+      railTitle: 'Episodic richness hardening',
+    });
+
+    expect(result.episodes).toHaveLength(1);
+    expect(result.episodes[0].authorName).toBe('recall-cartographer');
+    expect(result.episodes[0].railId).toBe('rail-fixture');
+    expect(result.episodes[0].intent).toBe('Populate dormant metadata');
+    expect(result.episodes[0].summary).toBe('Episodic richness hardening');
+  });
+
+  test('capture links verdict narration to decisive result evidence or explicit none', () => {
+    const withEvidence = deriveEpisodesFromMessages([
+      userMsg('debug the evidence gate'),
+      toolUse('Read', { file_path: '/repo/src/evidence.ts' }, 't1'),
+      {
+        role: 'user',
+        tsMs: Date.parse('2026-06-18T20:01:00.000Z'),
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 't1',
+          content: 'src/evidence.ts:12 failed because expected true but got false',
+        }],
+      },
+      assistantMsg('🏁 Fixed the evidence gate by preserving support.'),
+    ], 0, ID, { sealTrailing: true });
+    const evidenceAnnotation = withEvidence.episodes[0].annotations[0];
+    expect(evidenceAnnotation.evidence).toMatchObject({
+      kind: 'tool-result',
+      tool: 'Read',
+      sourceId: 't1',
+      eventIndex: 2,
+      ts: '2026-06-18T20:01:00.000Z',
+    });
+    expect(withEvidence.episodes[0].trace).toContain('expected true but got false');
+
+    const withoutEvidence = deriveEpisodesFromMessages([
+      userMsg('debug the generic gate'),
+      toolUse('Read', { file_path: '/repo/src/no-evidence.ts' }, 't1'),
+      toolResult('t1', 'ok'),
+      assistantMsg('🏁 Fixed the generic gate with no decisive result.'),
+    ], 0, ID, { sealTrailing: true });
+    expect(withoutEvidence.episodes[0].annotations[0]?.evidence).toEqual({ kind: 'none' });
+  });
+
+  test('associates each epistemic claim with relevant preceding support', () => {
+    const result = deriveEpisodesFromMessages([
+      userMsg('debug parser and renderer'),
+      toolUse('Read', { file_path: '/repo/src/parser.ts' }, 'parser-call'),
+      toolResult('parser-call', 'src/parser.ts:12 beta mismatch caused the regression'),
+      assistantMsg('🏁 Fixed the parser beta mismatch.'),
+      toolUse('Read', { file_path: '/repo/src/renderer.ts' }, 'renderer-call'),
+      toolResult('renderer-call', 'src/renderer.ts:22 omega regression remains in layout'),
+      assistantMsg('⚠️ Renderer omega regression remains blocked.'),
+    ], 0, ID, { sealTrailing: true });
+    const claims = result.episodes[0].annotations.filter((annotation) =>
+      annotation.kind === 'narration:verdict' || annotation.kind === 'narration:hazard');
+    expect(claims).toHaveLength(2);
+    expect(claims[0]?.evidence).toMatchObject({ kind: 'tool-result', sourceId: 'parser-call', eventIndex: 2 });
+    expect(claims[1]?.evidence).toMatchObject({ kind: 'tool-result', sourceId: 'renderer-call', eventIndex: 5 });
+    expect((result.episodes[0].trace.match(/beta mismatch/g) ?? [])).toHaveLength(1);
+    expect((result.episodes[0].trace.match(/omega regression/g) ?? [])).toHaveLength(1);
+  });
+
   test('PARITY: settled trailing burst — guard null, capture resumes past the consumed window', () => {
     const burst = [0, 1, 2].flatMap((i) => readTurn(i, `/repo/src/mod${i}.ts`));
     const tail = Array.from({ length: 26 }, (_, k) => assistantMsg(`idle ${k}`));

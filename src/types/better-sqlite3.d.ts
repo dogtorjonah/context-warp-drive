@@ -21,6 +21,10 @@ declare module 'better-sqlite3' {
 
     interface Transaction<T extends (...args: never[]) => unknown> {
       (...params: Parameters<T>): ReturnType<T>;
+      default(...params: Parameters<T>): ReturnType<T>;
+      deferred(...params: Parameters<T>): ReturnType<T>;
+      immediate(...params: Parameters<T>): ReturnType<T>;
+      exclusive(...params: Parameters<T>): ReturnType<T>;
     }
 
     interface Database {

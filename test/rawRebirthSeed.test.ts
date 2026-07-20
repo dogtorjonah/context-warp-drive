@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import {
   buildOpenQuestionsFromMessages,
@@ -11,10 +11,15 @@ import {
   DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS,
   findRawRebirthSeedTraceEnd,
   renderRawRebirthSeed,
+  placeRawTraceCoordinatesInline,
+  routeRawTraceCoordinates,
 } from '../src/rawRebirthSeed.ts';
+import type { RawTraceCoordinate, RawTraceCoordinateArtifact } from '../src/rawRebirthSeed.ts';
 import type { FoldMessage } from '../src/fold.ts';
 
 describe('raw rebirth seed renderer', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
   const closetEntries = (closet: string): string[] => closet
     .split('\n')
     .filter((line) => line.startsWith('- '))
@@ -62,7 +67,7 @@ describe('raw rebirth seed renderer', () => {
     const threadIdx = seed.indexOf('── Current Thread ──');
     const starIdx = seed.indexOf('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
     const closetIdx = seed.indexOf('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
-    const neighborhoodsIdx = seed.indexOf('── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──');
+    const neighborhoodsIdx = seed.indexOf('── Coordinate Blast Radius (harvested literals live with their cognitive artifacts; orphan literals get deterministic exact-match source excerpts, never LLM summaries) ──');
     const editIdx = seed.indexOf('── Active Edit Delta ──');
     const railIdx = seed.indexOf('── Task Rail Context (process truth) ──');
     const workspaceIdx = seed.indexOf('── Workspace Context ──');
@@ -190,7 +195,8 @@ describe('raw rebirth seed renderer', () => {
       lastUserAiMessages: `👤 LAST USER MESSAGE (active request):\n${trigger}\n\n🤖 LAST AI MESSAGE:\nActual predecessor state.`,
     });
 
-    const aiSection = seed.split('── Last AI Message (READ FIRST) ──')[1] ?? '';
+    const aiRemainder = seed.split('── Last AI Message (READ FIRST) ──')[1] ?? '';
+    const aiSection = aiRemainder.split('\n── ', 1)[0] ?? '';
     expect(aiSection).toContain('🤖 LAST AI MESSAGE:\nActual predecessor state.');
     expect(aiSection).not.toContain('not the assistant boundary');
   });
@@ -383,7 +389,138 @@ describe('raw rebirth seed renderer', () => {
     expect(seed.length).toBeLessThanOrEqual(10_000);
   });
 
-  test('auto-builds neighborhoods only for coordinates absent from the recent thread', () => {
+  test('routes harvested coordinates by structural, containment, temporal, then explicit unknown-time precedence', () => {
+    const coordinate = (overrides: Partial<RawTraceCoordinate>): RawTraceCoordinate => ({
+      literal: 'rail-router-default-123456',
+      labelled: 'rail-router-default-123456 (rail)',
+      index: 0,
+      sourceIndex: null,
+      sourceRole: null,
+      ...overrides,
+    });
+    const artifacts: RawTraceCoordinateArtifact[] = [
+      {
+        id: 'artifact-b',
+        text: 'contains rail-containment-123456',
+        sourceIndexes: [9],
+        sourceTimestamp: '2026-07-19T10:10:00.000Z',
+        placementPriority: 1,
+      },
+      {
+        id: 'artifact-a',
+        text: 'different artifact',
+        sourceIndexes: [3],
+        sourceTimestamp: '2026-07-19T10:00:00.000Z',
+        placementPriority: 0,
+      },
+    ];
+
+    const placements = routeRawTraceCoordinates([
+      coordinate({ literal: 'rail-structural-123456', labelled: 'rail-structural-123456', sourceIndex: 9 }),
+      coordinate({ literal: 'rail-containment-123456', labelled: 'rail-containment-123456', sourceIndex: 7 }),
+      coordinate({
+        literal: 'rail-temporal-123456',
+        labelled: 'rail-temporal-123456',
+        sourceTimestamp: '2026-07-19T10:08:00.000Z',
+      }),
+      coordinate({ literal: 'rail-unknown-123456', labelled: 'rail-unknown-123456' }),
+    ], artifacts);
+
+    expect(placements.map(({ artifactId, reason }) => ({ artifactId, reason }))).toEqual([
+      { artifactId: 'artifact-b', reason: 'structural' },
+      { artifactId: 'artifact-b', reason: 'exact-containment' },
+      { artifactId: 'artifact-b', reason: 'temporal-nearest' },
+      { artifactId: 'artifact-a', reason: 'unknown-time-fallback' },
+    ]);
+    expect(placements[2]?.coordinate.sourceTimestamp).toBe('2026-07-19T10:08:00.000Z');
+    expect(placements[2]?.artifactSourceTimestamp).toBe('2026-07-19T10:10:00.000Z');
+    expect(placements).toHaveLength(4);
+  });
+
+  test('uses stable artifact identity for temporal ties and never treats non-absolute timestamps as chronology', () => {
+    const base: RawTraceCoordinate = {
+      literal: 'rail-router-tie-123456',
+      labelled: 'rail-router-tie-123456',
+      index: 0,
+      sourceIndex: null,
+      sourceRole: null,
+      sourceTimestamp: '2026-07-19T10:05:00.000Z',
+    };
+    const artifacts: RawTraceCoordinateArtifact[] = [
+      { id: 'later-id', text: '', sourceTimestamp: '2026-07-19T10:10:00.000Z' },
+      { id: 'earlier-id', text: '', sourceTimestamp: '2026-07-19T10:00:00.000Z' },
+    ];
+
+    expect(routeRawTraceCoordinates([base], artifacts)[0]).toMatchObject({
+      artifactId: 'earlier-id',
+      reason: 'temporal-nearest',
+    });
+    expect(routeRawTraceCoordinates([{ ...base, sourceTimestamp: '2026-07-19 10:05' }], artifacts)[0]).toMatchObject({
+      artifactId: 'earlier-id',
+      reason: 'unknown-time-fallback',
+    });
+  });
+
+  test('renders each routed literal once and leaves stable artifact pointers at duplicate sites', () => {
+    const coordinate: RawTraceCoordinate = {
+      literal: 'rail-inline-once-123456',
+      labelled: 'rail-inline-once-123456 (rail)',
+      index: 10,
+      sourceIndex: 4,
+      sourceRole: 'assistant',
+      sourceTimestamp: '2026-07-19T10:00:00.000Z',
+    };
+    const placed = placeRawTraceCoordinatesInline([coordinate], [
+      {
+        id: 'artifact-home',
+        text: 'structural home without the literal',
+        sourceIndexes: [4],
+      },
+      { id: 'artifact-sibling', text: 'first rail-inline-once-123456 and duplicate rail-inline-once-123456' },
+    ]);
+    const rendered = placed.artifacts.map((artifact) => artifact.text).join('\n');
+
+    expect(rendered.match(/rail-inline-once-123456/gu)).toHaveLength(1);
+    expect(rendered.match(/〔⌖→artifact-home〕/gu)).toHaveLength(2);
+    expect(rendered).toContain('source-time=2026-07-19T10:00:00.000Z; route=structural');
+  });
+
+  test('conserves a hyphen-suffixed coordinate verbatim when a bare-path prefix is placed elsewhere', () => {
+    // Regression: the bare path is a boundary-aligned prefix of the longer
+    // hyphen-suffixed literal. The cross-label dedup must not rewrite the bare
+    // literal inside the longer coordinate's own row (which would render it as
+    // `〔⌖→id〕-2834` and destroy the closet's verbatim-conservation guarantee).
+    const longer: RawTraceCoordinate = {
+      literal: 'relay/src/rebirthPackageBuilder.ts-2834',
+      labelled: 'relay/src/rebirthPackageBuilder.ts-2834',
+      index: 0,
+      sourceIndex: 2,
+      sourceRole: 'assistant',
+      sourceTimestamp: '2026-07-19T10:00:00.000Z',
+    };
+    const barePrefix: RawTraceCoordinate = {
+      literal: 'relay/src/rebirthPackageBuilder.ts',
+      labelled: 'relay/src/rebirthPackageBuilder.ts',
+      index: 1,
+      sourceIndex: 5,
+      sourceRole: 'assistant',
+      sourceTimestamp: '2026-07-19T10:01:00.000Z',
+    };
+    const placed = placeRawTraceCoordinatesInline([longer, barePrefix], [
+      { id: 'artifact-longer-home', text: 'longer home body without the coordinate', sourceIndexes: [2] },
+      { id: 'artifact-bare-home', text: 'bare home body without the coordinate', sourceIndexes: [5] },
+    ]);
+    const rendered = placed.artifacts.map((artifact) => artifact.text).join('\n');
+
+    // The hyphen-suffixed literal survives verbatim and is never corrupted into a pointer tail.
+    expect(rendered).toContain('relay/src/rebirthPackageBuilder.ts-2834');
+    expect(rendered).not.toMatch(/〔⌖→[^〕]+〕-2834/u);
+    // Both coordinates still render as their own inline rows.
+    expect(rendered).toMatch(/⌖ relay\/src\/rebirthPackageBuilder\.ts @ /u);
+    expect(rendered).toMatch(/⌖ relay\/src\/rebirthPackageBuilder\.ts-2834 @ /u);
+  });
+
+  test('routes carried and orphan coordinates inline exactly once with no residual blast list', () => {
     const messages: FoldMessage[] = [
       { role: 'user', content: 'Investigate rail-buried-context-123456.' },
       { role: 'assistant', content: 'The relevant implementation is /repo/src/buried.ts.' },
@@ -401,9 +538,55 @@ describe('raw rebirth seed renderer', () => {
       packageBudget: 30_000,
     });
 
-    expect(seed).toContain('── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──');
+    // Every harvested coordinate is re-homed to one artifact row; duplicate
+    // spellings in sibling sections become stable pointers.
     expect(seed).toContain('rail-buried-context-123456');
     expect(seed).toContain('preserve the retry invariant');
+    expect(seed).not.toContain('── Coordinate Blast Radius');
+    expect(seed.match(/rail-buried-context-123456/gu)).toHaveLength(1);
+    expect(seed.match(/\/repo\/src\/buried\.ts/gu)).toHaveLength(1);
+    expect(seed.match(/retryLimit=7/gu)).toHaveLength(1);
+
+    // An orphan coordinate truncated out of every artifact still receives a
+    // deterministic inline placement without synthesizing source chronology.
+    const orphanId = 'e5f6a7b8c9d0';
+    const orphanMessages: FoldMessage[] = [
+      { role: 'user', content: 'Investigate the deploy failure.' },
+      { role: 'tool', content: `verbose log ${'x'.repeat(1200)} orphan ${orphanId} ${'y'.repeat(1200)} end` },
+      { role: 'assistant', content: 'Noted the failure signature.' },
+      { role: 'user', content: 'A newer question with no exact coordinates.' },
+      { role: 'assistant', content: 'A newer answer with ordinary prose.' },
+      { role: 'user', content: 'LIVE_TRIGGER_MARKER current request' },
+    ];
+    const orphanSeed = buildRawRebirthSeedFromMessages(orphanMessages, {
+      predecessorName: 'neighborhood-agent',
+      includeTrailingUserTurn: false,
+      currentThreadMessageLimit: 2,
+      packageBudget: 30_000,
+    });
+    expect(orphanSeed).toContain(orphanId);
+    expect(orphanSeed.match(new RegExp(orphanId, 'gu'))).toHaveLength(1);
+    expect(orphanSeed).toContain('source-time=unknown; route=unknown-time-fallback');
+    expect(orphanSeed).not.toContain('── Coordinate Blast Radius');
+
+    const orphanIds = Array.from({ length: 8 }, (_unused, index) => `rail-orphan-${index}-123456`);
+    const manyOrphanSeed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: 'Investigate all buried deployment receipts.' },
+      { role: 'tool', content: `${'x'.repeat(1_400)} ${orphanIds.join(' ')} ${'y'.repeat(1_400)}` },
+      { role: 'assistant', content: 'The buried receipts were recorded.' },
+      { role: 'user', content: 'A newer question without identifiers.' },
+      { role: 'assistant', content: 'A newer answer without identifiers.' },
+      { role: 'user', content: 'LIVE_TRIGGER_MARKER current request' },
+    ], {
+      predecessorName: 'many-orphan-agent',
+      includeTrailingUserTurn: false,
+      currentThreadMessageLimit: 2,
+      packageBudget: 40_000,
+    });
+    for (const id of orphanIds) {
+      expect(manyOrphanSeed.match(new RegExp(id, 'gu'))).toHaveLength(1);
+    }
+    expect(manyOrphanSeed).not.toContain('── Coordinate Blast Radius');
 
     const suppressed = buildRawRebirthSeedFromMessages(messages, {
       predecessorName: 'neighborhood-agent',
@@ -412,6 +595,7 @@ describe('raw rebirth seed renderer', () => {
       traceNeighborhoods: '',
       packageBudget: 30_000,
     });
+    expect(suppressed).not.toContain('── Coordinate Blast Radius');
     expect(suppressed).not.toContain('── Trace Neighborhoods');
   });
 
@@ -448,7 +632,7 @@ describe('raw rebirth seed renderer', () => {
     const reel = buildStarredMomentsFromMessages(messages);
     expect(reel).toContain('⭐ Starred Waypoints (2 of 2 trace-captured; chronological):');
     expect(reel).toContain(
-      '↞ msg#0 · tap_star:handoff · source-time=2026-07-18T20:31:00.000Z · source-id=call_raw_star_1',
+      '↞ msg#0 · tap_star:handoff · authority=pointer · completion=insufficient_alone · source-time=2026-07-18T20:31:00.000Z · source-id=call_raw_star_1',
     );
     expect(reel).toContain('⭐ [handoff] Carry this handoff into raw and hard-epoch continuity.');
     expect(reel.indexOf('source-id=call_raw_star_0'))
@@ -598,10 +782,42 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).toContain('[CONTEXT REBIRTH] Lifecycle boundary: continuation for "provider-loop"');
     expect(seed).toContain('── Last User + AI Messages (READ FIRST) ──');
     expect(seed).toContain('── Current Thread ──');
-    expect(seed).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
+    // Flat closet dissolved by default: literals conserved inline by the
+    // thread are not re-listed in a flat box (kill-switch coverage below
+    // proves VOXXO_REBIRTH_FLAT_CLOSET=1 restores the legacy section).
+    expect(seed).not.toContain('── Raw Trace Coordinate Closet');
     expect(seed).toContain('/repo/src/mod.ts');
     expect(seed).toContain('rail-provider-seed-123456');
     expect(seed).not.toContain('LIVE_TRIGGER_MARKER current request');
+  });
+
+  test('kill-switch restores the complete legacy raw closet and neighborhood layout', () => {
+    vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1');
+    const messages: FoldMessage[] = [
+      { role: 'user', content: 'Inspect the old deployment receipt.' },
+      { role: 'assistant', content: 'Buried source /repo/buried.ts carries rail-buried-123456.' },
+      { role: 'user', content: 'Now inspect the current source.' },
+      { role: 'assistant', content: 'Current source /repo/current.ts carries rail-current-123456.' },
+      { role: 'user', content: 'LIVE_TRIGGER_MARKER current request' },
+    ];
+    const seed = buildRawRebirthSeedFromMessages(messages, {
+      predecessorName: 'legacy-layout-agent',
+      includeTrailingUserTurn: false,
+      currentThreadMessageLimit: 2,
+      packageBudget: 30_000,
+    });
+
+    expect(seed).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
+    expect(seed).toContain('── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──');
+    expect(seed).toContain('Deterministic exact-match neighborhoods around Coordinate Closet literals');
+    expect(seed).not.toContain('Coordinate Blast Radius');
+    expect(seed).not.toContain('exact-match blast radius around harvested coordinate literals');
+
+    const neighborhoods = seed
+      .split('── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──')[1]!
+      .split('── Task Rail Context')[0]!;
+    expect(neighborhoods).toContain('/repo/buried.ts');
+    expect(neighborhoods).not.toContain('⌖ literal: /repo/current.ts');
   });
 
   test('compacts a long AI message to head+pointer in LAST AI MESSAGE, matching relay behavior', () => {

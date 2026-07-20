@@ -36,6 +36,13 @@
  *   Nothing in this module reaches back to transcript files at render time.
  */
 
+/**
+ * Persisted membership strength within a burst. Live capture emits only
+ * edit/read touches (tool-file interactions). 'mention' is NOT burst
+ * membership: it is the recall-side trigger tier (assistant-prose path
+ * mentions fire mention-tier cards at recall time) and stays in the union
+ * only for durable-store compatibility with pre-capture-gate rows.
+ */
 export type EpisodeTouchKind = 'edit' | 'read' | 'mention';
 
 export type EpisodeClosedBy = 'epoch' | 'rebirth' | 'release' | 'idle' | 'backfill';
@@ -89,9 +96,29 @@ export interface EpisodeAnnotation {
   kind: EpisodeAnnotationKind;
   /** VERBATIM agent-authored text, ≤ VOICE_TEXT_CAP_CHARS at write time. */
   text: string;
+  /**
+   * Stable pointer to support for verdict/hazard-style claims. The result body
+   * stays in the trace; this field only identifies which source result backed
+   * the claim, or records that capture found no decisive result.
+   */
+  evidence?: EpisodeEvidenceRef;
   /** Optional file path this annotation was about (e.g. atlas_commit target). */
   path?: string;
 }
+
+export type EpisodeEvidenceRef =
+  | {
+    kind: 'tool-result';
+    /** Short tool name whose result supplied the decisive evidence. */
+    tool: string;
+    /** Stable provider/canonical tool-call identity for this result. */
+    sourceId?: string;
+    /** Source-message event index of the supporting tool_result/tool row. */
+    eventIndex: number;
+    /** ISO source timestamp for the supporting result, absent when unknown. */
+    ts?: string;
+  }
+  | { kind: 'none' };
 
 export interface EpisodeMember {
   path: string;
@@ -108,7 +135,12 @@ export interface Episode {
   id?: number;
   workspace: string;
   instanceId: string;
+  /** Stable structural lineage root when the capture surface can resolve it. */
   lineageRoot?: string;
+  /** Durable fork-family identity retained separately from structural ancestry. */
+  forkGroupId?: string;
+  /** Immediate durable parent identity at capture time, when known. */
+  parentInstanceId?: string;
   /**
    * Authoring agent's stable display name at capture time (e.g. "turbo-ocelot").
    * Absent on legacy rows and before capture persistence wires it; attribution
@@ -119,6 +151,15 @@ export interface Episode {
   startedAt: string;
   /** ISO source time, or UNKNOWN_EPISODE_TIME when no source timestamp exists. */
   endedAt: string;
+  /**
+   * Nullable first-class provenance from the durable store: ISO source
+   * start/end when known. Absent on legacy rows and whenever the sentinel
+   * contract above reports unknown — these never carry a substitute value.
+   */
+  sourceStartedAt?: string;
+  sourceEndedAt?: string;
+  /** Worker ingestion time of the durable row; absent on pre-migration rows. */
+  ingestedAt?: string;
   closedBy: EpisodeClosedBy;
   /** One-line header; see deriveEpisodeSummary fallback chain. */
   summary: string;
@@ -613,6 +654,10 @@ export function extractProcessNarrationLines(
 // the glyph itself as the trust signal and bypass only this lexical opener gate;
 // hard safety gates (synthetic/card quotes, length bounds, no questions) remain.
 const NARRATION_VERDICT_RE = /^(?:(?:found|fixed|confirmed|verified|implemented|landed|shipped|resolved|diagnosed|root cause|turns out|it was|caused by|no longer|tests? pass(?:ed|ing)?|typecheck (?:clean|passes)|all \d+ tests)\b|(?:done|result(?:s)?|conclusion|verdict)\s*[:—–-]|the (?:bug|fix|issue|problem|culprit|root cause)\b)/i;
+
+export function isNarrationVerdictText(text: string): boolean {
+  return NARRATION_VERDICT_RE.test(text.trim());
+}
 
 // Leading list/heading/status decorations stripped before the verdict gate
 // ("- ✅ Fixed ..." → "Fixed ..."). Includes the eligible message-register
@@ -1393,15 +1438,26 @@ function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   const text = truncateVerbatim(annotation.text, VOICE_TEXT_CAP_CHARS);
   const at = voiceTimeSuffix(annotation);
   const who = label ? ` ${label}` : '';
-  if (annotation.kind.startsWith('star:')) return `  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}`;
-  if (annotation.kind === 'changelog') return `  ✎${who}:"${text}"${at}`;
-  if (annotation.kind.startsWith('narration')) return `  🗣${who}:"${text}"${at}`;
+  const evidence = evidenceRefSuffix(annotation);
+  if (annotation.kind.startsWith('star:')) return `  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}${evidence}`;
+  if (annotation.kind === 'changelog') return `  ✎${who}:"${text}"${at}${evidence}`;
+  if (annotation.kind.startsWith('narration')) return `  🗣${who}:"${text}"${at}${evidence}`;
   if (annotation.kind.startsWith('process:')) {
     const category = annotation.kind.slice('process:'.length);
-    return `  🗣${who} [${category}]:"${text}"${at}`;
+    return `  🗣${who} [${category}]:"${text}"${at}${evidence}`;
   }
-  if (annotation.kind === 'rail') return `  🛤${who}:"${text}"${at}`;
-  return `  💬${who}:"${text}"${at}`;
+  if (annotation.kind === 'rail') return `  🛤${who}:"${text}"${at}${evidence}`;
+  return `  💬${who}:"${text}"${at}${evidence}`;
+}
+
+function evidenceRefSuffix(annotation: EpisodeAnnotation): string {
+  const evidence = annotation.evidence;
+  if (!evidence) return '';
+  if (evidence.kind === 'none') return ' ↞ evidence:none';
+  const stamp = evidence.ts ? formatEpisodeDate(evidence.ts) : '';
+  const at = stamp ? ` ${stamp}` : '';
+  const source = evidence.sourceId ? ` source:${truncateVerbatim(evidence.sourceId, 40)}` : '';
+  return ` ↞ evidence:${truncateVerbatim(evidence.tool, 32)} result${source} event#${evidence.eventIndex}${at}`;
 }
 
 /**
@@ -2168,6 +2224,17 @@ export function episodicServedChapterIds(state: EpisodicInjectionState): number[
     for (const id of zone.chapterIds) ids.add(id);
   }
   return Array.from(ids).sort((a, b) => a - b);
+}
+
+/** Served chapter ids keyed by the live target zone that actually exposed them. */
+export function episodicServedChapterIdsByTarget(
+  state: EpisodicInjectionState,
+): Record<string, number[]> {
+  const byTarget: Record<string, number[]> = {};
+  for (const [targetPath, zone] of [...state.zones.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    byTarget[targetPath] = [...new Set(zone.chapterIds)].sort((a, b) => a - b);
+  }
+  return byTarget;
 }
 
 /** Chain targets whose walk-complete pointer has already been injected while the zone is live. */

@@ -155,7 +155,10 @@ describe('FoldSession hard-epoch consume', () => {
     const content = out.messages[0].content as string;
     expect(content).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
     expect(content).toContain('old question one');
-    expect(content).toContain('LIVE CURRENT QUESTION');
+    expect(content.match(/── Live Continuity State \(AUTHORITATIVE\) ──/gu)).toHaveLength(1);
+    expect(content.match(/LIVE CURRENT QUESTION/gu)).toHaveLength(1);
+    expect(content).toContain('coordinate=message#4..message#4 source-time=unknown captured=1970-01-01T00:00:01.000Z');
+    expect(content).not.toContain(HARD_EPOCH_LIVE_TURN_HEADER);
   });
 
   it('freezes categorized tap_star waypoints into a local raw hard-epoch seed', () => {

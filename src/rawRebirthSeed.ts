@@ -24,6 +24,7 @@ import { classifyMessageGlyph } from './foldEpisodes.ts';
 import { DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS } from './contextBudget.ts';
 import { renderContinuityPackageProvenance } from './chronologicalProvenance.ts';
 import {
+  buildContinuityReceipt,
   continuityReceiptFromProse,
   isContinuityReceipt,
   renderContinuityReceiptControl,
@@ -377,8 +378,11 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly workspaceContext?: RawRebirthWorkspaceContext | string;
   readonly activeEditDelta?: string;
   readonly taskRailContext?: string;
+  readonly chatroomMembership?: string;
   /** Typed continuity receipt — see RawRebirthSeedInput.continuityReceipt. */
   readonly continuityReceipt?: ContinuityReceipt;
+  /** Capture time for the derived live-state snapshot; unknown is preserved when omitted. */
+  readonly capturedAt?: string;
   // pre-rendered Resume Point string.
   readonly resumePoint?: string;
   readonly predecessorStatus?: string;
@@ -420,6 +424,8 @@ interface BudgetedPromptSection {
 interface VisibleTraceMessage {
   readonly type: string;
   readonly text?: string | null;
+  /** Authoritative source-event time. Omitted when the provider supplied none. */
+  readonly sourceTimestamp?: string;
 }
 
 export const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 200_000;
@@ -685,7 +691,7 @@ function formatForkContextLines(forkContext: RawRebirthForkContext | undefined):
   }
 
   const lines = [
-    '🌱 Fresh-fork provenance — the lifecycle identity contract is authoritative in Rebirth Control above.',
+    '🌱 Fresh-fork provenance — the lifecycle identity contract is authoritative in Live Continuity State below.',
     'The copied pre-fork transcript is inherited reference context. Claims, edits, and actions after the fork belong to this instance only.',
   ];
 
@@ -983,18 +989,18 @@ function resolveLifecycleBoundary(input: RawRebirthSeedInput): RawRebirthLifecyc
 
 function formatLifecycleHeader(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
   if (boundary === 'same_instance_hard_epoch') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "${input.predecessorName}". Follow the authoritative Rebirth Control below. Continue silently; do not produce wake-up commentary.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption. Continue silently; do not produce wake-up commentary.`;
   }
   if (boundary === 'fresh_fork') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: fresh_fork from "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: fresh_fork from "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
   }
   if (boundary === 'resurrection') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: resurrection for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: resurrection for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
   }
   if (boundary === 'brain_merge') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: brain_merge for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: brain_merge for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
   }
-  return `[CONTEXT REBIRTH] Lifecycle boundary: continuation for "${input.predecessorName}". Follow the authoritative Rebirth Control below.`;
+  return `[CONTEXT REBIRTH] Lifecycle boundary: continuation for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
 }
 
 /**
@@ -1056,13 +1062,13 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
   const headerBlocks = [
     customHeader ?? defaultHeader,
     chronology,
-    customHeader ? '' : formatRebirthControl(input, lifecycleBoundary),
     formatMergedLineageProvenance(input),
     formatDurableMergedLineageBanner(input),
     formatSummonVaultLedger(input),
     formatForkContextBlock(input.forkContext),
     runtimeBlock,
   ].filter(Boolean);
+  const liveStateBlock = customHeader ? '' : formatRebirthControl(input, lifecycleBoundary);
 
   const budgetedSections: BudgetedPromptSection[] = [];
   pushSection(
@@ -1085,7 +1091,7 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
           && !aiOnly.includes('🤖 LAST AI MESSAGE');
         return errorOnly
           ? `\n── Unresolved Provider/Runtime Error (READ FIRST) ──\n***READ THIS FIRST. No genuine assistant remainder followed the active request; this provider/runtime failure was unresolved at the package boundary.***\n\n${aiOnly}${resumeSuffix}`
-          : `\n── Last AI Message (READ FIRST) ──\n***READ THIS FIRST. This is the freshest AI message available at rebirth; the freshest user message is the active request in Rebirth Control.***\n\n${aiOnly}${resumeSuffix}`;
+          : `\n── Last AI Message (READ FIRST) ──\n***READ THIS FIRST. This is the freshest AI message available at rebirth; the freshest user message is the active request in Live Continuity State.***\n\n${aiOnly}${resumeSuffix}`;
       }
       return input.resumePoint?.trim() ? `\n${input.resumePoint.trim()}` : undefined;
     })(),
@@ -1114,7 +1120,9 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     input,
     'traceNeighborhoods',
     input.traceNeighborhoods?.trim()
-      ? `\n── Coordinate Blast Radius (harvested literals live with their cognitive artifacts; orphan literals get deterministic exact-match source excerpts, never LLM summaries) ──\n${input.traceNeighborhoods.trim()}`
+      ? flatCoordinateClosetEnabled()
+        ? `\n── Trace Neighborhoods (deterministic literal cross-reference; source excerpts, not LLM summaries) ──\n${input.traceNeighborhoods.trim()}`
+        : `\n── Coordinate Blast Radius (harvested literals live with their cognitive artifacts; orphan literals get deterministic exact-match source excerpts, never LLM summaries) ──\n${input.traceNeighborhoods.trim()}`
       : undefined,
   );
   pushSection(budgetedSections, input, 'activeEditDelta', input.activeEditDelta ? `\n── Active Edit Delta ──\n${input.activeEditDelta}` : undefined);
@@ -1222,20 +1230,32 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
   const footer = input.footerOverride !== undefined
     ? input.footerOverride
     : input.userMessageTriggered === true
-      ? 'The active user message appears once in Rebirth Control as the authoritative request body — respond to it directly.'
+      ? 'The active user message appears once in Live Continuity State as the authoritative request body — respond to it directly.'
       : input.predecessorStatus === 'idle'
         ? 'Predecessor was idle with no active task — default to waiting for the next request; do not invent work or re-investigate the codebase from scratch. But if Last User + AI Messages or Current Thread shows a user request that was never answered or was cut off mid-work, treat that as your active task and engage with it directly rather than sitting idle.'
         : 'Resume the active task. The Activity Log + Active Edit Delta are your primary context. Evaluate predecessor work on its merits before diverging — if the approach is flawed, refactor it rather than discarding (see Core Principle 15). Continue using atlas_query as your primary codebase investigation tool — the File Context above is a handoff snapshot, not a substitute for live Atlas queries when exploring new files or verifying current state. Self-tap only if the package is insufficient or contradictory.';
   const footerBlock = footer ? `\n── Orientation ──\n${footer}` : '';
-  const fixedOverhead = headerBlocks.join('\n').length + footerBlock.length;
+  const fixedOverhead = headerBlocks.join('\n').length + liveStateBlock.length + footerBlock.length;
   const allocatedBlocks = allocateSectionBlocks(budgetedSections, packageBudget - fixedOverhead);
   const renderOrder = input.renderOrder ?? DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER;
-  const promptBlocks = [
+  const historicalBlocks = [
     ...headerBlocks,
     ...renderOrder.map((key) => allocatedBlocks.get(key)).filter((block): block is string => Boolean(block)),
+  ].filter(Boolean);
+  const promptBlocks = [
+    ...historicalBlocks,
+    liveStateBlock,
     footerBlock,
-  ];
-  return truncate(promptBlocks.join('\n'), packageBudget);
+  ].filter(Boolean);
+  const rendered = promptBlocks.join('\n');
+  if (rendered.length <= packageBudget) return rendered;
+  const hasTypedLiveState = isContinuityReceipt(input.continuityReceipt)
+    && input.continuityReceipt.liveState !== undefined;
+  if (!hasTypedLiveState) return truncate(rendered, packageBudget);
+  const protectedTail = [liveStateBlock, footerBlock].filter(Boolean).join('\n');
+  const head = historicalBlocks.join('\n');
+  const headBudget = Math.max(0, packageBudget - protectedTail.length - 1);
+  return [headBudget > 0 ? truncate(head, headBudget) : '', protectedTail].filter(Boolean).join('\n');
 }
 
 interface PreparedTraceMessage {
@@ -1243,14 +1263,50 @@ interface PreparedTraceMessage {
   readonly role: string;
   readonly text: string;
   readonly sourceText: string;
+  readonly sourceTimestamp?: string;
 }
 
-interface RawTraceCoordinate {
+export interface RawTraceCoordinate {
   readonly literal: string;
   readonly labelled: string;
   readonly index: number;
   readonly sourceIndex: number | null;
   readonly sourceRole: string | null;
+  /** Authoritative source-event time, never ingestion or render time. */
+  readonly sourceTimestamp?: string;
+}
+
+export type RawTraceCoordinatePlacementReason =
+  | 'structural'
+  | 'exact-containment'
+  | 'temporal-nearest'
+  | 'unknown-time-fallback';
+
+/**
+ * A cognitive artifact that can receive harvested trace coordinates.
+ * `id` is the durable placement identity; callers must keep it stable across
+ * rebuilds. Source indexes and timestamps describe source events, never the
+ * time this derived artifact was built.
+ */
+export interface RawTraceCoordinateArtifact {
+  readonly id: string;
+  readonly text: string;
+  readonly sourceIndexes?: readonly number[];
+  readonly sourceTimestamp?: string;
+  /** Lower values win deterministic ties. Defaults to zero. */
+  readonly placementPriority?: number;
+}
+
+export interface RawTraceCoordinatePlacement {
+  readonly coordinate: RawTraceCoordinate;
+  readonly artifactId: string;
+  readonly artifactSourceTimestamp?: string;
+  readonly reason: RawTraceCoordinatePlacementReason;
+}
+
+export interface InlineRawTraceCoordinatePlacementResult {
+  readonly artifacts: RawTraceCoordinateArtifact[];
+  readonly placements: RawTraceCoordinatePlacement[];
 }
 
 interface FittedRawTraceCoordinates {
@@ -1320,7 +1376,13 @@ function prepareVisibleTraceMessages(
     const bounded = scrubbed.length > RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE
       ? `${scrubbed.slice(0, RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE)}\n... [message source truncated for closet nomination]`
       : scrubbed;
-    return [{ sourceIndex, role, text: bounded, sourceText: `${role}:\n${bounded}` }];
+    return [{
+      sourceIndex,
+      role,
+      text: bounded,
+      sourceText: `${role}:\n${bounded}`,
+      sourceTimestamp: message.sourceTimestamp,
+    }];
   });
 }
 
@@ -1373,36 +1435,230 @@ function collectRawTraceCoordinates(
       index: Math.max(0, fullText.lastIndexOf(literal)),
       sourceIndex: origin?.sourceIndex ?? null,
       sourceRole: origin?.role ?? null,
+      sourceTimestamp: origin?.sourceTimestamp,
     }];
   });
 }
 
 /**
- * Coordinate placement partition — the flat-closet dissolver.
- *
- * A harvested literal whose exact text already lives inside another package
- * artifact (rail context, star reel, glyph log, activity trail, current
- * thread, …) is CONSERVED: the artifact stream already carries it inline with
- * its cognitive neighborhood, so re-listing it in a flat box is pure
- * duplication. Literals with no artifact home are ORPHANS: they route to the
- * attributed neighborhood expansion (buildLiteralTraceNeighborhoods with
- * excludeTexts = the same artifact corpus), and whatever the neighborhood
- * budget cannot fit is elided with a recovery pointer — never re-listed flat.
- *
- * Pure + deterministic: exact containment only, no I/O, no harvest changes.
+ * Parse only timestamps that identify an absolute instant. Timestamp-less or
+ * malformed source rows remain unknown; the router never fabricates order.
  */
-export function partitionRawTraceCoordinates(
+function authoritativeTimestampMs(sourceTimestamp: string | undefined): number | null {
+  if (!sourceTimestamp
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(sourceTimestamp)) return null;
+  const parsed = Date.parse(sourceTimestamp);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function comparePlacementArtifacts(
+  left: RawTraceCoordinateArtifact,
+  right: RawTraceCoordinateArtifact,
+): number {
+  const leftPriority = Number.isFinite(left.placementPriority) ? left.placementPriority! : 0;
+  const rightPriority = Number.isFinite(right.placementPriority) ? right.placementPriority! : 0;
+  return leftPriority - rightPriority || left.id.localeCompare(right.id);
+}
+
+/**
+ * Pure provenance-aware placement router for harvested coordinates.
+ *
+ * Precedence is structural source membership, exact textual containment, then
+ * authoritative temporal proximity. Ties use placementPriority and stable
+ * artifact id. When either side lacks an absolute source time, chronology is
+ * not guessed: the deterministic priority/id fallback is explicit in the
+ * returned reason. Every input coordinate produces exactly one placement.
+ */
+export function routeRawTraceCoordinates(
   coordinates: readonly RawTraceCoordinate[],
-  artifactTexts: readonly string[],
-): { conserved: RawTraceCoordinate[]; orphans: RawTraceCoordinate[] } {
-  const corpus = artifactTexts.filter((text) => text.trim().length > 0);
-  const conserved: RawTraceCoordinate[] = [];
-  const orphans: RawTraceCoordinate[] = [];
-  for (const coordinate of coordinates) {
-    if (corpus.some((text) => isConservedIn(text, coordinate.literal))) conserved.push(coordinate);
-    else orphans.push(coordinate);
+  artifacts: readonly RawTraceCoordinateArtifact[],
+): RawTraceCoordinatePlacement[] {
+  if (coordinates.length === 0) return [];
+  if (artifacts.length === 0) {
+    throw new TypeError('routeRawTraceCoordinates requires at least one artifact for non-empty coordinates');
   }
-  return { conserved, orphans };
+  const seenIds = new Set<string>();
+  for (const artifact of artifacts) {
+    if (!artifact.id.trim()) throw new TypeError('coordinate artifact id must be non-empty');
+    if (seenIds.has(artifact.id)) throw new TypeError(`duplicate coordinate artifact id: ${artifact.id}`);
+    seenIds.add(artifact.id);
+  }
+  const orderedArtifacts = [...artifacts].sort(comparePlacementArtifacts);
+
+  const selectFirst = (candidates: readonly RawTraceCoordinateArtifact[]): RawTraceCoordinateArtifact => (
+    [...candidates].sort(comparePlacementArtifacts)[0]!
+  );
+
+  const placements: RawTraceCoordinatePlacement[] = [];
+  for (const coordinate of coordinates) {
+    const structural = orderedArtifacts.filter((artifact) => (
+      coordinate.sourceIndex !== null && artifact.sourceIndexes?.includes(coordinate.sourceIndex)
+    ));
+    if (structural.length > 0) {
+      const artifact = selectFirst(structural);
+      placements.push({
+        coordinate,
+        artifactId: artifact.id,
+        artifactSourceTimestamp: artifact.sourceTimestamp,
+        reason: 'structural',
+      });
+      continue;
+    }
+
+    const containing = orderedArtifacts.filter((artifact) => isConservedIn(artifact.text, coordinate.literal));
+    if (containing.length > 0) {
+      const artifact = selectFirst(containing);
+      placements.push({
+        coordinate,
+        artifactId: artifact.id,
+        artifactSourceTimestamp: artifact.sourceTimestamp,
+        reason: 'exact-containment',
+      });
+      continue;
+    }
+
+    const coordinateTime = authoritativeTimestampMs(coordinate.sourceTimestamp);
+    const temporal = coordinateTime === null
+      ? []
+      : orderedArtifacts.flatMap((artifact) => {
+          const artifactTime = authoritativeTimestampMs(artifact.sourceTimestamp);
+          return artifactTime === null ? [] : [{ artifact, distance: Math.abs(artifactTime - coordinateTime) }];
+        });
+    if (temporal.length > 0) {
+      temporal.sort((left, right) => (
+        left.distance - right.distance
+        || comparePlacementArtifacts(left.artifact, right.artifact)
+      ));
+      const artifact = temporal[0]!.artifact;
+      placements.push({
+        coordinate,
+        artifactId: artifact.id,
+        artifactSourceTimestamp: artifact.sourceTimestamp,
+        reason: 'temporal-nearest',
+      });
+      continue;
+    }
+
+    const artifact = orderedArtifacts[0]!;
+    placements.push({
+      coordinate,
+      artifactId: artifact.id,
+      artifactSourceTimestamp: artifact.sourceTimestamp,
+      reason: 'unknown-time-fallback',
+    });
+  }
+  return placements;
+}
+
+function rewriteCoordinateOccurrences(
+  text: string,
+  literal: string,
+  artifactId: string,
+  keepFirst: boolean,
+): { text: string; kept: boolean } {
+  if (!text || !literal) return { text, kept: false };
+  const escaped = literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`(^|[^A-Za-z0-9])${escaped}(?=[^A-Za-z0-9]|$)`, 'gu');
+  let kept = false;
+  const rewritten = text.replace(pattern, (match, prefix: string) => {
+    if (keepFirst && !kept) {
+      kept = true;
+      return match;
+    }
+    return `${prefix}〔⌖→${artifactId}〕`;
+  });
+  return { text: rewritten, kept };
+}
+
+/**
+ * True when `inner` occurs inside `outer` aligned to the same token boundaries
+ * `rewriteCoordinateOccurrences` treats as edges (non-alphanumeric on both sides,
+ * or string start/end). Such an `inner` literal is part of `outer`'s own spelling
+ * — e.g. `X.ts` inside `X.ts-2834` — so rewriting its occurrences would corrupt
+ * the longer coordinate and break the closet's verbatim-conservation guarantee.
+ */
+function literalIsBoundaryAlignedSubToken(inner: string, outer: string): boolean {
+  if (!inner || !outer || inner.length >= outer.length) return false;
+  const isBoundary = (char: string): boolean => char === '' || /[^A-Za-z0-9]/u.test(char);
+  for (let index = outer.indexOf(inner); index !== -1; index = outer.indexOf(inner, index + 1)) {
+    const before = index === 0 ? '' : outer[index - 1]!;
+    const afterIndex = index + inner.length;
+    const after = afterIndex >= outer.length ? '' : outer[afterIndex]!;
+    if (isBoundary(before) && isBoundary(after)) return true;
+  }
+  return false;
+}
+
+/**
+ * Render router output inline without leaving duplicate literal spellings in
+ * sibling artifacts. Coordinate rows are prepended so normal tail truncation
+ * cannot split them; each row keeps the original source identity/time and the
+ * router reason. Pointer substitutions retain the chosen stable artifact id.
+ */
+export function placeRawTraceCoordinatesInline(
+  coordinates: readonly RawTraceCoordinate[],
+  artifacts: readonly RawTraceCoordinateArtifact[],
+): InlineRawTraceCoordinatePlacementResult {
+  const placements = routeRawTraceCoordinates(coordinates, artifacts);
+  const mutable = artifacts.map((artifact) => ({ ...artifact }));
+  const byId = new Map(mutable.map((artifact) => [artifact.id, artifact]));
+  const rowsByArtifact = new Map<string, string[]>();
+  const keptInHomeByLiteral = new Map<string, boolean>();
+
+  // Rewrite longest literals first so a shorter coordinate never pointerizes the
+  // boundary-aligned prefix of a longer one before that longer literal has been
+  // conserved (e.g. `X.ts` must not consume the `X.ts` head of `X.ts-2834`).
+  const longestFirst = [...placements].sort((left, right) => (
+    right.coordinate.literal.length - left.coordinate.literal.length
+    || (left.coordinate.literal < right.coordinate.literal ? -1
+      : left.coordinate.literal > right.coordinate.literal ? 1 : 0)
+  ));
+
+  for (const placement of longestFirst) {
+    let keptInHome = false;
+    for (const artifact of mutable) {
+      const rewritten = rewriteCoordinateOccurrences(
+        artifact.text,
+        placement.coordinate.literal,
+        placement.artifactId,
+        artifact.id === placement.artifactId,
+      );
+      artifact.text = rewritten.text;
+      if (artifact.id === placement.artifactId && rewritten.kept) keptInHome = true;
+    }
+    keptInHomeByLiteral.set(placement.coordinate.literal, keptInHome);
+  }
+
+  for (const placement of placements) {
+    if (keptInHomeByLiteral.get(placement.coordinate.literal) === true) continue;
+    let labelled = placement.coordinate.labelled;
+    for (const other of longestFirst) {
+      if (other.coordinate.literal === placement.coordinate.literal) continue;
+      // A literal that is a boundary-aligned sub-token of this coordinate's own
+      // literal is part of its identity, not an independent mention — rewriting
+      // it would corrupt the longer literal, so never dedupe it here.
+      if (literalIsBoundaryAlignedSubToken(other.coordinate.literal, placement.coordinate.literal)) continue;
+      labelled = rewriteCoordinateOccurrences(
+        labelled,
+        other.coordinate.literal,
+        other.artifactId,
+        false,
+      ).text;
+    }
+    const sourceTime = placement.coordinate.sourceTimestamp ?? 'unknown';
+    const rows = rowsByArtifact.get(placement.artifactId) ?? [];
+    rows.push(
+      `⌖ ${labelled} @ ${rawTraceCoordinateOrigin(placement.coordinate)}; source-time=${sourceTime}; route=${placement.reason}`,
+    );
+    rowsByArtifact.set(placement.artifactId, rows);
+  }
+
+  for (const [artifactId, rows] of rowsByArtifact) {
+    const artifact = byId.get(artifactId);
+    if (!artifact) continue;
+    artifact.text = [...rows, artifact.text].filter(Boolean).join('\n');
+  }
+  return { artifacts: mutable, placements };
 }
 
 export function buildRawTraceCoordinateCloset(
@@ -1592,7 +1848,9 @@ export function buildLiteralTraceNeighborhoods(
     || left.coordinate.literal.localeCompare(right.coordinate.literal)
   ));
 
-  const header = 'Deterministic exact-match blast radius around harvested coordinate literals not already conserved inline by an artifact section; source excerpts are whitespace-compacted, never LLM-summarized.';
+  const header = flatCoordinateClosetEnabled()
+    ? 'Deterministic exact-match neighborhoods around Coordinate Closet literals; source excerpts are whitespace-compacted, never LLM-summarized.'
+    : 'Deterministic exact-match blast radius around harvested coordinate literals not already conserved inline by an artifact section; source excerpts are whitespace-compacted, never LLM-summarized.';
   const selectedRanges: Array<{ start: number; end: number }> = [];
   const blocks: string[] = [];
   let usedChars = countStringChars(header);
@@ -1858,6 +2116,9 @@ function visibleTraceMessagesFromFoldMessages(
     return [{
       type: message.role === 'assistant' ? 'assistant_text' : message.role,
       text: providerMessageToTraceText(message),
+      sourceTimestamp: typeof message.tsMs === 'number' && Number.isFinite(message.tsMs)
+        ? new Date(message.tsMs).toISOString()
+        : undefined,
     }];
   });
 }
@@ -1877,63 +2138,166 @@ export function buildRawRebirthSeedFromMessages(
   messages: readonly FoldMessage[],
   options: RawRebirthSeedFromMessagesOptions = {},
 ): string {
+  const predecessorName = options.predecessorName ?? 'predecessor';
   const includeTrailingUserTurn = options.includeTrailingUserTurn !== false;
   const traceEnd = findRawRebirthSeedTraceEnd(messages, includeTrailingUserTurn);
   const excluded = excludedTrailingStringUserIndexes(messages, includeTrailingUserTurn);
-  const currentThread = buildCurrentThreadFromMessages(
+  let currentThread = buildCurrentThreadFromMessages(
     messages,
     traceEnd,
     Math.max(1, Math.floor(options.currentThreadMessageLimit ?? 30)),
     Math.max(200, Math.floor(options.currentThreadMessageChars ?? 1_600)),
     excluded,
   );
-  const lastUserAiMessages = buildLastUserAiMessagesFromMessages(messages, traceEnd, excluded);
+  let lastUserAiMessages = buildLastUserAiMessagesFromMessages(messages, traceEnd, excluded);
   const visibleTraceMessages = visibleTraceMessagesFromFoldMessages(messages, includeTrailingUserTurn);
   // Coordinate placement: build the artifact sections FIRST so every harvested
   // literal can be checked against the corpus it would live in. Conserved
   // literals stay inline with their artifact; only orphans spend neighborhood
   // budget on an attributed expansion. The flat closet renders only behind
   // the VOXXO_REBIRTH_FLAT_CLOSET kill-switch.
-  const starredMoments = options.starredMoments === undefined
+  let starredMoments = options.starredMoments === undefined
     ? buildStarredMomentsFromMessages(
         messages,
         options.sectionMaxChars?.starredMoments
           ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.starredMoments,
       )
     : options.starredMoments;
-  const openQuestions = options.openQuestions ?? buildOpenQuestionsFromMessages(messages);
-  const thinkingTrail = buildActivityLogFromMessages(
+  let openQuestions = options.openQuestions ?? buildOpenQuestionsFromMessages(messages);
+  let thinkingTrail = buildActivityLogFromMessages(
     messages,
     traceEnd,
     Math.max(200, Math.floor(options.activityMessageChars ?? 1_000)),
     excluded,
   );
-  const artifactCorpus = [
-    currentThread,
-    lastUserAiMessages,
-    options.activeEditDelta ?? '',
-    options.taskRailContext ?? '',
-    options.episodicCrossRef ?? '',
-    options.lineageGlyphLog ?? '',
-    starredMoments,
-    openQuestions,
-    thinkingTrail,
-    options.resumePoint ?? '',
-  ];
-  const rawTraceCoordinateCloset = flatCoordinateClosetEnabled()
+  let activeEditDelta = options.activeEditDelta ?? '';
+  let taskRailContext = options.taskRailContext ?? '';
+  let episodicCrossRef = options.episodicCrossRef ?? '';
+  let lineageGlyphLog = options.lineageGlyphLog ?? '';
+  let resumePoint = options.resumePoint ?? '';
+  const legacyLayout = flatCoordinateClosetEnabled();
+  const rawTraceCoordinateCloset = legacyLayout
     ? buildRawTraceCoordinateClosetFromMessages(messages, {
         includeTrailingUserTurn,
         rawTraceCoordinateClosetChars: options.rawTraceCoordinateClosetChars,
       })
     : '';
-  const traceNeighborhoods = options.traceNeighborhoods === undefined
+  let traceNeighborhoods = legacyLayout && options.traceNeighborhoods === undefined
     ? buildLiteralTraceNeighborhoods(visibleTraceMessages, {
         maxChars: options.traceNeighborhoodChars,
-        excludeTexts: artifactCorpus,
+        excludeTexts: [
+          currentThread,
+          lastUserAiMessages,
+          activeEditDelta,
+          taskRailContext,
+        ],
       })
-    : options.traceNeighborhoods;
+    : options.traceNeighborhoods ?? '';
+
+  if (!legacyLayout) {
+    const prepared = prepareVisibleTraceMessages(visibleTraceMessages);
+    const coordinates = fitRawTraceCoordinates(
+      collectRawTraceCoordinates(prepared),
+      options.rawTraceCoordinateClosetChars
+        ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset,
+    ).coordinates;
+    const newestSourceTimestamp = [...prepared].reverse()
+      .find((message) => message.sourceTimestamp)?.sourceTimestamp;
+    const artifacts: RawTraceCoordinateArtifact[] = [
+      { id: 'task-rail-context', text: taskRailContext, placementPriority: 0 },
+      { id: 'active-edit-delta', text: activeEditDelta, placementPriority: 1 },
+      { id: 'starred-moments', text: starredMoments, placementPriority: 2 },
+      { id: 'lineage-glyph-log', text: lineageGlyphLog, placementPriority: 3 },
+      { id: 'episodic-cross-ref', text: episodicCrossRef, placementPriority: 4 },
+      { id: 'resume-point', text: resumePoint, placementPriority: 5 },
+      { id: 'current-thread', text: currentThread, sourceTimestamp: newestSourceTimestamp, placementPriority: 6 },
+      { id: 'last-user-ai', text: lastUserAiMessages, sourceTimestamp: newestSourceTimestamp, placementPriority: 7 },
+      { id: 'open-questions', text: openQuestions, placementPriority: 8 },
+      { id: 'activity-log', text: thinkingTrail, sourceTimestamp: newestSourceTimestamp, placementPriority: 9 },
+    ].filter((artifact) => artifact.text.trim().length > 0);
+    if (coordinates.length > 0 && artifacts.length > 0) {
+      const placed = placeRawTraceCoordinatesInline(coordinates, artifacts);
+      const placedById = new Map(placed.artifacts.map((artifact) => [artifact.id, artifact.text]));
+      currentThread = placedById.get('current-thread') ?? currentThread;
+      lastUserAiMessages = placedById.get('last-user-ai') ?? lastUserAiMessages;
+      activeEditDelta = placedById.get('active-edit-delta') ?? activeEditDelta;
+      taskRailContext = placedById.get('task-rail-context') ?? taskRailContext;
+      episodicCrossRef = placedById.get('episodic-cross-ref') ?? episodicCrossRef;
+      lineageGlyphLog = placedById.get('lineage-glyph-log') ?? lineageGlyphLog;
+      starredMoments = placedById.get('starred-moments') ?? starredMoments;
+      openQuestions = placedById.get('open-questions') ?? openQuestions;
+      thinkingTrail = placedById.get('activity-log') ?? thinkingTrail;
+      resumePoint = placedById.get('resume-point') ?? resumePoint;
+    }
+    traceNeighborhoods = '';
+  }
+  let continuityReceipt = options.continuityReceipt;
+  if (options.lifecycleBoundary === 'same_instance_hard_epoch'
+    && !isContinuityReceipt(continuityReceipt)) {
+    const trailingStart = trailingUserRunStartIndex(messages);
+    const activeRequestMessages = messages.slice(trailingStart)
+      .filter((message) => message.role === 'user' && typeof message.content === 'string');
+    const activeRequestText = activeRequestMessages
+      .map((message) => message.content as string)
+      .filter((text) => text.trim().length > 0)
+      .join('\n\n') || undefined;
+    const activeRequestSourceTimestamp = [...activeRequestMessages].reverse()
+      .find((message) => typeof message.tsMs === 'number' && Number.isFinite(message.tsMs))?.tsMs;
+    const legacyReceipt = continuityReceiptFromProse({
+      boundary: 'same_instance_hard_epoch',
+      predecessorName,
+      sourceStatus: options.predecessorStatus,
+      resumePoint,
+      taskRailContext,
+      activeEditDelta,
+      currentThread,
+      lastUserAiMessages,
+      activeRequestText,
+    });
+    const lastSourceTimestampMs = [...messages.slice(0, traceEnd)].reverse()
+      .find((message) => typeof message.tsMs === 'number' && Number.isFinite(message.tsMs))?.tsMs;
+    continuityReceipt = buildContinuityReceipt({
+      boundary: 'same_instance_hard_epoch',
+      predecessorName,
+      sourceStatus: options.predecessorStatus,
+      capturedAt: options.capturedAt ?? 'unknown',
+      captureSourceId: `raw-hard-epoch:${predecessorName}:message#${traceEnd}`,
+      instance: {
+        instanceId: 'unknown',
+        instanceName: predecessorName,
+        runtimeStatus: options.predecessorStatus ?? 'unknown',
+      },
+      rail: legacyReceipt.rail,
+      nextAction: legacyReceipt.nextAction,
+      activeRequestText,
+      activeRequestSourceId: 'unknown',
+      activeRequestSourceCoordinate: activeRequestText
+        ? `message#${trailingStart}..message#${messages.length - 1}`
+        : undefined,
+      activeRequestSourceTimestamp: activeRequestSourceTimestamp !== undefined
+        ? new Date(activeRequestSourceTimestamp).toISOString()
+        : undefined,
+      claims: legacyReceipt.editClaim.claims,
+      editEvidenceFiles: legacyReceipt.editClaim.editEvidenceFiles,
+      claimsAreLive: false,
+      hasActiveEditDelta: legacyReceipt.editClaim.supplied,
+      validationFact: legacyReceipt.validation.fact,
+      hazards: legacyReceipt.hazards,
+      chatroomMembership: options.chatroomMembership,
+      rawTailFrontier: {
+        traceId: predecessorName,
+        unit: 'message',
+        index: traceEnd,
+        exactCount: Math.max(0, messages.length - traceEnd),
+        ...(lastSourceTimestampMs !== undefined
+          ? { sourceTimestamp: new Date(lastSourceTimestampMs).toISOString() }
+          : {}),
+      },
+      extraDisagreements: legacyReceipt.disagreements,
+    });
+  }
   return renderRawRebirthSeed({
-    predecessorName: options.predecessorName ?? 'predecessor',
+    predecessorName,
     packageBudget: options.packageBudget,
     runtimeModel: options.runtimeModel,
     relayBootTime: options.relayBootTime,
@@ -1946,13 +2310,13 @@ export function buildRawRebirthSeedFromMessages(
     currentThread,
     rawTraceCoordinateCloset,
     traceNeighborhoods,
-    activeEditDelta: options.activeEditDelta,
-    taskRailContext: options.taskRailContext,
-    continuityReceipt: options.continuityReceipt,
-    resumePoint: options.resumePoint,
+    activeEditDelta,
+    taskRailContext,
+    continuityReceipt,
+    resumePoint,
     workspaceContext: options.workspaceContext,
-    episodicCrossRef: options.episodicCrossRef,
-    lineageGlyphLog: options.lineageGlyphLog,
+    episodicCrossRef,
+    lineageGlyphLog,
     starredMoments,
     openQuestions,
     thinkingTrail,
