@@ -124,4 +124,23 @@ describe('boundary auction pure core', () => {
     expect(result.selected.map((decision) => decision.id)).toEqual(['fold', 'aa', 'episode']);
     expect(result.text).toBe([block('fold', 8), block('aa', 6), block('episode', 7)].join('\n'));
   });
+
+  test('commits visibility hooks only for nominations that actually render', () => {
+    const selected = vi.fn();
+    const omitted = vi.fn();
+    const result = runBoundaryAuction([
+      { ...nomination('winner', 'fold-recall', 0, 2, 8), onSelected: selected },
+      { ...nomination('omitted', 'episodic-chain', 1, 1, 8), onSelected: omitted },
+    ], { enabled: true, charBudget: 8, separator: '' });
+
+    expect(result.text).toBe(block('winner', 8));
+    expect(selected).toHaveBeenCalledTimes(1);
+    expect(omitted).not.toHaveBeenCalled();
+
+    const empty = vi.fn();
+    expect(runBoundaryAuction([
+      { id: 'empty', source: 'fold-recall', tier: 0, value: 1, chars: 0, render: '', onSelected: empty },
+    ], { enabled: true, charBudget: 8 }).text).toBe('');
+    expect(empty).not.toHaveBeenCalled();
+  });
 });

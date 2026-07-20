@@ -35,6 +35,8 @@ export interface FoldRecallUsageEvent {
   boundarySeq: number;
   tsMs: number;
   cardKind?: string;
+  /** Card identity retained in memory for rail/path-scoped outcome valence. */
+  targetPath?: string;
   matchedPath?: string;
   weight?: number;
   /** True only for an expiry preceded by unrelated activity after injection. */
@@ -49,7 +51,7 @@ export interface FoldRecallUtilityRank {
   usefulOutcomes: number;
   ignoredOutcomes: number;
   falsePositiveProxies: number;
-  /** Mean observed proxy weight across terminal outcomes; null means exposure-only. */
+  /** Mean observed proxy weight across positive usage outcomes; null means no positive evidence. */
   observationalProxy: number | null;
 }
 
@@ -79,7 +81,10 @@ export interface AdvanceFoldRecallUsageResult {
 }
 
 export interface FoldRecallUsageSignals {
+  /** All read/edit/search touches; these count as activity but not edit success. */
   touchedPaths?: readonly string[];
+  /** The subset produced by a mutating tool. Only these may emit path_edited. */
+  editedPaths?: readonly string[];
   toolArgsText?: string;
   assistantText?: string;
 }
@@ -175,6 +180,7 @@ export function addInjectedFoldRecallUsageCards(
         boundarySeq,
         tsMs,
         cardKind: card.kind,
+        targetPath: card.targetPath,
       });
     }
   }
@@ -227,6 +233,7 @@ export function advanceFoldRecallUsageWatches(
 ): AdvanceFoldRecallUsageResult {
   const tsMs = nowMs(opts);
   const touched = new Set(signals.touchedPaths ?? []);
+  const edited = new Set(signals.editedPaths ?? []);
   const toolText = signals.toolArgsText ?? '';
   const assistantText = signals.assistantText ?? '';
   const assistantTerms = assistantText.length > 0
@@ -242,17 +249,17 @@ export function advanceFoldRecallUsageWatches(
       continue;
     }
 
-    const matchedPath = firstMatchedPath(watch, touched);
+    const matchedPath = firstMatchedPath(watch, edited);
     if (matchedPath) {
-      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'path_edited', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, matchedPath });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'path_edited', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath, matchedPath });
       continue;
     }
     if (includesVerbatimKey(watch, `${toolText}\n${assistantText}`)) {
-      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'verbatim_reused', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'verbatim_reused', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath });
       continue;
     }
     if (termEchoMatched(watch, assistantTerms, opts)) {
-      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'term_echo', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'term_echo', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath });
       continue;
     }
     const unmatchedActivityBoundaries = watch.unmatchedActivityBoundaries + (hasActivity ? 1 : 0);
@@ -265,6 +272,7 @@ export function advanceFoldRecallUsageWatches(
         boundarySeq,
         tsMs,
         cardKind: watch.cardKind,
+        targetPath: watch.targetPath,
         ...(unmatchedActivityBoundaries > 0 ? { falsePositiveProxy: true } : {}),
       });
       continue;
@@ -280,7 +288,6 @@ export function advanceFoldRecallUsageWatches(
 export function foldRecallUsageEventWeight(event: FoldRecallUsageEvent): number | null {
   if (event.kind === 'path_edited' || event.kind === 'verbatim_reused') return 1;
   if (event.kind === 'term_echo') return 0.5;
-  if (event.kind === 'expired') return 0;
   return null;
 }
 

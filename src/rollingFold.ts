@@ -79,7 +79,30 @@ export interface FoldConfig {
    * package preamble; override only when a host lacks the default recall hooks.
    */
   foldBlockPreamble?: string;
+  /**
+   * Artifact-mode band body builder (VOXXO_FOLD_ARTIFACT_ONLY). When present,
+   * the fold block's per-turn skeleton rows are replaced by the builder's
+   * output: typed receipts + aggregated investigations + cognitive artifacts
+   * + conserved literals + provenance header (see foldReceipts.ts). The
+   * builder receives the surviving fold-window messages on every assembly
+   * (including eviction re-renders) so the body always reflects the surviving
+   * window. Absent → byte-identical legacy skeleton rendering; the field is
+   * dependency-injected by orchestrators so rollingFold keeps its leaf
+   * position in the package DAG (foldReceipts imports rollingFold, never the
+   * reverse).
+   */
+  artifactModeBody?: ArtifactModeBodyBuilder;
 }
+
+/**
+ * Builds the artifact-mode fold-block body from the surviving fold-window
+ * messages. Returns the body lines and their total char count for block
+ * accounting/eviction. Must be pure and deterministic (provider-cache
+ * invariant).
+ */
+export type ArtifactModeBodyBuilder = (
+  windowMessages: readonly FoldMessage[],
+) => { bodyLines: string[]; blockChars: number };
 
 export interface FoldedTurn {
   timestamp: string;
@@ -676,6 +699,14 @@ export const FOLD_BLOCK_PREAMBLE_FLAT_CLOSET = '(Context note: older turns were 
 export const FOLD_BLOCK_PREAMBLE_SIGNATURE = 'older turns were auto-folded into the skeletons below';
 
 /**
+ * Artifact-mode preamble (VOXXO_FOLD_ARTIFACT_ONLY). Deliberately carries
+ * FOLD_BLOCK_PREAMBLE_SIGNATURE verbatim so every layout-blind carrier
+ * detection path (re-fold, pointer substitution, host band builders) keeps
+ * working unchanged; the mode note follows the signature sentence.
+ */
+export const FOLD_BLOCK_PREAMBLE_ARTIFACT = '(Context note: older turns were auto-folded into the skeletons below. ARTIFACT MODE: skeleton rows are replaced by typed receipts — every edit/write/bash/test/typecheck/error/rail/Atlas/spawn/chat outcome is preserved with source-time prefixes, investigation runs are aggregated, and conserved ids/paths/values ride the ⌖ literals line. Folded content that becomes relevant again is paged back in automatically as "[Recalled from fold —" cards at tool boundaries. Mechanics: docs/context-folding.md)';
+
+/**
  * One-line stand-in emitted when a surviving message already carries the full
  * fold preamble. Without this, append-only band stacks restate the ~500-char
  * mechanics note once per band (each tail-epoch band fossilizes its own copy
@@ -1091,23 +1122,31 @@ export function planActiveTurnStepFold(
 
 // ── Tool extraction ──
 
-interface ExtractedToolCall {
+export interface ExtractedToolCall {
   name: string;
   input: Record<string, unknown>;
   resultText: string;
   toolId: string;
+  /** Index of the message carrying the tool outcome (result) — the receipt's
+   *  source pointer. Falls back to the call-site message when the result
+   *  hasn't arrived (pending call). */
+  messageIndex: number;
+  /** Source time of the outcome message when the window carries tsMs.
+   *  Undefined stays explicitly unknown — never substituted with fold time. */
+  tsMs?: number;
 }
 
-function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall[] {
+export function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall[] {
   const calls: ExtractedToolCall[] = [];
-  const pending = new Map<string, { name: string; input: Record<string, unknown> }>();
+  const pending = new Map<string, { name: string; input: Record<string, unknown>; callIndex: number; callTsMs?: number }>();
 
-  for (const msg of turnMessages) {
+  for (let messageIndex = 0; messageIndex < turnMessages.length; messageIndex++) {
+    const msg = turnMessages[messageIndex];
     // Anthropic format: assistant content blocks with type tool_use
     if (msg.role === 'assistant' && Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
         if (block?.type === 'tool_use' && block.name && block.id) {
-          pending.set(block.id, { name: block.name, input: block.input ?? {} });
+          pending.set(block.id, { name: block.name, input: block.input ?? {}, callIndex: messageIndex, callTsMs: msg.tsMs });
         }
       }
     }
@@ -1119,7 +1158,7 @@ function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall[] {
         if (fn?.name && tc.id) {
           let args: Record<string, unknown> = {};
           try { args = JSON.parse(fn.arguments ?? '{}'); } catch { /* skip */ }
-          pending.set(tc.id, { name: fn.name, input: args });
+          pending.set(tc.id, { name: fn.name, input: args, callIndex: messageIndex, callTsMs: msg.tsMs });
         }
       }
     }
@@ -1131,7 +1170,7 @@ function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall[] {
           const fc = part.functionCall;
           if (fc.name) {
             const tcId = fc.id || '';
-            pending.set(tcId, { name: fc.name, input: fc.args ?? {} });
+            pending.set(tcId, { name: fc.name, input: fc.args ?? {}, callIndex: messageIndex, callTsMs: msg.tsMs });
           }
         }
       }
@@ -1148,7 +1187,7 @@ function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall[] {
               : Array.isArray(block.content)
                 ? block.content.map((b: any) => typeof b === 'string' ? b : b?.text ?? JSON.stringify(b)).join('\n')
                 : JSON.stringify(block.content ?? '');
-            calls.push({ ...p, resultText: rt, toolId: block.tool_use_id });
+            calls.push({ name: p.name, input: p.input, resultText: rt, toolId: block.tool_use_id, messageIndex, tsMs: msg.tsMs ?? p.callTsMs });
             pending.delete(block.tool_use_id);
           }
         }
@@ -1161,7 +1200,7 @@ function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall[] {
       const p = pending.get(tcId);
       if (p) {
         const rt = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        calls.push({ ...p, resultText: rt, toolId: tcId });
+        calls.push({ name: p.name, input: p.input, resultText: rt, toolId: tcId, messageIndex, tsMs: msg.tsMs ?? p.callTsMs });
         pending.delete(tcId);
       }
     }
@@ -1178,7 +1217,7 @@ function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall[] {
             const rt = typeof respObj.result === 'string'
               ? respObj.result
               : JSON.stringify(respObj.result ?? respObj);
-            calls.push({ ...p, resultText: rt, toolId: tcId });
+            calls.push({ name: p.name, input: p.input, resultText: rt, toolId: tcId, messageIndex, tsMs: msg.tsMs ?? p.callTsMs });
             pending.delete(tcId);
           }
         }
@@ -1261,8 +1300,8 @@ function truncate(s: string, max: number): string {
  * Extract the earliest message tsMs from a turn's raw messages. Returns the
  * creation time of the first message that carries a tsMs field, so the folded
  * skeleton is stamped with WHEN the turn actually happened — not fold time.
- * Returns null when no message carries tsMs (backward-compatible: caller falls
- * back to new Date()).
+ * Returns null when no message carries tsMs. Callers retain explicit unknown
+ * time rather than substituting the ambient processing clock.
  */
 function extractTurnTsMs(messages: readonly FoldMessage[]): number | null {
   for (const msg of messages) {
@@ -1279,7 +1318,7 @@ function extractTurnTsMs(messages: readonly FoldMessage[]): number | null {
  * deterministic for a given input — uses UTC to avoid locale-dependent output
  * in server-side fold rendering.
  */
-function formatFoldTime(ts: string | number): string {
+export function formatFoldTime(ts: string | number): string {
   const date = typeof ts === 'number' ? new Date(ts) : new Date(ts);
   if (isNaN(date.getTime())) return '';
   let h = date.getUTCHours();
@@ -1833,7 +1872,7 @@ export function isClosetNoiseLiteral(value: string): boolean {
  * Value-deduped via isConservedIn so `deadbeefcafe` and `id: deadbeefcafe` never
  * spend two slots on one value (nominates a wider pool, then greedy-selects).
  */
-function beltVerbatim(text: string, max = 2): string {
+export function beltVerbatim(text: string, max = 2): string {
   const picked: string[] = [];
   for (const lit of nominateVerbatim(text, max * 4)) {
     if (picked.length >= max) break;
@@ -1893,7 +1932,7 @@ const COORDINATION_TOOLS = new Set([
 
 const MUTATING_BASH_RE = /\b(npm run build|npm install|git commit|git push|rm |mkdir |mv |cp |chmod|make |cargo build|pip install|docker )\b/;
 
-function isMutatingBash(input: Record<string, unknown>): boolean {
+export function isMutatingBash(input: Record<string, unknown>): boolean {
   return MUTATING_BASH_RE.test(String(input.command ?? ''));
 }
 
@@ -2330,6 +2369,7 @@ function renderFoldedBlock(
   tombstoneLines?: readonly string[],
   counterStamp?: string,
   preamble: string = FOLD_BLOCK_PREAMBLE,
+  bodyLines?: readonly string[],
 ): string {
   const lines: string[] = [
     `[Conversation Context — ${stats.turnsFolded} turns folded, ${Math.round(stats.origChars / 1000)}K → ${Math.round(stats.blockChars / 1000)}K chars${counterStamp ? ` · ${counterStamp}` : ''}]`,
@@ -2343,7 +2383,10 @@ function renderFoldedBlock(
     lines.push(...tombstoneLines, '');
   }
 
-  for (const ft of collapsed) {
+  if (bodyLines) {
+    // Artifact mode: receipts/aggregates/artifacts replace per-turn skeletons.
+    lines.push(...bodyLines);
+  } else for (const ft of collapsed) {
     const formattedSkeletonTime = ft.skeletonTimestamp ? formatFoldTime(ft.skeletonTimestamp) : '';
     const tsPrefix = formattedSkeletonTime ? `${formattedSkeletonTime} ` : '';
     lines.push(`${tsPrefix}${ft.skeleton}`);
@@ -2515,7 +2558,9 @@ export function foldContext(
 ): FoldResult {
   const originalChars = countChars(messages);
   let foldBlockPreamble = config.foldBlockPreamble
-    ?? (flatCoordinateClosetEnabled() ? FOLD_BLOCK_PREAMBLE_FLAT_CLOSET : FOLD_BLOCK_PREAMBLE);
+    ?? (config.artifactModeBody
+      ? FOLD_BLOCK_PREAMBLE_ARTIFACT
+      : flatCoordinateClosetEnabled() ? FOLD_BLOCK_PREAMBLE_FLAT_CLOSET : FOLD_BLOCK_PREAMBLE);
   const priorCoordinateCorpus = config.priorCoordinateCorpus
     || extractCoordinateConservationCorpus(messages);
 
@@ -2746,7 +2791,7 @@ export function foldContext(
     const charsSaved = Math.max(0, turnChars - retainedLen);
 
     const turnTsMs = extractTurnTsMs(turn.messages);
-    const turnTimestamp = turnTsMs !== null ? new Date(turnTsMs).toISOString() : new Date().toISOString();
+    const turnTimestamp = turnTsMs !== null ? new Date(turnTsMs).toISOString() : '';
 
     builtTurns.push({
       ordinal: turnIdx,
@@ -2779,6 +2824,20 @@ export function foldContext(
     const survivors = builtTurns.filter(b => b.ordinal >= evictedThroughOrdinal);
     const collapsed = collapseSequences(survivors.map(b => b.folded));
     const tombstoneLines = spans.map(formatFoldTombstoneLine);
+
+    // Artifact mode (VOXXO_FOLD_ARTIFACT_ONLY): the dependency-injected
+    // builder compiles the surviving window into receipts + aggregates +
+    // artifacts + literals. Rebuilt on every assembly, so eviction re-renders
+    // stay consistent: evicted turns' receipts vanish and tombstones replace
+    // them. `collapsed` still returns for foldSummaries metadata.
+    if (config.artifactModeBody) {
+      const rawSurvivors = survivors.flatMap(b => turns[b.ordinal]?.messages ?? []);
+      const { bodyLines, blockChars: artifactChars } = config.artifactModeBody(rawSurvivors);
+      const blockChars = artifactChars
+        + foldBlockPreamble.length
+        + tombstoneLines.reduce((s, line) => s + line.length, 0);
+      return { collapsed, closetLine: undefined, blockChars, tombstoneLines, bodyLines };
+    }
 
     const bodyCorpus = collapsed
       .map(ft => (ft.retained ? `${ft.skeleton}\n${ft.retained}` : ft.skeleton))
@@ -2903,7 +2962,7 @@ export function foldContext(
       (closetLine?.length ?? 0) +
       foldBlockPreamble.length +
       tombstoneLines.reduce((s, line) => s + line.length, 0);
-    return { collapsed: renderedCollapsed, closetLine, blockChars, tombstoneLines };
+    return { collapsed: renderedCollapsed, closetLine, blockChars, tombstoneLines, bodyLines: undefined };
   };
 
   // ── E10 eviction.
@@ -2916,7 +2975,8 @@ export function foldContext(
   let evictionOutcome: FoldEvictionOutcome | undefined;
   const spansFor = (through: number): FoldEvictionSpan[] => {
     if (through <= initialEvictedThrough) return mergeEvictionSpans(evictionSpans);
-    const stamp = eviction?.nowIso ?? new Date().toISOString();
+    if (!eviction) return mergeEvictionSpans(evictionSpans);
+    const stamp = eviction.nowIso;
     return mergeEvictionSpans([
       ...evictionSpans,
       {
@@ -2976,7 +3036,7 @@ export function foldContext(
     turnsFolded: actualFoldCount,
     origChars: countChars(foldZone) - countChars(systemInFoldZone),
     blockChars: block.blockChars,
-  }, block.closetLine, block.tombstoneLines, counterStamp, foldBlockPreamble);
+  }, block.closetLine, block.tombstoneLines, counterStamp, foldBlockPreamble, block.bodyLines);
 
   const foldedMessage: FoldMessage = { role: 'user', content: foldedBlockText };
   const ackMessage: FoldMessage = {

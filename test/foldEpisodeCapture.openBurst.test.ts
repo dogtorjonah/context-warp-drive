@@ -89,6 +89,65 @@ describe('computeOpenBurst — read-burst fold-guard boundary', () => {
     expect(guard.openBurstStartIndex).toBe(cap.openBurstStartIndex);
   });
 
+  test('PARITY: intent voice floor holds the same trailing burst in guard and durable capture', () => {
+    const idle = (prefix: string) => Array.from({ length: 30 }, (_, i) => assistantMsg(`${prefix} ${i}`));
+    const messages: FoldMessage[] = [
+      userMsg('inspect the three related files'),
+      toolUse('Read', { file_path: '/repo/src/a.ts' }, 'a'),
+      ...idle('after-a'),
+      toolUse('Read', { file_path: '/repo/src/b.ts' }, 'b'),
+      ...idle('after-b'),
+      toolUse('Read', { file_path: '/repo/src/c.ts' }, 'c'),
+    ];
+
+    const guard = computeOpenBurst(messages);
+    const capture = deriveEpisodesFromMessages(messages, 0, ID);
+
+    expect(capture.episodes).toHaveLength(1);
+    expect(capture.episodes[0]?.members.map((member) => member.path)).toEqual(['/repo/src/a.ts']);
+    expect(guard.openBurstStartIndex).toBe(32);
+    expect(guard.openBurstStartIndex).toBe(capture.openBurstStartIndex);
+    expect(guard.heldPaths).toEqual(['/repo/src/b.ts', '/repo/src/c.ts']);
+  });
+
+  test('value fidelity is explicit and shared by capture and the open-burst guard', () => {
+    const messages: FoldMessage[] = [
+      toolUse('Read', { file_path: '/repo/src/a.ts' }, 'a1'),
+      toolResult('a1', 'a1'),
+      toolUse('Read', { file_path: '/repo/src/b.ts' }, 'b'),
+      toolResult('b', 'b'),
+      toolUse('Read', { file_path: '/repo/src/a.ts' }, 'a2'),
+      toolResult('a2', 'a2'),
+    ];
+    const timestamps = [
+      '2026-06-18T00:00:00.000Z',
+      '2026-06-18T00:00:01.000Z',
+      '2026-06-18T00:25:00.000Z',
+      '2026-06-18T00:25:01.000Z',
+      '2026-06-18T00:26:00.000Z',
+      '2026-06-18T00:26:01.000Z',
+    ];
+    const prior = process.env.VOXXO_FOLD_VALUE_FIDELITY;
+    process.env.VOXXO_FOLD_VALUE_FIDELITY = '1';
+    try {
+      const implicit = deriveEpisodesFromMessages(messages, 0, ID, { sealTrailing: true, timestamps });
+      const explicit = deriveEpisodesFromMessages(messages, 0, ID, {
+        sealTrailing: true,
+        timestamps,
+        valueFidelity: true,
+      });
+      const guard = computeOpenBurst(messages, { timestamps, valueFidelity: true });
+
+      expect(implicit.episodes).toHaveLength(2);
+      expect(explicit.episodes).toHaveLength(1);
+      expect(guard.burstCount).toBe(1);
+      expect(guard.openBurstStartIndex).toBe(0);
+    } finally {
+      if (prior === undefined) delete process.env.VOXXO_FOLD_VALUE_FIDELITY;
+      else process.env.VOXXO_FOLD_VALUE_FIDELITY = prior;
+    }
+  });
+
   test('capture stamps authorName and uses railTitle as an in-window summary fallback', () => {
     const messages: FoldMessage[] = [
       userMsg('wire dormant capture metadata'),
@@ -179,5 +238,22 @@ describe('computeOpenBurst — read-burst fold-guard boundary', () => {
     // capture resumes its cursor past the whole sealed window (messages.length).
     expect(guard.openBurstStartIndex).toBeNull();
     expect(cap.openBurstStartIndex).toBe(messages.length);
+    expect(cap.nextCaptureIndex).toBe(messages.length);
+  });
+
+  test('returns an unambiguous next cursor for no-touch and open-burst suffixes', () => {
+    const noTouch = [userMsg('explain the result'), assistantMsg('done')];
+    const noTouchCapture = deriveEpisodesFromMessages(noTouch, 0, ID, {});
+    expect(noTouchCapture).toMatchObject({
+      episodes: [],
+      openBurstStartIndex: null,
+      nextCaptureIndex: noTouch.length,
+    });
+
+    const open = readTurn(1, '/repo/src/open.ts');
+    const openCapture = deriveEpisodesFromMessages(open, 0, ID, {});
+    expect(openCapture.episodes).toEqual([]);
+    expect(openCapture.openBurstStartIndex).toBe(1);
+    expect(openCapture.nextCaptureIndex).toBe(1);
   });
 });

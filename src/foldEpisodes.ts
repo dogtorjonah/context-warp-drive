@@ -1852,6 +1852,8 @@ function formatRelativeWalkDelta(currentIso: string, spineIso: string): string {
 export const EPISODIC_STASH_MAX_AGE_BOUNDARIES = 2;
 /** Default sliding zone-residency TTL, in tool boundaries (mirrors fold-recall's 8-pass default). */
 export const EPISODIC_ZONE_TTL_BOUNDARIES = 8;
+/** Hard process-memory bound for the once-per-epoch automatic-serve registry. */
+export const EPISODIC_SERVED_SIGNATURE_MAX_ENTRIES = 4_096;
 /** Default per-boundary char budget for the episodic block (one breath). */
 export const EPISODIC_DEFAULT_CHAR_BUDGET = 2000;
 /** Default max distinct chains served per boundary. */
@@ -2518,10 +2520,19 @@ export function noteEpisodicInjection(
   const config = valueOptions?.config;
   for (const card of cards) {
     if (epoch !== undefined) {
+      // Refresh insertion order for hot paths, then evict the oldest identities.
+      // Epoch dedupe is an optimization, never an authorization to grow for the
+      // full process lifetime.
+      state.servedPathCardSignatures.delete(card.targetPath);
       state.servedPathCardSignatures.set(card.targetPath, {
         epoch,
         signature: episodicCardSignature(card),
       });
+      while (state.servedPathCardSignatures.size > EPISODIC_SERVED_SIGNATURE_MAX_ENTRIES) {
+        const oldest = state.servedPathCardSignatures.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        state.servedPathCardSignatures.delete(oldest);
+      }
     }
     const existing = state.zones.get(card.targetPath);
     const merged = new Set(existing ? existing.chapterIds : []);

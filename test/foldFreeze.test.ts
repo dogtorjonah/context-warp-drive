@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import {
   createFoldFreezeState,
   evaluateFoldFreeze,
+  consumeFoldFreezeEvaluationState,
   commitFoldFreeze,
   appendFoldFreezeTailEpoch,
   touchFoldFreeze,
@@ -322,6 +323,7 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
       forceAcceptRestoredView: true,
     });
     const whale = msg('user', 'x'.repeat(CFG.maxTailChars + 500));
+    const beforeEvaluation = serializeFoldFreezeState(restored);
 
     const decision = evaluateFoldFreeze(restored, [...history, whale], ctx(), T0 + 5_000, CFG);
 
@@ -333,7 +335,11 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
       reason: 'restored-overcap',
       detail: 'restored-tail-overcap',
     });
+    expect(serializeFoldFreezeState(restored)).toEqual(beforeEvaluation);
+    expect(restored.forceAcceptRestoredView).toBe(true);
+    expect(consumeFoldFreezeEvaluationState(restored)).toBe(true);
     expect(restored.forceAcceptRestoredView).toBe(false);
+    expect(consumeFoldFreezeEvaluationState(restored)).toBe(false);
   });
 
   it('touch bumps hotReuses and slides lastCallAt; commit resets hotReuses and bumps epochs', () => {

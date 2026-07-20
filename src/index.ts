@@ -40,6 +40,7 @@
  * provider-cache invariant.
  */
 export * from './fold.ts';
+export * from './foldReceipts.ts';
 export * from './foldProvenance.ts';
 export * from './contextBudget.ts';
 export * from './boundaryAuction.ts';

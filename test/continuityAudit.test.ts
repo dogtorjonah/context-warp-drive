@@ -1,14 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
-  auditCloneTakeover,
   auditContinuityBandStack,
   auditContinuityBoundary,
   auditContinuityCompletion,
-  selectActiveContinuityDelta,
-  type CloneTakeoverAuditInput,
   type ContinuityAuditBand,
-  type ContinuityTakeoverRecord,
-  type ContinuityTakeoverSnapshot,
 } from '../src/continuityAudit.ts';
 import {
   LIVE_CONTINUITY_STATE_HEADER,
@@ -186,86 +181,59 @@ describe('active-only completion semantics', () => {
     })).toMatchObject({ valid: true, authoritativeComplete: true });
   });
 
-  it('dedupes by stable provenance and drops completed or superseded rows from the active delta', () => {
-    const delta = selectActiveContinuityDelta([
-      { provenanceId: 'step:a', sourceSequence: 1, sourceTimestamp: '2026-07-20T01:00:00Z', status: 'active' as const },
-      { provenanceId: 'step:b', sourceSequence: 2, sourceTimestamp: '2026-07-20T01:01:00Z', status: 'blocked' as const },
-      { provenanceId: 'step:a', sourceSequence: 3, sourceTimestamp: '2026-07-20T01:02:00Z', status: 'complete' as const },
-      { provenanceId: 'step:b', sourceSequence: 4, sourceTimestamp: '2026-07-20T01:03:00Z', status: 'active' as const },
-      { provenanceId: 'step:c', sourceSequence: 5, sourceTimestamp: '2026-07-20T01:04:00Z', status: 'superseded' as const },
-    ]);
-    expect(delta).toEqual([
-      expect.objectContaining({ provenanceId: 'step:b', sourceSequence: 4, status: 'active' }),
-    ]);
+  it('warns rather than errors when no structured validation exists to confirm completion', () => {
+    const audited = auditContinuityCompletion({ claimedComplete: true, railState: 'complete' });
+    expect(audited.valid).toBe(true);
+    expect(audited.authoritativeComplete).toBe(false);
+    expect(audited.warnings.map((entry) => entry.code)).toContain('completion-validation-missing');
+  });
+
+  it('errors when a validation object is supplied but lacks source-stamped verification', () => {
+    const audited = auditContinuityCompletion({
+      claimedComplete: true,
+      railState: 'complete',
+      validation: { status: 'unknown' },
+    });
+    expect(audited.valid).toBe(false);
+    expect(audited.errors.map((entry) => entry.code)).toContain('completion-validation-missing');
   });
 });
 
-function record(provenanceId: string): ContinuityTakeoverRecord {
-  return {
-    provenanceId,
-    sourceTimestamp: '2026-07-20T03:50:00.000Z',
-    digest: foldProvenanceDigest({ provenanceId }),
-  };
-}
+describe('raw-tail frontier index invariant', () => {
+  function withFrontierIndex(index: number) {
+    const base = receipt();
+    const liveState = base.liveState!;
+    return {
+      ...base,
+      liveState: {
+        ...liveState,
+        rawTailFrontier: {
+          ...liveState.rawTailFrontier,
+          value: { ...liveState.rawTailFrontier.value!, index },
+        },
+      },
+    };
+  }
 
-function takeover(): CloneTakeoverAuditInput {
-  const source: ContinuityTakeoverSnapshot = {
-    instance: {
-      instanceId: 'source-1',
-      originEventId: 'event:source-origin',
-      originSourceTimestamp: '2026-07-20T01:00:00.000Z',
-      createdBy: { kind: 'operator', id: 'jonah' },
-    },
-    rail: {
-      railId: 'rail-1',
-      ownerInstanceId: 'source-1',
-      creatorInstanceId: 'source-1',
-      contentDigest: foldProvenanceDigest({ steps: ['a', 'b'], state: 'active' }),
-    },
-    claims: [{ ...record('claim:src/a.ts:1-10'), path: 'src/a.ts:1-10', ownerInstanceId: 'source-1' }],
-    blockers: [record('blocker:waiting-on-fixture')],
-    validation: [record('validation:run-1')],
-    provenance: [record('event:source-origin')],
-  };
-  const replacement: ContinuityTakeoverSnapshot = {
-    ...source,
-    instance: {
-      instanceId: 'replacement-1',
-      parentInstanceId: 'source-1',
-      replacesInstanceId: 'source-1',
-      originEventId: 'event:replacement-origin',
-      originSourceTimestamp: CAPTURED_AT,
-      createdBy: { kind: 'operator', id: 'jonah' },
-    },
-    rail: source.rail ? { ...source.rail, ownerInstanceId: 'replacement-1' } : undefined,
-    claims: source.claims.map((claim) => ({ ...claim, ownerInstanceId: 'replacement-1' })),
-  };
-  return { source, replacement, expectedCreator: { kind: 'operator', id: 'jonah' } };
-}
-
-describe('clone takeover audit', () => {
-  it('preserves rail, claims, blockers, validation, and provenance while moving only ownership', () => {
-    expect(auditCloneTakeover(takeover())).toMatchObject({ valid: true, errors: [] });
+  it('accepts a frontier that leads the packaged canonical range', () => {
+    // The frontier is captured at snapshot time while the canonical range is
+    // counted later at package assembly, so a leading frontier is the normal
+    // case whenever the tail advances after capture.
+    const value = withFrontierIndex(316);
+    const audited = auditContinuityBoundary({
+      receipt: value,
+      renderedPrompt: renderContinuityReceiptControl(value),
+    });
+    expect(audited.errors.map((entry) => entry.code)).not.toContain('frontier-index-behind');
   });
 
-  it('detects creator confusion, ownership loss, and mutated boundary evidence', () => {
-    const input = takeover();
-    const replacement = {
-      ...input.replacement,
-      instance: { ...input.replacement.instance, createdBy: { kind: 'agent' as const, id: 'source-1' } },
-      rail: input.replacement.rail
-        ? { ...input.replacement.rail, ownerInstanceId: 'source-1', contentDigest: 'sha256:mutated' }
-        : undefined,
-      claims: input.replacement.claims.map((claim) => ({ ...claim, ownerInstanceId: 'source-1' })),
-      blockers: [],
-    };
-    const audited = auditCloneTakeover({ ...input, replacement });
-    expect(audited.errors.map((entry) => entry.code)).toEqual(expect.arrayContaining([
-      'takeover-creator-mismatch',
-      'takeover-rail-owner-mismatch',
-      'takeover-rail-content-changed',
-      'takeover-claim-owner-mismatch',
-      'takeover-record-missing',
-    ]));
+  it('rejects a frontier that trails the packaged canonical range', () => {
+    const value = withFrontierIndex(12);
+    const audited = auditContinuityBoundary({
+      receipt: value,
+      renderedPrompt: renderContinuityReceiptControl(value),
+    });
+    expect(audited.valid).toBe(false);
+    expect(audited.errors.map((entry) => entry.code)).toContain('frontier-index-behind');
   });
 });

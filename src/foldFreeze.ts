@@ -845,6 +845,17 @@ export type FoldFreezeDecision =
   | { action: 'recompute'; reason: FoldFreezeRecomputeReason; gapMs: number; detail?: string };
 
 /**
+ * Consume the one-shot restored-view trust flag after a host evaluates a
+ * boundary. Kept separate from evaluateFoldFreeze so the evaluator remains
+ * referentially transparent and preview callers cannot mutate state by reading.
+ */
+export function consumeFoldFreezeEvaluationState(state: FoldFreezeState): boolean {
+  if (state.forceAcceptRestoredView !== true) return false;
+  state.forceAcceptRestoredView = false;
+  return true;
+}
+
+/**
  * Decide whether the frozen view can be reused byte-identical (hot path) or
  * the compaction pipeline must run (epoch). Pure function — mutates nothing;
  * the caller applies `touchFoldFreeze` on reuse or `commitFoldFreeze` after
@@ -873,11 +884,10 @@ export function evaluateFoldFreeze(
   // current raw history and reuse the predecessor's frozen prefix bytes. This
   // is the mechanism that lets the cache survive the rebirth boundary.
   //
-  // Safety: one-shot — the flag is cleared regardless of outcome. If raw
-  // history doesn't even cover the frozen range, fall through to the normal
-  // first-call path (the session must build a fresh epoch).
+  // Safety: hosts consume this one-shot flag immediately after evaluation via
+  // consumeFoldFreezeEvaluationState. If raw history doesn't even cover the
+  // frozen range, fall through to normal evaluation.
   if (state.forceAcceptRestoredView) {
-    state.forceAcceptRestoredView = false;
     if (state.frozenView && history.length >= state.frozenRawCount) {
       const tail = history.slice(state.frozenRawCount);
       const tailChars = tail.length > 0 ? countChars(tail) : 0;

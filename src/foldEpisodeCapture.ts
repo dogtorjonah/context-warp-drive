@@ -53,13 +53,14 @@ import {
   type EpisodeAnnotation,
   type EpisodeEvidenceRef,
   type EpisodeAnnotationKind,
+  type EpisodeBurst,
   type EpisodePivotMarker,
   type EpisodeTouch,
   type TraceStep,
 } from './foldEpisodes.ts';
 import { canonicalizeExtractedPaths, type CanonContext } from './foldPathCanon.ts';
 import { extractPathsFromBashCommand, extractRecallSignals } from './foldRecall.ts';
-import { extractUserText, isSyntheticContextText, type FoldMessage, type SyntheticContextOptions } from './rollingFold.ts';
+import { extractUserText, isSyntheticContextText, normalizeToolPath, type FoldMessage, type SyntheticContextOptions } from './rollingFold.ts';
 
 const EDIT_TOOL_HINTS = ['edit', 'write', 'apply_patch', 'notebookedit', 'str_replace', 'create_file'];
 const CHECK_TOOL_RE = /test|typecheck|tsc|vitest|build|lint/i;
@@ -137,6 +138,12 @@ export interface EpisodeCaptureResult {
   episodes: Episode[];
   /** Message index where the open (unrecorded) burst starts; null if none. */
   openBurstStartIndex: number | null;
+  /**
+   * First raw message index not durably covered by this derivation. Unlike
+   * openBurstStartIndex this is never ambiguous: a no-touch suffix advances to
+   * messages.length, while an open burst parks at its start.
+   */
+  nextCaptureIndex: number;
 }
 
 export interface EpisodeCaptureOptions {
@@ -172,6 +179,13 @@ export interface EpisodeCaptureOptions {
    * host-neutral.
    */
   syntheticContext?: SyntheticContextOptions;
+  /**
+   * Preserve high-value path co-activation by widening grouping gaps for paths
+   * that are re-read, claimed, or edited downstream. Default false. Hosts must
+   * resolve any operator configuration and pass it explicitly so this pure
+   * package path never reads process.env.
+   */
+  valueFidelity?: boolean;
   /**
    * Host-supplied behavioral affinity matrix (path -> neighbor -> score).
    * When present, high-affinity current/incoming path pairs widen the grouping
@@ -437,10 +451,12 @@ function shortToolName(name: string): string {
   return lastSegment || name;
 }
 
-function isEditTool(name: string): boolean {
+export function isEpisodeEditTool(name: string): boolean {
   const lower = name.toLowerCase();
   return EDIT_TOOL_HINTS.some((hint) => lower.includes(hint));
 }
+
+const isEditTool = isEpisodeEditTool;
 
 function basename(p: string): string {
   const idx = p.lastIndexOf('/');
@@ -451,12 +467,18 @@ function extractTouchPaths(input: Record<string, unknown>, canon?: CanonContext)
   const paths = new Set<string>();
   try {
     const signals = extractRecallSignals(input, new Set<string>());
-    for (const p of signals.touchedPaths) paths.add(p);
-  } catch { /* fail-open per touch */ }
-  if (typeof input.command === 'string') {
-    try {
-      for (const p of extractPathsFromBashCommand(input.command)) paths.add(p);
-    } catch { /* fail-open per touch */ }
+    const sourcePaths = signals.sourceTouchedPaths ?? [];
+    for (const p of sourcePaths) paths.add(p);
+    for (const p of signals.touchedPaths) {
+      if (!sourcePaths.some((source) => normalizeToolPath(source) === p)) paths.add(p);
+    }
+  } catch {
+    // Preserve the legacy bash-only fallback if signal extraction ever fails.
+    if (typeof input.command === 'string') {
+      try {
+        for (const p of extractPathsFromBashCommand(input.command)) paths.add(p);
+      } catch { /* fail-open per touch */ }
+    }
   }
   const sorted = Array.from(paths).sort();
   if (!canon) return sorted;
@@ -842,6 +864,94 @@ function mineIntentForBurst(
   return undefined;
 }
 
+interface CaptureGroupingOptions {
+  syntheticContext: SyntheticContextOptions;
+  valueFidelity?: boolean;
+  affinityFloor?: Readonly<Record<string, Record<string, number>>>;
+  affinityGapThreshold?: number;
+  affinityGapMultiplier?: number;
+}
+
+/** Build the one canonical burst partition used by durable capture and the fold guard. */
+function groupCaptureBursts(
+  messages: readonly FoldMessage[],
+  touches: readonly EpisodeTouch[],
+  annotated: readonly { eventIndex: number; annotation: EpisodeAnnotation }[],
+  pivots: readonly EpisodePivotMarker[],
+  railSealEventIndexes: readonly number[],
+  options: CaptureGroupingOptions,
+): EpisodeBurst[] {
+  // star:pivot is the ONE star that is a SPLIT boundary, not a hold signal:
+  // exclude it from voice/tap-star floors while retaining it in `pivots`.
+  const isPivotAnnotation = (a: { annotation: EpisodeAnnotation }): boolean =>
+    a.annotation.kind === 'star:pivot';
+  const voiceEventIndexes = annotated
+    .filter((a) => !isPivotAnnotation(a))
+    .map((a) => a.eventIndex)
+    .sort((a, b) => a - b);
+
+  const intentEventIndexes: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role !== 'user') continue;
+    const text = extractUserText([msg], options.syntheticContext).trim();
+    if (text.length === 0 || isSyntheticContextText(text, options.syntheticContext)) continue;
+    intentEventIndexes.push(i);
+  }
+
+  const tapStarFloorEventIndexes = annotated
+    .filter((a) => typeof a.annotation.kind === 'string'
+      && a.annotation.kind.startsWith('star:')
+      && !isPivotAnnotation(a))
+    .map((a) => a.eventIndex)
+    .sort((a, b) => a - b);
+
+  const valueFloorPaths = options.valueFidelity === true
+    ? computeValueFloorPaths(messages, touches)
+    : [];
+
+  return groupTouchesIntoEpisodes(touches, {
+    pivots,
+    ...(voiceEventIndexes.length > 0 || intentEventIndexes.length > 0
+      ? {
+          voiceFloor: true,
+          ...(voiceEventIndexes.length > 0 ? { voiceEventIndexes } : {}),
+          ...(intentEventIndexes.length > 0 ? { intentEventIndexes } : {}),
+        }
+      : {}),
+    ...(valueFloorPaths.length > 0 ? { valueFloorPaths } : {}),
+    ...(tapStarFloorEventIndexes.length > 0 ? { tapStarFloorEventIndexes } : {}),
+    ...(railSealEventIndexes.length > 0 ? { railSealEventIndexes } : {}),
+    ...(options.affinityFloor
+      ? {
+          affinityFloor: options.affinityFloor,
+          affinityGapThreshold: options.affinityGapThreshold,
+          affinityGapMultiplier: options.affinityGapMultiplier,
+        }
+      : {}),
+  });
+}
+
+function trailingBurstSettled(
+  messages: readonly FoldMessage[],
+  bursts: readonly EpisodeBurst[],
+  railSealEventIndexes: readonly number[],
+  nowIso: string | undefined,
+): boolean {
+  const lastBurst = bursts[bursts.length - 1];
+  if (!lastBurst) return false;
+  const trailingEventGap = messages.length - lastBurst.endEventIndex;
+  const trailingMsGap = nowIso !== undefined && lastBurst.endedAt !== undefined
+    ? Date.parse(nowIso) - Date.parse(lastBurst.endedAt)
+    : Number.NaN;
+  const trailingRailSeal = railSealEventIndexes.some(
+    (idx) => idx > lastBurst.endEventIndex && idx < messages.length,
+  );
+  return trailingRailSeal
+    || trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
+    || (Number.isFinite(trailingMsGap) && trailingMsGap > DEFAULT_EPISODE_GROUPING.gapMs);
+}
+
 /**
  * Derive sealed episodes from the raw message window starting at startIndex.
  * Touch kinds come from tool names (edit-ish vs read); pivot stars seal
@@ -892,76 +1002,16 @@ export function deriveEpisodesFromMessages(
     });
   }
 
-  // Voice floor: pass voice event indexes to grouping so bursts with zero
-  // voice annotations refuse to seal on gap alone — producing fewer, fatter
-  // episodes that each carry voice by construction.
-  //
-  // star:pivot is the ONE star that is a SPLIT boundary, not a hold signal:
-  // feeding it into the voice floor (or the tap-star floor below) lets the pivot
-  // ENABLE the floor that then suppresses its OWN seal (the burst absorbs the
-  // next one). Exclude it from both floors — it still drives grouping via the
-  // `pivots` array and still attaches to its closing burst as voice.
-  const isPivotAnnotation = (a: { annotation: EpisodeAnnotation }): boolean =>
-    a.annotation.kind === 'star:pivot';
-  const voiceEventIndexes = annotated
-    .filter((a) => !isPivotAnnotation(a))
-    .map((a) => a.eventIndex)
-    .sort((a, b) => a - b);
-
-  // Intent voice floor: collect indexes of user messages carrying REAL intent
-  // (non-synthetic, non-tool-result user text). The operator's ask that
-  // motivates a burst is voice too — without this, 91.7% of the remaining
-  // "voiceless" episodes are ones that carry intent but no annotations.
-  const intentEventIndexes: number[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg.role !== 'user') continue;
-    const text = extractUserText([msg], syntheticContext).trim();
-    if (text.length === 0) continue;
-    if (isSyntheticContextText(text, syntheticContext)) continue;
-    intentEventIndexes.push(i);
-  }
-
-  // TAP-STAR FLOOR: collect event indexes of deliberate operator pins
-  // (star:decision, star:pivot, star:gotcha, star:discovery). These are the
-  // strongest "resurface this" signals — the burst holding a pin should hold
-  // open longest (gapMs × 2.0) and never seal voiceless. Stars are explicit
-  // operator acts, so the floor is always-on like voiceFloor (not env-gated).
-  const STAR_PIN_PREFIX = 'star:';
-  const tapStarFloorEventIndexes = annotated
-    .filter((a) => typeof a.annotation.kind === 'string' && a.annotation.kind.startsWith(STAR_PIN_PREFIX) && !isPivotAnnotation(a))
-    .map((a) => a.eventIndex)
-    .sort((a, b) => a - b);
-
-  const bursts = groupTouchesIntoEpisodes(touches, {
-    pivots,
-    ...(voiceEventIndexes.length > 0 || intentEventIndexes.length > 0
-      ? { voiceFloor: true, ...(voiceEventIndexes.length > 0 ? { voiceEventIndexes } : {}), ...(intentEventIndexes.length > 0 ? { intentEventIndexes } : {}) }
-      : {}),
-    // VALUE FLOOR: env-gated — permanently rewrites chunk boundaries, so opt-in.
-    // When enabled, compute high-value paths and widen their burst gaps.
-    ...(process.env.VOXXO_FOLD_VALUE_FIDELITY === '1'
-      ? (() => {
-          const vfp = computeValueFloorPaths(messages, touches);
-          return vfp.length > 0 ? { valueFloorPaths: vfp } : {};
-        })()
-      : {}),
-    // TAP-STAR FLOOR: always-on (stars are explicit operator acts). Widens
-    // gap for bursts containing a deliberate pin so they accumulate more voice.
-    ...(tapStarFloorEventIndexes.length > 0 ? { tapStarFloorEventIndexes } : {}),
-    ...(railSealEventIndexes.length > 0 ? { railSealEventIndexes } : {}),
-    // AFFINITY FLOOR: host-supplied co-activation scores from the worker. The
-    // capture layer only threads the matrix through; scoring remains outside
-    // this pure package path.
-    ...(options.affinityFloor
-      ? {
-          affinityFloor: options.affinityFloor,
-          affinityGapThreshold: options.affinityGapThreshold,
-          affinityGapMultiplier: options.affinityGapMultiplier,
-        }
-      : {}),
+  const bursts = groupCaptureBursts(messages, touches, annotated, pivots, railSealEventIndexes, {
+    syntheticContext,
+    valueFidelity: options.valueFidelity,
+    affinityFloor: options.affinityFloor,
+    affinityGapThreshold: options.affinityGapThreshold,
+    affinityGapMultiplier: options.affinityGapMultiplier,
   });
-  if (bursts.length === 0) return { episodes: [], openBurstStartIndex: null };
+  if (bursts.length === 0) {
+    return { episodes: [], openBurstStartIndex: null, nextCaptureIndex: messages.length };
+  }
 
   const sealTrailing = options.sealTrailing === true;
   // The trailing burst is normally DEFERRED (it may still be growing) and left
@@ -975,20 +1025,18 @@ export function deriveEpisodesFromMessages(
   // touch, or >gapMs of wall-clock has elapsed since it), it will not grow, so
   // seal it now and resume the cursor PAST it instead of deferring forever.
   const lastBurst = bursts[bursts.length - 1];
-  const trailingEventGap = messages.length - lastBurst.endEventIndex;
-  const trailingMsGap = lastBurst.endedAt !== undefined
-    ? Date.parse(identity.nowIso) - Date.parse(lastBurst.endedAt)
-    : Number.NaN;
-  const trailingRailSeal = railSealEventIndexes.some((idx) => idx > lastBurst.endEventIndex && idx < messages.length);
   const trailingSettled = !sealTrailing
-    && (trailingRailSeal
-      || trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
-      || (Number.isFinite(trailingMsGap) && trailingMsGap > DEFAULT_EPISODE_GROUPING.gapMs));
+    && trailingBurstSettled(messages, bursts, railSealEventIndexes, identity.nowIso);
   const sealAll = sealTrailing || trailingSettled;
   const openBurst = sealAll ? null : lastBurst;
   const sealed = sealAll ? bursts : bursts.slice(0, -1);
   if (sealed.length === 0) {
-    return { episodes: [], openBurstStartIndex: openBurst ? openBurst.startEventIndex : null };
+    const openBurstStartIndex = openBurst ? openBurst.startEventIndex : null;
+    return {
+      episodes: [],
+      openBurstStartIndex,
+      nextCaptureIndex: openBurstStartIndex ?? messages.length,
+    };
   }
   const voiceHorizon = openBurst ? openBurst.startEventIndex : Number.POSITIVE_INFINITY;
 
@@ -1136,10 +1184,14 @@ export function deriveEpisodesFromMessages(
   // backfill sealTrailing path), resume the caller's capture cursor past the
   // whole consumed window so the next epoch starts on genuinely new work — and
   // so eviction, which is bounded by this same cursor, can finally advance.
-  const resumeIndex = openBurst
+  const openBurstStartIndex = openBurst
     ? openBurst.startEventIndex
     : trailingSettled ? messages.length : null;
-  return { episodes, openBurstStartIndex: resumeIndex };
+  return {
+    episodes,
+    openBurstStartIndex,
+    nextCaptureIndex: openBurstStartIndex ?? messages.length,
+  };
 }
 
 /** Result of {@link computeOpenBurst} — the still-open read-burst the fold guard holds. */
@@ -1160,9 +1212,10 @@ export interface OpenBurstResult {
 /**
  * Open-burst boundary for the read-burst fold guard (consumed by FoldSession).
  *
- * Lean sibling of {@link deriveEpisodesFromMessages}: it runs the SAME touch loop
- * (`iterToolCalls` + `extractTouchPaths` + `isEditTool`) and the SAME
- * `groupTouchesIntoEpisodes` + trailing-settled seal, but skips voice mining,
+ * Lean sibling of {@link deriveEpisodesFromMessages}: it runs the SAME touch and
+ * cheap grouping-signal loop (including mined voice/pivots, intent, value,
+ * affinity, synthetic-context filtering, and rail seals) through the SAME
+ * `groupCaptureBursts` + trailing-settled seal. It skips result resolution,
  * narration, and Episode assembly. It answers one question — *which trailing
  * message window is the still-open read-burst that the fold should hold resident?*
  *
@@ -1185,10 +1238,8 @@ export interface OpenBurstResult {
  *
  * Called without nowIso (the FoldSession default), trailing settlement is pure
  * event-count. Burst grouping still consumes FoldMessage.tsMs when available.
- * Pivots are not mined here (that needs voice mining); pass them only for exact
- * parity testing. task_rail lifecycle boundaries are structural and cheap, so
- * they are mined here too to keep ACK-sealed bursts from being over-held by the
- * fold guard.
+ * task_rail lifecycle boundaries and tool-input voice are cheap, so they are
+ * mined here too to keep the guard byte-for-byte aligned with capture grouping.
  */
 export function computeOpenBurst(
   messages: readonly FoldMessage[],
@@ -1197,10 +1248,17 @@ export function computeOpenBurst(
     timestamps?: readonly (string | undefined)[];
     pivots?: readonly EpisodePivotMarker[];
     nowIso?: string;
+    syntheticContext?: SyntheticContextOptions;
+    valueFidelity?: boolean;
+    affinityFloor?: Readonly<Record<string, Record<string, number>>>;
+    affinityGapThreshold?: number;
+    affinityGapMultiplier?: number;
   } = {},
 ): OpenBurstResult {
   const touches: EpisodeTouch[] = [];
   const railSealEventIndexes: number[] = [];
+  const annotated: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
+  const pivots = [...(options.pivots ?? [])];
   for (const call of iterToolCalls(messages, 0)) {
     if (isTaskRailLifecycleBoundary(call)) railSealEventIndexes.push(call.eventIndex);
     const touched = extractTouchPaths(call.input, options.canon);
@@ -1209,11 +1267,19 @@ export function computeOpenBurst(
     for (const p of touched) {
       touches.push({ eventIndex: call.eventIndex, path: p, kind, ...(ts !== undefined ? { ts } : {}) });
     }
+    const voice = mineVoice(call);
+    if (voice) {
+      annotated.push({ eventIndex: call.eventIndex, annotation: voice });
+      if (voice.kind === 'star:pivot') pivots.push({ eventIndex: call.eventIndex });
+    }
   }
 
-  const bursts = groupTouchesIntoEpisodes(touches, {
-    pivots: options.pivots ?? [],
-    ...(railSealEventIndexes.length > 0 ? { railSealEventIndexes } : {}),
+  const bursts = groupCaptureBursts(messages, touches, annotated, pivots, railSealEventIndexes, {
+    syntheticContext: options.syntheticContext ?? {},
+    valueFidelity: options.valueFidelity,
+    affinityFloor: options.affinityFloor,
+    affinityGapThreshold: options.affinityGapThreshold,
+    affinityGapMultiplier: options.affinityGapMultiplier,
   });
   if (bursts.length === 0) return { openBurstStartIndex: null, heldPaths: [], burstCount: 0 };
 
@@ -1221,14 +1287,7 @@ export function computeOpenBurst(
   //    `trailingSettled` block above). The guard never force-seals the trailing
   //    burst (no sealTrailing), so this is purely: has work moved on past it?
   const lastBurst = bursts[bursts.length - 1];
-  const trailingEventGap = messages.length - lastBurst.endEventIndex;
-  const trailingMsGap = (options.nowIso !== undefined && lastBurst.endedAt !== undefined)
-    ? Date.parse(options.nowIso) - Date.parse(lastBurst.endedAt)
-    : Number.NaN;
-  const trailingRailSeal = railSealEventIndexes.some((idx) => idx > lastBurst.endEventIndex && idx < messages.length);
-  const trailingSettled = trailingRailSeal
-    || trailingEventGap > DEFAULT_EPISODE_GROUPING.gapEvents
-    || (Number.isFinite(trailingMsGap) && trailingMsGap > DEFAULT_EPISODE_GROUPING.gapMs);
+  const trailingSettled = trailingBurstSettled(messages, bursts, railSealEventIndexes, options.nowIso);
   if (trailingSettled) return { openBurstStartIndex: null, heldPaths: [], burstCount: bursts.length };
 
   return {

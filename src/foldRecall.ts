@@ -341,24 +341,29 @@ warnFoldGeometryViolations(
  *   WARP_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
  *   WARP_FOLD_RECALL_EPISODES=0|false|off|no → disable episodic voice (default ON)
  *   WARP_FOLD_RECALL_ATLAS_META=0|false|off|no → disable Atlas identity meta (default ON)
+ * Every WARP_* key also accepts the legacy VOXXO_* spelling. When both are
+ * present, WARP_* wins (including an explicitly empty value).
  */
 export function resolveFoldRecallConfig(
   env: Record<string, string | undefined> = process.env,
 ): FoldRecallConfig {
-  const raw = (env.WARP_FOLD_RECALL ?? '').trim().toLowerCase();
+  const readEnv = (suffix: string): string | undefined =>
+    env[`WARP_FOLD_RECALL${suffix}`] ?? env[`VOXXO_FOLD_RECALL${suffix}`];
+  const normalizedEnv = (suffix: string): string => (readEnv(suffix) ?? '').trim().toLowerCase();
+  const raw = normalizedEnv('');
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
-  const termRaw = (env.WARP_FOLD_RECALL_TERMS ?? '').trim().toLowerCase();
-  const verbatimRaw = (env.WARP_FOLD_RECALL_VERBATIM ?? '').trim().toLowerCase();
-  const highlightsRaw = (env.WARP_FOLD_RECALL_HIGHLIGHTS ?? '').trim().toLowerCase();
-  const hazardsRaw = (env.WARP_FOLD_RECALL_HAZARDS ?? '').trim().toLowerCase();
-  const episodesRaw = (env.WARP_FOLD_RECALL_EPISODES ?? '').trim().toLowerCase();
-  const atlasMetaRaw = (env.WARP_FOLD_RECALL_ATLAS_META ?? '').trim().toLowerCase();
+  const termRaw = normalizedEnv('_TERMS');
+  const verbatimRaw = normalizedEnv('_VERBATIM');
+  const highlightsRaw = normalizedEnv('_HIGHLIGHTS');
+  const hazardsRaw = normalizedEnv('_HAZARDS');
+  const episodesRaw = normalizedEnv('_EPISODES');
+  const atlasMetaRaw = normalizedEnv('_ATLAS_META');
   const config: FoldRecallConfig = {
     enabled,
-    maxCards: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARDS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
-    maxTotalChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_TOTAL_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
-    maxCardChars: parsePositiveInt(env.WARP_FOLD_RECALL_MAX_CARD_CHARS) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCardChars,
-    ttlPasses: parsePositiveInt(env.WARP_FOLD_RECALL_TTL_PASSES) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
+    maxCards: parsePositiveInt(readEnv('_MAX_CARDS')) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCards,
+    maxTotalChars: parsePositiveInt(readEnv('_MAX_TOTAL_CHARS')) ?? DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
+    maxCardChars: parsePositiveInt(readEnv('_MAX_CARD_CHARS')) ?? DEFAULT_FOLD_RECALL_CONFIG.maxCardChars,
+    ttlPasses: parsePositiveInt(readEnv('_TTL_PASSES')) ?? DEFAULT_FOLD_RECALL_CONFIG.ttlPasses,
     // Tier-2 term recall passed rail-c63e326e A/B: default ON; only explicit
     // disable values turn it off. Same default-on idiom as verbatim recall.
     termRecallEnabled:
@@ -426,6 +431,25 @@ function tokenizeShell(cmd: string): string[] {
   return tokens;
 }
 
+/** Raw path spellings accepted by the bounded bash-token parser. */
+export function extractPathSpellingsFromBashCommand(command: string): string[] {
+  const tokens = tokenizeShell(command);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of tokens) {
+    if (result.length >= 4) break;
+    const token = raw.replace(/[;:,)"']+$/, '');
+    if (!token || !token.includes('/') || token.includes('://') || token.startsWith('-')) continue;
+    if (/[<>]/.test(token) || token.length > 256) continue;
+    if (token === '/dev' || token.startsWith('/dev/')) continue;
+    if (!seen.has(token)) {
+      seen.add(token);
+      result.push(token);
+    }
+  }
+  return result;
+}
+
 /**
  * Extract file paths from a bash command string.
  *
@@ -437,26 +461,31 @@ function tokenizeShell(cmd: string): string[] {
  * normalizeToolPath — identical to structured-tool path normalization.
  */
 export function extractPathsFromBashCommand(command: string): string[] {
-  const tokens = tokenizeShell(command);
   const seen = new Set<string>();
   const result: string[] = [];
-  for (const raw of tokens) {
-    if (result.length >= 4) break;
-    const token = raw.replace(/[;:,)"']+$/, '');
-    if (!token) continue;
-    if (!token.includes('/')) continue;
-    if (token.includes('://')) continue;
-    if (token.startsWith('-')) continue;
-    if (/[<>]/.test(token)) continue;
-    if (token.length > 256) continue;
-    const normalized = normalizeToolPath(token);
-    if (normalized === '/dev' || normalized.startsWith('/dev/')) continue;
+  for (const spelling of extractPathSpellingsFromBashCommand(command)) {
+    const normalized = normalizeToolPath(spelling);
     if (normalized && !seen.has(normalized)) {
       seen.add(normalized);
       result.push(normalized);
     }
   }
   return result;
+}
+
+function sourceAbsolutePathsFromInput(input: Record<string, unknown>): string[] {
+  const source = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value !== 'string') return;
+    const path = value.trim();
+    if (path.startsWith('/')) source.add(path);
+  };
+  add(input.file_path ?? input.path ?? input.filePath ?? input.file);
+  if (Array.isArray(input.paths)) for (const path of input.paths) add(path);
+  if (typeof input.command === 'string') {
+    for (const path of extractPathSpellingsFromBashCommand(input.command)) add(path);
+  }
+  return [...source];
 }
 
 /** Collect normalized bash-command paths from tool_use blocks in a turn's messages. */
@@ -488,6 +517,32 @@ function extractBashPathsFromMessages(messages: readonly FoldMessage[]): string[
     }
   }
   return Array.from(paths);
+}
+
+function extractSourcePathsFromMessages(messages: readonly FoldMessage[]): string[] {
+  const paths = new Set<string>();
+  const addInput = (input: unknown): void => {
+    if (!input || typeof input !== 'object') return;
+    for (const path of sourceAbsolutePathsFromInput(input as Record<string, unknown>)) paths.add(path);
+  };
+  for (const msg of messages) {
+    if (msg.role !== 'assistant' && msg.role !== 'model') continue;
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content as any[]) if (block?.type === 'tool_use') addInput(block.input);
+    }
+    if (Array.isArray((msg as any).tool_calls)) {
+      for (const tc of (msg as any).tool_calls as any[]) {
+        let args: Record<string, unknown> = {};
+        try { args = JSON.parse(tc?.function?.arguments ?? '{}'); } catch { /* skip */ }
+        addInput(args);
+      }
+    }
+    if (Array.isArray((msg as any).parts)) {
+      for (const part of (msg as any).parts as any[]) addInput(part?.functionCall?.args);
+    }
+  }
+  for (const path of extractCompactToolTraceSourcePaths(messages)) paths.add(path);
+  return [...paths].sort();
 }
 
 function unescapeJsonStringFragment(value: string): string {
@@ -536,6 +591,35 @@ function extractCompactToolTracePaths(messages: readonly FoldMessage[]): string[
   return Array.from(paths).sort();
 }
 
+function extractCompactToolTraceSourcePaths(messages: readonly FoldMessage[]): string[] {
+  const paths = new Set<string>();
+  const scan = (text: string): void => {
+    COMPACT_TOOL_TRACE_RE.lastIndex = 0;
+    let trace: RegExpExecArray | null;
+    while ((trace = COMPACT_TOOL_TRACE_RE.exec(text)) !== null) {
+      const payload = trace[1];
+      if (!payload) continue;
+      COMPACT_TRACE_PATH_RE.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = COMPACT_TRACE_PATH_RE.exec(payload)) !== null) {
+        const rawPath = unescapeJsonStringFragment(match[2]);
+        if (rawPath.startsWith('/')) paths.add(rawPath);
+      }
+    }
+  };
+  for (const msg of messages) {
+    if (msg.role !== 'assistant' && msg.role !== 'model') continue;
+    if (typeof msg.content === 'string') scan(msg.content);
+    else if (Array.isArray(msg.content)) {
+      for (const block of msg.content as Array<{ type?: string; text?: unknown } | string>) {
+        if (typeof block === 'string') scan(block);
+        else if (block?.type === 'text' && typeof block.text === 'string') scan(block.text);
+      }
+    }
+  }
+  return [...paths].sort();
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Index (page table)
 // ══════════════════════════════════════════════════════════════════════
@@ -553,6 +637,8 @@ export interface InterTurnIndexEntry {
   category: TurnCategory;
   /** Normalized tool-arg paths touched in this turn, sorted (trigger matching). */
   paths: string[];
+  /** Original repo-qualified absolute spellings retained beside legacy aliases. */
+  sourcePaths?: string[];
   /** Bounded lowercased turn text (reserved for deferred tier-2 term matching). */
   digest: string;
   /** Original turn size in chars (telemetry / card header). */
@@ -577,6 +663,8 @@ export interface IntraTurnIndexEntry {
   tool: string;
   /** Normalized path parsed from the fold marker ('' when the tool had none). */
   path: string;
+  /** Original repo-qualified target spelling recovered from the raw tool call. */
+  sourcePath?: string;
   /** Recency coordinate (raw message index of the folded result). */
   recency: number;
   /** Folded chars parsed from the marker (telemetry / card header). */
@@ -894,8 +982,9 @@ function buildEpisodeVoiceBlock(
 ): string {
   if (charBudget <= 0 || !config.episodesEnabled) return '';
   const path = item.matchedPath;
-  if (suppressPaths.has(path)) return '';
-  const voices = state.pathEpisodes?.get(path);
+  const alias = normalizeToolPath(path);
+  if (suppressPaths.has(path) || suppressPaths.has(alias)) return '';
+  const voices = state.pathEpisodes?.get(path) ?? state.pathEpisodes?.get(alias);
   if (!voices || voices.length === 0) return '';
 
   const parts: string[] = ['🗣 Your lineage:'];
@@ -941,6 +1030,30 @@ function buildToolResultPositions(rawHistory: readonly FoldMessage[]): Map<strin
     }
   }
   return positions;
+}
+
+function buildToolSourcePaths(rawHistory: readonly FoldMessage[]): Map<string, string> {
+  const paths = new Map<string, string>();
+  for (const msg of rawHistory) {
+    if (msg.role !== 'assistant' && msg.role !== 'model') continue;
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content as any[]) {
+        if (block?.type !== 'tool_use' || typeof block.id !== 'string') continue;
+        const source = sourceAbsolutePathsFromInput((block.input ?? {}) as Record<string, unknown>)[0];
+        if (source && !paths.has(block.id)) paths.set(block.id, source);
+      }
+    }
+    if (Array.isArray((msg as any).tool_calls)) {
+      for (const call of (msg as any).tool_calls as any[]) {
+        if (typeof call?.id !== 'string') continue;
+        let input: Record<string, unknown> = {};
+        try { input = JSON.parse(call.function?.arguments ?? '{}'); } catch { /* skip */ }
+        const source = sourceAbsolutePathsFromInput(input)[0];
+        if (source && !paths.has(call.id)) paths.set(call.id, source);
+      }
+    }
+  }
+  return paths;
 }
 
 /**
@@ -1027,6 +1140,7 @@ export function buildFoldIndex(
       const bashPaths = extractBashPathsFromMessages(turn.messages);
       const compactTracePaths = extractCompactToolTracePaths(turn.messages);
       const paths = Array.from(new Set([...structuredPaths, ...bashPaths, ...compactTracePaths])).sort();
+      const sourcePaths = extractSourcePathsFromMessages(turn.messages);
       const verbatimTokens = nominateVerbatim(extractTurnVerbatimText(turn.messages, syntheticContext)).sort();
       entries.push({
         kind: 'turn',
@@ -1036,6 +1150,7 @@ export function buildFoldIndex(
         recency: turn.startIndex,
         category: classifyTurn(turn.messages),
         paths,
+        ...(sourcePaths.length > 0 ? { sourcePaths } : {}),
         digest: buildTurnDigest(turn.messages, syntheticContext),
         chars: countChars(turn.messages),
         ...(verbatimTokens.length > 0 ? { verbatimTokens } : {}),
@@ -1045,6 +1160,7 @@ export function buildFoldIndex(
 
   // ── Intra-turn entries: scan the view for fold markers, anchor to raw by tool id ──
   const rawPositions = buildToolResultPositions(rawHistory);
+  const toolSourcePaths = buildToolSourcePaths(rawHistory);
   for (const msg of foldedView) {
     if (msg.role === 'user' && Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
@@ -1062,6 +1178,7 @@ export function buildFoldIndex(
           toolId: block.tool_use_id,
           tool: marker.tool,
           path: marker.path,
+          ...(toolSourcePaths.get(block.tool_use_id) ? { sourcePath: toolSourcePaths.get(block.tool_use_id) } : {}),
           recency: rawIndex,
           chars: marker.chars,
         });
@@ -1081,6 +1198,7 @@ export function buildFoldIndex(
         toolId,
         tool: marker.tool,
         path: marker.path,
+        ...(toolSourcePaths.get(toolId) ? { sourcePath: toolSourcePaths.get(toolId) } : {}),
         recency: rawIndex,
         chars: marker.chars,
       });
@@ -1300,8 +1418,12 @@ export function createFoldRecallState(): FoldRecallState {
 export interface RecallSignals {
   /** Normalized paths touched by the just-executed tool call, sorted. */
   touchedPaths: string[];
+  /** Original absolute touch spellings, sorted; hosts use these for repo identity. */
+  sourceTouchedPaths?: string[];
   /** Normalized currently-claimed paths, sorted. */
   claimedPaths: string[];
+  /** Original absolute claim spellings, sorted; matching prefers these over aliases. */
+  sourceClaimedPaths?: string[];
   /** Active-window distinctive terms for tier-2 matching. Empty/omitted unless supplied by caller. */
   terms?: string[];
   /** Exact verbatim identifiers seen in the active window, sorted. Drives the verbatim-token tier; omitted unless supplied. */
@@ -1314,6 +1436,33 @@ export interface RecallSignals {
    * folded card BODY still pages in, and tier matching is unaffected.
   */
   atlasReadPaths?: string[];
+}
+
+/**
+ * Repo-aware touch spellings for hosts that canonicalize episodic storage.
+ * Absolute originals replace only their own stripped compatibility alias;
+ * unrelated relative inputs remain present.
+ */
+function sourceAwareRecallPaths(source: readonly string[], aliases: readonly string[]): string[] {
+  if (source.length === 0) return [...aliases];
+  const shadowedAliases = new Set(source.map((path) => normalizeToolPath(path)));
+  return [...new Set([
+    ...source,
+    ...aliases.filter((path) => !shadowedAliases.has(path)),
+  ])].sort();
+}
+
+export function recallSignalTouchPaths(signals: RecallSignals): string[] {
+  return sourceAwareRecallPaths(signals.sourceTouchedPaths ?? [], signals.touchedPaths);
+}
+
+function indexContainsAnySourcePath(
+  index: FoldRecallIndex,
+  sourcePaths: readonly string[],
+): boolean {
+  if (sourcePaths.length === 0) return false;
+  const wanted = new Set(sourcePaths);
+  return index.entries.some((entry) => foldIndexEntryPaths(entry).some((path) => wanted.has(path)));
 }
 
 /**
@@ -1425,7 +1574,9 @@ export function extractRecallSignals(
   activeText: string | readonly string[] = '',
 ): RecallSignals {
   const touched = new Set<string>();
+  const sourceTouched = new Set<string>();
   if (toolInput) {
+    for (const path of sourceAbsolutePathsFromInput(toolInput)) sourceTouched.add(path);
     const primary = extractPath(toolInput);
     if (primary) touched.add(primary);
     const multi = (toolInput as { paths?: unknown }).paths;
@@ -1440,12 +1591,18 @@ export function extractRecallSignals(
     }
   }
   const claimed = new Set<string>();
-  for (const p of claimedPaths) claimed.add(normalizeToolPath(p));
+  const sourceClaimed = new Set<string>();
+  for (const p of claimedPaths) {
+    claimed.add(normalizeToolPath(p));
+    if (p.startsWith('/')) sourceClaimed.add(p);
+  }
   const termText = typeof activeText === 'string' ? activeText : activeText.join('\n');
   const terms = extractDistinctiveTerms(termText);
   return {
     touchedPaths: Array.from(touched).sort(),
+    ...(sourceTouched.size > 0 ? { sourceTouchedPaths: Array.from(sourceTouched).sort() } : {}),
     claimedPaths: Array.from(claimed).sort(),
+    ...(sourceClaimed.size > 0 ? { sourceClaimedPaths: Array.from(sourceClaimed).sort() } : {}),
     ...(terms.length > 0 ? { terms } : {}),
   };
 }
@@ -1540,9 +1697,19 @@ function pressureBudget(level: ContextUtilizationLevel, config: FoldRecallConfig
   }
 }
 
-function entryPaths(entry: FoldIndexEntry): readonly string[] {
-  return entry.kind === 'turn' ? entry.paths : entry.path ? [entry.path] : [];
+export function foldIndexEntryPaths(entry: FoldIndexEntry): readonly string[] {
+  const aliases = entry.kind === 'turn' ? entry.paths : entry.path ? [entry.path] : [];
+  const source = entry.kind === 'turn'
+    ? (entry.sourcePaths ?? [])
+    : entry.sourcePath ? [entry.sourcePath] : [];
+  if (source.length === 0) return aliases;
+  // Keep compatibility aliases first for stable card rendering. Matching still
+  // uses the absolute source signal (its stripped alias is shadowed upstream),
+  // so this ordering cannot reintroduce cross-repo collisions.
+  return [...new Set([...aliases, ...source])];
 }
+
+const entryPaths = foldIndexEntryPaths;
 
 function isSyntheticRecallKey(matchedPath: string): boolean {
   return matchedPath.startsWith('verbatim:') || matchedPath.startsWith('term:');
@@ -1731,6 +1898,14 @@ export function planRecall(
   const suppressedResidencies: RecallSuppressedResidency[] = [];
   const queryTerms = config.termRecallEnabled ? (signals.terms ?? []) : [];
   const queryTokens = config.verbatimRecallEnabled ? (signals.verbatimTokens ?? []) : [];
+  const sourceTouches = signals.sourceTouchedPaths ?? [];
+  const sourceClaims = signals.sourceClaimedPaths ?? [];
+  const touchSignals = sourceTouches.length > 0 && !indexContainsAnySourcePath(index, sourceTouches)
+    ? [...new Set([...sourceTouches, ...signals.touchedPaths])].sort()
+    : recallSignalTouchPaths(signals);
+  const claimSignals = sourceClaims.length > 0 && !indexContainsAnySourcePath(index, sourceClaims)
+    ? [...new Set([...sourceClaims, ...signals.claimedPaths])].sort()
+    : sourceAwareRecallPaths(sourceClaims, signals.claimedPaths);
   // Memoize per-turn distinctive-term extraction for this pass: idfForTurnDigests
   // and the tier-2 match loop below would otherwise tokenize each turn digest
   // twice. Pure cache keyed by entry.id — identical content per entry, so plan
@@ -1750,7 +1925,8 @@ export function planRecall(
   let suppressed = 0;
 
   for (const entry of index.entries) {
-    const paths = entryPaths(entry);
+    const paths = foldIndexEntryPaths(entry);
+    const matchPaths = [...paths].sort();
     // Exact verbatim-token re-surface: a single kept hash/id matching the active
     // window pages this turn in. Stronger than fuzzy term overlap (evaluated
     // first within tier 2), but path-touch/claim still outrank.
@@ -1764,17 +1940,17 @@ export function planRecall(
     let matchedPath: string | null = null;
     let trigger: string | null = null;
     let relevanceScore = 0;
-    const touch = firstIntersection(paths, signals.touchedPaths);
+    const touch = firstIntersection(matchPaths, touchSignals);
     if (touch !== null) {
       tier = 0;
       matchedPath = touch;
-      trigger = `path-touch ${matchedPath}`;
+      trigger = `path-touch ${normalizeToolPath(matchedPath)}`;
     } else {
-      const claim = firstIntersection(paths, signals.claimedPaths);
+      const claim = firstIntersection(matchPaths, claimSignals);
       if (claim !== null) {
         tier = 1;
         matchedPath = claim;
-        trigger = `claim ${matchedPath}`;
+        trigger = `claim ${normalizeToolPath(matchedPath)}`;
       } else if (tokenHit !== null) {
         tier = 2;
         matchedPath = `verbatim:${tokenHit}`;
@@ -2297,7 +2473,8 @@ function buildAtlasMetaBlock(
 ): string {
   if (!config.atlasMetaEnabled) return '';
   if (charBudget <= 0) return '';
-  const meta = state.pathAtlasMeta?.get(item.matchedPath);
+  const meta = state.pathAtlasMeta?.get(item.matchedPath)
+    ?? state.pathAtlasMeta?.get(normalizeToolPath(item.matchedPath));
   if (!meta) return '';
 
   const parts: string[] = [];
@@ -2489,7 +2666,13 @@ function resolveItemSourceDeltaMap(item: RecallPlanItem, state: FoldRecallState)
   const map = new Map<string, RecallSourceDelta>();
   for (const key of recallZonePaths(item, state).slice(0, ZONE_ENRICHMENT_MAX_PATHS)) {
     const delta = state.pathSourceDeltas.get(key);
-    if (delta && !map.has(delta.path)) map.set(delta.path, delta);
+    if (!delta) continue;
+    if (!map.has(delta.path)) map.set(delta.path, delta);
+    // renderEntryBody addresses historical tool results by their compatibility
+    // alias. Alias the already-selected source-qualified delta within this one
+    // item only; anchor ordering ensures a same-named foreign path cannot win.
+    const alias = normalizeToolPath(delta.path);
+    if (!map.has(alias)) map.set(alias, delta);
   }
   return map;
 }
@@ -2588,7 +2771,9 @@ function renderRecallProvenance(
     },
   });
   if (!rendered) return '';
-  const paths = entryPaths(item.entry).slice(0, 3);
+  const paths = (item.entry.kind === 'turn'
+    ? item.entry.paths
+    : item.entry.path ? [item.entry.path] : []).slice(0, 3);
   const tools = recallEpisodeToolLabels(rawHistory.slice(sourceStart, sourceEnd));
   const sourceBits = [
     tools.length > 0 ? tools.join(' → ') : '',
@@ -2827,6 +3012,12 @@ function takeSuppressedRecallManifest(
   return '';
 }
 
+function fitSuppressedRecallManifest(manifest: string, maxChars: number): string {
+  if (!manifest || maxChars < 80) return '';
+  if (manifest.length <= maxChars) return manifest;
+  return `${charSafeSlice(manifest, 0, maxChars - 1)}…`;
+}
+
 function rawTailProviderPovText(
   index: FoldRecallIndex,
   rawHistory: readonly FoldMessage[],
@@ -2919,8 +3110,10 @@ export function buildFoldRecallContext(
     if (residency.refreshEntry) refreshResidency(state.resident, residency.entryId, refreshedExpiresAtPass);
     if (residency.refreshPath) refreshResidency(state.residentPaths, residency.matchedPath, refreshedExpiresAtPass);
   }
+  const budget = pressureBudget(utilization, config);
   if (plan.items.length === 0) {
-    const suppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
+    const rawSuppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
+    const suppressedManifest = fitSuppressedRecallManifest(rawSuppressedManifest, budget.charBudget);
     state.suppressed += suppressed;
     state.recallChars += suppressedManifest.length;
     return {
@@ -2932,7 +3125,6 @@ export function buildFoldRecallContext(
     };
   }
 
-  const budget = pressureBudget(utilization, config);
   const providerPovText = foldRecallProviderPovText(state.index, rawHistory);
   const rawTailPovText = rawTailProviderPovText(state.index, rawHistory);
   const blocks: string[] = [];
@@ -2948,7 +3140,8 @@ export function buildFoldRecallContext(
   const radarSuppressPaths = new Set(signals.atlasReadPaths ?? []);
 
   for (const item of plan.items) {
-    const remaining = budget.charBudget - charsUsed;
+    const separatorChars = blocks.length > 0 ? 2 : 0;
+    const remaining = budget.charBudget - charsUsed - separatorChars;
     if (remaining <= 0) break;
 
     let level: 'card' | 'hint' = item.render;
@@ -3071,7 +3264,7 @@ export function buildFoldRecallContext(
       // Lifetime repeat counter (rail-c63e326e s6) — never expires/clears, unlike residency.
       state.pathCardShowCounts.set(item.matchedPath, (state.pathCardShowCounts.get(item.matchedPath) ?? 0) + 1);
     }
-    charsUsed += rendered.length;
+    charsUsed += separatorChars + rendered.length;
     if (level === 'card') cards++;
     else hints++;
     if (level === 'card' && cardStats !== null) {
@@ -3093,20 +3286,26 @@ export function buildFoldRecallContext(
   }
   state.cardsInjected += cards;
   state.hintsInjected += hints;
-  const suppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
+  const rawSuppressedManifest = takeSuppressedRecallManifest(state, suppressed, [...suppressedCoordinates.values()]);
+  const manifestSeparatorChars = blocks.length > 0 ? 2 : 0;
+  const suppressedManifest = fitSuppressedRecallManifest(
+    rawSuppressedManifest,
+    budget.charBudget - charsUsed - manifestSeparatorChars,
+  );
   if (suppressedManifest) {
     blocks.push(suppressedManifest);
-    charsUsed += suppressedManifest.length;
+    charsUsed += manifestSeparatorChars + suppressedManifest.length;
   }
   state.recallChars += charsUsed;
   state.suppressed += suppressed;
 
   if (blocks.length === 0) return { ...EMPTY_OUTCOME, suppressed };
+  const text = blocks.join('\n\n');
   return {
-    text: blocks.join('\n\n'),
+    text,
     cards,
     hints,
-    chars: charsUsed,
+    chars: text.length,
     suppressed,
     ...(suppressedManifest ? { suppressedManifest } : {}),
     triggers,

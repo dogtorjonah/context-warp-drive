@@ -23,6 +23,7 @@ export { flatCoordinateClosetEnabled };
 import { classifyMessageGlyph } from './foldEpisodes.ts';
 import { DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS } from './contextBudget.ts';
 import { renderContinuityPackageProvenance } from './chronologicalProvenance.ts';
+import { foldArtifactOnlyEnabled } from './foldReceipts.ts';
 import {
   buildContinuityReceipt,
   continuityReceiptFromProse,
@@ -1595,6 +1596,33 @@ function literalIsBoundaryAlignedSubToken(inner: string, outer: string): boolean
  * cannot split them; each row keeps the original source identity/time and the
  * router reason. Pointer substitutions retain the chosen stable artifact id.
  */
+/**
+ * Artifact mode (VOXXO_FOLD_ARTIFACT_ONLY): maximum ⌖ placement rows prepended
+ * to any one artifact section. Rows beyond the cap collapse into a single
+ * elision note — the full coordinate set stays recoverable via
+ * tap_instance_messages and fold recall.
+ */
+export const RAW_ARTIFACT_MODE_ANCHOR_CAP = 25;
+
+/**
+ * Artifact-mode anchor worthiness: a ⌖ placement row earns its bytes only when
+ * the literal is dereferenceable by the successor. Kept: file paths, verbatim
+ * recall keys, spool artifact ids, rail ids, UUIDs. Dropped: bare sha256
+ * digests (they already live inside their spool digest blocks on disk),
+ * timestamps, generic words, member-list fragments, and other prose literals
+ * with no retrieval value.
+ */
+export function rawAnchorWorthyForArtifactMode(literal: string): boolean {
+  const t = literal.trim();
+  if (!t) return false;
+  if (t.includes('/')) return true;
+  if (t.startsWith('verbatim:')) return true;
+  if (/^spool:/i.test(t) || /-spool\b/i.test(t)) return true;
+  if (/^rail-[0-9a-f]{6,}/i.test(t)) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t)) return true;
+  return false;
+}
+
 export function placeRawTraceCoordinatesInline(
   coordinates: readonly RawTraceCoordinate[],
   artifacts: readonly RawTraceCoordinateArtifact[],
@@ -1603,7 +1631,9 @@ export function placeRawTraceCoordinatesInline(
   const mutable = artifacts.map((artifact) => ({ ...artifact }));
   const byId = new Map(mutable.map((artifact) => [artifact.id, artifact]));
   const rowsByArtifact = new Map<string, string[]>();
+  const elidedByArtifact = new Map<string, number>();
   const keptInHomeByLiteral = new Map<string, boolean>();
+  const artifactOnly = foldArtifactOnlyEnabled();
 
   // Rewrite longest literals first so a shorter coordinate never pointerizes the
   // boundary-aligned prefix of a longer one before that longer literal has been
@@ -1645,8 +1675,16 @@ export function placeRawTraceCoordinatesInline(
         false,
       ).text;
     }
+    if (artifactOnly && !rawAnchorWorthyForArtifactMode(placement.coordinate.literal)) {
+      elidedByArtifact.set(placement.artifactId, (elidedByArtifact.get(placement.artifactId) ?? 0) + 1);
+      continue;
+    }
     const sourceTime = placement.coordinate.sourceTimestamp ?? 'unknown';
     const rows = rowsByArtifact.get(placement.artifactId) ?? [];
+    if (artifactOnly && rows.length >= RAW_ARTIFACT_MODE_ANCHOR_CAP) {
+      elidedByArtifact.set(placement.artifactId, (elidedByArtifact.get(placement.artifactId) ?? 0) + 1);
+      continue;
+    }
     rows.push(
       `⌖ ${labelled} @ ${rawTraceCoordinateOrigin(placement.coordinate)}; source-time=${sourceTime}; route=${placement.reason}`,
     );
@@ -1656,7 +1694,24 @@ export function placeRawTraceCoordinatesInline(
   for (const [artifactId, rows] of rowsByArtifact) {
     const artifact = byId.get(artifactId);
     if (!artifact) continue;
-    artifact.text = [...rows, artifact.text].filter(Boolean).join('\n');
+    const elided = elidedByArtifact.get(artifactId) ?? 0;
+    const elisionNote = elided > 0
+      ? [`⌖ …${elided} more anchor(s) elided (artifact mode) — recover via tap_instance_messages or fold recall`]
+      : [];
+    artifact.text = [...rows, ...elisionNote, artifact.text].filter(Boolean).join('\n');
+  }
+  // Artifacts whose every placement was elided never entered rowsByArtifact —
+  // they still get the elision note so the drop is visible, not silent.
+  if (artifactOnly) {
+    for (const [artifactId, elided] of elidedByArtifact) {
+      if (rowsByArtifact.has(artifactId)) continue;
+      const artifact = byId.get(artifactId);
+      if (!artifact) continue;
+      artifact.text = [
+        `⌖ …${elided} anchor(s) elided (artifact mode) — recover via tap_instance_messages or fold recall`,
+        artifact.text,
+      ].filter(Boolean).join('\n');
+    }
   }
   return { artifacts: mutable, placements };
 }

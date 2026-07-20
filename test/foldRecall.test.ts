@@ -1644,6 +1644,29 @@ describe('buildFoldRecallContext', () => {
     expect(out.hints).toBe(1);
     expect(out.text!).toContain(RECALL_CARD_PREFIX);
     expect(out.text!).toContain(RECALL_HINT_PREFIX);
+    expect(out.chars).toBe(out.text!.length);
+    expect(out.chars).toBeLessThanOrEqual(config.maxTotalChars);
+  });
+
+  test('hard total-char budget includes suppressed manifests and block separators', () => {
+    const raw = buildAnthropicHistory();
+    for (const maxTotalChars of [1, 80, 120, 800]) {
+      const state = freshState(raw);
+      expect(buildFoldRecallContext(
+        state,
+        raw,
+        touchBigfile(),
+        'healthy',
+        DEFAULT_FOLD_RECALL_CONFIG,
+      ).cards).toBe(1);
+
+      const out = buildFoldRecallContext(state, raw, touchBigfile(), 'healthy', {
+        ...DEFAULT_FOLD_RECALL_CONFIG,
+        maxTotalChars,
+      });
+      expect(out.chars).toBe(out.text?.length ?? 0);
+      expect(out.chars).toBeLessThanOrEqual(maxTotalChars);
+    }
   });
 
   test('intra-turn entry recalls the ORIGINAL pre-fold tool result body by tool id', () => {
@@ -1694,17 +1717,17 @@ describe('buildFoldRecallContext', () => {
 
     const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(first.cards).toBe(1);
-    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(1);
+    expect(state.pathCardShowCounts.get(ABS(BIGFILE))).toBe(1);
 
     // ttlPasses: 1 expires residency every pass, so the same path re-cards.
     const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(second.cards).toBe(1);
-    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(2);
+    expect(state.pathCardShowCounts.get(ABS(BIGFILE))).toBe(2);
     expect(second.chars).toBeLessThan(first.chars);
 
     const third = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(third.cards).toBe(1);
-    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(3);
+    expect(state.pathCardShowCounts.get(ABS(BIGFILE))).toBe(3);
     expect(third.chars).toBeLessThan(second.chars);
   });
 
@@ -1738,21 +1761,21 @@ describe('buildFoldRecallContext', () => {
     const first = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     const second = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(second.chars).toBeLessThan(first.chars);
-    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(2);
+    expect(state.pathCardShowCounts.get(ABS(BIGFILE))).toBe(2);
 
     // Relay signals a genuine live-source change since the prior pass — this
     // is the correctness guard: shrink must NOT apply to genuinely changed
     // content, even though priorShowCount is already 2. The change is a
     // genuine append (shared prefix) so it clears the context floor.
-    state.pathSourceDeltas.set(BIGFILE, {
-      path: BIGFILE,
+    state.pathSourceDeltas.set(ABS(BIGFILE), {
+      path: ABS(BIGFILE),
       liveHash: 'changed-hash',
       liveSource: `${BIGFILE_CONTENT}\nNEW TRAILING LINE ON DISK\nANOTHER NEW LINE ADDED SINCE THE FOLD`,
       stableSincePrior: false,
     });
     const third = buildFoldRecallContext(state, raw, signals, 'healthy', config);
     expect(third.cards).toBe(1);
-    expect(state.pathCardShowCounts.get(BIGFILE)).toBe(3);
+    expect(state.pathCardShowCounts.get(ABS(BIGFILE))).toBe(3);
     expect(third.text!).toContain('Δ Source changed since fold');
     // Full (unshrunk) body budget used again despite priorShowCount=2.
     expect(third.chars).toBeGreaterThan(second.chars);
@@ -1848,6 +1871,37 @@ describe('resolveFoldRecallConfig', () => {
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_VERBATIM: 'off' }).verbatimRecallEnabled).toBe(false);
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_VERBATIM: 'false' }).verbatimRecallEnabled).toBe(false);
     expect(resolveFoldRecallConfig({ WARP_FOLD_RECALL_VERBATIM: '1' }).verbatimRecallEnabled).toBe(true);
+  });
+
+  test('accepts legacy VOXXO aliases and gives WARP deterministic precedence', () => {
+    const legacy = resolveFoldRecallConfig({
+      VOXXO_FOLD_RECALL: '0',
+      VOXXO_FOLD_RECALL_MAX_CARDS: '7',
+      VOXXO_FOLD_RECALL_MAX_TOTAL_CHARS: '17000',
+      VOXXO_FOLD_RECALL_MAX_CARD_CHARS: '7000',
+      VOXXO_FOLD_RECALL_TTL_PASSES: '9',
+      VOXXO_FOLD_RECALL_TERMS: '0',
+      VOXXO_FOLD_RECALL_VERBATIM: '0',
+    });
+    expect(legacy.enabled).toBe(false);
+    expect(legacy.maxCards).toBe(7);
+    expect(legacy.maxTotalChars).toBe(17_000);
+    expect(legacy.maxCardChars).toBe(7_000);
+    expect(legacy.ttlPasses).toBe(9);
+    expect(legacy.termRecallEnabled).toBe(false);
+    expect(legacy.verbatimRecallEnabled).toBe(false);
+
+    const canonicalWins = resolveFoldRecallConfig({
+      WARP_FOLD_RECALL: '1',
+      VOXXO_FOLD_RECALL: '0',
+      WARP_FOLD_RECALL_MAX_CARDS: '4',
+      VOXXO_FOLD_RECALL_MAX_CARDS: '9',
+      WARP_FOLD_RECALL_TERMS: '1',
+      VOXXO_FOLD_RECALL_TERMS: '0',
+    });
+    expect(canonicalWins.enabled).toBe(true);
+    expect(canonicalWins.maxCards).toBe(4);
+    expect(canonicalWins.termRecallEnabled).toBe(true);
   });
 });
 

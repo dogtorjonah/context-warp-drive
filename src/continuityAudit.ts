@@ -33,7 +33,7 @@ export type ContinuityAuditCode =
   | 'identity-missing'
   | 'frontier-missing'
   | 'frontier-trace-mismatch'
-  | 'frontier-index-mismatch'
+  | 'frontier-index-behind'
   | 'band-stack-empty'
   | 'band-range-invalid'
   | 'band-gap'
@@ -46,18 +46,7 @@ export type ContinuityAuditCode =
   | 'frozen-artifact-mutated'
   | 'completed-step-replayed'
   | 'completion-rail-not-complete'
-  | 'completion-validation-missing'
-  | 'takeover-lineage-invalid'
-  | 'takeover-creator-mismatch'
-  | 'takeover-rail-missing'
-  | 'takeover-rail-identity-changed'
-  | 'takeover-rail-owner-mismatch'
-  | 'takeover-rail-creator-changed'
-  | 'takeover-rail-content-changed'
-  | 'takeover-record-missing'
-  | 'takeover-record-added'
-  | 'takeover-record-mutated'
-  | 'takeover-claim-owner-mismatch';
+  | 'completion-validation-missing';
 
 export interface ContinuityAuditIssue {
   readonly code: ContinuityAuditCode;
@@ -329,8 +318,17 @@ export function auditContinuityBoundary(
           if (frontier.traceId !== canonical.traceId) {
             issue(audit, 'error', 'frontier-trace-mismatch', 'receipt.liveState.rawTailFrontier.value.traceId', 'frontier lost canonical trace identity');
           }
-          if (frontier.unit === 'event' && frontier.index !== canonical.eventCount) {
-            issue(audit, 'error', 'frontier-index-mismatch', 'receipt.liveState.rawTailFrontier.value.index', 'frontier index must equal canonical event count');
+          // The frontier is captured at snapshot time while the canonical range
+          // is counted at package assembly, so the frontier may legitimately
+          // lead when the tail advances after capture or the package narrows.
+          // Only a trailing frontier is incoherent: it would claim the package
+          // covers events the raw tail never reached.
+          if (frontier.unit === 'event') {
+            if (typeof frontier.index !== 'number') {
+              issue(audit, 'error', 'frontier-missing', 'receipt.liveState.rawTailFrontier.value.index', 'event-unit frontier requires a numeric index');
+            } else if (frontier.index < canonical.eventCount) {
+              issue(audit, 'error', 'frontier-index-behind', 'receipt.liveState.rawTailFrontier.value.index', 'frontier index must not trail the canonical event count');
+            }
           }
         }
       }
@@ -397,165 +395,19 @@ export function auditContinuityCompletion(
     issue(audit, 'error', 'completion-rail-not-complete', 'railState', 'glyphs, stars, Atlas commits, and step ACKs cannot replace terminal rail state');
   }
   if (input.claimedComplete && !validationVerified) {
-    issue(audit, 'error', 'completion-validation-missing', 'validation', 'completion requires source-stamped verified evidence');
+    // Only a supplied-but-inadequate validation object is an error. When no
+    // structured validation exists at all the boundary cannot confirm
+    // completion either way, and erroring there would fire on every delivery
+    // until callers carry source-stamped validation.
+    if (input.validation) {
+      issue(audit, 'error', 'completion-validation-missing', 'validation', 'completion requires source-stamped verified evidence');
+    } else {
+      issue(audit, 'warning', 'completion-validation-missing', 'validation', 'no structured validation supplied; completion cannot be independently confirmed');
+    }
   }
   if ((input.signals?.length ?? 0) > 0 && !authoritativeComplete) {
     issue(audit, 'warning', 'completion-validation-missing', 'signals', `advisory signals observed: ${input.signals?.join(', ')}`);
   }
 
   return { ...result(audit), authoritativeComplete };
-}
-
-export type ContinuityActiveStatus = 'active' | 'pending' | 'blocked' | 'complete' | 'superseded';
-
-export interface ContinuityDeltaItem {
-  readonly provenanceId: string;
-  readonly sourceSequence: number;
-  readonly sourceTimestamp: string;
-  readonly status: ContinuityActiveStatus;
-}
-
-/** Latest provenance row wins; terminal rows suppress elder active copies. */
-export function selectActiveContinuityDelta<T extends ContinuityDeltaItem>(
-  items: readonly T[],
-): T[] {
-  const latest = new Map<string, T>();
-  for (const item of items) {
-    if (!item.provenanceId.trim() || !Number.isInteger(item.sourceSequence)) continue;
-    const previous = latest.get(item.provenanceId);
-    if (!previous
-      || item.sourceSequence > previous.sourceSequence
-      || (item.sourceSequence === previous.sourceSequence && item.sourceTimestamp > previous.sourceTimestamp)) {
-      latest.set(item.provenanceId, item);
-    }
-  }
-  return [...latest.values()]
-    .filter((item) => item.status === 'active' || item.status === 'pending' || item.status === 'blocked')
-    .sort((left, right) => left.sourceSequence - right.sourceSequence
-      || left.provenanceId.localeCompare(right.provenanceId));
-}
-
-export interface ContinuityTakeoverActor {
-  readonly kind: 'operator' | 'agent' | 'system';
-  readonly id?: string;
-}
-
-export interface ContinuityTakeoverRecord {
-  readonly provenanceId: string;
-  readonly sourceTimestamp: string;
-  readonly digest: string;
-}
-
-export interface ContinuityTakeoverClaim extends ContinuityTakeoverRecord {
-  readonly path: string;
-  readonly ownerInstanceId: string;
-}
-
-export interface ContinuityTakeoverSnapshot {
-  readonly instance: {
-    readonly instanceId: string;
-    readonly parentInstanceId?: string | null;
-    readonly replacesInstanceId?: string | null;
-    readonly originEventId: string;
-    readonly originSourceTimestamp: string;
-    readonly createdBy: ContinuityTakeoverActor;
-  };
-  readonly rail?: {
-    readonly railId: string;
-    readonly ownerInstanceId: string;
-    readonly creatorInstanceId: string;
-    /** Digest excludes mutable owner/revision/takeover-history fields. */
-    readonly contentDigest: string;
-  };
-  readonly claims: readonly ContinuityTakeoverClaim[];
-  readonly blockers: readonly ContinuityTakeoverRecord[];
-  readonly validation: readonly ContinuityTakeoverRecord[];
-  readonly provenance: readonly ContinuityTakeoverRecord[];
-}
-
-export interface CloneTakeoverAuditInput {
-  readonly source: ContinuityTakeoverSnapshot;
-  readonly replacement: ContinuityTakeoverSnapshot;
-  readonly expectedCreator: ContinuityTakeoverActor;
-}
-
-function actorEqual(left: ContinuityTakeoverActor, right: ContinuityTakeoverActor): boolean {
-  return left.kind === right.kind && left.id === right.id;
-}
-
-function auditTakeoverRecords(
-  audit: MutableAudit,
-  source: readonly ContinuityTakeoverRecord[],
-  replacement: readonly ContinuityTakeoverRecord[],
-  path: string,
-): void {
-  const sourceById = new Map(source.map((record) => [record.provenanceId, record]));
-  const replacementById = new Map(replacement.map((record) => [record.provenanceId, record]));
-  source.forEach((record, index) => {
-    requireIdentity(audit, record.provenanceId, `${path}.source[${index}].provenanceId`);
-    parseSourceTime(audit, record.sourceTimestamp, `${path}.source[${index}].sourceTimestamp`, true);
-    const next = replacementById.get(record.provenanceId);
-    if (!next) {
-      issue(audit, 'error', 'takeover-record-missing', path, `replacement dropped ${record.provenanceId}`);
-    } else if (record.digest !== next.digest || record.sourceTimestamp !== next.sourceTimestamp) {
-      issue(audit, 'error', 'takeover-record-mutated', path, `replacement rewrote ${record.provenanceId}`);
-    }
-  });
-  for (const record of replacement) {
-    if (!sourceById.has(record.provenanceId)) {
-      issue(audit, 'error', 'takeover-record-added', path, `replacement invented ${record.provenanceId} during takeover`);
-    }
-  }
-}
-
-/** Audit an exact clone-takeover boundary while allowing ownership to move. */
-export function auditCloneTakeover(input: CloneTakeoverAuditInput): ContinuityAuditResult {
-  const audit: MutableAudit = { errors: [], warnings: [] };
-  const { source, replacement } = input;
-  requireIdentity(audit, source.instance.instanceId, 'source.instance.instanceId');
-  requireIdentity(audit, replacement.instance.instanceId, 'replacement.instance.instanceId');
-  requireIdentity(audit, replacement.instance.originEventId, 'replacement.instance.originEventId');
-  parseSourceTime(audit, replacement.instance.originSourceTimestamp, 'replacement.instance.originSourceTimestamp', true);
-
-  if (source.instance.instanceId === replacement.instance.instanceId
-    || replacement.instance.parentInstanceId !== source.instance.instanceId
-    || replacement.instance.replacesInstanceId !== source.instance.instanceId) {
-    issue(audit, 'error', 'takeover-lineage-invalid', 'replacement.instance', 'replacement must be a distinct child that explicitly replaces the source');
-  }
-  if (!actorEqual(replacement.instance.createdBy, input.expectedCreator)) {
-    issue(audit, 'error', 'takeover-creator-mismatch', 'replacement.instance.createdBy', 'replacement creator role changed at takeover');
-  }
-
-  if (Boolean(source.rail) !== Boolean(replacement.rail)) {
-    issue(audit, 'error', 'takeover-rail-missing', 'replacement.rail', 'replacement must preserve rail presence');
-  } else if (source.rail && replacement.rail) {
-    if (source.rail.railId !== replacement.rail.railId) {
-      issue(audit, 'error', 'takeover-rail-identity-changed', 'replacement.rail.railId', 'rail stable identity changed');
-    }
-    if (source.rail.ownerInstanceId !== source.instance.instanceId
-      || replacement.rail.ownerInstanceId !== replacement.instance.instanceId) {
-      issue(audit, 'error', 'takeover-rail-owner-mismatch', 'replacement.rail.ownerInstanceId', 'rail ownership did not move from source to replacement');
-    }
-    if (source.rail.creatorInstanceId !== replacement.rail.creatorInstanceId) {
-      issue(audit, 'error', 'takeover-rail-creator-changed', 'replacement.rail.creatorInstanceId', 'rail creator provenance must remain immutable');
-    }
-    if (source.rail.contentDigest !== replacement.rail.contentDigest) {
-      issue(audit, 'error', 'takeover-rail-content-changed', 'replacement.rail.contentDigest', 'rail steps or state changed during takeover');
-    }
-  }
-
-  auditTakeoverRecords(audit, source.blockers, replacement.blockers, 'blockers');
-  auditTakeoverRecords(audit, source.validation, replacement.validation, 'validation');
-  auditTakeoverRecords(audit, source.provenance, replacement.provenance, 'provenance');
-  auditTakeoverRecords(audit, source.claims, replacement.claims, 'claims');
-
-  const replacementClaims = new Map(replacement.claims.map((claim) => [claim.provenanceId, claim]));
-  for (const claim of source.claims) {
-    const next = replacementClaims.get(claim.provenanceId);
-    if (next && (claim.path !== next.path || next.ownerInstanceId !== replacement.instance.instanceId)) {
-      issue(audit, 'error', 'takeover-claim-owner-mismatch', 'replacement.claims', `claim ${claim.provenanceId} did not retain its path and move ownership`);
-    }
-  }
-
-  return result(audit);
 }

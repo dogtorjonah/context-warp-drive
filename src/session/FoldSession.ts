@@ -49,6 +49,7 @@ import {
   type FoldFidelityValueInput,
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
+import { withArtifactModeConfig } from '../foldReceipts.ts';
 import { extractCognitiveArtifacts, renderCognitiveBlock, mergeBlockIntoViewTail } from '../cognitiveArtifacts.ts';
 import {
   appendDedicatedChronologicalMessage,
@@ -61,6 +62,7 @@ import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
   createFoldFreezeState,
   evaluateFoldFreeze,
+  consumeFoldFreezeEvaluationState,
   commitFoldFreeze,
   appendFoldFreezeTailEpoch,
   touchFoldFreeze,
@@ -668,10 +670,18 @@ export class FoldSession {
    * burst yields via computeOpenBurst returning null; growth is bounded by the
    * segmenter's maxBurst caps. floor <= base always, so this can only DEFER a fold.
    */
-  private guardedTurnsToFold(messages: FoldMessage[], pressureCeilingTriggered: boolean): number {
+  private guardedTurnsToFold(
+    messages: FoldMessage[],
+    pressureCeilingTriggered: boolean,
+    now: number,
+  ): number {
     const base = this.resolveTurnsToFold(messages);
     if (!this.readBurstGuardEnabled || pressureCeilingTriggered || base <= 0) return base;
-    const { openBurstStartIndex } = computeOpenBurst(messages);
+    const { openBurstStartIndex } = computeOpenBurst(messages, {
+      nowIso: new Date(now).toISOString(),
+      syntheticContext: this.syntheticContext,
+      valueFidelity: this.valueFidelityInput !== undefined,
+    });
     if (openBurstStartIndex === null) return base;
     const turns = detectTurns(messages, this.syntheticContext);
     let floor = 0;
@@ -780,7 +790,7 @@ export class FoldSession {
       !fidelity ||
       (fidelity.fullRetentionFraction === undefined && fidelity.essenceRetentionFraction === undefined)
     ) {
-      return this.foldConfig;
+      return this.withArtifactMode(this.foldConfig);
     }
     const base = this.foldConfig.assistantTextBudget ?? DEFAULT_ASSISTANT_TEXT_BUDGET;
     const fullRetentionChars =
@@ -791,7 +801,17 @@ export class FoldSession {
       fidelity.essenceRetentionFraction !== undefined
         ? Math.round(base.essenceRetentionChars * (fidelity.essenceRetentionFraction / DEFAULT_ESSENCE_RETENTION_FRACTION))
         : base.essenceRetentionChars;
-    return { ...this.foldConfig, assistantTextBudget: { fullRetentionChars, essenceRetentionChars } };
+    return this.withArtifactMode({ ...this.foldConfig, assistantTextBudget: { fullRetentionChars, essenceRetentionChars } });
+  }
+
+  /**
+   * Artifact-only fold mode (VOXXO_FOLD_ARTIFACT_ONLY). The env flag is read
+   * per fold — never cached on the session — so a relay-wide flip takes
+   * effect at the next fold render without restart or session rebuild.
+   * Flag off: the config passes through untouched (byte-identical folding).
+   */
+  private withArtifactMode(config: FoldConfig): FoldConfig {
+    return withArtifactModeConfig(config);
   }
 
   private effectiveAppendFoldConfig(): FoldConfig {
@@ -800,7 +820,7 @@ export class FoldSession {
       ? cold
       : { ...cold, foldBlockPreamble: this.foldConfig.foldBlockPreamble };
     const priorCoordinateCorpus = extractCoordinateConservationCorpus(this.freezeState.frozenView ?? []);
-    return priorCoordinateCorpus ? { ...base, priorCoordinateCorpus } : base;
+    return this.withArtifactMode(priorCoordinateCorpus ? { ...base, priorCoordinateCorpus } : base);
   }
 
   /**
@@ -812,7 +832,7 @@ export class FoldSession {
     return foldContext(
       messages,
       this.resolveTurnsToFold(messages, turnsToFold),
-      this.foldConfig,
+      this.withArtifactMode(this.foldConfig),
       undefined,
       undefined,
       undefined,
@@ -1081,7 +1101,7 @@ export class FoldSession {
       const foldConfig = this.effectiveFoldConfig(desiredFidelity);
       const result = foldContext(
         messages,
-        this.guardedTurnsToFold(messages, pressureCeilingTriggered),
+        this.guardedTurnsToFold(messages, pressureCeilingTriggered, now),
         foldConfig,
         this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
           allowVaultBackedCoverage: pressureCeilingTriggered,
@@ -1123,6 +1143,7 @@ export class FoldSession {
       measuredInputTokens: context.measuredInputTokens,
     };
     const decision = evaluateFoldFreeze(this.freezeState, messages, ctx, now, this.freezeConfig);
+    consumeFoldFreezeEvaluationState(this.freezeState);
 
     // Resolve any pending post-fold floor from THIS turn's measured reading before
     // the reuse/append branch, so a hot-reuse turn immediately after an append
@@ -1430,7 +1451,7 @@ export class FoldSession {
     const foldConfig = this.effectiveFoldConfig(desiredFidelity);
     const result = foldContext(
       messages,
-      this.guardedTurnsToFold(messages, pressureCeilingTriggered),
+      this.guardedTurnsToFold(messages, pressureCeilingTriggered, now),
       foldConfig,
       this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
         allowVaultBackedCoverage: pressureCeilingTriggered,

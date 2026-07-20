@@ -217,27 +217,27 @@ describe('classifyTurn', () => {
 
 describe('skeletonizeTool', () => {
   test('Read tool', () => {
-    const skeleton = skeletonizeTool({ name: 'Read', input: { file_path: '/home/user/my-monorepo/relay/src/auth.ts' }, resultText: 'source', toolId: 't1' });
+    const skeleton = skeletonizeTool({ name: 'Read', input: { file_path: '/home/user/my-monorepo/relay/src/auth.ts' }, resultText: 'source', toolId: 't1', messageIndex: 0 });
     expect(skeleton).toContain('📖');
     expect(skeleton).toContain('relay/src/auth.ts');
   });
 
   test('Grep tool', () => {
-    const skeleton = skeletonizeTool({ name: 'Grep', input: { pattern: 'authenticate' }, resultText: 'file1\nfile2\nfile3', toolId: 't2' });
+    const skeleton = skeletonizeTool({ name: 'Grep', input: { pattern: 'authenticate' }, resultText: 'file1\nfile2\nfile3', toolId: 't2', messageIndex: 0 });
     expect(skeleton).toContain('🔍');
     expect(skeleton).toContain('"authenticate"');
     expect(skeleton).toContain('3 hit(s)');
   });
 
   test('Bash tool', () => {
-    const skeleton = skeletonizeTool({ name: 'Bash', input: { command: 'npm run build' }, resultText: 'Build complete', toolId: 't3' });
+    const skeleton = skeletonizeTool({ name: 'Bash', input: { command: 'npm run build' }, resultText: 'Build complete', toolId: 't3', messageIndex: 0 });
     expect(skeleton).toContain('$');
     expect(skeleton).toContain('npm run build');
     expect(skeleton).toContain('ok');
   });
 
   test('Bash tool with error', () => {
-    const skeleton = skeletonizeTool({ name: 'Bash', input: { command: 'npm run build' }, resultText: 'Error: compilation failed', toolId: 't4' });
+    const skeleton = skeletonizeTool({ name: 'Bash', input: { command: 'npm run build' }, resultText: 'Error: compilation failed', toolId: 't4', messageIndex: 0 });
     expect(skeleton).toContain('err');
   });
 
@@ -247,6 +247,7 @@ describe('skeletonizeTool', () => {
       input: { file_path: '/home/user/my-monorepo/relay/src/auth.ts', old_string: 'return false;', new_string: 'return true;' },
       resultText: 'edited',
       toolId: 't5',
+      messageIndex: 0,
     });
     expect(skeleton).toContain('✏️');
     expect(skeleton).toContain('relay/src/auth.ts');
@@ -260,6 +261,7 @@ describe('skeletonizeTool', () => {
       input: { action: 'search', query: 'context thinning' },
       resultText: 'results',
       toolId: 't6',
+      messageIndex: 0,
     });
     expect(skeleton).toContain('🗺️');
     expect(skeleton).toContain('atlas search');
@@ -271,6 +273,7 @@ describe('skeletonizeTool', () => {
       input: { action: 'send', room: 'dev-auth' },
       resultText: 'sent',
       toolId: 't7',
+      messageIndex: 0,
     });
     expect(skeleton).toContain('💬');
     expect(skeleton).toContain('chatroom');
@@ -282,6 +285,7 @@ describe('skeletonizeTool', () => {
       input: { file_path: '/home/user/my-monorepo/relay/src/newFile.ts', content: 'x'.repeat(500) },
       resultText: 'written',
       toolId: 't8',
+      messageIndex: 0,
     });
     expect(skeleton).toContain('📝');
     expect(skeleton).toContain('500 chars');
@@ -1985,6 +1989,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
       input: { command: 'git log --oneline' },
       resultText: `commit ${sha} add feature`,
       toolId: 'tu1',
+      messageIndex: 0,
     } as any);
     expect(skeleton).toContain(sha);
     expect(skeleton).toMatch(/\[.+\]$/); // trailing bracket section
@@ -1996,6 +2001,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
       input: { command: 'echo hello' },
       resultText: 'hello world nothing special',
       toolId: 'tu2',
+      messageIndex: 0,
     } as any);
     expect(skeleton).not.toContain('[');
   });
@@ -2007,6 +2013,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
       input: {},
       resultText: `id: ${hexId}`,
       toolId: 'tu3',
+      messageIndex: 0,
     } as any);
     expect(skeleton).toContain(hexId);
     expect(skeleton).toMatch(/\[.+\]$/);
@@ -2018,6 +2025,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
       input: {},
       resultText: 'plain text output nothing here',
       toolId: 'tu4',
+      messageIndex: 0,
     } as any);
     expect(skeleton).not.toContain('[');
   });
@@ -2028,6 +2036,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
       input: { command: 'show job' },
       resultText: 'job id=a1b2c3d4e5f6 done',
       toolId: 'tu_dedup',
+      messageIndex: 0,
     } as any);
     const bracket = /\[(.+)\]$/.exec(skeleton);
     expect(bracket).not.toBeNull();
@@ -2044,6 +2053,7 @@ describe('skeletonizeTool — receipts belt (P3/s9)', () => {
       input: { command: 'list ids' },
       resultText: `${h1} ${h2} ${h3}`,
       toolId: 'tu5',
+      messageIndex: 0,
     } as any);
     // belt format: [hex1, hex2] — exactly two
     const bracketMatch = /\[(.+)\]$/.exec(skeleton);
@@ -2737,6 +2747,24 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
     const cfg: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 15 };
     const closetLine = closetOf(msgs, cfg, 1);
     expect(closetLine ?? '').not.toContain(ts);
+  });
+});
+
+describe('foldContext explicit timestamp provenance', () => {
+  test('timestamp-less fold metadata stays explicitly unknown and deterministic', () => {
+    const messages: FoldMessage[] = [
+      userMsg('historical question'),
+      assistantMsg('historical answer'),
+      userMsg('active question'),
+      assistantMsg('active answer'),
+    ];
+    const config: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1 };
+    const first = foldContext(messages, 1, config);
+    const second = foldContext(messages, 1, config);
+
+    expect(first.foldSummaries.every((summary) => summary.timestamp === '')).toBe(true);
+    expect(second.foldSummaries).toEqual(first.foldSummaries);
+    expect(second.messages).toEqual(first.messages);
   });
 });
 

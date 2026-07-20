@@ -50,7 +50,10 @@ describe('fold recall usage detector', () => {
     const advanced = advanceFoldRecallUsageWatches(
       added.watches,
       4,
-      { touchedPaths: ['/repo/test/memoryLoop.test.ts'] },
+      {
+        touchedPaths: ['/repo/test/memoryLoop.test.ts'],
+        editedPaths: ['/repo/test/memoryLoop.test.ts'],
+      },
       { nowMs: 20 },
     );
 
@@ -62,9 +65,24 @@ describe('fold recall usage detector', () => {
       boundarySeq: 4,
       tsMs: 20,
       cardKind: 'chain',
+      targetPath: '/repo/src/memoryLoop.ts',
       matchedPath: '/repo/test/memoryLoop.test.ts',
     }]);
     expect(advanced.watches).toEqual([]);
+  });
+
+  test('treats a utility read as activity but not as a successful path edit', () => {
+    const added = addInjectedFoldRecallUsageCards([], [card()], 3, { nowMs: 10 });
+    const read = advanceFoldRecallUsageWatches(
+      added.watches,
+      4,
+      { touchedPaths: ['/repo/src/memoryLoop.ts'], editedPaths: [] },
+      { nowMs: 20 },
+    );
+
+    expect(read.events).toEqual([]);
+    expect(read.watches).toHaveLength(1);
+    expect(read.watches[0].unmatchedActivityBoundaries).toBe(1);
   });
 
   test('detects verbatim pointer reuse in later tool args or assistant text', () => {
@@ -140,7 +158,10 @@ describe('fold recall usage detector', () => {
     const used = advanceFoldRecallUsageWatches(
       added.watches,
       4,
-      { touchedPaths: ['/repo/src/memoryLoop.ts'] },
+      {
+        touchedPaths: ['/repo/src/memoryLoop.ts'],
+        editedPaths: ['/repo/src/memoryLoop.ts'],
+      },
       { nowMs: 20 },
     );
     const expired = advanceFoldRecallUsageWatches(used.watches, 10, {}, { nowMs: 30 });
@@ -170,7 +191,7 @@ describe('fold recall usage detector', () => {
         usefulOutcomes: 0,
         ignoredOutcomes: 1,
         falsePositiveProxies: 1,
-        observationalProxy: 0,
+        observationalProxy: null,
       },
     ]);
   });

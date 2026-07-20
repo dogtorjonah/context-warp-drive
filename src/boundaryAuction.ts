@@ -35,6 +35,12 @@ export interface BoundaryAuctionNomination<Payload = unknown> {
   chars: number;
   /** Pre-rendered text or a budget-aware pure render function. */
   render: BoundaryAuctionRender;
+  /**
+   * Commit visibility/accounting only after this nomination wins selection.
+   * Omitted nominations never invoke the hook. Failures are isolated so
+   * observability cannot break provider context assembly.
+   */
+  onSelected?: () => void;
   /** Caller-owned payload carried through decisions. */
   payload?: Payload;
 }
@@ -261,9 +267,17 @@ export function selectBoundaryAuctionNominations<Payload = unknown>(
   return { budget, selected, omitted, decisions, chars };
 }
 
-function renderNomination(render: BoundaryAuctionRender, charBudget: number): string {
-  const rendered = typeof render === 'function' ? render(charBudget) : render;
-  return rendered ?? '';
+function renderNomination(nomination: BoundaryAuctionNomination, charBudget: number): string {
+  const rendered = typeof nomination.render === 'function'
+    ? nomination.render(charBudget)
+    : nomination.render;
+  const text = rendered ?? '';
+  if (text.length > 0) {
+    try {
+      nomination.onSelected?.();
+    } catch { /* fail-open: selection accounting must never break the boundary */ }
+  }
+  return text;
 }
 
 export function runBoundaryAuction<Payload = unknown>(
@@ -293,7 +307,7 @@ export function runBoundaryAuction<Payload = unknown>(
   const selection = selectBoundaryAuctionNominations(nominations, options);
   const separator = options.separator ?? '\n\n';
   const text = selection.selected
-    .map((decision) => renderNomination(decision.nomination.render, decision.chars))
+    .map((decision) => renderNomination(decision.nomination, decision.chars))
     .filter((rendered) => rendered.length > 0)
     .join(separator);
 
