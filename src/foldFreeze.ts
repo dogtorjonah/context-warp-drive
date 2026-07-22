@@ -245,6 +245,24 @@ export type FoldFreezeTransitionReason =
   | 'hot-reuse'
   | 'append-tail-epoch';
 
+/** Cache consequence of the transition that produced one provider request. */
+export type FoldFreezePrefixDisposition = 'preserved' | 'replaced' | 'unknown';
+
+/**
+ * Classify whether a committed transition retained the preceding
+ * provider-visible prefix byte-for-byte. An appended tail band preserves the
+ * already-sealed prefix even though it extends the cached request; every
+ * whole-view cause replaces it. Missing transition evidence stays unknown.
+ */
+export function classifyFoldFreezePrefixDisposition(
+  reason: FoldFreezeTransitionReason | undefined,
+): FoldFreezePrefixDisposition {
+  if (reason === undefined) return 'unknown';
+  return reason === 'hot-reuse' || reason === 'append-tail-epoch'
+    ? 'preserved'
+    : 'replaced';
+}
+
 export type FoldFreezeAppendCommitReason = 'material-shrink';
 
 export type FoldFreezeAppendSkipReason =

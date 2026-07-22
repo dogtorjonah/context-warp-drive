@@ -2,13 +2,14 @@
  * Tests for the unified fold-recall card: episodic voice + Atlas meta blocks.
  *
  * 11a: Populated carriers → card shows 🗣 voice and 📌/🏷 Atlas-meta blocks.
- * 11b: Empty/missing carriers → byte-identical to pre-unification baseline.
+ * 11b: Empty/missing carriers → explicit unavailable drill-down, never prose invention.
  */
 import { describe, expect, test } from 'vitest';
 
 import {
   buildFoldRecallContext,
   buildFoldIndex,
+  buildRecallRankingContext,
   createFoldRecallState,
   DEFAULT_FOLD_RECALL_CONFIG,
   extractRecallSignals,
@@ -56,6 +57,12 @@ function indexFor(raw: FoldMessage[]) {
   return buildFoldIndex(raw, runPipeline(raw));
 }
 
+function editRelevantSignals(file = FILE) {
+  const signals = extractRecallSignals({ file_path: ABS(file) }, new Set());
+  signals.ranking = buildRecallRankingContext({ activeFiles: [ABS(file)] });
+  return signals;
+}
+
 const UNIFIED_SEED: FoldMessage[] = [
   userMsg('Review unified-target.ts'),
   anthropicToolUse('tu1', 'Read', { file_path: ABS(FILE) }),
@@ -88,13 +95,19 @@ describe('foldRecall unified card — voice + Atlas meta blocks', () => {
       purpose: 'Package fold recall engine with host-supplied synthetic context filtering.',
       blurb: 'Fold recall engine for context warp drive.',
       tags: ['fold-recall', 'context-warp', 'package'],
+      drilldown: {
+        changelogId: 34438,
+        snapshotId: 901,
+        startLine: 1405,
+        endLine: 1488,
+      },
     };
     state.pathAtlasMeta!.set(FILE, meta);
 
     const out = buildFoldRecallContext(
       state,
       UNIFIED_SEED,
-      extractRecallSignals({ file_path: ABS(FILE) }, new Set()),
+      editRelevantSignals(),
       'healthy',
       DEFAULT_FOLD_RECALL_CONFIG,
     );
@@ -113,10 +126,41 @@ describe('foldRecall unified card — voice + Atlas meta blocks', () => {
     expect(text).toContain('Package fold recall engine');
     expect(text).toContain('🏷');
     expect(text).toContain('fold-recall');
+    expect(text).toContain('atlas_snapshot changelog_id=34438 start_line=1405 end_line=1488');
+    expect(text).toContain('atlas_query action=history file_path="relay/src/unified-target.ts" limit=5');
+    expect(text).toContain('latest changelog_id=34438');
 
     // Card well-formed
     expect(text).toContain(RECALL_CARD_PREFIX);
     expect(text).toContain('[End fold recall]');
+  });
+
+  test('11a-history-scope: passive path reads keep the snapshot coordinate without claiming a history gate', () => {
+    const state = createFoldRecallState();
+    state.index = indexFor(UNIFIED_SEED);
+    state.pathAtlasMeta!.set(FILE, {
+      path: FILE,
+      purpose: null,
+      blurb: null,
+      tags: [],
+      drilldown: {
+        changelogId: 34438,
+        snapshotId: 901,
+        startLine: 1405,
+        endLine: 1488,
+      },
+    });
+
+    const out = buildFoldRecallContext(
+      state,
+      UNIFIED_SEED,
+      extractRecallSignals({ file_path: ABS(FILE) }, new Set()),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+
+    expect(out.text).toContain('atlas_snapshot changelog_id=34438 start_line=1405 end_line=1488');
+    expect(out.text).not.toContain('atlas_query action=history');
   });
 
   test('11a-b: budget boundary — voice + meta do not cause card overflow', () => {
@@ -141,26 +185,161 @@ describe('foldRecall unified card — voice + Atlas meta blocks', () => {
       purpose: 'A'.repeat(200),
       blurb: null,
       tags: ['tag1', 'tag2', 'tag3', 'tag4', 'tag5', 'tag6', 'tag7'],
+      drilldown: {
+        changelogId: 34438,
+        snapshotId: 901,
+        startLine: 1,
+        endLine: 160,
+      },
     });
+
+    const tightConfig = {
+      ...DEFAULT_FOLD_RECALL_CONFIG,
+      maxTotalChars: 4_000,
+      maxCardChars: 3_600,
+    };
 
     const out = buildFoldRecallContext(
       state,
       UNIFIED_SEED,
-      extractRecallSignals({ file_path: ABS(FILE) }, new Set()),
+      editRelevantSignals(),
       'healthy',
-      DEFAULT_FOLD_RECALL_CONFIG,
+      tightConfig,
     );
 
     // The output must stay bounded (maxCardChars)
     expect(out.cards).toBeGreaterThan(0);
     expect(out.text).not.toBeNull();
     const text = out.text ?? '';
-    expect(text.length).toBeLessThan(20_000);
+    expect(out.chars).toBeLessThanOrEqual(tightConfig.maxTotalChars);
+    expect(text).toContain('atlas_snapshot changelog_id=34438 start_line=1 end_line=160');
+    expect(text).toContain('atlas_query action=history file_path="relay/src/unified-target.ts" limit=5');
     expect(text).toContain(RECALL_CARD_PREFIX);
     expect(text).toContain('[End fold recall]');
   });
 
-  test('11b: empty carriers = byte-identical to pre-unification baseline', () => {
+  test('11a-c: route reserve cannot consume header/footer framing under a tight cap', () => {
+    const state = createFoldRecallState();
+    state.index = indexFor(UNIFIED_SEED);
+    state.pathAtlasMeta!.set(FILE, {
+      path: FILE,
+      purpose: null,
+      blurb: null,
+      tags: [],
+      drilldown: {
+        changelogId: 34438,
+        snapshotId: 901,
+        startLine: 1,
+        endLine: 160,
+      },
+    });
+    const tightConfig = {
+      ...DEFAULT_FOLD_RECALL_CONFIG,
+      maxTotalChars: 900,
+      maxCardChars: 700,
+    };
+
+    const out = buildFoldRecallContext(
+      state,
+      UNIFIED_SEED,
+      editRelevantSignals(),
+      'healthy',
+      tightConfig,
+    );
+
+    expect(out.cards).toBeGreaterThan(0);
+    expect(out.chars).toBeLessThanOrEqual(tightConfig.maxTotalChars);
+    expect(out.text).toContain('atlas_snapshot changelog_id=34438 start_line=1 end_line=160');
+    expect(out.text).toContain('atlas_query action=history file_path="relay/src/unified-target.ts" limit=5');
+    expect(out.text).toContain('[End fold recall]');
+  });
+
+  test('11a-d: an oversized mandatory history route degrades to a hint, never a pointerless card', () => {
+    const longFile = `relay/src/${'nested-'.repeat(70)}target.ts`;
+    const longSeed: FoldMessage[] = [
+      userMsg(`Review ${longFile}`),
+      anthropicToolUse('long-tu1', 'Read', { file_path: ABS(longFile) }),
+      anthropicToolResult('long-tu1', 'LONG FILE CONTENT ' + 'z'.repeat(3_000)),
+      assistantMsg(`Reviewed ${longFile}.`),
+      userMsg('Now check another file'),
+      anthropicToolUse('long-tu2', 'Read', { file_path: ABS('relay/src/other-long.ts') }),
+      anthropicToolResult('long-tu2', 'OTHER CONTENT ' + 'w'.repeat(3_000)),
+      assistantMsg('Done with other.'),
+    ];
+    const state = createFoldRecallState();
+    state.index = indexFor(longSeed);
+    state.pathAtlasMeta!.set(longFile, {
+      path: longFile,
+      purpose: null,
+      blurb: null,
+      tags: [],
+      drilldown: {
+        changelogId: 34438,
+        snapshotId: 901,
+        startLine: 1,
+        endLine: 160,
+      },
+    });
+    const tightConfig = {
+      ...DEFAULT_FOLD_RECALL_CONFIG,
+      maxTotalChars: 2_000,
+      maxCardChars: 700,
+    };
+
+    const out = buildFoldRecallContext(
+      state,
+      longSeed,
+      editRelevantSignals(longFile),
+      'healthy',
+      tightConfig,
+    );
+
+    expect(out.cards).toBe(0);
+    expect(out.hints).toBeGreaterThan(0);
+    expect(out.chars).toBeLessThanOrEqual(tightConfig.maxTotalChars);
+    expect(out.text).not.toContain(RECALL_CARD_PREFIX);
+    expect(out.text).not.toContain('history gate:');
+  });
+
+  test('11a-e: mismatched or non-positive drill-down carriers cannot mint routes', () => {
+    const carriers: AtlasFileMeta[] = [
+      {
+        path: 'relay/src/different-target.ts',
+        purpose: null,
+        blurb: null,
+        tags: [],
+        drilldown: { changelogId: 34438, snapshotId: 901, startLine: 1, endLine: 160 },
+      },
+      {
+        path: FILE,
+        purpose: null,
+        blurb: null,
+        tags: [],
+        drilldown: { changelogId: 0, snapshotId: 901, startLine: 1, endLine: 160 },
+      },
+    ];
+
+    for (const carrier of carriers) {
+      const state = createFoldRecallState();
+      state.index = indexFor(UNIFIED_SEED);
+      state.pathAtlasMeta!.set(FILE, carrier);
+
+      const out = buildFoldRecallContext(
+        state,
+        UNIFIED_SEED,
+        editRelevantSignals(),
+        'healthy',
+        DEFAULT_FOLD_RECALL_CONFIG,
+      );
+
+      expect(out.cards).toBeGreaterThan(0);
+      expect(out.text).toContain('Atlas drill-down unavailable');
+      expect(out.text).not.toContain('atlas_snapshot changelog_id=');
+      expect(out.text).not.toContain('history gate:');
+    }
+  });
+
+  test('11b: empty carriers expose unavailable Atlas coverage without invented metadata', () => {
     // Build state with empty new carriers (default createFoldRecallState)
     const state = createFoldRecallState();
     state.index = indexFor(UNIFIED_SEED);
@@ -172,7 +351,7 @@ describe('foldRecall unified card — voice + Atlas meta blocks', () => {
     const out = buildFoldRecallContext(
       state,
       UNIFIED_SEED,
-      extractRecallSignals({ file_path: ABS(FILE) }, new Set()),
+      editRelevantSignals(),
       'healthy',
       DEFAULT_FOLD_RECALL_CONFIG,
     );
@@ -181,6 +360,8 @@ describe('foldRecall unified card — voice + Atlas meta blocks', () => {
     expect(out.text).not.toContain('🗣 Your lineage:');
     expect(out.text).not.toContain('📌');
     expect(out.text).not.toContain('🏷');
+    expect(out.text).toContain('Atlas drill-down unavailable');
+    expect(out.text).not.toContain('atlas_query action=history');
 
     // Card well-formed
     if (out.cards > 0) {
@@ -189,7 +370,7 @@ describe('foldRecall unified card — voice + Atlas meta blocks', () => {
     }
   });
 
-  test('11b-missing: missing optional pathAtlasMeta map = byte-identical', () => {
+  test('11b-missing: legacy state without pathAtlasMeta exposes unavailable Atlas coverage', () => {
     const state = createFoldRecallState();
     state.index = indexFor(UNIFIED_SEED);
 
@@ -207,6 +388,7 @@ describe('foldRecall unified card — voice + Atlas meta blocks', () => {
     // No meta blocks
     expect(out.text).not.toContain('📌');
     expect(out.text).not.toContain('🏷');
+    expect(out.text).toContain('Atlas drill-down unavailable');
 
     // Must not crash — optional access handles missing map
     if (out.cards > 0) {

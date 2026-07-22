@@ -192,6 +192,138 @@ export interface ContinuityReceipt {
   readonly liveState?: ContinuityReceiptLiveState;
 }
 
+/**
+ * Executable truth order for continuity surfaces. Lower array position means
+ * stronger authority. Keep the names stable: they are rendered into rebirth
+ * control output and may be used as audit coordinates.
+ */
+export const CONTINUITY_AUTHORITY_ORDER = [
+  'later-unanswered-operator-message',
+  'live-task-rail',
+  'newest-tail-band',
+  'frozen-control-snapshot',
+  'active-edit-delta',
+  'rail-context',
+  'recent-dialogue',
+  'historical-evidence',
+] as const;
+
+export type ContinuityAuthorityRank = typeof CONTINUITY_AUTHORITY_ORDER[number];
+
+export interface ContinuityAuthoritySource<T> {
+  /** Stable provenance identity; the candidate value itself is never rendered. */
+  readonly sourceId: string;
+  readonly value: T;
+}
+
+/** Named fields prevent callers from inventing or silently reordering ranks. */
+export interface ContinuityAuthorityLattice<T> {
+  readonly laterUnansweredOperatorMessage?: ContinuityAuthoritySource<T>;
+  readonly liveTaskRail?: ContinuityAuthoritySource<T>;
+  readonly newestTailBand?: ContinuityAuthoritySource<T>;
+  readonly frozenControlSnapshot?: ContinuityAuthoritySource<T>;
+  readonly activeEditDelta?: ContinuityAuthoritySource<T>;
+  readonly railContext?: ContinuityAuthoritySource<T>;
+  readonly recentDialogue?: ContinuityAuthoritySource<T>;
+  readonly historicalEvidence?: ContinuityAuthoritySource<T>;
+}
+
+export interface ContinuityAuthorityResolution<T> {
+  readonly winner: ContinuityAuthoritySource<T> & { readonly rank: ContinuityAuthorityRank };
+  readonly shadowedRanks: readonly ContinuityAuthorityRank[];
+  readonly explanation: string;
+}
+
+const CONTINUITY_AUTHORITY_FIELDS = [
+  ['later-unanswered-operator-message', 'laterUnansweredOperatorMessage'],
+  ['live-task-rail', 'liveTaskRail'],
+  ['newest-tail-band', 'newestTailBand'],
+  ['frozen-control-snapshot', 'frozenControlSnapshot'],
+  ['active-edit-delta', 'activeEditDelta'],
+  ['rail-context', 'railContext'],
+  ['recent-dialogue', 'recentDialogue'],
+  ['historical-evidence', 'historicalEvidence'],
+] as const satisfies readonly (readonly [ContinuityAuthorityRank, keyof ContinuityAuthorityLattice<unknown>])[];
+
+/** Resolve the strongest present source and retain a deterministic audit explanation. */
+export function resolveContinuityAuthority<T>(
+  lattice: ContinuityAuthorityLattice<T>,
+): ContinuityAuthorityResolution<T> | null {
+  const present = CONTINUITY_AUTHORITY_FIELDS.flatMap(([rank, field]) => {
+    const source = lattice[field] as ContinuityAuthoritySource<T> | undefined;
+    return source ? [{ rank, source }] : [];
+  });
+  const selected = present[0];
+  if (!selected) return null;
+  const shadowedRanks = present.slice(1).map(({ rank }) => rank);
+  const rankPosition = CONTINUITY_AUTHORITY_ORDER.indexOf(selected.rank) + 1;
+  const explanation = `${selected.rank} (rank ${rankPosition}/${CONTINUITY_AUTHORITY_ORDER.length})`
+    + ` from ${selected.source.sourceId}`
+    + (shadowedRanks.length > 0 ? ` outranks ${shadowedRanks.join(' > ')}` : ' is the only present source');
+  return {
+    winner: { ...selected.source, rank: selected.rank },
+    shadowedRanks,
+    explanation,
+  };
+}
+
+/** Render only provenance and rank, never candidate payload text. */
+export function renderContinuityAuthorityResolution<T>(
+  resolution: ContinuityAuthorityResolution<T>,
+): string {
+  const sourceId = JSON.stringify(resolution.winner.sourceId)
+    .replace(/\u2028/gu, '\\u2028')
+    .replace(/\u2029/gu, '\\u2029');
+  const shadowed = resolution.shadowedRanks.length > 0
+    ? resolution.shadowedRanks.join(' > ')
+    : 'none';
+  return `authority resolution · winner=${resolution.winner.rank} · source=${sourceId} · outranks=${shadowed}`;
+}
+
+/** Resolve the authority sources materially present in one typed receipt. */
+export function resolveContinuityReceiptAuthority(
+  receipt: ContinuityReceipt,
+): ContinuityAuthorityResolution<boolean> {
+  const live = receipt.liveState;
+  const currentRequest = live?.request.status === 'current' && live.request.value?.text.trim()
+    ? live.request
+    : undefined;
+  const currentRail = live !== undefined
+    && ((live.step.status === 'current' && live.step.value !== undefined)
+      || (live.rail.status === 'current' && live.rail.value !== undefined));
+  const currentTail = live?.rawTailFrontier.status === 'current'
+    && (live.rawTailFrontier.value?.exactCount ?? 0) > 0
+    ? live.rawTailFrontier
+    : undefined;
+  const currentEdits = live !== undefined
+    && ((live.claims.status === 'current' && (live.claims.value?.length ?? 0) > 0)
+      || (live.edits.status === 'current' && (live.edits.value?.length ?? 0) > 0));
+  return resolveContinuityAuthority<boolean>({
+    laterUnansweredOperatorMessage: currentRequest
+      ? { sourceId: currentRequest.source.id, value: true }
+      : !live && receipt.activeRequest?.text.trim()
+        ? { sourceId: 'continuity-receipt.active-request', value: true }
+        : undefined,
+    liveTaskRail: currentRail
+      ? { sourceId: 'continuity-receipt.live-state', value: true }
+      : undefined,
+    newestTailBand: currentTail
+      ? { sourceId: currentTail.source.id, value: true }
+      : undefined,
+    frozenControlSnapshot: {
+      sourceId: `continuity-receipt/v${receipt.version}`,
+      value: true,
+    },
+    activeEditDelta: currentEdits || (!live && receipt.editClaim.supplied)
+      ? { sourceId: live ? 'continuity-receipt.live-edits' : 'continuity-receipt.edit-claim', value: true }
+      : undefined,
+    railContext: receipt.rail
+      ? { sourceId: 'continuity-receipt.rail-context', value: true }
+      : undefined,
+    historicalEvidence: { sourceId: 'continuity-receipt.historical-evidence', value: true },
+  })!;
+}
+
 // ── Boundary resolution ────────────────────────────────────────────────
 
 /**
@@ -921,8 +1053,11 @@ export function renderContinuityReceiptControl(
   receipt: ContinuityReceipt,
   _options: RenderContinuityReceiptControlOptions = {},
 ): string {
+  const authorityLine = renderContinuityAuthorityResolution(
+    resolveContinuityReceiptAuthority(receipt),
+  );
   if (receipt.liveState) {
-    return renderContinuityLiveState(receipt, receipt.liveState);
+    return [renderContinuityLiveState(receipt, receipt.liveState), authorityLine].join('\n');
   }
   const canonical = receipt.canonicalRange
     ? `${receipt.canonicalRange.traceId}@event#${receipt.canonicalRange.eventCount}`
@@ -942,5 +1077,6 @@ export function renderContinuityReceiptControl(
       ? `validation=${truncateContinuity(receipt.validation.fact, 240)}`
       : '',
     ...(receipt.hazards.length > 0 ? [`unresolved hazards: ${receipt.hazards.join('; ')}`] : []),
+    authorityLine,
   ].filter(Boolean).join('\n');
 }

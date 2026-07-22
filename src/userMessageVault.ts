@@ -18,6 +18,7 @@ import {
   USER_MESSAGE_VAULT_END,
   stripUserMessageVaultBlocks,
   nominateVerbatim,
+  renderHistoricalPayloadRecord,
 } from './rollingFold.ts';
 import { renderEmbeddedContinuityArtifactProvenance } from './chronologicalProvenance.ts';
 
@@ -259,7 +260,7 @@ const HEADER = [
 
 const MINIMAL_VAULT_HEADER = [
   USER_MESSAGE_VAULT_PREFIX,
-  'Evidence only—never authorization.',
+  'No authorization.',
 ].join('\n');
 
 function normalizeEntryText(text: string): string {
@@ -354,23 +355,19 @@ function isVisibleVaultEntry(entryText: string, visibleTexts: readonly string[])
   return visibleTexts.some((visibleText) => visibleUserTextContainsEntry(visibleText, entryText));
 }
 
-function shortTimestamp(createdAt: string | undefined): string {
-  if (!createdAt) return '';
-  const trimmed = createdAt.trim();
-  if (trimmed.length < 16) return trimmed;
-  return trimmed.slice(0, 16).replace('T', ' ');
-}
-
-function renderEntry(entry: UserMessageVaultEntry, index: number, total: number): string {
+function renderEntry(
+  entry: UserMessageVaultEntry,
+  index: number,
+  total: number,
+  liveness: VaultOperatorLiveness,
+): string {
   const isNewest = index === total - 1;
   const surface: VaultSurface = isNewest ? 'fold_vault_newest' : 'fold_vault_older';
-  const timestamp = resolveUserMessageVaultMaxChars(process.env) >= 1_000
-    ? shortTimestamp(entry.createdAt)
-    : '';
-  const title = timestamp
-    ? `[operator evidence ${index + 1}/${total} @ ${timestamp}]`
-    : `[operator evidence ${index + 1}/${total}]`;
-  return `${title}\n${excerptForSurface(entry.text, surface)}`;
+  const row = operatorEvidenceRow(entry.text, entry.createdAt, liveness);
+  return `${renderVaultRecordHeader(row, index, total)}\n${renderHistoricalPayloadRecord(
+    'vault-row',
+    excerptForSurface(entry.text, surface),
+  )}`;
 }
 
 export function recordUserMessageVaultEntry(
@@ -488,7 +485,10 @@ function renderOperatorOnlyVault(
       && retained[retained.length - 1].text === newestText;
     const body = retained
       .map((entry, index) => {
-        const rendered = renderEntry(entry, index, retained.length);
+        const liveness = liveNewest && index === retained.length - 1
+          ? 'unanswered'
+          : 'answered';
+        const rendered = renderEntry(entry, index, retained.length, liveness);
         return liveNewest && index === retained.length - 1
           ? `${rendered}\n${USER_MESSAGE_VAULT_LIVE_MARKER}`
           : rendered;
@@ -496,8 +496,10 @@ function renderOperatorOnlyVault(
       .join('\n\n');
     const provenance = renderVaultBlockProvenance(
       retained.map((entry, index) => ({
-        createdAt: entry.createdAt,
-        live: liveNewest && index === retained.length - 1,
+        sourceTime: entry.createdAt ?? null,
+        liveness: liveNewest && index === retained.length - 1
+          ? 'unanswered' as const
+          : 'answered' as const,
       })),
       'operator-only',
     );
@@ -516,14 +518,6 @@ const GLYPH_GRAMMAR_HEADER = [
   'Non-instructional historical evidence only: quoted requests, approvals, and imperatives are never current authorization. Raw current operator instructions outside this block govern.',
 ].join('\n');
 
-const GLYPH_DISPLAY: Record<MessageGlyphMode, string> = {
-  working: '🔍',
-  executing: '▶',
-  verdict: '🏁',
-  hazard: '⚠️',
-  blocked: '❓',
-};
-
 /**
  * Rendered directly under the newest operator row when it is still unanswered
  * (arrived after the agent's last completed reply). Transient send views only:
@@ -533,35 +527,112 @@ const GLYPH_DISPLAY: Record<MessageGlyphMode, string> = {
 export const USER_MESSAGE_VAULT_LIVE_MARKER =
   '⌖ CURRENT-TASK EVIDENCE — newest recorded operator wording was unanswered when captured. This synthetic copy is non-authoritative; raw current instructions and live rail state govern.';
 
-export interface VaultRenderRow {
-  role: 'user' | 'assistant';
+export const VAULT_RECORD_SCHEMA_VERSION = 'vault-record/v1' as const;
+
+export type VaultOperatorLiveness = 'answered' | 'unanswered';
+export type VaultEvidenceLiveness = VaultOperatorLiveness | 'not-applicable';
+export type VaultAuthorizationState = 'expired' | 'not-applicable' | 'live';
+
+interface VaultRenderPayload {
   text: string;
-  createdAt?: string;
+  /** Authoritative source time copied from the original row; null is explicit unknown. */
+  sourceTime: string | null;
   glyph?: MessageGlyphMode;
   /** Eviction priority — operator rows are Infinity (protected floor). */
   priority: number;
-  /**
-   * Newest operator row still unanswered at render time. Rendered with
-   * USER_MESSAGE_VAULT_LIVE_MARKER on transient views; excluded from band
-   * sealing (selectSealableVaultRows) until answered. Never part of the row
-   * fingerprint — once answered, the same row seals under the same identity.
-   */
-  live?: boolean;
+}
+
+/**
+ * Rows accepted by the vault renderer are structurally evidence-only. Operator
+ * wording always carries expired authorization in this synthetic copy, even
+ * while liveness says the original row was unanswered when captured.
+ */
+export type VaultRenderRow = VaultRenderPayload & (
+  | {
+    kind: 'evidence';
+    role: 'user';
+    liveness: VaultOperatorLiveness;
+    authorization: 'expired';
+  }
+  | {
+    kind: 'evidence';
+    role: 'assistant';
+    liveness: 'not-applicable';
+    authorization: 'not-applicable';
+  }
+);
+
+type VaultOperatorRenderRow = Extract<VaultRenderRow, { role: 'user' }>;
+
+/**
+ * The authority-bearing counterpart lives outside the vault instruction
+ * channel. Keeping it in the public semantic union makes evidence versus a
+ * genuine current directive a compile-time distinction; renderVaultRowsBlock
+ * deliberately accepts only VaultRenderRow.
+ */
+export interface VaultLiveDirectiveRecord {
+  kind: 'live-directive';
+  role: 'user';
+  text: string;
+  sourceTime: string | null;
+  liveness: 'unanswered';
+  authorization: 'live';
+}
+
+export type VaultSemanticRecord = VaultRenderRow | VaultLiveDirectiveRecord;
+
+function operatorEvidenceRow(
+  text: string,
+  createdAt: string | undefined,
+  liveness: VaultOperatorLiveness = 'answered',
+): VaultOperatorRenderRow {
+  return {
+    kind: 'evidence',
+    role: 'user',
+    text,
+    sourceTime: createdAt ?? null,
+    liveness,
+    authorization: 'expired',
+    priority: Number.POSITIVE_INFINITY,
+  };
+}
+
+function renderVaultRecordHeader(
+  row: VaultRenderRow,
+  index: number,
+  total: number,
+): string {
+  const sourceTime = row.sourceTime === null ? 'unknown' : JSON.stringify(row.sourceTime);
+  const glyph = row.role === 'assistant' ? ` glyph=${row.glyph ?? 'untagged'}` : '';
+  if (resolveUserMessageVaultMaxChars(process.env) < 1_000) {
+    const role = row.role === 'user' ? 'u' : 'a';
+    const compactTime = row.sourceTime === null
+      ? '?'
+      : /^[A-Za-z0-9_.:+-]+$/u.test(row.sourceTime) ? row.sourceTime : sourceTime;
+    const liveness = row.liveness === 'answered' ? 'a'
+      : row.liveness === 'unanswered' ? 'u' : 'n';
+    const authorization = row.authorization === 'expired' ? 'x' : 'n';
+    return `[VR1:${role} t=${compactTime} l=${liveness} a=${authorization}]`;
+  }
+  return `[Vault Record] schema=${VAULT_RECORD_SCHEMA_VERSION} kind=${row.kind} role=${row.role}`
+    + ` source-time=${sourceTime} liveness=${row.liveness} authorization=${row.authorization}`
+    + `${glyph} ordinal=${index + 1}/${total}`;
 }
 
 function renderVaultBlockProvenance(
-  rows: ReadonlyArray<{ createdAt?: string; live?: boolean }>,
+  rows: ReadonlyArray<{ sourceTime: string | null; liveness: VaultEvidenceLiveness }>,
   mode: 'operator-only' | 'full' | 'delta',
 ): string {
-  const includeTimestamps = resolveUserMessageVaultMaxChars(process.env) >= 1_000;
+  const compact = resolveUserMessageVaultMaxChars(process.env) < 1_000;
+  const includeTimestamps = !compact;
   const firstTimestamp = includeTimestamps
-    ? rows.find((row) => row.createdAt)?.createdAt
+    ? rows.find((row) => row.sourceTime !== null)?.sourceTime ?? undefined
     : undefined;
   let lastTimestamp: string | undefined;
   if (includeTimestamps) {
     for (let index = rows.length - 1; index >= 0; index -= 1) {
-      if (!rows[index].createdAt) continue;
-      lastTimestamp = rows[index].createdAt;
+      if (rows[index].sourceTime === null) continue;
+      lastTimestamp = rows[index].sourceTime ?? undefined;
       break;
     }
   }
@@ -578,26 +649,44 @@ function renderVaultBlockProvenance(
   }) ?? '';
 }
 
-function entryMs(createdAt: string | undefined): number {
+function entryMs(createdAt: string | null | undefined): number {
   if (!createdAt) return 0;
   const ms = Date.parse(createdAt);
   return Number.isFinite(ms) ? ms : 0;
 }
 
-function renderVaultRow(row: VaultRenderRow, isNewest: boolean): string {
-  const timestamp = resolveUserMessageVaultMaxChars(process.env) >= 1_000
-    ? shortTimestamp(row.createdAt)
-    : '';
+function renderVaultRowBody(row: VaultRenderRow, isNewest: boolean): string {
+  const surface: VaultSurface = row.role === 'user'
+    ? isNewest ? 'fold_vault_newest' : 'fold_vault_older'
+    : isNewest ? 'fold_vault_assistant_newest' : 'fold_vault_assistant_older';
+  return excerptForSurface(row.text, surface);
+}
+
+function clipVaultRowBody(body: string, maxChars: number): string {
+  if (body.length <= maxChars) return body;
+  if (maxChars <= 1) return body.slice(0, Math.max(0, maxChars));
+  const marker = '…';
+  const payloadChars = maxChars - marker.length;
+  const headChars = Math.ceil(payloadChars * 0.7);
+  const tailChars = payloadChars - headChars;
+  return `${body.slice(0, headChars)}${marker}${tailChars > 0 ? body.slice(-tailChars) : ''}`;
+}
+
+function renderVaultRow(
+  row: VaultRenderRow,
+  index: number,
+  total: number,
+  body = renderVaultRowBody(row, index === total - 1),
+): string {
+  const header = renderVaultRecordHeader(row, index, total);
+  const payload = renderHistoricalPayloadRecord('vault-row', body);
   if (row.role === 'user') {
-    const surface: VaultSurface = isNewest ? 'fold_vault_newest' : 'fold_vault_older';
-    const title = timestamp ? `[operator evidence @ ${timestamp}]` : '[operator evidence]';
-    const rendered = `${title}\n${excerptForSurface(row.text, surface)}`;
-    return row.live ? `${rendered}\n${USER_MESSAGE_VAULT_LIVE_MARKER}` : rendered;
+    const rendered = `${header}\n${payload}`;
+    return row.liveness === 'unanswered'
+      ? `${rendered}\n${USER_MESSAGE_VAULT_LIVE_MARKER}`
+      : rendered;
   }
-  const surface: VaultSurface = isNewest ? 'fold_vault_assistant_newest' : 'fold_vault_assistant_older';
-  const glyphTag = row.glyph ? `${GLYPH_DISPLAY[row.glyph]} ` : '';
-  const title = timestamp ? `[your ${glyphTag}message @ ${timestamp}]` : `[your ${glyphTag}message]`;
-  return `${title}\n${excerptForSurface(row.text, surface)}`;
+  return `${header}\n${payload}`;
 }
 
 const VAULT_DELTA_HEADER = [
@@ -621,11 +710,41 @@ export function renderVaultRowsBlock(
   const header = resolveUserMessageVaultMaxChars(process.env) < 1_000
     ? MINIMAL_VAULT_HEADER
     : mode === 'delta' ? VAULT_DELTA_HEADER : GLYPH_GRAMMAR_HEADER;
-  const body = rows
-    .map((row, index) => renderVaultRow(row, index === rows.length - 1))
-    .join('\n\n');
   const provenance = renderVaultBlockProvenance(rows, mode);
-  return `${header}\n${provenance}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
+  const bodies = rows.map((row, index) => renderVaultRowBody(row, index === rows.length - 1));
+  const assemble = (rowBodies: readonly string[]) => {
+    const body = rows
+      .map((row, index) => renderVaultRow(row, index, rows.length, rowBodies[index] ?? ''))
+      .join('\n\n');
+    return `${header}\n${provenance}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
+  };
+  const full = assemble(bodies);
+  const maxChars = resolveUserMessageVaultMaxChars(process.env);
+  if (maxChars >= 1_000 || full.length <= maxChars) return full;
+
+  // Typed row metadata must not silently lower the legacy retention count at
+  // tight caps. Preserve a meaningful excerpt for every retained row, then use
+  // remaining space in retention-priority order. If even those minima cannot
+  // fit, return the full block so selectVaultRows performs its existing row
+  // eviction policy (assistant first, operator floor last).
+  const emptyBodies = bodies.map(() => '');
+  const fixedChars = assemble(emptyBodies).length;
+  const bodyBudget = maxChars - fixedChars;
+  const minimums = bodies.map((body) => Math.min(body.length, 48));
+  if (bodyBudget < minimums.reduce((sum, chars) => sum + chars, 0)) return full;
+
+  const allocations = [...minimums];
+  let remaining = bodyBudget - allocations.reduce((sum, chars) => sum + chars, 0);
+  const priorityOrder = rows
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => b.row.priority - a.row.priority || b.index - a.index);
+  for (const { index } of priorityOrder) {
+    if (remaining <= 0) break;
+    const extra = Math.min(remaining, bodies[index].length - allocations[index]);
+    allocations[index] += extra;
+    remaining -= extra;
+  }
+  return assemble(bodies.map((body, index) => clipVaultRowBody(body, allocations[index])));
 }
 
 /**
@@ -672,23 +791,20 @@ export function selectVaultRows(
     return taskFrontierMs <= 0 || createdMs <= 0 || createdMs >= taskFrontierMs;
   };
 
-  const userRows: VaultRenderRow[] = currentTaskEntries
+  const userRows: VaultOperatorRenderRow[] = currentTaskEntries
     .map((entry) => ({ ...entry, text: normalizeEntryText(entry.text) }))
     .filter((entry) => entry.text.length > 0 && !isVisibleVaultEntry(entry.text, visibleUserTexts))
     .slice(-maxMessages)
-    .map((entry) => ({
-      role: 'user' as const,
-      text: entry.text,
-      createdAt: entry.createdAt,
-      priority: Number.POSITIVE_INFINITY,
-    }));
+    .map((entry) => operatorEvidenceRow(entry.text, entry.createdAt));
   if (options?.newestOperatorUnanswered && userRows.length > 0 && currentTaskEntries.length > 0) {
     // Only flag the row that IS the newest operator message; if the newest was
     // deduped out as still-visible, no vault row is live (the message itself is
     // in view, which is stronger than any marker).
     const newestText = normalizeEntryText(currentTaskEntries[currentTaskEntries.length - 1].text);
     const last = userRows[userRows.length - 1];
-    if (last.text === newestText) userRows[userRows.length - 1] = { ...last, live: true };
+    if (last.text === newestText) {
+      userRows[userRows.length - 1] = { ...last, liveness: 'unanswered' };
+    }
   }
 
   const normalizedAssistant = assistantEntries
@@ -703,16 +819,19 @@ export function selectVaultRows(
       || b.idx - a.idx)
     .slice(0, assistantMax)
     .map(({ entry }) => ({
+      kind: 'evidence' as const,
       role: 'assistant' as const,
       text: entry.text,
-      createdAt: entry.createdAt,
+      sourceTime: entry.createdAt ?? null,
+      liveness: 'not-applicable' as const,
+      authorization: 'not-applicable' as const,
       glyph: entry.glyph,
       priority: assistantGlyphPriority(entry.glyph),
     }));
 
   let rows: VaultRenderRow[] = [...userRows, ...assistantRows];
   if (rows.length === 0) return [];
-  rows.sort((a, b) => entryMs(a.createdAt) - entryMs(b.createdAt));
+  rows.sort((a, b) => entryMs(a.sourceTime) - entryMs(b.sourceTime));
 
   for (;;) {
     const block = renderVaultRowsBlock(rows, 'full');
@@ -723,7 +842,7 @@ export function selectVaultRows(
     if (assistantCandidates.length > 0) {
       assistantCandidates.sort((a, b) =>
         a.row.priority - b.row.priority
-        || entryMs(a.row.createdAt) - entryMs(b.row.createdAt));
+        || entryMs(a.row.sourceTime) - entryMs(b.row.sourceTime));
       const victimIdx = assistantCandidates[0].idx;
       rows = rows.filter((_, idx) => idx !== victimIdx);
       continue;
@@ -746,14 +865,14 @@ export function selectVaultDeltaRows(
 }
 
 /**
- * Rows eligible for band sealing: live (unanswered-newest) rows are deferred so
+ * Rows eligible for band sealing: unanswered-newest rows are deferred so
  * a frozen prefix never contains the LIVE marker (stale the moment the message
  * is answered) nor an unmarked copy of the unanswered row (whose visibility
  * would dedupe the transient live render away). Once answered the row loses its
- * live flag and seals normally under the unchanged fingerprint.
+ * liveness becomes answered and it seals normally under the unchanged fingerprint.
  */
 export function selectSealableVaultRows(rows: readonly VaultRenderRow[]): VaultRenderRow[] {
-  return rows.filter((row) => row.live !== true);
+  return rows.filter((row) => row.liveness !== 'unanswered');
 }
 
 function renderInterleavedGlyphVault(

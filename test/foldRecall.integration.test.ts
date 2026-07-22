@@ -37,6 +37,7 @@ import {
   checkFoldTrigger,
   foldContext,
   intraTurnFold,
+  isSyntheticContextText,
   RECALL_CARD_PREFIX,
   type FoldMessage,
 } from '../src/rollingFold.ts';
@@ -111,7 +112,7 @@ function buildHistory(): FoldMessage[] {
 // ══════════════════════════════════════════════════════════════════════
 
 describe('fold recall ⇄ fold freeze lifecycle', () => {
-  test('epoch → index → re-touch → card rides tail HOT → next epoch pages it back out → tier-0 can page it again', () => {
+  test('synthetic card rides the append-only HOT tail without forcing an epoch, then refolds out', () => {
     const freeze = createFoldFreezeState();
     const recall = createFoldRecallState();
     const raw = buildHistory();
@@ -134,6 +135,7 @@ describe('fold recall ⇄ fold freeze lifecycle', () => {
     expect(out.cards).toBe(1);
     expect(out.text!).toContain(RECALL_CARD_PREFIX);
     expect(out.text!).toContain('BIGFILE UNIQUE PAYLOAD');
+    expect(isSyntheticContextText(out.text!)).toBe(true);
 
     // The dispatcher appends the card to the tool result OUTPUT → raw history
     // grows append-only (frozen prefix untouched).

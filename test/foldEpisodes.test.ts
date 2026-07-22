@@ -133,11 +133,11 @@ describe('walk breadcrumb rendering', () => {
     });
 
     const lines = rendered.split('\n');
-    expect(lines[0]).toBe('[Episode recall — walking back, chapter 6/12, 2026-06-10 14:30, "current walk chapter"]');
+    expect(lines[0]).toBe('[Episode recall — walking back, chapter 6/12, 2026-06-10 14:30, "current walk chapter"] [origin=derived]');
     expect(lines[1]).toBe(
-      '  ↞ origin [T-9d] origin decision that explains the invariant | reopen: inst-1 events 1..9',
+      '  ↞ origin [T-9d] origin decision that explains the invariant [origin=derived] | reopen: inst-1 events 1..9 [origin=witnessed]',
     );
-    expect(lines[2]).toBe('  members: src/a.ts*×3, src/b.ts');
+    expect(lines[2]).toBe('  members: src/a.ts*×3, src/b.ts [origin=derived]');
   });
 
   it('keeps the origin reopen pointer when the origin summary truncates', () => {
@@ -158,7 +158,38 @@ describe('walk breadcrumb rendering', () => {
     expect(originLine).toContain('origin origin origin');
     expect(originLine).toContain('…');
     expect(originLine).toHaveLength(180);
-    expect(originLine).toMatch(/\| reopen: inst-1 events 1\.\.9$/);
+    expect(originLine).toMatch(/\[origin=derived\] \| reopen: inst-1 events 1\.\.9 \[origin=witnessed\]$/);
+  });
+
+  it('keeps compound origin labels attached under final card-budget pressure', () => {
+    const chapter = makeEpisode({
+      endedAt: '2026-06-10T14:30:22.123Z',
+      summary: 'current walk chapter',
+    });
+    const origin = makeEpisode({
+      endedAt: '2026-06-01T14:30:22.123Z',
+      summary: 'origin '.repeat(40),
+      members: [{ path: 'src/origin.ts', touchKind: 'edit', touchCount: 1, firstSeen: 1, lastSeen: 9 }],
+    });
+    const renderAt = (charBudget: number) => formatWalkPromotionCard(
+      chapter,
+      { index: 6, total: 12 },
+      [],
+      { spines: [{ chapter: origin, kind: 'origin' }], charBudget },
+    );
+
+    const pressured = renderAt(300);
+    expect(pressured).toMatch(
+      /↞ origin .* \[origin=derived\] \| reopen: inst-1 events 1\.\.9 \[origin=witnessed\]/u,
+    );
+    expect(renderAt(220)).toContain(
+      '  ↞ reopen: inst-1 events 1..9 [origin=witnessed]',
+    );
+    const tagResidue = renderAt(350).replace(
+      /\[origin=(?:derived|witnessed|synthesized)\]/gu,
+      '',
+    );
+    expect(tagResidue).not.toContain('[origin=');
   });
 
   it('uses annotation prose for degenerate path-list waypoint summaries', () => {
@@ -242,13 +273,68 @@ describe('formatChainCard lineage filtering', () => {
 
     const defaultCard = formatChainCard([own, peer], 'src/shared.ts', [], opts);
     expect(defaultCard).toContain('theirs');
-    expect(defaultCard).toContain('peer lineage');
+    expect(defaultCard).toContain('peer lead');
 
     const ownOnlyCard = formatChainCard([own, peer], 'src/shared.ts', [], { ...opts, selfLineageOnly: true });
     expect(ownOnlyCard).toContain('mine');
     expect(ownOnlyCard).not.toContain('theirs');
-    expect(ownOnlyCard).not.toContain('peer lineage');
+    expect(ownOnlyCard).not.toContain('peer lead');
     expect(formatChainCard([peer], 'src/shared.ts', [], { ...opts, selfLineageOnly: true })).toBe('');
+  });
+
+  it('requires an exact own-lineage verification record before peer material can render as evidence', () => {
+    const peer = makeEpisode({
+      endedAt: '2026-06-11T14:00:00.000Z',
+      summary: 'peer says the filter is fixed',
+      instanceId: 'other-lineage',
+      gitHead: 'peer-revision-a',
+    });
+    const base = {
+      ownLineage: new Set(['me']),
+      currentRevision: 'local-revision-b',
+      charBudget: 4_000,
+    };
+    const staleLead = formatChainCard([peer], 'src/shared.ts', [], base);
+    expect(staleLead).toContain('peer lead from other-lineage');
+    expect(staleLead).toContain('status=stale-revision');
+    expect(staleLead).toContain('verify: tap_instance_messages');
+    expect(formatChainCard([peer], 'src/shared.ts', [], { ...base, charBudget: 300 })).toBe('');
+
+    const verification = {
+      sourceIdentity: 'other-lineage:events:10..40',
+      sourceRevision: 'peer-revision-a',
+      localRevision: 'local-revision-b',
+      verifierInstanceId: 'me',
+      verificationId: 'read-receipt:shared-filter',
+      method: 'read' as const,
+      verifiedAt: '2026-06-11T15:00:00.000Z',
+    };
+    const verified = formatChainCard([peer], 'src/shared.ts', [], {
+      ...base,
+      peerEvidenceVerifications: [verification],
+    });
+    expect(verified).toContain('peer evidence from other-lineage');
+    expect(verified).toContain('local-verification:read-receipt:shared-filter method=read [origin=witnessed]');
+    expect(formatChainCard([peer], 'src/shared.ts', [], {
+      ...base,
+      charBudget: 300,
+      peerEvidenceVerifications: [verification],
+    })).toBe('');
+
+    const impossibleSourceTime = formatChainCard([peer], 'src/shared.ts', [], {
+      ...base,
+      peerEvidenceVerifications: [{ ...verification, verifiedAt: '2026-02-31T15:00:00.000Z' }],
+    });
+    expect(impossibleSourceTime).toContain('peer lead from other-lineage');
+    expect(impossibleSourceTime).not.toContain('peer evidence from');
+
+    const staleReceipt = formatChainCard([peer], 'src/shared.ts', [], {
+      ...base,
+      currentRevision: 'local-revision-c',
+      peerEvidenceVerifications: [verification],
+    });
+    expect(staleReceipt).toContain('status=stale-revision');
+    expect(staleReceipt).not.toContain('peer evidence from');
   });
 });
 
@@ -305,7 +391,7 @@ describe('episodic card richness', () => {
     const members = formatChainCard([episode], 'src/hot.ts', []).split('\n')[1];
 
     expect(members).toBe(
-      '  members: src/hot.ts*×9, src/warm.ts×4, src/cold-a.ts, src/cold-b.ts, src/cold-c.ts (+1)',
+      '  members: src/hot.ts*×9, src/warm.ts×4, src/cold-a.ts, src/cold-b.ts, src/cold-c.ts (+1) [origin=derived]',
     );
   });
 
@@ -628,12 +714,12 @@ Make your fixes`;
     const base = { endedAt: '2026-06-11T13:00:00.000Z', summary: 'did the work' } as const;
     const withIntent = makeEpisode({ ...base, intent: 'Fix the cold-zone proximity fallback' });
     const withLines = formatChainCard([withIntent], 'src/a.ts', []).split('\n');
-    expect(withLines[0]).toBe('[Episode recall src/a.ts — 2026-06-11 13:00, "did the work"]');
-    expect(withLines[1]).toBe('  ↳ ask:"Fix the cold-zone proximity fallback"');
-    expect(withLines[2]).toBe('  members: src/a.ts*×3, src/b.ts');
+    expect(withLines[0]).toBe('[Episode recall src/a.ts — 2026-06-11 13:00, "did the work"] [origin=derived]');
+    expect(withLines[1]).toBe('  ↳ ask:"Fix the cold-zone proximity fallback" [origin=witnessed]');
+    expect(withLines[2]).toBe('  members: src/a.ts*×3, src/b.ts [origin=derived]');
 
     const cardWithout = formatChainCard([makeEpisode(base)], 'src/a.ts', []);
-    expect(cardWithout.split('\n')[1]).toBe('  members: src/a.ts*×3, src/b.ts');
+    expect(cardWithout.split('\n')[1]).toBe('  members: src/a.ts*×3, src/b.ts [origin=derived]');
     expect(cardWithout).not.toContain('↳ ask');
   });
 });

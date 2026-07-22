@@ -1118,7 +1118,57 @@ function vaultSession(overrides: Record<string, unknown> = {}): FoldSession {
   });
 }
 
+interface VaultBakeHarness {
+  bakeVault(
+    view: FoldMessage[],
+    mode: 'full' | 'delta',
+    additionallyVisible?: readonly FoldMessage[],
+  ): FoldMessage[];
+  prepareVaultDelta(
+    view: FoldMessage[],
+    additionallyVisible?: readonly FoldMessage[],
+  ): { view: FoldMessage[]; fingerprints: string[] };
+}
+
 describe('FoldSession per-band vault sealing', () => {
+  it('excludes the unanswered row from every freeze bake helper, then admits it once answered', () => {
+    const operatorText = 'OPERATOR-LIVE-BAKE must remain transient until answered';
+    const baseView: FoldMessage[] = [{ role: 'user', content: 'folded base view' }];
+    const bakePaths: Array<{
+      name: string;
+      run: (harness: VaultBakeHarness) => { view: FoldMessage[]; fingerprints: string[] };
+    }> = [
+      {
+        name: 'full bake',
+        run: (harness) => ({ view: harness.bakeVault([...baseView], 'full'), fingerprints: [] }),
+      },
+      {
+        name: 'delta bake',
+        run: (harness) => ({ view: harness.bakeVault([...baseView], 'delta'), fingerprints: [] }),
+      },
+      {
+        name: 'transactional tail delta',
+        run: (harness) => harness.prepareVaultDelta([...baseView]),
+      },
+    ];
+
+    for (const path of bakePaths) {
+      const session = vaultSession();
+      const harness = session as unknown as VaultBakeHarness;
+      session.recordOperatorMessage(operatorText, '2026-06-19T10:05:00Z');
+
+      const live = path.run(harness);
+      expect(vaultText(live.view), path.name).not.toContain(operatorText);
+      expect(vaultText(live.view), path.name).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
+      expect(live.fingerprints, path.name).toEqual([]);
+
+      session.recordAssistantMessage('🏁 answered the live bake request', '2026-06-19T10:06:00Z');
+      const answered = path.run(harness);
+      expect(vaultText(answered.view), path.name).toContain(operatorText);
+      expect(vaultText(answered.view), path.name).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
+    }
+  });
+
   it('bakes the full vault into the frozen view at a full recompute', () => {
     const session = vaultSession();
     session.recordOperatorMessage('OPERATOR-ALPHA wants the build green', '2026-06-19T10:00:00Z');
@@ -1265,7 +1315,7 @@ describe('FoldSession per-band vault sealing', () => {
     const joined = vaultText(hardEpoch.messages);
     expect(joined).toContain('OPERATOR-IOTA hard epoch ask');
     expect(joined.split('[User Message Vault]').length - 1).toBe(1);
-    expect(joined).not.toContain('⌖ LIVE');
+    expect(joined).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
   });
 
   it('defers the unanswered newest operator row from band sealing and re-seals it once answered', () => {
@@ -1287,6 +1337,9 @@ describe('FoldSession per-band vault sealing', () => {
     const liveText = vaultText(live.messages);
     expect(liveText).toContain('OPERATOR-THETA live ask');
     expect(liveText).toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
+    const liveFrozenCorpus = vaultText(session.snapshotFoldFreezeState()?.frozenView ?? []);
+    expect(liveFrozenCorpus).not.toContain('OPERATOR-THETA live ask');
+    expect(liveFrozenCorpus).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
 
     // Once answered, the row seals into the NEXT band — proving it was never
     // sealed while live (a sealed fingerprint would have deduped it out) —
@@ -1300,5 +1353,8 @@ describe('FoldSession per-band vault sealing', () => {
     const bandText = vaultText(answered.messages.slice(boundary));
     expect(bandText).toContain('OPERATOR-THETA live ask');
     expect(vaultText(answered.messages)).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
+    const answeredFrozenCorpus = vaultText(session.snapshotFoldFreezeState()?.frozenView ?? []);
+    expect(answeredFrozenCorpus).toContain('OPERATOR-THETA live ask');
+    expect(answeredFrozenCorpus).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
   });
 });

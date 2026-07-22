@@ -143,8 +143,9 @@ describe('supersession-aware recall suppression', () => {
       { role: 'user', content: foldMarker },
       {
         role: 'user',
+        contextWarpSynthetic: 'cognitive-overlay',
         content: supersessionBand(
-          '↞ msg#10 · verdict · source-id=fixture:event#10 · current=superseded · superseded-by=fixture:event#20 (msg#20)',
+          '↞ msg#10 · verdict · source-id=fixture:event#10 · source-identity=exact · current=superseded · superseded-by=fixture:event#20 (msg#20)',
           '⊘ STALE-BELIEF says the migration must mutate the frozen prefix.',
         ),
       },
@@ -223,8 +224,9 @@ describe('supersession-aware recall suppression', () => {
       { role: 'user', content: foldMarker },
       {
         role: 'user',
+        contextWarpSynthetic: 'cognitive-overlay',
         content: supersessionBand(
-          '↞ msg#10 · verdict · source-id=fixture:event#10 · current=superseded · superseded-by=fixture:event#20 (msg#20)',
+          '↞ msg#10 · verdict · source-id=fixture:event#10 · source-identity=exact · current=superseded · superseded-by=fixture:event#20 (msg#20)',
         ),
       },
     ]);
@@ -293,7 +295,7 @@ describe('supersession-aware recall suppression', () => {
         content: [
           '[cognitive — historical waypoints from the folded window, NOT your current state]',
           '[Chronological Provenance v1] artifact=cognitive-waypoints class=synthesized-history',
-          '↞ msg#10 · verdict · source-id=fixture:event#10 · current=superseded · superseded-by=fixture:event#20 (msg#20)',
+          '↞ msg#10 · verdict · source-id=fixture:event#10 · source-identity=exact · current=superseded · superseded-by=fixture:event#20 (msg#20)',
         ].join('\n'),
       },
     ]);
@@ -2690,6 +2692,74 @@ describe('buildFoldRecallContext', () => {
     }
   });
 
+  test('hard maxCards and ordinary four-hint cap omit over-limit matches', () => {
+    const raw: FoldMessage[] = [];
+    const entries: InterTurnIndexEntry[] = [];
+    const paths: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const path = `relay/src/budget-${i}.ts`;
+      const rawStart = raw.length;
+      paths.push(path);
+      raw.push(
+        userMsg(`Inspect ${path}`),
+        assistantMsg(`BUDGET-BODY-${i} ${'x'.repeat(120)}`),
+      );
+      entries.push(turnEntry(`budget-${i}`, `budget body ${i}`, i, [path], rawStart, raw.length));
+    }
+    const signals = { touchedPaths: [...paths].reverse(), claimedPaths: [] };
+    const uncapped = planRecall(
+      makeIndex(entries, raw.length),
+      new Map(),
+      new Map(),
+      1,
+      signals,
+      'healthy',
+      { ...DEFAULT_FOLD_RECALL_CONFIG, maxCards: entries.length },
+    );
+    expect(uncapped.items).toHaveLength(8); // all eight are genuinely eligible
+
+    const state = createFoldRecallState();
+    state.index = makeIndex(entries, raw.length);
+    const out = buildFoldRecallContext(state, raw, signals, 'healthy', {
+      ...DEFAULT_FOLD_RECALL_CONFIG,
+      maxCards: 2,
+    });
+
+    expect(out.cards).toBe(2);
+    expect(out.hints).toBe(4);
+    expect(out.triggers).toHaveLength(6);
+    expect(out.text!.match(new RegExp(RECALL_CARD_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))).toHaveLength(2);
+    expect(out.text!.match(new RegExp(RECALL_HINT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))).toHaveLength(4);
+    expect(out.text).not.toContain('relay/src/budget-0.ts');
+    expect(out.text).not.toContain('relay/src/budget-1.ts');
+  });
+
+  test('hard maxCardChars excerpts an over-limit body without losing its head or tail', () => {
+    const path = 'relay/src/card-budget.ts';
+    const raw: FoldMessage[] = [
+      userMsg(`Inspect ${path}`),
+      assistantMsg(`CARD-HEAD ${'a'.repeat(1_200)} CARD-MIDDLE-MUST-BE-ELIDED ${'b'.repeat(1_200)} CARD-TAIL`),
+    ];
+    const state = createFoldRecallState();
+    state.index = makeIndex([
+      turnEntry('card-budget', 'oversized card budget witness', 1, [path], 0, raw.length),
+    ], raw.length);
+
+    const out = buildFoldRecallContext(
+      state,
+      raw,
+      { touchedPaths: [path], claimedPaths: [] },
+      'healthy',
+      { ...DEFAULT_FOLD_RECALL_CONFIG, maxCardChars: 500 },
+    );
+
+    expect(out.cards).toBe(1);
+    expect(out.text).toContain('CARD-HEAD');
+    expect(out.text).toContain('CARD-TAIL');
+    expect(out.text).toContain('chars omitted — self-tap for full content');
+    expect(out.text).not.toContain('CARD-MIDDLE-MUST-BE-ELIDED');
+  });
+
   test('intra-turn entry recalls the ORIGINAL pre-fold tool result body by tool id', () => {
     const raw = buildAnthropicHistory();
     const state = freshIntraState(raw);
@@ -2717,12 +2787,67 @@ describe('buildFoldRecallContext', () => {
     expect(state.passSeq).toBe(0); // all three calls are guard no-ops — no pass consumed
   });
 
-  test('byte-identical determinism: identical fresh states and inputs render identical bytes', () => {
-    const raw = buildAnthropicHistory();
-    const a = buildFoldRecallContext(freshState(raw), raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
-    const b = buildFoldRecallContext(freshState(raw), raw, touchBigfile(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+  test('byte-identical determinism: shuffled index, signal, and enrichment Map insertion render identical bytes', () => {
+    const alpha = 'relay/src/determinism-alpha.ts';
+    const beta = 'relay/src/determinism-beta.ts';
+    const raw: FoldMessage[] = [
+      userMsg(`Inspect ${alpha}`),
+      assistantMsg('DETERMINISM ALPHA BODY'),
+      userMsg(`Inspect ${beta}`),
+      assistantMsg('DETERMINISM BETA BODY'),
+    ];
+    const alphaEntry = turnEntry('determinism-alpha', 'determinism alpha', 10, [alpha], 0, 2);
+    const betaEntry = turnEntry('determinism-beta', 'determinism beta', 10, [beta], 2, 4);
+    const buildShuffledState = (reverse: boolean) => {
+      const state = createFoldRecallState();
+      const orderedPaths = reverse ? [beta, alpha] : [alpha, beta];
+      state.index = makeIndex(reverse ? [betaEntry, alphaEntry] : [alphaEntry, betaEntry], raw.length);
+      state.pathHighlights = new Map(orderedPaths.map((path) => [path, [{
+        label: `${path} highlight`,
+        startLine: path === alpha ? 1 : 2,
+        endLine: path === alpha ? 1 : 2,
+      }]]));
+      state.pathHazards = new Map(orderedPaths.map((path) => [path, [{
+        text: `${path} hazard`,
+        startLine: path === alpha ? 11 : 12,
+        endLine: path === alpha ? 11 : 12,
+      }]]));
+      state.pathEpisodes = new Map(orderedPaths.map((path) => [path, [{
+        path,
+        voiceLines: [`episode voice for ${path}`],
+        intent: `intent for ${path}`,
+        chapterIds: [path === alpha ? 1 : 2],
+        endedAt: path === alpha ? '2026-07-21T00:00:00.000Z' : '2026-07-22T00:00:00.000Z',
+      }]]));
+      state.pathAtlasMeta = new Map(orderedPaths.map((path) => [path, {
+        path,
+        purpose: `Purpose for ${path}`,
+        blurb: null,
+        tags: ['determinism'],
+      }]));
+      return state;
+    };
+
+    const a = buildFoldRecallContext(
+      buildShuffledState(false),
+      raw,
+      { touchedPaths: [alpha, beta], claimedPaths: [] },
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+    const b = buildFoldRecallContext(
+      buildShuffledState(true),
+      raw,
+      { touchedPaths: [beta, alpha], claimedPaths: [] },
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
     expect(a.text).toBe(b.text);
     expect(a.chars).toBe(b.chars);
+    expect(a.triggers).toEqual(b.triggers);
+    expect(a.exposures?.map(({ entryId, matchedPath, passSeq }) => ({ entryId, matchedPath, passSeq }))).toEqual(
+      b.exposures?.map(({ entryId, matchedPath, passSeq }) => ({ entryId, matchedPath, passSeq })),
+    );
   });
 
   // ── Repeat-recall card shrink (rail-c63e326e s6) ──

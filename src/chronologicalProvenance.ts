@@ -8,6 +8,7 @@
  * unavailable coordinates remain visibly unknown.
  */
 import { CHRONOLOGICAL_PROVENANCE_PREFIX, type FoldMessage } from './rollingFold.ts';
+import { chronologicalContentOrigin } from './historicalClaimOrigin.ts';
 
 export type ChronologicalContentClass =
   | 'raw'
@@ -289,12 +290,37 @@ function boundedObjective(value: string | undefined, capChars = 300): string | u
   return JSON.stringify(bounded);
 }
 
+function hasStableWitnessSource(envelope: ChronologicalProvenanceEnvelope): boolean {
+  const start = envelope.source.start;
+  if (start.id?.trim()) return true;
+  return Boolean(start.traceId?.trim())
+    && start.index !== undefined
+    && Number.isInteger(start.index)
+    && start.index >= 0;
+}
+
+function chronologicalEnvelopeOrigin(
+  envelope: ChronologicalProvenanceEnvelope,
+  provenanceValid: boolean,
+): ReturnType<typeof chronologicalContentOrigin> {
+  const contentOrigin = chronologicalContentOrigin(envelope.contentClass);
+  if (contentOrigin !== 'witnessed') return contentOrigin;
+  return provenanceValid && hasStableWitnessSource(envelope) ? 'witnessed' : 'derived';
+}
+
+function chronologicalEnvelopeOriginField(
+  envelope: ChronologicalProvenanceEnvelope,
+  provenanceValid: boolean,
+): string {
+  return ` origin=${chronologicalEnvelopeOrigin(envelope, provenanceValid)}`;
+}
+
 function renderInvalidChronologicalProvenance(
   envelope: ChronologicalProvenanceEnvelope,
   errors: readonly string[],
 ): string {
   const artifact = envelope.artifact.replace(/\s+/g, '_').slice(0, 120) || 'unknown';
-  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${artifact} class=${envelope.contentClass} provenance=invalid errors=${errors.join(',') || 'unknown'} authority=${envelope.authority} supersession=${envelope.supersession} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=unknown`;
+  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${artifact} class=${envelope.contentClass} provenance=invalid errors=${errors.join(',') || 'unknown'} authority=${envelope.authority} supersession=${envelope.supersession}${chronologicalEnvelopeOriginField(envelope, false)} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=unknown`;
 }
 
 /** Render the stable grammar; contradictory coordinates become an explicit invalid marker. */
@@ -317,7 +343,7 @@ export function renderChronologicalProvenance(
   const supersession = supersessionText(envelope);
   return [
     CHRONOLOGICAL_PROVENANCE_PREFIX,
-    `artifact=${envelope.artifact} class=${envelope.contentClass} authority=${envelope.authority} supersession=${supersession}`,
+    `artifact=${envelope.artifact} class=${envelope.contentClass} authority=${envelope.authority} supersession=${supersession}${chronologicalEnvelopeOriginField(envelope, true)}`,
     `source=${sourceText(envelope.source)}`,
     `created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)}`,
     `topology=${envelope.topology.previous}>artifact>seam>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation}`,
@@ -340,7 +366,7 @@ export function renderChronologicalProvenanceCompact(
   const rawFrontier = envelope.rawResumesAt
     ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)}(${envelope.topology.rawTailCount} exact)`
     : 'none';
-  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${envelope.artifact} class=${envelope.contentClass} source=${sourceText(envelope.source)} created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)} authority=${envelope.authority} supersession=${supersessionText(envelope)} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=${rawFrontier}`;
+  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${envelope.artifact} class=${envelope.contentClass} source=${sourceText(envelope.source)} created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)} authority=${envelope.authority} supersession=${supersessionText(envelope)}${chronologicalEnvelopeOriginField(envelope, true)} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=${rawFrontier}`;
 }
 
 export interface TailEpochProvenanceInput {

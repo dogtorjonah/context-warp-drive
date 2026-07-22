@@ -32,12 +32,18 @@ export interface BirthFoldSeedMessage {
    * distinguishable from processing time (chronological provenance).
    */
   tsMs?: number;
+  /** Exact persisted source rows represented by this merged seed block. */
+  sourceIdentities?: readonly string[];
+  /** Exact cognitive/tool source when the merged block has one unambiguous candidate. */
+  sourceIdentity?: string;
 }
 
 /** Structural subset of persistence LocalMessage — deliberately no import. */
 export interface BirthFoldSourceRow {
   /** Stable transcript row identity when available. Tool-use rows normally use the provider call id. */
   id?: string;
+  /** Original row identity when this transcript row was inherited through a copy. */
+  prov?: { sourceRowId?: string | null };
   /** Row type: user, assistant_text, tool_use, tool_result, system_reminder, reasoning. */
   ty: string;
   /** Text content. */
@@ -69,6 +75,8 @@ export interface BirthFoldEpisodeMessage {
   role: 'user' | 'assistant';
   content: string | BirthFoldEpisodeContentBlock[];
   tsMs?: number;
+  sourceIdentity?: string;
+  sourceIdentities?: readonly string[];
 }
 
 export interface BirthFoldConversionStats {
@@ -227,11 +235,28 @@ function mergeConsecutiveRoles(messages: BirthFoldSeedMessage[]): BirthFoldSeedM
     const last = out[out.length - 1];
     if (last && last.role === m.role) {
       last.content = `${last.content}\n\n${m.content}`;
+      const identities = [...new Set([
+        ...(last.sourceIdentities ?? []),
+        ...(m.sourceIdentities ?? []),
+      ])];
+      if (identities.length > 0) last.sourceIdentities = identities;
+      const primaryCandidates = [...new Set(
+        [last.sourceIdentity, m.sourceIdentity].filter((value): value is string => Boolean(value)),
+      )];
+      if (primaryCandidates.length === 1) last.sourceIdentity = primaryCandidates[0];
+      else delete last.sourceIdentity;
     } else {
       out.push({ ...m });
     }
   }
   return out;
+}
+
+function sourceRowIdentity(row: BirthFoldSourceRow): string | undefined {
+  const inherited = row.prov?.sourceRowId?.trim();
+  if (inherited) return inherited;
+  const native = row.id?.trim();
+  return native || undefined;
 }
 
 function sourceRowToolUseId(row: BirthFoldSourceRow): string | undefined {
@@ -297,11 +322,15 @@ export function convertLocalMessagesToEpisodeMessages(
     if (row.sg === true) continue;
     const tsMs = sourceRowTsMs(row);
     const stamp = tsMs !== undefined ? { tsMs } : {};
+    const sourceIdentity = sourceRowIdentity(row);
+    const source = sourceIdentity
+      ? { sourceIdentity, sourceIdentities: [sourceIdentity] as const }
+      : {};
 
     if (row.ty === 'user' || row.ty === 'assistant_text') {
       const text = typeof row.tx === 'string' ? clip(row.tx, maxMessageChars) : '';
       if (!text.trim()) continue;
-      messages.push({ role: row.ty === 'user' ? 'user' : 'assistant', content: text, ...stamp });
+      messages.push({ role: row.ty === 'user' ? 'user' : 'assistant', content: text, ...stamp, ...source });
       continue;
     }
 
@@ -313,6 +342,7 @@ export function convertLocalMessagesToEpisodeMessages(
         role: 'assistant',
         content: [{ type: 'tool_use', id, name, input: row.ti ?? {} }],
         ...stamp,
+        ...source,
       });
       continue;
     }
@@ -336,6 +366,7 @@ export function convertLocalMessagesToEpisodeMessages(
           ...(row.isError === true ? { is_error: true } : {}),
         }],
         ...stamp,
+        ...source,
       });
     }
   }
@@ -390,15 +421,42 @@ export function convertLocalMessagesToSeedHistory(
     }
   }
 
-  interface MutableBlock { role: 'user' | 'assistant'; parts: string[]; tsMs?: number }
+  interface MutableBlock {
+    role: 'user' | 'assistant';
+    parts: string[];
+    tsMs?: number;
+    sourceIdentities: string[];
+    cognitiveSourceIdentities: string[];
+  }
   const blocks: MutableBlock[] = [];
   let usedRows = 0;
 
-  const append = (role: 'user' | 'assistant', part: string, tsMs: number | undefined): void => {
+  const append = (
+    role: 'user' | 'assistant',
+    part: string,
+    tsMs: number | undefined,
+    row: BirthFoldSourceRow,
+  ): void => {
     if (!part.trim()) return;
+    const sourceIdentity = sourceRowIdentity(row);
+    const toolLeaf = typeof row.tn === 'string' ? row.tn.split('__').at(-1)?.split('.').at(-1) : undefined;
+    const cognitiveSourceIdentity = row.ty === 'tool_use' && toolLeaf === 'tap_star'
+      ? sourceIdentity
+      : undefined;
     const last = blocks[blocks.length - 1];
-    if (last && last.role === role) last.parts.push(part);
-    else blocks.push({ role, parts: [part], ...(tsMs !== undefined ? { tsMs } : {}) });
+    if (last && last.role === role) {
+      last.parts.push(part);
+      if (sourceIdentity) last.sourceIdentities.push(sourceIdentity);
+      if (cognitiveSourceIdentity) last.cognitiveSourceIdentities.push(cognitiveSourceIdentity);
+    } else {
+      blocks.push({
+        role,
+        parts: [part],
+        sourceIdentities: sourceIdentity ? [sourceIdentity] : [],
+        cognitiveSourceIdentities: cognitiveSourceIdentity ? [cognitiveSourceIdentity] : [],
+        ...(tsMs !== undefined ? { tsMs } : {}),
+      });
+    }
     usedRows += 1;
   };
 
@@ -406,14 +464,25 @@ export function convertLocalMessagesToSeedHistory(
   for (const row of sourceRows) {
     const part = renderRowPart(row, renderBudgets);
     if (!part) continue;
-    append(part.role, part.text, sourceRowTsMs(row));
+    append(part.role, part.text, sourceRowTsMs(row), row);
   }
 
-  const rendered: BirthFoldSeedMessage[] = blocks.map((b) => ({
-    role: b.role,
-    content: b.parts.join('\n\n'),
-    ...(b.tsMs !== undefined ? { tsMs: b.tsMs } : {}),
-  }));
+  const rendered: BirthFoldSeedMessage[] = blocks.map((b) => {
+    const sourceIdentities = [...new Set(b.sourceIdentities)];
+    const cognitiveSourceIdentities = [...new Set(b.cognitiveSourceIdentities)];
+    const sourceIdentity = cognitiveSourceIdentities.length === 1
+      ? cognitiveSourceIdentities[0]
+      : sourceIdentities.length === 1
+        ? sourceIdentities[0]
+        : undefined;
+    return {
+      role: b.role,
+      content: b.parts.join('\n\n'),
+      ...(b.tsMs !== undefined ? { tsMs: b.tsMs } : {}),
+      ...(sourceIdentities.length > 0 ? { sourceIdentities } : {}),
+      ...(sourceIdentity ? { sourceIdentity } : {}),
+    };
+  });
 
   // Per-block ceiling. Retention below never cuts the newest block (dropping
   // it would gut the seed), so a single block bigger than maxChars — e.g. a
@@ -627,7 +696,13 @@ export function convertLocalMessagesToTraceMessages(
     const part = renderRowPart(row, budgets);
     if (!part) continue;
     const tsMs = sourceRowTsMs(row);
-    rendered.push({ role: part.role, content: part.text, ...(tsMs !== undefined ? { tsMs } : {}) });
+    const sourceIdentity = sourceRowIdentity(row);
+    rendered.push({
+      role: part.role,
+      content: part.text,
+      ...(tsMs !== undefined ? { tsMs } : {}),
+      ...(sourceIdentity ? { sourceIdentity, sourceIdentities: [sourceIdentity] } : {}),
+    });
   }
 
   // Newest-first retention over whole messages; the newest message always survives.
@@ -730,23 +805,37 @@ export function resolveBirthFoldSeedMaxChars(
 export function seedToAnthropicMessage(
   m: BirthFoldSeedMessage,
 ):
-  | { role: 'user'; content: Array<{ type: 'text'; text: string }> }
-  | { role: 'assistant'; content: Array<{ type: 'text'; text: string }> } {
+  | { role: 'user'; content: Array<{ type: 'text'; text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[] }
+  | { role: 'assistant'; content: Array<{ type: 'text'; text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[] } {
+  const source = {
+    ...(m.sourceIdentity ? { sourceIdentity: m.sourceIdentity } : {}),
+    ...(m.sourceIdentities ? { sourceIdentities: m.sourceIdentities } : {}),
+  };
   return m.role === 'user'
-    ? { role: 'user', content: [{ type: 'text', text: m.content }] }
-    : { role: 'assistant', content: [{ type: 'text', text: m.content }] };
+    ? { role: 'user', content: [{ type: 'text', text: m.content }], ...source }
+    : { role: 'assistant', content: [{ type: 'text', text: m.content }], ...source };
 }
 
 /** OpenAI Chat Completions history: plain string content. */
 export function seedToOpenAIChatMessage(
   m: BirthFoldSeedMessage,
-): { role: 'user' | 'assistant'; content: string } {
-  return { role: m.role, content: m.content };
+): { role: 'user' | 'assistant'; content: string; sourceIdentity?: string; sourceIdentities?: readonly string[] } {
+  return {
+    role: m.role,
+    content: m.content,
+    ...(m.sourceIdentity ? { sourceIdentity: m.sourceIdentity } : {}),
+    ...(m.sourceIdentities ? { sourceIdentities: m.sourceIdentities } : {}),
+  };
 }
 
 /** Gemini history: model role + parts array. */
 export function seedToGeminiContent(
   m: BirthFoldSeedMessage,
-): { role: 'user' | 'model'; parts: Array<{ text: string }> } {
-  return { role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] };
+): { role: 'user' | 'model'; parts: Array<{ text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[] } {
+  return {
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+    ...(m.sourceIdentity ? { sourceIdentity: m.sourceIdentity } : {}),
+    ...(m.sourceIdentities ? { sourceIdentities: m.sourceIdentities } : {}),
+  };
 }

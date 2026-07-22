@@ -25,6 +25,7 @@ function artifact(overrides: Partial<CognitiveArtifact>): CognitiveArtifact {
     completionSupport: 'insufficient_alone',
     currentStatus: 'unresolved',
     ...overrides,
+    sourceIdentityAuthority: overrides.sourceIdentityAuthority ?? 'synthetic-position',
   };
 }
 
@@ -77,7 +78,7 @@ describe('cognitive artifact transient supersession', () => {
       }),
     ]);
     expect(block).toContain(
-      '↞ msg#3 · in_progress · authority=historical_observation · completion=insufficient_alone · source-time=unknown · source-id=fold-window:message:3 · superseded-by=fold-window:message:7 (msg#7)',
+      '↞ msg#3 · in_progress · authority=historical_observation · completion=insufficient_alone · source-time=unknown · source-id=fold-window:message:3 · source-identity=synthetic-position · superseded-by=fold-window:message:7 (msg#7)',
     );
     expect(block).toContain('⊘ Mapping the render path.');
     expect(block).toContain('🏁 Fixed.');

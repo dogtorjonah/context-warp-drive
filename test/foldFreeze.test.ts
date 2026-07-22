@@ -34,6 +34,7 @@ import {
   isTailEpochEfficiencyAlarm,
   TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO,
   summarizeFrozenBands,
+  classifyFoldFreezePrefixDisposition,
   classifyFoldWriteTarget,
   isFoldWriteAllowed,
   assertFoldWriteAllowed,
@@ -66,6 +67,17 @@ const ctx = (thinningMode = 'off', claims: string[] = []): FoldFreezeContext => 
 
 const CFG: FoldFreezeConfig = { enabled: true, ttlMs: 300_000, maxTailChars: 1_000 };
 const T0 = 1_000_000;
+
+describe('classifyFoldFreezePrefixDisposition', () => {
+  it('separates byte-identical prefix retention from whole-view replacement', () => {
+    expect(classifyFoldFreezePrefixDisposition('hot-reuse')).toBe('preserved');
+    expect(classifyFoldFreezePrefixDisposition('append-tail-epoch')).toBe('preserved');
+    expect(classifyFoldFreezePrefixDisposition('first-call')).toBe('replaced');
+    expect(classifyFoldFreezePrefixDisposition('cold-gap')).toBe('replaced');
+    expect(classifyFoldFreezePrefixDisposition('hard-epoch')).toBe('replaced');
+    expect(classifyFoldFreezePrefixDisposition(undefined)).toBe('unknown');
+  });
+});
 
 /** Build a state frozen at T0 over a 4-message history, returning all parts. */
 function frozenFixture(): {
@@ -1464,15 +1476,31 @@ describe('artifact-mode flip cannot mutate sealed bytes', () => {
 });
 
 describe('vault seal-once across a freeze generation', () => {
-  const vaultRow = (role: 'user' | 'assistant', text: string): VaultRenderRow => ({
-    role,
-    text,
-    priority: role === 'user' ? Number.POSITIVE_INFINITY : 0,
-  });
+  const vaultRow = (role: 'user' | 'assistant', text: string): VaultRenderRow => (
+    role === 'user'
+      ? {
+        kind: 'evidence',
+        role,
+        text,
+        sourceTime: '2026-07-22T01:00:00.000Z',
+        liveness: 'answered',
+        authorization: 'expired',
+        priority: Number.POSITIVE_INFINITY,
+      }
+      : {
+        kind: 'evidence',
+        role,
+        text,
+        sourceTime: '2026-07-22T01:01:00.000Z',
+        liveness: 'not-applicable',
+        authorization: 'not-applicable',
+        priority: 0,
+      }
+  );
 
   it('a reborn session cannot re-seal a row already present in the restored prefix', () => {
     const { state: predecessor, history } = frozenFixture();
-    const sealedRow = vaultRow('user', 'operator directive already baked');
+    const sealedRow = vaultRow('user', 'operator approval wording already baked');
     const freshRow = vaultRow('assistant', 'verdict rendered after rebirth');
     const firstRows = selectVaultDeltaRows([sealedRow], predecessor.sealedVaultFingerprints);
     const firstRawTail = [msg('user', 'a'.repeat(1000)), msg('assistant', 'b'.repeat(1000))];
@@ -1487,6 +1515,11 @@ describe('vault seal-once across a freeze generation', () => {
     );
     expect(first.committed).toBe(true);
     expect(predecessor.sealedVaultFingerprints.has(vaultRowFingerprint(sealedRow))).toBe(true);
+    const firstBandText = JSON.stringify(predecessor.frozenView);
+    expect(firstBandText).toContain('schema=vault-record/v1 kind=evidence role=user');
+    expect(firstBandText).toContain('liveness=answered authorization=expired');
+    expect(firstBandText).not.toContain('kind=live-directive');
+    expect(firstBandText).not.toContain('authorization=live');
 
     // Cross the real rebirth ownership boundary after the row joined band one.
     const restored = restoreFoldFreezeState(serializeFoldFreezeState(predecessor));
@@ -1498,6 +1531,8 @@ describe('vault seal-once across a freeze generation', () => {
       ),
     );
     expect(restoredFirstBandText).toContain(sealedRow.text);
+    expect(restoredFirstBandText).toContain('schema=vault-record/v1 kind=evidence role=user');
+    expect(restoredFirstBandText).toContain('liveness=answered authorization=expired');
     const delta = selectVaultDeltaRows([sealedRow, freshRow], restored.sealedVaultFingerprints);
     expect(delta.map((row) => row.text)).toEqual([freshRow.text]);
 

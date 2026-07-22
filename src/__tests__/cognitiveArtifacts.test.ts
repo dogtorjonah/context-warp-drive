@@ -20,6 +20,7 @@ function artifact(overrides: Partial<CognitiveArtifact>): CognitiveArtifact {
     completionSupport: 'insufficient_alone',
     currentStatus: 'unresolved',
     ...overrides,
+    sourceIdentityAuthority: overrides.sourceIdentityAuthority ?? 'synthetic-position',
   };
 }
 
@@ -121,6 +122,8 @@ describe('cognitiveArtifacts', () => {
       const messages = [{
         role: 'assistant',
         tsMs,
+        sourceIdentity: 'provider-snapshot-0',
+        sourceIdentities: ['provider-snapshot-0', 'call_star_decision_1'],
         content: [
           { type: 'text', text: '▶ continuing the implementation' },
           {
@@ -147,7 +150,10 @@ describe('cognitiveArtifacts', () => {
         sourceTimestamp: '2026-07-18T20:29:00.000Z',
         sourceIdentity: 'call_star_decision_1',
       });
-      expect(artifacts.some((artifact) => artifact.register === 'executing')).toBe(true);
+      expect(artifacts.find((artifact) => artifact.register === 'executing')).toMatchObject({
+        sourceIdentity: 'provider-snapshot-0',
+        sourceIdentityAuthority: 'exact',
+      });
     });
 
     it('preserves long categorized tap_star notes verbatim and ignores harvest calls', () => {
@@ -377,7 +383,7 @@ describe('cognitiveArtifacts', () => {
         messageIndex: 7,
         trust: 'durable',
       }))).toBe(
-        '↞ msg#7 · blocked · authority=historical_observation · completion=insufficient_alone · source-time=unknown · source-id=fold-window:message:7',
+        '↞ msg#7 · blocked · authority=historical_observation · completion=insufficient_alone · source-time=unknown · source-id=fold-window:message:7 · source-identity=synthetic-position',
       );
     });
   });

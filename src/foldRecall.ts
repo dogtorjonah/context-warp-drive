@@ -902,7 +902,7 @@ function collectCognitiveSupersessions(
       || message.contextWarpSynthetic === 'cognitive-overlay';
     if (message.role !== 'assistant' && message.role !== 'model' && !trustedSynthetic) continue;
     for (const text of collectMessageTextFragments(message)) {
-      if (!isSyntheticContextText(text, syntheticContext)) continue;
+      if (!trustedSynthetic && !isSyntheticContextText(text, syntheticContext)) continue;
       for (const pointer of extractCognitiveSupersessionPointers(text)) {
         bySource.set(pointer.sourceIdentity, pointer.supersededByIdentity);
       }
@@ -1671,6 +1671,20 @@ export interface AtlasFileMeta {
   blurb: string | null;
   /** Canonical tag list from Atlas (empty when not curated). */
   tags: string[];
+  /**
+   * Exact Atlas history route for this path. `null` means the worker checked
+   * Atlas and found no changelog coverage; `undefined` is a legacy/unhydrated
+   * carrier and is rendered with the same honest unavailable state.
+   */
+  drilldown?: AtlasSnapshotDrilldown | null;
+}
+
+/** Exact retained Atlas snapshot coordinate; no summary text is synthesized. */
+export interface AtlasSnapshotDrilldown {
+  changelogId: number;
+  snapshotId: number | null;
+  startLine: number | null;
+  endLine: number | null;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1930,7 +1944,7 @@ export function buildRecallRankingContext(input: {
  * unrelated relative inputs remain present.
  */
 function sourceAwareRecallPaths(source: readonly string[], aliases: readonly string[]): string[] {
-  if (source.length === 0) return [...aliases];
+  if (source.length === 0) return [...new Set(aliases)].sort();
   const shadowedAliases = new Set(source.map((path) => normalizeToolPath(path)));
   return [...new Set([
     ...source,
@@ -3442,25 +3456,81 @@ function buildAtlasMetaBlock(
   config: FoldRecallConfig,
   charBudget: number,
   _suppressPaths: ReadonlySet<string>,
-): string {
+): string | null {
   if (!config.atlasMetaEnabled) return '';
   if (charBudget <= 0) return '';
-  const meta = state.pathAtlasMeta?.get(item.matchedPath)
+  const candidateMeta = state.pathAtlasMeta?.get(item.matchedPath)
     ?? state.pathAtlasMeta?.get(normalizeToolPath(item.matchedPath));
-  if (!meta) return '';
+  const matchedPath = normalizeToolPath(item.matchedPath);
+  // A route is authoritative only for the exact path whose Atlas row minted
+  // it. Treat mismatched legacy/host carriers as uncovered instead of pairing
+  // one file's changelog id with another file's history query.
+  const meta = candidateMeta && normalizeToolPath(candidateMeta.path) === matchedPath
+    ? candidateMeta
+    : undefined;
+  const pathTriggered = item.tier <= 1 && !isSyntheticRecallKey(item.matchedPath);
+  if (!meta && !pathTriggered) return '';
 
   const parts: string[] = [];
   let used = 0;
+  const optionalMetaBudget = Math.floor(charBudget / 3);
 
-  const identity = meta.purpose ?? meta.blurb;
-  if (identity && used + identity.length + 5 < charBudget) {
+  // Path recall is an index, not a summary generator. Put the exact Atlas
+  // route first so pressure drops optional identity prose before it can detach
+  // the changelog/snapshot coordinate. Missing coverage stays visibly missing.
+  if (pathTriggered) {
+    const rawDrilldown = meta?.drilldown;
+    const drilldown = rawDrilldown
+      && Number.isSafeInteger(rawDrilldown.changelogId)
+      && rawDrilldown.changelogId > 0
+      ? rawDrilldown
+      : null;
+    const hasSnapshotRange = drilldown
+      && Number.isSafeInteger(drilldown.startLine)
+      && Number.isSafeInteger(drilldown.endLine)
+      && (drilldown.startLine ?? 0) > 0
+      && (drilldown.endLine ?? 0) >= (drilldown.startLine ?? 0);
+    const line = drilldown
+      && hasSnapshotRange
+      ? `  ↳ atlas_snapshot changelog_id=${drilldown.changelogId} start_line=${drilldown.startLine} end_line=${drilldown.endLine}`
+      : drilldown
+        ? `  ↳ Atlas changelog #${drilldown.changelogId}; snapshot coordinates unavailable`
+        : '  ↳ Atlas drill-down unavailable';
+    if (line.length + 1 > charBudget) return null;
+    parts.push(line);
+    used += line.length + 1;
+  }
+
+  // A claim-tier card, or a path-touch card that the host marks as an active
+  // file, sits on the behavior-changing boundary. Carry the actual Atlas
+  // history query there rather than relying on separate operator discipline.
+  // The route is minted only from a real changelog row; uncovered paths retain
+  // the explicit unavailable line above and never receive a fabricated link.
+  const historyGateRequired = pathTriggered && (
+    item.tier === 1 || (item.intentRelevance?.activeFileCoverage ?? 0) > 0
+  );
+  const validHistoryDrilldown = meta?.drilldown
+    && Number.isSafeInteger(meta.drilldown.changelogId)
+    && meta.drilldown.changelogId > 0
+    ? meta.drilldown
+    : null;
+  if (historyGateRequired && validHistoryDrilldown) {
+    const historyPath = matchedPath;
+    const line = `  ↳ history gate: atlas_query action=history file_path=${JSON.stringify(historyPath)} limit=5 (latest changelog_id=${validHistoryDrilldown.changelogId})`;
+    if (used + line.length + 1 > charBudget) return null;
+    parts.push(line);
+    used += line.length + 1;
+  }
+
+  const identity = meta?.purpose ?? meta?.blurb;
+  if (identity && used + identity.length + 5 < Math.max(used, optionalMetaBudget)) {
     const line = `  📌 ${identity}`;
     parts.push(line);
     used += line.length + 1;
   }
-  if (meta.tags.length > 0) {
-    const tagLine = `  🏷 ${meta.tags.slice(0, 5).join(', ')}`;
-    if (used + tagLine.length + 1 < charBudget) {
+  if ((meta?.tags.length ?? 0) > 0) {
+    const tagLine = `  🏷 ${meta?.tags.slice(0, 5).join(', ')}`;
+    if (used + tagLine.length + 1 < Math.max(used, optionalMetaBudget)) {
       parts.push(tagLine);
       used += tagLine.length + 1;
     }
@@ -3756,7 +3826,7 @@ function renderRecallProvenance(
   return `${rendered}\n${episode.length > 260 ? `${charSafeSlice(episode, 0, 259)}…` : episode}`;
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', atlasMeta = ''): RenderedCard {
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, cardEnvelopeChars: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', atlasMeta = ''): RenderedCard {
   // Radar (hazard + highlight guideposts), episodic voice, and the source-delta
   // notifier all prepend the body excerpt and share the card budget. For a
   // claim-tier recall the body is already swapped to CURRENT box source for
@@ -3767,14 +3837,40 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, rada
   const metaBlock = atlasMeta ? `${atlasMeta}\n` : '';
   const provenance = renderRecallProvenance(item, rawHistory, rawTailStart);
   const provenanceBlock = provenance ? `${provenance}\n` : '';
-  const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - metaBlock.length - provenanceBlock.length) / 2);
+  const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
+  const footer = '[End fold recall]';
+  // The first Atlas line is a mechanical coordinate required on every path
+  // card. Fund it from RECALL_BODY_RESERVED_GAP_CHARS (the framing reserve)
+  // only after charging the actual header/footer framing. Any remainder stays
+  // body-budgeted so the route cannot overflow the total card envelope.
+  const atlasLines = atlasMeta.split('\n');
+  const framingChars = header.length + 1 + 1 + footer.length;
+  const availableRouteReserve = Math.max(0, RECALL_BODY_RESERVED_GAP_CHARS - framingChars);
+  const routeReserve = atlasLines[0]?.trimStart().startsWith('↳')
+    ? Math.min((atlasLines[0]?.length ?? 0) + 1, availableRouteReserve)
+    : 0;
+  const chargedMetaChars = Math.max(0, metaBlock.length - routeReserve);
+  const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - chargedMetaChars - provenanceBlock.length) / 2);
   const notifier = formatDeltaNotifier(applied, notifierBudget);
   const notifierBlock = notifier ? `${notifier}\n` : '';
   const prefixBlock = `${provenanceBlock}${metaBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
-  const excerpt = excerptForRecall(body, Math.max(0, bodyBudget - prefixBlock.length));
-  const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
+  const preferredExcerptChars = Math.max(0, bodyBudget - prefixBlock.length + routeReserve);
+  const excerptRenderedLimit = Math.max(
+    0,
+    cardEnvelopeChars - framingChars - prefixBlock.length,
+  );
+  let boundedExcerptChars = Math.min(preferredExcerptChars, excerptRenderedLimit);
+  let excerpt = excerptForRecall(body, boundedExcerptChars);
+  // excerptForRecall adds an omission marker outside its payload budget. Pay
+  // that marker from the remaining framing reserve too; otherwise a route can
+  // make a valid card overflow and silently downgrade to a hint.
+  for (let pass = 0; excerpt.length > excerptRenderedLimit && pass < 4; pass++) {
+    boundedExcerptChars = Math.max(0, boundedExcerptChars - (excerpt.length - excerptRenderedLimit));
+    excerpt = excerptForRecall(body, boundedExcerptChars);
+  }
+  if (excerpt.length > excerptRenderedLimit) excerpt = '';
   return {
-    text: `${header}\n${prefixBlock}${excerpt}\n[End fold recall]`,
+    text: `${header}\n${prefixBlock}${excerpt}\n${footer}`,
     stats: {
       bodyChars: excerpt.length,
       notifierChars: notifier.length,
@@ -4303,55 +4399,68 @@ export function buildFoldRecallContext(
         // notifier + excerpt share the rest. '' (empty carriers / flags off) ⇒ byte-identical.
         const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
         const episodeVoice = buildEpisodeVoiceBlock(item, state, config, Math.floor(bodyBudget / 4), radarSuppressPaths);
-        const atlasMeta = buildAtlasMetaBlock(item, state, config, Math.floor(bodyBudget / 5), radarSuppressPaths);
-        // Information residency is broader than recall-card residency. Suppress
-        // only when the recovered body AND every rendered enrichment are already
-        // present. A source-delta notifier is always novel continuity evidence,
-        // so changed/beyond-source cards must still render even when their body
-        // is resident elsewhere in POV.
-        const residentPrunedBody = rb.applied.length === 0
-          ? pruneRawTailResidentParagraphs(rb.body, rawTailPovText)
-          : rb.body;
-        if (!residentPrunedBody) {
-          suppressed++;
-          recordSuppressed(item.entry, item.matchedPath);
-          continue;
-        }
-        const povComponents = [residentPrunedBody, radar, episodeVoice, atlasMeta].filter((part) => part.length > 0);
-        cardContentKey = povComponents.map(normalizeFoldRecallPovText).join('\u0000');
-        const allComponentsResident = rb.applied.length === 0
-          && povComponents.length > 0
-          && povComponents.every((part) => {
-            const normalized = normalizeFoldRecallPovText(part);
-            return normalized.length >= 82 && providerPovText.includes(normalized);
-          });
-        if (allComponentsResident) {
-          suppressed++;
-          recordSuppressed(item.entry, item.matchedPath);
-          continue;
-        }
-        if (rb.applied.length === 0 && cardContentKey && emittedCardContentKeys.has(cardContentKey)) {
-          suppressed++;
-          recordSuppressed(item.entry, item.matchedPath);
-          continue;
-        }
-        const rc = renderCard(
-          item,
-          residentPrunedBody,
-          bodyBudget,
-          radar,
-          rb.applied,
-          rawHistory,
-          state.index?.rawCount ?? rawHistory.length,
-          episodeVoice,
-          atlasMeta,
-        );
-        rendered = rc.text;
-        if (rendered.length > remaining) {
+        // Atlas routes are mandatory coordinates, so let them consume the full
+        // body budget. buildAtlasMetaBlock keeps optional identity prose on the
+        // former one-third sub-ceiling; renderCard charges every non-reserved
+        // byte against the same measured envelope.
+        const atlasMeta = buildAtlasMetaBlock(item, state, config, bodyBudget, radarSuppressPaths);
+        if (atlasMeta === null) {
+          // A mandatory mechanical route could not fit. Preserve the invariant
+          // that every full edit-relevant card carries it by degrading this
+          // candidate to the ordinary bounded hint path.
           level = 'hint';
-          rendered = null;
         } else {
-          cardStats = rc.stats;
+          // Information residency is broader than recall-card residency. Suppress
+          // only when the recovered body AND every rendered enrichment are already
+          // present. A source-delta notifier is always novel continuity evidence,
+          // so changed/beyond-source cards must still render even when their body
+          // is resident elsewhere in POV.
+          const residentPrunedBody = rb.applied.length === 0
+            ? pruneRawTailResidentParagraphs(rb.body, rawTailPovText)
+            : rb.body;
+          if (!residentPrunedBody) {
+            suppressed++;
+            recordSuppressed(item.entry, item.matchedPath);
+            continue;
+          }
+          const povComponents = [residentPrunedBody, radar, episodeVoice, atlasMeta].filter((part) => part.length > 0);
+          cardContentKey = povComponents.map(normalizeFoldRecallPovText).join('\u0000');
+          const allComponentsResident = rb.applied.length === 0
+            && povComponents.length > 0
+            && povComponents.every((part) => {
+              const normalized = normalizeFoldRecallPovText(part);
+              const minimumResidentChars = part === atlasMeta ? 20 : 82;
+              return normalized.length >= minimumResidentChars && providerPovText.includes(normalized);
+            });
+          if (allComponentsResident) {
+            suppressed++;
+            recordSuppressed(item.entry, item.matchedPath);
+            continue;
+          }
+          if (rb.applied.length === 0 && cardContentKey && emittedCardContentKeys.has(cardContentKey)) {
+            suppressed++;
+            recordSuppressed(item.entry, item.matchedPath);
+            continue;
+          }
+          const rc = renderCard(
+            item,
+            residentPrunedBody,
+            bodyBudget,
+            remaining,
+            radar,
+            rb.applied,
+            rawHistory,
+            state.index?.rawCount ?? rawHistory.length,
+            episodeVoice,
+            atlasMeta,
+          );
+          rendered = rc.text;
+          if (rendered.length > remaining) {
+            level = 'hint';
+            rendered = null;
+          } else {
+            cardStats = rc.stats;
+          }
         }
       }
     }

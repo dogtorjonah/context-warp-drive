@@ -13,7 +13,7 @@
  * touching ONE member recalls the WHOLE zone.
  *
  * INVARIANTS
- * - Pure CPU island: zero I/O, zero imports, zero ambient reads (no Date.now,
+ * - Pure CPU island: zero I/O, one pure origin-grammar import, zero ambient reads (no Date.now,
  *   no randomness). Same inputs → byte-identical output. Safe to import from
  *   worker handlers, capture seams, backfill scripts, and replay studies alike.
  * - NO-NARRATOR RULE: traces and cards contain only structural tokens (tools,
@@ -35,6 +35,13 @@
  *   `annotations` denormalized at write time (aa-ledger ENOENT lesson).
  *   Nothing in this module reaches back to transcript files at render time.
  */
+
+import {
+  derivedHistoricalClaim,
+  renderHistoricalClaim,
+  synthesizedHistoricalClaim,
+  witnessedHistoricalClaim,
+} from './historicalClaimOrigin.ts';
 
 /**
  * Persisted membership strength within a burst. Live capture emits only
@@ -363,6 +370,30 @@ export interface WalkSpineCitation {
   label?: string;
 }
 
+/**
+ * Append-only local evidence that a caller actually re-checked one peer
+ * episode against its own current workspace revision. The record is separate
+ * from the peer episode: recall may project the pair, but it never upgrades or
+ * rewrites the historical peer row in place.
+ */
+export interface PeerEvidenceVerificationRecord {
+  /** Stable peer source coordinate, e.g. `instance:events:first..last`. */
+  sourceIdentity: string;
+  /** Revision stored on the peer episode when its source events were observed. */
+  sourceRevision: string;
+  /** Caller's workspace revision at which the local check ran. */
+  localRevision: string;
+  /** Caller/own-lineage instance that performed the local check. */
+  verifierInstanceId: string;
+  /** Stable local read/test/review receipt identity. */
+  verificationId: string;
+  method: 'read' | 'test' | 'review';
+  /** ISO source time of the local verification action. */
+  verifiedAt: string;
+}
+
+export type PeerEvidenceDisposition = 'verified' | 'unverified' | 'stale-revision';
+
 export interface ChainCardOptions {
   /** Pre-rendered session-adjacent one-liners (resolved at recall by the store). */
   bookends?: { before?: string; after?: string };
@@ -388,6 +419,14 @@ export interface ChainCardOptions {
    * to keep cross-lineage coordination signal.
    */
   selfLineageOnly?: boolean;
+  /** Current caller workspace revision, resolved locally at recall time. */
+  currentRevision?: string;
+  /**
+   * Explicit local verification overlays. Only an exact source identity,
+   * source revision, current local revision, and own-lineage verifier match can
+   * promote peer material from a lead to locally verified evidence.
+   */
+  peerEvidenceVerifications?: readonly PeerEvidenceVerificationRecord[];
 }
 
 export const DEFAULT_EPISODE_GROUPING = {
@@ -1401,7 +1440,10 @@ function voiceTimeSuffix(annotation: EpisodeAnnotation): string {
  * chapter can be labeled with WHO authored it — the identity-bleed guard for
  * cross-lineage recall.
  */
-type AttributionOpts = Pick<ChainCardOptions, 'ownLineage' | 'selfName'>;
+type AttributionOpts = Pick<
+  ChainCardOptions,
+  'ownLineage' | 'selfName' | 'currentRevision' | 'peerEvidenceVerifications'
+>;
 
 /**
  * Voice/identity attribution label for an episode, or '' when attribution is
@@ -1439,25 +1481,33 @@ function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   const at = voiceTimeSuffix(annotation);
   const who = label ? ` ${label}` : '';
   const evidence = evidenceRefSuffix(annotation);
-  if (annotation.kind.startsWith('star:')) return `  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}${evidence}`;
-  if (annotation.kind === 'changelog') return `  ✎${who}:"${text}"${at}${evidence}`;
-  if (annotation.kind.startsWith('narration')) return `  🗣${who}:"${text}"${at}${evidence}`;
+  const withOrigin = (line: string): string => renderHistoricalClaim(synthesizedHistoricalClaim(line));
+  if (annotation.kind.startsWith('star:')) return `${withOrigin(`  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}`)}${evidence}`;
+  if (annotation.kind === 'changelog') return `${withOrigin(`  ✎${who}:"${text}"${at}`)}${evidence}`;
+  if (annotation.kind.startsWith('narration')) return `${withOrigin(`  🗣${who}:"${text}"${at}`)}${evidence}`;
   if (annotation.kind.startsWith('process:')) {
     const category = annotation.kind.slice('process:'.length);
-    return `  🗣${who} [${category}]:"${text}"${at}${evidence}`;
+    return `${withOrigin(`  🗣${who} [${category}]:"${text}"${at}`)}${evidence}`;
   }
-  if (annotation.kind === 'rail') return `  🛤${who}:"${text}"${at}${evidence}`;
-  return `  💬${who}:"${text}"${at}${evidence}`;
+  if (annotation.kind === 'rail') return `${withOrigin(`  🛤${who}:"${text}"${at}`)}${evidence}`;
+  return `${withOrigin(`  💬${who}:"${text}"${at}`)}${evidence}`;
 }
 
 function evidenceRefSuffix(annotation: EpisodeAnnotation): string {
   const evidence = annotation.evidence;
   if (!evidence) return '';
-  if (evidence.kind === 'none') return ' ↞ evidence:none';
+  if (evidence.kind === 'none') {
+    return ` ↞ ${renderHistoricalClaim(derivedHistoricalClaim('evidence:none'))}`;
+  }
   const stamp = evidence.ts ? formatEpisodeDate(evidence.ts) : '';
   const at = stamp ? ` ${stamp}` : '';
   const source = evidence.sourceId ? ` source:${truncateVerbatim(evidence.sourceId, 40)}` : '';
-  return ` ↞ evidence:${truncateVerbatim(evidence.tool, 32)} result${source} event#${evidence.eventIndex}${at}`;
+  const sourceIdentity = evidence.sourceId?.trim() || `event#${evidence.eventIndex}`;
+  const claim = witnessedHistoricalClaim(
+    `evidence:${truncateVerbatim(evidence.tool, 32)} result${source} event#${evidence.eventIndex}${at}`,
+    { sourceIdentity, ...(evidence.ts ? { sourceTimestamp: evidence.ts } : {}) },
+  );
+  return ` ↞ ${renderHistoricalClaim(claim)}`;
 }
 
 /**
@@ -1495,13 +1545,135 @@ function renderMembersLine(episode: Episode): string {
     return member.touchCount > 1 ? `${path}×${member.touchCount}` : path;
   });
   const extra = ordered.length > visible.length ? ` (+${ordered.length - visible.length})` : '';
-  return `  members: ${visible.join(', ')}${extra}`;
+  return renderHistoricalClaim(derivedHistoricalClaim(`  members: ${visible.join(', ')}${extra}`));
+}
+
+function episodeSourceIdentity(episode: Episode): string {
+  const range = episodeEventRange(episode);
+  return `${episode.instanceId}:events:${range.first}..${range.last}`;
+}
+
+export interface PeerEvidenceResolution {
+  disposition: PeerEvidenceDisposition;
+  sourceIdentity: string;
+  observedRevision: string | null;
+  currentRevision: string | null;
+  verification?: PeerEvidenceVerificationRecord;
+}
+
+function nonEmptyScalar(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 && !/[\r\n]/u.test(trimmed) ? trimmed : null;
+}
+
+function isValidIsoTimestamp(value: unknown): value is string {
+  const timestamp = nonEmptyScalar(value);
+  if (!timestamp) return false;
+  const match = timestamp.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2}))$/u,
+  );
+  if (!match) return false;
+  const [year, month, day, hour, minute, second, offsetHour, offsetMinute] = match
+    .slice(1)
+    .map((part) => part === undefined ? 0 : Number(part));
+  const leapYear = year! % 4 === 0 && (year! % 100 !== 0 || year! % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month! >= 1
+    && month! <= 12
+    && day! >= 1
+    && day! <= daysInMonth[month! - 1]!
+    && hour! <= 23
+    && minute! <= 59
+    && second! <= 59
+    && offsetHour! <= 14
+    && offsetMinute! <= 59
+    && (offsetHour! !== 14 || offsetMinute === 0)
+    && Number.isFinite(Date.parse(timestamp));
+}
+
+/**
+ * Resolve the peer evidence boundary without mutating the peer episode. A
+ * verification is accepted only when it binds the exact source coordinate and
+ * source revision to the caller's exact current revision, and the verifier is
+ * a member of the caller's own lineage. A record for yesterday's checkout is
+ * therefore inert after HEAD moves.
+ */
+export function resolvePeerEvidenceDisposition(
+  episode: Episode,
+  opts: Pick<ChainCardOptions, 'ownLineage' | 'currentRevision' | 'peerEvidenceVerifications'>,
+): PeerEvidenceResolution {
+  const sourceIdentity = episodeSourceIdentity(episode);
+  const observedRevision = nonEmptyScalar(episode.gitHead);
+  const currentRevision = nonEmptyScalar(opts.currentRevision);
+  const verification = observedRevision && currentRevision && opts.ownLineage
+    ? opts.peerEvidenceVerifications?.find((candidate) =>
+        nonEmptyScalar(candidate.sourceIdentity) === sourceIdentity
+        && nonEmptyScalar(candidate.sourceRevision) === observedRevision
+        && nonEmptyScalar(candidate.localRevision) === currentRevision
+        && !!nonEmptyScalar(candidate.verificationId)
+        && isValidIsoTimestamp(candidate.verifiedAt)
+        && (candidate.method === 'read' || candidate.method === 'test' || candidate.method === 'review')
+        && opts.ownLineage?.has(candidate.verifierInstanceId) === true,
+      )
+    : undefined;
+  if (verification) {
+    return { disposition: 'verified', sourceIdentity, observedRevision, currentRevision, verification };
+  }
+  return {
+    disposition: observedRevision && currentRevision && observedRevision !== currentRevision
+      ? 'stale-revision'
+      : 'unverified',
+    sourceIdentity,
+    observedRevision,
+    currentRevision,
+  };
+}
+
+/** Render the mandatory peer lead/evidence boundary carried by recall cards. */
+export function formatPeerEvidenceBoundary(
+  episode: Episode,
+  targetPath: string,
+  opts: AttributionOpts,
+  contextPrefix = '  ↞ ',
+): string {
+  const resolution = resolvePeerEvidenceDisposition(episode, opts);
+  const label = episodeAuthorLabel(episode, opts);
+  const observed = resolution.observedRevision ?? 'unknown';
+  const current = resolution.currentRevision ?? 'unknown';
+  if (resolution.disposition === 'verified' && resolution.verification) {
+    const record = resolution.verification;
+    const boundary = renderHistoricalClaim(derivedHistoricalClaim(
+      `${contextPrefix}peer evidence from ${label} observed-revision=${observed} local-revision=${current}`,
+    ));
+    const receipt = renderHistoricalClaim(witnessedHistoricalClaim(
+      `local-verification:${truncateVerbatim(record.verificationId, 80)} method=${record.method}`,
+      { sourceIdentity: record.verificationId, sourceTimestamp: record.verifiedAt },
+    ));
+    return `${boundary} | ${receipt}`;
+  }
+  const target = JSON.stringify(targetPath);
+  const source = JSON.stringify(episode.instanceId);
+  return renderHistoricalClaim(derivedHistoricalClaim(
+    `${contextPrefix}peer lead from ${label} status=${resolution.disposition} observed-revision=${observed} current-revision=${current}; verify: tap_instance_messages target_instance=${source} rag=true search=${target}, then read/test locally at revision ${current}`,
+  ));
+}
+
+function renderEpisodeWitnessedClaim(episode: Episode, text: string, sourceTimestamp?: string): string {
+  return renderHistoricalClaim(witnessedHistoricalClaim(text, {
+    sourceIdentity: episodeSourceIdentity(episode),
+    ...(sourceTimestamp ? { sourceTimestamp } : {}),
+  }));
 }
 
 /** Pointer into the full verbatim record — exactness is reachable, not resident. */
 export function formatPointerLine(episode: Episode): string {
   const range = episodeEventRange(episode);
-  return `  ⌖ verbatim: ${episode.instanceId} events ${range.first}..${range.last}`;
+  return renderEpisodeWitnessedClaim(
+    episode,
+    `  ⌖ verbatim: ${episode.instanceId} events ${range.first}..${range.last}`,
+    episode.endedAt !== UNKNOWN_EPISODE_TIME ? episode.endedAt : undefined,
+  );
 }
 
 function renderChapterBody(
@@ -1515,27 +1687,53 @@ function renderChapterBody(
   // members/trace. Hot + full-previous chapters render full bodies so both surface
   // it; warm/cold collapse to one-liners and never reach here. Guarded so episodes
   // with no mined ask (agent-initiated / legacy) stay byte-identical to before.
-  if (episode.intent) lines.push(`  ↳ ask:"${truncateVerbatim(episode.intent, INTENT_TEXT_CAP_CHARS)}"`);
+  if (episode.intent) {
+    lines.push(renderEpisodeWitnessedClaim(
+      episode,
+      `  ↳ ask:"${truncateVerbatim(episode.intent, INTENT_TEXT_CAP_CHARS)}"`,
+      episode.startedAt !== UNKNOWN_EPISODE_TIME ? episode.startedAt : undefined,
+    ));
+  }
   lines.push(renderMembersLine(episode));
-  if (episode.trace.length > 0) lines.push(`  trace: ${episode.trace}`);
+  if (episode.trace.length > 0) {
+    lines.push(renderHistoricalClaim(derivedHistoricalClaim(`  trace: ${episode.trace}`)));
+  }
   for (const inlay of selectVoiceInlays(episode.annotations, maxVoiceInlays)) {
     lines.push(renderVoiceLine(inlay, voiceLabel));
   }
   for (const delta of sinceDeltas) {
-    lines.push(`  Δ ${delta}`);
+    lines.push(renderHistoricalClaim(derivedHistoricalClaim(`  Δ ${delta}`)));
   }
   return lines;
 }
 
-function warmLine(episode: Episode, opts: AttributionOpts): string {
-  const peer = isForeignChapter(episode, opts) ? ` (peer ${episodeAuthorLabel(episode, opts)})` : '';
-  return `  prev ${formatEpisodeDate(episode.endedAt)}${peer}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`;
+function warmLine(episode: Episode, targetPath: string, opts: AttributionOpts): string {
+  if (isForeignChapter(episode, opts)) {
+    return formatPeerEvidenceBoundary(
+      episode,
+      targetPath,
+      opts,
+      `  prev ${formatEpisodeDate(episode.endedAt)}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}" | `,
+    );
+  }
+  return renderHistoricalClaim(derivedHistoricalClaim(
+    `  prev ${formatEpisodeDate(episode.endedAt)}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`,
+  ));
 }
 
-function fullPreviousChapterLines(episode: Episode, maxVoiceInlays: number, opts: AttributionOpts): string[] {
+function fullPreviousChapterLines(
+  episode: Episode,
+  targetPath: string,
+  maxVoiceInlays: number,
+  opts: AttributionOpts,
+): string[] {
   const voiceLabel = episodeAuthorLabel(episode, opts);
-  const lines = [`  prev full ${formatEpisodeDate(episode.endedAt)}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`];
-  if (isForeignChapter(episode, opts)) lines.push(`  ↞ from ${voiceLabel} (peer lineage)`);
+  const lines = [renderHistoricalClaim(derivedHistoricalClaim(
+    `  prev full ${formatEpisodeDate(episode.endedAt)}: "${truncateVerbatim(episode.summary, HEADER_SUMMARY_CAP_CHARS)}"`,
+  ))];
+  if (isForeignChapter(episode, opts)) {
+    lines.push(formatPeerEvidenceBoundary(episode, targetPath, opts));
+  }
   lines.push(...renderChapterBody(episode, [], maxVoiceInlays, voiceLabel));
   return lines;
 }
@@ -1544,18 +1742,52 @@ function cardLinePriority(line: string): number {
   if (line.startsWith('  trace: ') && line.includes(' ⇢ ')) return 100;
   if (line.startsWith('  ⭐gotcha:') || line.startsWith('  ⚠')) return 95;
   if (line.startsWith('  ↞ origin ')) return 90;
+  if (line.includes('peer lead from ') || line.includes('peer evidence from ')) return 88;
   if (line.startsWith('  ↳ ask:')) return 85;
   if (line.startsWith('  members:')) return 80;
   if (line.startsWith('  trace: ')) return 75;
   if (/^  (?:⭐|✎|🗣|🛤|💬)/u.test(line)) return 70;
-  if (line.startsWith('  ↞ from ')) return 60;
   return 40;
+}
+
+function truncateCompoundOriginBreadcrumb(line: string, cap: number): string | null {
+  const separator = ' [origin=derived] | ';
+  const separatorIndex = line.indexOf(separator);
+  if (!line.startsWith('  ↞ origin ')
+    || separatorIndex < 0
+    || !line.endsWith(' [origin=witnessed]')) return null;
+
+  const derivedText = line.slice(0, separatorIndex);
+  const witnessedClaim = line.slice(separatorIndex + separator.length);
+  const compoundSuffix = `${separator}${witnessedClaim}`;
+  const derivedRoom = cap - compoundSuffix.length;
+  if (derivedRoom >= 8) {
+    return `${truncateVerbatim(derivedText, derivedRoom)}${compoundSuffix}`;
+  }
+  const witnessedOnly = `  ↞ ${witnessedClaim}`;
+  if (witnessedOnly.length <= cap) return witnessedOnly;
+
+  const derivedSuffix = ' [origin=derived]';
+  const derivedOnlyRoom = cap - derivedSuffix.length;
+  return derivedOnlyRoom >= 8
+    ? `${truncateVerbatim(derivedText, derivedOnlyRoom)}${derivedSuffix}`
+    : '';
 }
 
 function truncateCardLine(line: string, capChars: number): string {
   const cap = Math.max(0, Math.floor(capChars));
   if (cap === 0) return '';
   if (line.length <= cap) return line;
+  const compoundOriginBreadcrumb = truncateCompoundOriginBreadcrumb(line, cap);
+  if (compoundOriginBreadcrumb !== null) return compoundOriginBreadcrumb;
+  const originTags = [...line.matchAll(/\s*\[origin=(?:witnessed|derived|synthesized)(?:\s+invalid-origin=[^\]]+)?\]/gu)]
+    .map((match) => match[0].trim());
+  if (originTags.length > 0) {
+    const suffix = ` ${originTags.join(' ')}`;
+    if (cap - suffix.length < 8) return '';
+    const withoutTags = line.replace(/\s*\[origin=(?:witnessed|derived|synthesized)(?:\s+invalid-origin=[^\]]+)?\]/gu, '');
+    return `${truncateCardLine(withoutTags, cap - suffix.length)}${suffix}`;
+  }
   const tracePrefix = '  trace: ';
   if (line.startsWith(tracePrefix) && cap > tracePrefix.length) {
     return `${tracePrefix}${truncateEvidenceToken(line.slice(tracePrefix.length), cap - tracePrefix.length)}`;
@@ -1639,20 +1871,29 @@ export function formatChainCard(
   const cold = ordered.slice(0, Math.max(0, warmEnd - warmCount));
 
   const hotLabel = episodeAuthorLabel(hot, opts);
-  const header = `[Episode recall ${targetPath} — ${formatEpisodeDate(hot.endedAt)}, "${truncateVerbatim(hot.summary, HEADER_SUMMARY_CAP_CHARS)}"]`;
+  const header = renderHistoricalClaim(derivedHistoricalClaim(
+    `[Episode recall ${targetPath} — ${formatEpisodeDate(hot.endedAt)}, "${truncateVerbatim(hot.summary, HEADER_SUMMARY_CAP_CHARS)}"]`,
+  ));
+  const peerBoundary = isForeignChapter(hot, opts)
+    ? formatPeerEvidenceBoundary(hot, targetPath, opts)
+    : undefined;
   const body = [
-    ...(isForeignChapter(hot, opts) ? [`  ↞ from ${hotLabel} (peer lineage)`] : []),
+    ...(peerBoundary ? [peerBoundary] : []),
     ...renderChapterBody(hot, sinceDeltas, maxVoice, hotLabel),
   ];
 
   const bookendLines: string[] = [];
-  if (opts.bookends?.before) bookendLines.push(`  ↞ before: ${opts.bookends.before}`);
-  if (opts.bookends?.after) bookendLines.push(`  after: ↠ ${opts.bookends.after}`);
+  if (opts.bookends?.before) {
+    bookendLines.push(renderHistoricalClaim(derivedHistoricalClaim(`  ↞ before: ${opts.bookends.before}`)));
+  }
+  if (opts.bookends?.after) {
+    bookendLines.push(renderHistoricalClaim(derivedHistoricalClaim(`  after: ↠ ${opts.bookends.after}`)));
+  }
 
-  const fullPreviousLines = fullPrevious.map((episode) => fullPreviousChapterLines(episode, maxVoice, opts));
-  const warmLines = warm.map((episode) => warmLine(episode, opts));
+  const fullPreviousLines = fullPrevious.map((episode) => fullPreviousChapterLines(episode, targetPath, maxVoice, opts));
+  const warmLines = warm.map((episode) => warmLine(episode, targetPath, opts));
   const coldLine = cold.length > 0
-    ? `  older: ${cold.length} chapter${cold.length === 1 ? '' : 's'} ${formatEpisodeDate(cold[0].endedAt)} → ${formatEpisodeDate(cold[cold.length - 1].endedAt)}`
+    ? renderHistoricalClaim(derivedHistoricalClaim(`  older: ${cold.length} chapter${cold.length === 1 ? '' : 's'} ${formatEpisodeDate(cold[0].endedAt)} → ${formatEpisodeDate(cold[cold.length - 1].endedAt)}`))
     : undefined;
 
   const pointer = formatPointerLine(hot);
@@ -1702,7 +1943,8 @@ export function formatChainCard(
   }
   if (rendered.length <= budget) return rendered;
   if (state.bookends.length > 0) { state.bookends = []; rendered = assemble(state); if (rendered.length <= budget) return rendered; }
-  return fitCardToBudget(header, state.body, pointer, budget);
+  const fitted = fitCardToBudget(header, state.body, pointer, budget);
+  return peerBoundary && !fitted.split('\n').includes(peerBoundary) ? '' : fitted;
 }
 
 /**
@@ -1715,7 +1957,7 @@ export function formatWalkPromotionCard(
   chapter: Episode,
   position: WalkPosition,
   sinceDeltas: readonly string[],
-  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays' | 'ownLineage' | 'selfName' | 'selfLineageOnly'> & {
+  opts: Pick<ChainCardOptions, 'charBudget' | 'maxVoiceInlays' | 'ownLineage' | 'selfName' | 'selfLineageOnly' | 'currentRevision' | 'peerEvidenceVerifications'> & {
     /**
      * Origin-anchored breadcrumb trail (nearest waypoint → … → origin).
      * Optional and additive: absent ⇒ byte-identical pre-breadcrumb grammar.
@@ -1727,9 +1969,14 @@ export function formatWalkPromotionCard(
   const budget = opts.charBudget ?? CHAIN_CARD_DEFAULT_BUDGET_CHARS;
   const maxVoice = opts.maxVoiceInlays ?? 2;
   const label = episodeAuthorLabel(chapter, opts);
-  const header = `[Episode recall — walking back, chapter ${position.index}/${position.total}, ${formatEpisodeDate(chapter.endedAt)}, "${truncateVerbatim(chapter.summary, HEADER_SUMMARY_CAP_CHARS)}"]`;
+  const header = renderHistoricalClaim(derivedHistoricalClaim(
+    `[Episode recall — walking back, chapter ${position.index}/${position.total}, ${formatEpisodeDate(chapter.endedAt)}, "${truncateVerbatim(chapter.summary, HEADER_SUMMARY_CAP_CHARS)}"]`,
+  ));
+  const peerBoundary = isForeignChapter(chapter, opts)
+    ? formatPeerEvidenceBoundary(chapter, chapter.members[0]?.path ?? '(episode)', opts)
+    : undefined;
   const body = [
-    ...(isForeignChapter(chapter, opts) ? [`  ↞ from ${label} (peer lineage)`] : []),
+    ...(peerBoundary ? [peerBoundary] : []),
     ...(opts.spines && opts.spines.length > 0
       ? opts.spines.map((crumb) => formatBreadcrumb(chapter, crumb))
       : []),
@@ -1747,7 +1994,8 @@ export function formatWalkPromotionCard(
     rendered = assemble(state);
   }
   if (rendered.length <= budget) return rendered;
-  return fitCardToBudget(header, state, pointer, budget);
+  const fitted = fitCardToBudget(header, state, pointer, budget);
+  return peerBoundary && !fitted.split('\n').includes(peerBoundary) ? '' : fitted;
 }
 
 /**
@@ -1764,18 +2012,27 @@ export function formatWalkPromotionCard(
 function formatBreadcrumb(current: Episode, crumb: WalkSpineCitation): string {
   const delta = formatRelativeWalkDelta(current.endedAt, crumb.chapter.endedAt);
   const gist = nonDegenerateGist(crumb.chapter);
+  const derivedOriginCost = ' [origin=derived]'.length;
   if (crumb.kind === 'origin') {
-    const pointer = formatPointerLine(crumb.chapter).replace(/^  ⌖ verbatim: /, '');
+    const range = episodeEventRange(crumb.chapter);
+    const pointer = renderEpisodeWitnessedClaim(
+      crumb.chapter,
+      `reopen: ${crumb.chapter.instanceId} events ${range.first}..${range.last}`,
+      crumb.chapter.endedAt !== UNKNOWN_EPISODE_TIME ? crumb.chapter.endedAt : undefined,
+    );
     const prefix = `  ↞ origin [${delta}] `;
-    const suffix = ` | reopen: ${pointer}`;
-    const room = Math.max(1, 180 - prefix.length - suffix.length);
-    return `${prefix}${truncateVerbatim(gist, room)}${suffix}`;
+    const suffix = ` | ${pointer}`;
+    const room = Math.max(1, 180 - prefix.length - suffix.length - derivedOriginCost);
+    const derivedGist = renderHistoricalClaim(derivedHistoricalClaim(
+      `${prefix}${truncateVerbatim(gist, room)}`,
+    ));
+    return `${derivedGist}${suffix}`;
   }
   const role = crumb.label ?? walkSpineRole(crumb.chapter);
   const back = crumb.backDistance ?? 0;
   const prefix = `  ↳ ${back} back [${delta}] ${role}: `;
-  const room = Math.max(1, 160 - prefix.length);
-  return `${prefix}${truncateVerbatim(gist, room)}`;
+  const room = Math.max(1, 160 - prefix.length - derivedOriginCost);
+  return renderHistoricalClaim(derivedHistoricalClaim(`${prefix}${truncateVerbatim(gist, room)}`));
 }
 
 /** Annotation-derived role for a waypoint (the origin is labeled by kind, not here). */

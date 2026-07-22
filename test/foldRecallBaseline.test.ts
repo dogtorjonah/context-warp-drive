@@ -98,8 +98,9 @@ describe('foldRecall golden baseline (pre-unification)', () => {
     }
     expect(out.text).toMatchInlineSnapshot(`
       "[Recalled from fold — research turn (relay/src/baseline-target.ts) | trigger: path-touch relay/src/baseline-target.ts | 3,260 chars folded]
-      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#4 n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none
+      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#4 n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known origin=derived topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none
       ↞ source episode: Read · relay/src/baseline-target.ts
+        ↳ Atlas drill-down unavailable
       User asked: Read baseline-target.ts
 
       Reviewed baseline-target.ts for issues.
@@ -152,8 +153,9 @@ describe('foldRecall golden baseline (pre-unification)', () => {
 
     expect(out.text).toMatchInlineSnapshot(`
       "[Recalled from fold — research turn (relay/src/baseline-target.ts) | trigger: path-touch relay/src/baseline-target.ts | 3,296 chars folded]
-      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#4 n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none
+      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#4 n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known origin=derived topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none
       ↞ source episode: Read · relay/src/baseline-target.ts
+        ↳ Atlas drill-down unavailable
       Δ Source changed since fold — body below is the HISTORICAL folded copy; fresh-read before relying on it; what changed:
       relay/src/baseline-target.ts (liveHash=new-hash)
       @@ ~line 2 @@
