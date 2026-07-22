@@ -61,6 +61,8 @@ import {
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
   createFoldFreezeState,
+  restoreFoldFreezeState,
+  serializeFoldFreezeState,
   evaluateFoldFreeze,
   consumeFoldFreezeEvaluationState,
   commitFoldFreeze,
@@ -75,6 +77,7 @@ import {
   type FoldFreezeConfig,
   type FoldFreezeContext,
   type FoldFreezeAppendSkipReason,
+  type SerializedFoldFreezeState,
 } from '../foldFreeze.ts';
 import {
   DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS,
@@ -83,6 +86,8 @@ import {
   DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS,
   DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS,
   DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS,
+  resolveMeasuredEpochEligibility,
+  type MeasuredEpochEligibility,
 } from '../contextBudget.ts';
 import {
   renderUserMessageVault,
@@ -107,9 +112,9 @@ const EMPTY_CLAIMED: ReadonlySet<string> = new Set<string>();
 //   F = hard minimum append runway
 //   P = measured pressure ceiling
 //
-// Runtime invariant: when measured provider tokens are available, append a
-// folded tail band only when P - measuredInputTokens >= F. The S/M/A projection
-// is a telemetryless fallback, not the live runway gate.
+// Runtime invariant: append/hard-epoch pressure eligibility comes only from
+// provider-measured tokens. Without telemetry the result is explicit unknown;
+// S/M/A never substitutes a pressure estimate.
 export const DEFAULT_FOLD_PRESSURE_CEILING_TOKENS = DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
 export const DEFAULT_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS = DEFAULT_CONTEXT_BUDGET_SYSTEM_TOOLS_RESERVE_TOKENS;
 export const DEFAULT_FOLD_TARGET_BAND_TOKENS = DEFAULT_CONTEXT_BUDGET_TARGET_BAND_TOKENS;
@@ -138,11 +143,11 @@ export interface FoldPressureCeilingConfig {
 }
 
 export interface FoldTailEpochRunwayConfig {
-  /** S: fallback modeled system/tools prefix reserve tokens. */
+  /** @deprecated S no longer participates in live pressure eligibility. */
   readonly systemToolsReserveTokens?: number;
-  /** M: fallback modeled folded memory band after a whole-view rebuild. */
+  /** M: folded memory target after a whole-view rebuild. */
   readonly targetBandTokens?: number;
-  /** A: fallback modeled size of one appended folded-tail band. */
+  /** A: resolved minimum target for an appended folded-tail band. */
   readonly appendBandTargetTokens?: number;
   /** T: preferred/default next raw-tail runway used for geometry signposts. */
   readonly runwayTokens?: number;
@@ -153,8 +158,8 @@ export interface FoldTailEpochRunwayConfig {
    * trigger-anchored post-fold-floor gate. When set alongside a captured
    * post-fold floor and ≥1 sealed band, the runway that matters becomes
    * TRIGGER − floor (CLI parity) instead of ceiling − current occupancy.
-   * Omitted → the gate keeps its legacy ceiling-anchored measured/modeled
-   * runway (no behavior change for hosts that do not configure it).
+   * Omitted → the gate uses the measured ceiling anchor until a trigger is
+   * configured. No modeled runway is permitted.
    */
   readonly foldTriggerTokens?: number;
 }
@@ -187,6 +192,13 @@ export interface FoldSessionOptions {
    */
   readonly freeze?: boolean | FoldFreezeConfig;
   /**
+   * Optional v2 freeze snapshot from a predecessor instance. Integrity is
+   * verified before its frozen bytes are admitted; invalid or legacy
+   * unverifiable strata self-heal through a `restore-integrity-failed` hard
+   * epoch on the first prepare call.
+   */
+  readonly restoredFoldFreezeState?: SerializedFoldFreezeState;
+  /**
    * E10 sawtooth eviction for the standing fold block. Enabled by default for
    * prepare(), because FoldSession's contract is full raw append-only history:
    * hosts can compose foldRecall with that raw history to page tombstoned
@@ -204,10 +216,16 @@ export interface FoldSessionOptions {
    */
   readonly pressureCeiling?: false | number | FoldPressureCeilingConfig;
   /**
-   * Standalone S/M/A/T/F fallback runway geometry for append-only tail epochs
-   * when measuredInputTokens is absent. Defaults to effective S37/M40/A5/T10/F10;
-   * pass false to disable the runway gate while keeping ordinary pressure-ceiling
-   * recomputes.
+   * Default-on single-ceiling routing: a measured hit at P appends onto an
+   * existing frozen prefix when the projected-floor gate permits it. Pass
+   * false only for the legacy hybrid policy where P is hard-epoch-only.
+   */
+  readonly singleCeilingMode?: boolean;
+  /**
+   * Token-denominated M/A/T/F geometry for append-only tail epochs. Live
+   * eligibility still requires measuredInputTokens; without it the pressure
+   * result is unknown and the current provider-visible shape is reused. Pass
+   * false to disable the runway gate while keeping pressure-ceiling handling.
    */
   readonly tailEpochRunway?: false | FoldTailEpochRunwayConfig;
   /**
@@ -395,7 +413,7 @@ export class FoldSession {
   private readonly evictionEnabled: boolean;
   private readonly evictionThresholdChars: number;
   private readonly pressureCeilingTokens: number | null;
-  private readonly tailEpochSystemToolsReserveTokens: number;
+  private readonly singleCeilingMode: boolean;
   private readonly tailEpochTargetBandTokens: number;
   private readonly tailEpochAppendBandTargetTokens: number;
   private readonly tailEpochRunwayTokens: number | null;
@@ -451,7 +469,6 @@ export class FoldSession {
   private foldEpochFrontiers: Array<{ epoch: number; turnsFolded: number }> = [];
   private lastPreparedRawCount = 0;
   private activeFidelity: FidelityOverrides | null = null;
-  private hardEpochCompactBaselineActive = false;
 
   constructor(options: FoldSessionOptions = {}) {
     const baseFoldConfig = options.foldConfig ?? resolveFoldConfigForBand(DEFAULT_FOLD_TARGET_BAND_TOKENS);
@@ -495,11 +512,11 @@ export class FoldSession {
         : options.pressureCeiling?.tokens ?? DEFAULT_FOLD_PRESSURE_CEILING_TOKENS;
       this.pressureCeilingTokens = Number.isFinite(configured) && configured > 0 ? configured : null;
     }
+    this.singleCeilingMode = options.singleCeilingMode ?? true;
     if (options.tailEpochRunway === false) {
       this.tailEpochRunwayTokens = null;
       this.tailEpochMinRunwayTokens = null;
       this.tailEpochFoldTriggerTokens = null;
-      this.tailEpochSystemToolsReserveTokens = DEFAULT_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS;
       this.tailEpochTargetBandTokens = DEFAULT_FOLD_TARGET_BAND_TOKENS;
       this.tailEpochAppendBandTargetTokens = DEFAULT_FOLD_APPEND_BAND_TARGET_TOKENS;
     } else {
@@ -510,10 +527,6 @@ export class FoldSession {
         runway.runwayTokens === undefined
           ? Math.min(this.tailEpochRunwayTokens, DEFAULT_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS)
           : this.tailEpochRunwayTokens,
-      );
-      this.tailEpochSystemToolsReserveTokens = positiveFinite(
-        runway.systemToolsReserveTokens,
-        DEFAULT_FOLD_SYSTEM_TOOLS_RESERVE_TOKENS,
       );
       this.tailEpochTargetBandTokens = positiveFinite(runway.targetBandTokens, DEFAULT_FOLD_TARGET_BAND_TOKENS);
       this.tailEpochAppendBandTargetTokens = positiveFinite(
@@ -542,7 +555,10 @@ export class FoldSession {
       this.vaultEnabled = false;
       this.vaultTailWindow = undefined;
     }
-    this.freezeState = createFoldFreezeState();
+    this.freezeState = this.freezeEnabled && options.restoredFoldFreezeState
+      ? restoreFoldFreezeState(options.restoredFoldFreezeState)
+      : createFoldFreezeState();
+    if (this.freezeState.frozenView) this.freezeState.forceAcceptRestoredView = true;
     this.clock = options.now ?? Date.now;
   }
 
@@ -587,21 +603,21 @@ export class FoldSession {
   }
 
   /**
-   * Freeze-path transient overlay: render ONLY the deferred live
-   * (unanswered-newest) rows onto the outgoing view. Sealed rows already ride
-   * the cached frozen prefix — re-rendering the full vault here would duplicate
-   * them (band text does not dedupe row-for-row) — so this appends nothing
-   * unless a live row is currently deferred from sealing.
-   * Cache-safe: touches only the uncached tail, never frozen bytes.
+   * Freeze-path transient overlay for rows not sealed into the cached prefix.
+   * Besides the deferred LIVE row, this deliberately carries a row after it is
+   * answered but before the next epoch can bake it. Otherwise the first hot
+   * reuse after an artifact-only foundation loses the opening operator request.
+   * Already-sealed rows are excluded by fingerprint, so standing vault bands
+   * remain byte-identical and are never duplicated.
    */
-  private applyLiveVaultOverlay(outcome: FoldOutcome): FoldOutcome {
-    if (!this.vaultEnabled || !this.newestOperatorUnanswered) return outcome;
-    const liveRows = selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
+  private applyUnsealedVaultOverlay(outcome: FoldOutcome): FoldOutcome {
+    if (!this.vaultEnabled) return outcome;
+    const unsealedRows = selectVaultDeltaRows(selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
       visibleUserMessages: outcome.messages,
-      newestOperatorUnanswered: true,
-    }).filter((row) => row.live === true);
-    if (liveRows.length === 0) return outcome;
-    const block = renderVaultRowsBlock(liveRows, 'full');
+      newestOperatorUnanswered: this.newestOperatorUnanswered,
+    }), this.freezeState.sealedVaultFingerprints);
+    if (unsealedRows.length === 0) return outcome;
+    const block = renderVaultRowsBlock(unsealedRows, 'full');
     if (!block) return outcome;
     const messages = appendUserMessageVaultToView(outcome.messages, block, this.vaultTailWindow);
     if (messages === outcome.messages) return { ...outcome, vault: block };
@@ -642,6 +658,32 @@ export class FoldSession {
     if (!block) return view;
     for (const row of bakeRows) this.freezeState.sealedVaultFingerprints.add(vaultRowFingerprint(row));
     return appendUserMessageVaultToView(view, block);
+  }
+
+  /**
+   * Prepare a per-band vault delta without consuming its seal-once markers.
+   * appendFoldFreezeTailEpoch publishes these fingerprints with the matching
+   * band manifest; a declined/interrupted seal therefore leaves both absent.
+   */
+  private prepareVaultDelta(
+    view: FoldMessage[],
+    additionallyVisible: readonly FoldMessage[] = [],
+  ): { view: FoldMessage[]; fingerprints: string[] } {
+    if (!this.vaultEnabled) return { view, fingerprints: [] };
+    const rows = selectSealableVaultRows(
+      selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
+        visibleUserMessages: additionallyVisible.length > 0 ? view.concat(additionallyVisible) : view,
+        newestOperatorUnanswered: this.newestOperatorUnanswered,
+      }),
+    );
+    const bakeRows = selectVaultDeltaRows(rows, this.freezeState.sealedVaultFingerprints);
+    if (bakeRows.length === 0) return { view, fingerprints: [] };
+    const block = renderVaultRowsBlock(bakeRows, 'delta');
+    if (!block) return { view, fingerprints: [] };
+    return {
+      view: appendUserMessageVaultToView(view, block),
+      fingerprints: bakeRows.map(vaultRowFingerprint),
+    };
   }
 
   /** Count conversational turns in a provider-shaped message array. */
@@ -895,17 +937,32 @@ export class FoldSession {
     }
   }
 
+  private resolvePressureEligibility(
+    measuredInputTokens: number | undefined,
+    tailEpochRequested: boolean,
+  ): MeasuredEpochEligibility {
+    return resolveMeasuredEpochEligibility({
+      measuredInputTokens,
+      pressureCeilingTokens: this.pressureCeilingTokens,
+      foldTriggerTokens: this.tailEpochFoldTriggerTokens,
+      postFoldFloorTokens: this.tailEpochPostFoldFloorTokens,
+      appendEpochsSinceHardReset: this.appendEpochsSinceHardReset,
+      tailEpochRequested,
+      singleCeilingMode: this.singleCeilingMode,
+      appendBandTargetTokens: this.tailEpochAppendBandTargetTokens,
+      tailEpochMinRunwayTokens: this.tailEpochMinRunwayTokens ?? 0,
+    });
+  }
+
   private isPressureCeilingTriggered(measuredInputTokens: number | undefined): boolean {
-    return this.pressureCeilingTokens !== null
-      && typeof measuredInputTokens === 'number'
-      && Number.isFinite(measuredInputTokens)
-      && measuredInputTokens >= this.pressureCeilingTokens;
+    return this.resolvePressureEligibility(measuredInputTokens, false)
+      .pressureCeilingTriggered;
   }
 
   /**
    * Public pressure-ceiling probe. Lets hosts short-circuit expensive
-   * hard-epoch seed preparation (glyph log scans, episode recall) when no
-   * hard epoch is imminent this turn. Mirrors the private check used inside
+   * pressure work when no measured ceiling hit is present. In single-ceiling
+   * mode a true result may route to append rather than hard epoch. Mirrors the private check used inside
    * {@link prepare}. Standalone parity: context-warp-drive FoldSession exposes
    * the same probe, so the published library and the relay engine stay in sync
    * even though the relay host builds hard-epoch seeds lazily and may not call it.
@@ -956,7 +1013,9 @@ export class FoldSession {
 
   private tailEpochRunwayCheck(measuredInputTokens: number | undefined): {
     readonly ok: boolean;
-    readonly basis: 'measured' | 'modeled' | 'disabled' | 'floor';
+    readonly eligibility: MeasuredEpochEligibility['decision'];
+    readonly eligibilityReason: MeasuredEpochEligibility['reason'];
+    readonly basis: MeasuredEpochEligibility['runwayBasis'];
     readonly measuredInputTokens: number | null;
     readonly sealedAppendBandCount: number;
     readonly postAppendModeledTokens: number | null;
@@ -964,83 +1023,16 @@ export class FoldSession {
     readonly requiredRunwayTokens: number | null;
   } {
     const sealedAppendBandCount = this.freezeState.sealedBands.length;
-    if (this.pressureCeilingTokens === null || this.tailEpochMinRunwayTokens === null) {
-      return {
-        ok: true,
-        basis: 'disabled',
-        measuredInputTokens: null,
-        sealedAppendBandCount,
-        postAppendModeledTokens: null,
-        postAppendRunwayTokens: null,
-        requiredRunwayTokens: this.tailEpochMinRunwayTokens,
-      };
-    }
-    const measuredTokens = typeof measuredInputTokens === 'number' && Number.isFinite(measuredInputTokens) && measuredInputTokens > 0
-      ? Math.floor(measuredInputTokens)
-      : null;
-    if (measuredTokens !== null) {
-      const floorTokens = this.tailEpochPostFoldFloorTokens !== null
-        && Number.isFinite(this.tailEpochPostFoldFloorTokens)
-        && this.tailEpochPostFoldFloorTokens > 0
-          ? Math.floor(this.tailEpochPostFoldFloorTokens)
-          : null;
-      const triggerTokens = this.tailEpochFoldTriggerTokens !== null
-        && Number.isFinite(this.tailEpochFoldTriggerTokens)
-        && this.tailEpochFoldTriggerTokens > 0
-          ? Math.floor(this.tailEpochFoldTriggerTokens)
-          : null;
-      if (floorTokens !== null && triggerTokens !== null && this.appendEpochsSinceHardReset >= 1) {
-        // Trigger-anchored post-fold-floor gate (CLI parity —
-        // checkClaudeCliHardEpochFromFloor; the fcBaseSession/foldMeasuredPressure
-        // mirror). Once ≥1 epoch has committed on this hard-epoch generation,
-        // compare the IRREDUCIBLE frozen prefix (the measured post-fold floor)
-        // directly to the fold TRIGGER. The minimum runway is already encoded by
-        // the trigger sitting below the P180 ceiling; subtracting it a second
-        // time from the floor hard-epochs healthy stair-step bands too early.
-        // Escalate only when the captured floor itself reaches or exceeds the
-        // trigger, because another append would leave no below-trigger raw-tail
-        // budget to reclaim. Arming counts epochs since the last hard reset, NOT
-        // sealed bands: an in-place recompute clears the bands without dropping
-        // the floor, and band-count arming disarmed the gate exactly inside the
-        // churn window. The ≥1-epoch requirement is the instant-loop guard: a
-        // fresh post-reset floor can never gate itself into back-to-back hard
-        // epochs. GOD RULE 7: floor + trigger are measured/resolved tokens.
-        const postAppendRunwayTokens = triggerTokens - floorTokens;
-        return {
-          ok: postAppendRunwayTokens > 0,
-          basis: 'floor',
-          measuredInputTokens: measuredTokens,
-          sealedAppendBandCount,
-          postAppendModeledTokens: null,
-          postAppendRunwayTokens,
-          requiredRunwayTokens: this.tailEpochMinRunwayTokens,
-        };
-      }
-      // First tail epoch on the seed (floor not yet captured) or no configured
-      // trigger: fall back to the legacy ceiling-anchored measured runway.
-      const postAppendRunwayTokens = this.pressureCeilingTokens - measuredTokens;
-      return {
-        ok: postAppendRunwayTokens >= this.tailEpochMinRunwayTokens,
-        basis: 'measured',
-        measuredInputTokens: measuredTokens,
-        sealedAppendBandCount,
-        postAppendModeledTokens: null,
-        postAppendRunwayTokens,
-        requiredRunwayTokens: this.tailEpochMinRunwayTokens,
-      };
-    }
-    const postAppendModeledTokens =
-      this.tailEpochSystemToolsReserveTokens
-      + this.tailEpochTargetBandTokens
-      + ((sealedAppendBandCount + 1) * this.tailEpochAppendBandTargetTokens);
-    const postAppendRunwayTokens = this.pressureCeilingTokens - postAppendModeledTokens;
+    const eligibility = this.resolvePressureEligibility(measuredInputTokens, true);
     return {
-      ok: postAppendRunwayTokens >= this.tailEpochMinRunwayTokens,
-      basis: 'modeled',
-      measuredInputTokens: null,
+      ok: eligibility.decision === 'append',
+      eligibility: eligibility.decision,
+      eligibilityReason: eligibility.reason,
+      basis: eligibility.runwayBasis,
+      measuredInputTokens: eligibility.measuredInputTokens,
       sealedAppendBandCount,
-      postAppendModeledTokens,
-      postAppendRunwayTokens,
+      postAppendModeledTokens: null,
+      postAppendRunwayTokens: eligibility.postAppendRunwayTokens,
       requiredRunwayTokens: this.tailEpochMinRunwayTokens,
     };
   }
@@ -1058,7 +1050,13 @@ export class FoldSession {
     const totalTurns = detectTurns(messages, this.syntheticContext).length;
     const durableCursorIndex = context.durableCursorIndex ?? messages.length;
     const pressureCeilingTriggered = this.isPressureCeilingTriggered(context.measuredInputTokens);
-    const hardEpochTriggered = context.hardEpoch === true || pressureCeilingTriggered;
+    const pressureAppendCandidate = pressureCeilingTriggered
+      && this.singleCeilingMode
+      && this.freezeEnabled
+      && Boolean(this.freezeState.frozenView)
+      && messages.length >= this.freezeState.frozenRawCount;
+    const hardEpochTriggered = context.hardEpoch === true
+      || (pressureCeilingTriggered && !pressureAppendCandidate);
     // Rewind self-heal. A SHRINK in raw count (turns removed) drops now-stale
     // eviction ordinals before they can mis-tombstone the wrong turns. EDGE
     // (no-freeze path only): this length check cannot see a SAME-LENGTH in-place
@@ -1159,7 +1157,7 @@ export class FoldSession {
       // liveness survives reuse sends without touching frozen bytes. NOT
       // applyVault: a full render would duplicate the
       // already-sealed band rows (dedupe is row-vs-visible-text, not band bytes).
-      return this.applyLiveVaultOverlay({
+      return this.applyUnsealedVaultOverlay({
         messages: decision.view,
         cacheHot: true,
         sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -1174,23 +1172,66 @@ export class FoldSession {
       });
     }
 
-    const recomputeReason = decision.action === 'recompute' ? decision.reason : undefined;
+    const pressureAppendPromoted = pressureAppendCandidate
+      && (decision.action === 'reuse' || decision.reason === 'tail-epoch');
+    if (pressureAppendCandidate && !pressureAppendPromoted) {
+      this.activeFidelity = desiredFidelity;
+      const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
+        maxChars: this.rawHardEpochSeedMaxChars,
+        capturedAt: new Date(now).toISOString(),
+      });
+      return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, true);
+    }
+    const recomputeReason = pressureAppendPromoted
+      ? 'tail-epoch'
+      : decision.action === 'recompute' ? decision.reason : undefined;
     if (recomputeReason === 'history-rewound' || recomputeReason === 'boundary-mismatch') {
       this.resetEvictionState();
     }
     const previousActiveFidelity = this.activeFidelity;
     this.activeFidelity = desiredFidelity;
     const runway = this.tailEpochRunwayCheck(context.measuredInputTokens);
-    const hardEpochBaselineAppend = recomputeReason === 'tail-epoch'
-      && !pressureCeilingTriggered
-      && this.hardEpochCompactBaselineActive;
-    const hardEpochBaselineRunwayBypass = hardEpochBaselineAppend
-      && runway.basis === 'modeled'
-      && !runway.ok;
+    if (recomputeReason === 'tail-epoch'
+      && (runway.eligibility === 'unknown' || runway.eligibility === 'reuse')) {
+      this.activeFidelity = previousActiveFidelity;
+      const liveTail = messages.slice(this.freezeState.frozenRawCount);
+      const reuseView = this.freezeState.frozenView
+        ? this.freezeState.frozenView.concat(liveTail)
+        : messages;
+      if (this.freezeState.frozenView) touchFoldFreeze(this.freezeState, now);
+      return this.applyUnsealedVaultOverlay({
+        messages: reuseView,
+        cacheHot: Boolean(this.freezeState.frozenView),
+        sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
+        appliedFidelity: this.activeFidelity,
+        stats: {
+          totalTurns,
+          cacheHot: Boolean(this.freezeState.frozenView),
+          hotReuses: this.freezeState.hotReuses,
+          epochs: this.freezeState.epochs,
+          ...this.pressureStats(false),
+        },
+      });
+    }
+    if (pressureAppendPromoted && runway.eligibility === 'hard-epoch') {
+      const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
+        maxChars: this.rawHardEpochSeedMaxChars,
+        capturedAt: new Date(now).toISOString(),
+      });
+      return this.commitHardEpoch(
+        messages,
+        seedPrompt,
+        context,
+        now,
+        totalTurns,
+        true,
+        'tail-runway-gate+hard-epoch',
+      );
+    }
     const upcomingEpoch = this.foldEpochs + 1;
     const appendOnlyTailEpoch = recomputeReason === 'tail-epoch'
-      && !pressureCeilingTriggered
-      && (runway.ok || hardEpochBaselineRunwayBypass);
+      && (!pressureCeilingTriggered || this.singleCeilingMode)
+      && runway.eligibility === 'append';
     if (appendOnlyTailEpoch) {
       // ── Kept-raw working set ──
       // Keep a live working set of recent messages untouched by the fold
@@ -1268,13 +1309,20 @@ export class FoldSession {
       if ((lastUserIndex === 0 || pendingCallBlocksEntireFold)
         && keptRawSplitIndex === 0
         && fullTail.length > 0) {
+        if (pressureAppendPromoted) {
+          const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
+            maxChars: this.rawHardEpochSeedMaxChars,
+            capturedAt: new Date(now).toISOString(),
+          });
+          return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, true);
+        }
         const deferReason = pendingCallBlocksEntireFold ? 'pending-tool-call' : 'live-user-anchor';
         this.activeFidelity = previousActiveFidelity;
         touchFoldFreeze(this.freezeState, now);
         const anchoredView = this.freezeState.frozenView
           ? this.freezeState.frozenView.concat(fullTail)
           : messages.slice();
-        return this.applyLiveVaultOverlay({
+        return this.applyUnsealedVaultOverlay({
           messages: anchoredView,
           cacheHot: true,
           sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -1332,7 +1380,15 @@ export class FoldSession {
           maxChars: this.rawHardEpochSeedMaxChars,
           capturedAt: new Date(now).toISOString(),
         });
-        return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, false, 'tail-yield-gate+hard-epoch');
+        return this.commitHardEpoch(
+          messages,
+          seedPrompt,
+          context,
+          now,
+          totalTurns,
+          pressureCeilingTriggered,
+          'tail-yield-gate+hard-epoch',
+        );
       }
       // Seal only the per-band DELTA (rows not already sealed into an earlier
       // band) into this folded tail band before it joins the byte-frozen prefix.
@@ -1341,7 +1397,8 @@ export class FoldSession {
       // band size — no post-commit inflation.
       const cognitiveBlock = renderCognitiveBlock(extractCognitiveArtifacts(tail));
       const survivingRawTail = hasKeptRaw ? fullTail.slice(keptRawSplitIndex) : [];
-      const sealedTail = this.bakeVault(tailResult.messages, 'delta', survivingRawTail);
+      const vaultDelta = this.prepareVaultDelta(tailResult.messages, survivingRawTail);
+      const sealedTail = vaultDelta.view;
       // Pre-commit enrichment: merge cognitive block into the sealed tail's
       // final message so the gate measures the actual committed size.
       // Merging (not appending) preserves the terminal role and message count.
@@ -1373,7 +1430,14 @@ export class FoldSession {
       const commitMessages = hasKeptRaw
         ? messages.slice(0, frozenCount + keptRawSplitIndex)
         : messages;
-      const appendCommit = appendFoldFreezeTailEpoch(this.freezeState, commitMessages, tailWithProvenance, ctx, now);
+      const appendCommit = appendFoldFreezeTailEpoch(
+        this.freezeState,
+        commitMessages,
+        tailWithProvenance,
+        ctx,
+        now,
+        { sealedVaultFingerprints: vaultDelta.fingerprints },
+      );
       if (appendCommit.committed) {
         const appendView = hasKeptRaw
           ? appendCommit.view.concat(fullTail.slice(keptRawSplitIndex))
@@ -1391,15 +1455,15 @@ export class FoldSession {
         }
         // Live overlay: deferred live row (excluded from the sealed band by
         // selectSealableVaultRows) still renders transiently.
-        return this.applyLiveVaultOverlay({
+        return this.applyUnsealedVaultOverlay({
           messages: appendView,
           cacheHot: false,
           sealedBoundary: appendCommit.sealedPrefixMessageCount,
           result: tailResult,
           appliedFidelity: this.activeFidelity,
           stats: {
-            ...this.statsFromResult(totalTurns, false, tailResult, false),
-            epochReason: hardEpochBaselineRunwayBypass ? 'tail-epoch-append+hard-epoch-baseline' : 'tail-epoch-append',
+            ...this.statsFromResult(totalTurns, false, tailResult, pressureCeilingTriggered),
+            epochReason: 'tail-epoch-append',
             appendDecision: 'committed',
             appendRawTailChars: appendCommit.rawTailChars,
             appendBandChars: appendCommit.bandViewChars,
@@ -1408,12 +1472,19 @@ export class FoldSession {
           },
         });
       }
+      if (pressureAppendPromoted) {
+        const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
+          maxChars: this.rawHardEpochSeedMaxChars,
+          capturedAt: new Date(now).toISOString(),
+        });
+        return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, true);
+      }
       if (appendCommit.view) {
         this.activeFidelity = previousActiveFidelity;
         touchFoldFreeze(this.freezeState, now);
         // Live overlay: same live-row transient render on the skipped-append
         // (hot view) path.
-        return this.applyLiveVaultOverlay({
+        return this.applyUnsealedVaultOverlay({
           messages: appendCommit.view,
           cacheHot: true,
           sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -1429,12 +1500,12 @@ export class FoldSession {
             appendBandChars: appendCommit.bandViewChars,
             appendSavedChars: appendCommit.savedChars,
             ...(appendCommit.shrinkRatio === null ? {} : { appendShrinkRatio: appendCommit.shrinkRatio }),
-            ...this.pressureStats(false),
+            ...this.pressureStats(pressureCeilingTriggered),
           },
         });
       }
     }
-    if (recomputeReason === 'tail-epoch' && !pressureCeilingTriggered && !appendOnlyTailEpoch) {
+    if (recomputeReason === 'tail-epoch' && !appendOnlyTailEpoch) {
       // Runway-gate escalation (FC parity — resolveTailEpochRouting's
       // runwayGateForcesHardEpoch routes to the portable seed reset). A tail
       // epoch whose captured post-fold floor reaches the fold trigger buys no
@@ -1446,7 +1517,15 @@ export class FoldSession {
         maxChars: this.rawHardEpochSeedMaxChars,
         capturedAt: new Date(now).toISOString(),
       });
-      return this.commitHardEpoch(messages, seedPrompt, context, now, totalTurns, false, 'tail-runway-gate+hard-epoch');
+      return this.commitHardEpoch(
+        messages,
+        seedPrompt,
+        context,
+        now,
+        totalTurns,
+        pressureCeilingTriggered,
+        'tail-runway-gate+hard-epoch',
+      );
     }
     const foldConfig = this.effectiveFoldConfig(desiredFidelity);
     const result = foldContext(
@@ -1476,8 +1555,14 @@ export class FoldSession {
     const sealedView = recomputeCognitiveBlock
       ? mergeBlockIntoViewTail(sealedBaseView, recomputeCognitiveBlock)
       : sealedBaseView;
-    commitFoldFreeze(this.freezeState, messages, sealedView, ctx, now);
-    this.hardEpochCompactBaselineActive = false;
+    commitFoldFreeze(
+      this.freezeState,
+      messages,
+      sealedView,
+      ctx,
+      now,
+      recomputeReason === 'restore-integrity-failed' ? 'restore-integrity-failed' : 'first-call',
+    );
     // In-place recompute clears the sealed-band generation, but it does not
     // reset the hard-epoch generation. Keep the runway gate's arming counter:
     // the floor itself PERSISTS, so resetting the counter here would create a
@@ -1499,7 +1584,7 @@ export class FoldSession {
     // Live overlay: the full bake seals everything EXCEPT the deferred live
     // row; render it transiently on the outgoing view so the unanswered ask is
     // never dropped at an epoch boundary.
-    return this.applyLiveVaultOverlay({
+    return this.applyUnsealedVaultOverlay({
       messages: sealedView,
       cacheHot: false,
       sealedBoundary: this.freezeState.lastAppendBoundaryViewCount ?? null,
@@ -1529,6 +1614,12 @@ export class FoldSession {
       evictedSpanCount: this.foldEvictedSpans.length,
       evictedTurnCount: this.foldEvictedSpans.reduce((sum, span) => sum + span.turnCount, 0),
     };
+  }
+
+  /** JSON-safe v2 snapshot for rebirth/fork handoff; null before a base is sealed. */
+  snapshotFoldFreezeState(): SerializedFoldFreezeState | null {
+    if (!this.freezeState.frozenView) return null;
+    return serializeFoldFreezeState(this.freezeState);
   }
 
   /**
@@ -1572,7 +1663,6 @@ export class FoldSession {
       };
       commitFoldFreeze(this.freezeState, messages, view, ctx, now, 'hard-epoch');
       this.freezeState.lastAppendBoundaryViewCount = view.length;
-      this.hardEpochCompactBaselineActive = true;
     }
     // Hard reset: the seed reset is the one epoch kind that drops the frozen
     // floor. Clear the trigger-anchored gate state and re-arm floor capture so

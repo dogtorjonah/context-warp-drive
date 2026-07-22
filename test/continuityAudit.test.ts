@@ -237,3 +237,49 @@ describe('raw-tail frontier index invariant', () => {
     expect(audited.errors.map((entry) => entry.code)).toContain('frontier-index-behind');
   });
 });
+
+describe('embedded active-request provenance', () => {
+  it('uses a stable boundary-scoped identity when the canonical event row is not visible yet', () => {
+    const value = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      capturedAt: CAPTURED_AT,
+      captureSourceId: 'rebirth-build:agent:boundary-9',
+      activeRequestText: 'make the cognitive artifacts chronological',
+      rawTailFrontier: { traceId: 'agent', unit: 'event', index: 0, exactCount: 1 },
+    });
+
+    expect(value.liveState?.request.source).toMatchObject({
+      id: 'rebirth-build:agent:boundary-9:embedded-active-request',
+      coordinate: 'embedded-active-request',
+    });
+    const audited = auditContinuityBoundary({
+      receipt: value,
+      renderedPrompt: renderContinuityReceiptControl(value),
+    });
+    expect(audited.errors.map((entry) => entry.code)).not.toContain('source-id-missing');
+    expect(audited.valid).toBe(true);
+  });
+
+  it('keeps a genuinely absent request explicit without raising a source-identity failure', () => {
+    const value = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      capturedAt: CAPTURED_AT,
+      captureSourceId: 'rebirth-build:agent:idle-boundary',
+      rawTailFrontier: { traceId: 'agent', unit: 'event', index: 0, exactCount: 1 },
+    });
+
+    expect(value.liveState?.request).toMatchObject({
+      status: 'unknown',
+      source: { id: 'none' },
+      note: 'no unanswered operator request bundled',
+    });
+    const audited = auditContinuityBoundary({
+      receipt: value,
+      renderedPrompt: renderContinuityReceiptControl(value),
+    });
+    expect(audited.errors.map((entry) => entry.code)).not.toContain('source-id-missing');
+    expect(audited.valid).toBe(true);
+  });
+});

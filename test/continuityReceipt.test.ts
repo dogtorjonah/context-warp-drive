@@ -298,23 +298,25 @@ describe('transport validation', () => {
 });
 
 describe('renderContinuityReceiptControl (canonical renderer)', () => {
-  test('renders every authoritative line from typed state', () => {
+  test('renders only the current task-rail step in the compact recovery boundary', () => {
     const block = renderContinuityReceiptControl(typedReceipt());
-    expect(block).toContain('── Rebirth Control (AUTHORITATIVE) ──');
-    expect(block).toContain('boundary: continuation');
-    expect(block).toContain('identity: same durable instance "rebirth-rail-snapshot" across a session or model boundary');
-    expect(block).toContain('source status: working');
-    expect(block).toContain('rail: 📋 Continue fold-continuity repair implementation (rail-9e2b1075) — active — 14/23 (61%)');
-    expect(block).toContain('active rail step: ▶ Active: continuity-receipt [active] — Make boundary state typed and singular');
-    expect(block).toContain('immediate next action: Introduce a versioned typed continuity receipt as the authoritative boundary snapshot.');
-    expect(block).toContain('queued after current: Finalize creation and transaction coordinates');
-    expect(block).toContain('edit/claim state: no active claims declared; recent edit evidence covers 1 file(s); recent edits are evidence, not ownership');
-    expect(block).toContain('validation state (explicit): 192/192 tests in both canonical trees');
-    expect(block).toContain('source disagreement: none detected among bundled explicit sources');
-    expect(block).toContain('active request (verbatim; sole authoritative body):\nFix the fold boundary.');
+    expect(block).toContain('── Continuity Boundary (RECOVERY COORDINATES) ──');
+    expect(block).toContain('boundary=continuation');
+    expect(block).toContain('identity=same durable instance "rebirth-rail-snapshot" across a session or model boundary');
+    expect(block).toContain('runtime=working');
+    expect(block).toContain('frontier=rebirth-rail-snapshot@event#336');
+    expect(block).toContain('current task-rail step · 15/23 · continuity-receipt [active] · Make boundary state typed and singular');
+    expect(block).toContain('updated=2026-07-17T20:56:55.631Z');
+    expect(block).toContain('step instruction=Introduce a versioned typed continuity receipt as the authoritative boundary snapshot.');
+    expect(block).toContain('active files · claims=none · recent edits=packages/context-warp/src/continuityReceipt.ts');
+    expect(block).toContain('validation=192/192 tests in both canonical trees');
+    expect(block).not.toContain('rail-9e2b1075');
+    expect(block).not.toContain('Continue fold-continuity repair implementation');
+    expect(block).not.toContain('Finalize creation and transaction coordinates');
+    expect(block).not.toContain('Fix the fold boundary.');
   });
 
-  test('renders honest unknowns and not-supplied lines when state is sparse', () => {
+  test('renders honest compact unknowns when state is sparse', () => {
     const block = renderContinuityReceiptControl(typedReceipt({
       rail: undefined,
       nextAction: undefined,
@@ -322,34 +324,32 @@ describe('renderContinuityReceiptControl (canonical renderer)', () => {
       editClaim: { supplied: false, claims: [], editEvidenceFiles: [] },
       validation: {},
     }));
-    expect(block).toContain('rail: unknown');
-    expect(block).toContain('active rail step: unknown');
-    expect(block).toContain('immediate next action: unknown');
-    expect(block).not.toContain('queued after current:');
-    expect(block).toContain('edit/claim state: not supplied');
-    expect(block).toContain('validation state: no explicit validation fact bundled; step status alone is not proof');
-    expect(block).toContain('active request: none bundled');
+    expect(block).toContain('frontier=rebirth-rail-snapshot@event#336');
+    expect(block).toContain('active files · claims=none · recent edits=none');
+    expect(block).not.toContain('rail:');
+    expect(block).not.toContain('active request');
+    expect(block).not.toContain('validation=');
   });
 
-  test('renders disagreements and hazards as visible lines', () => {
+  test('renders hazards while keeping reconciliation disagreements internal', () => {
     const block = renderContinuityReceiptControl(typedReceipt({
       disagreements: ['runtime status=idle conflicts with executable rail state=active; rail state wins for task continuity'],
       hazards: ['unresolved provider/runtime error captured after the last genuine assistant message'],
     }));
-    expect(block).toContain('source disagreement: runtime status=idle conflicts');
+    expect(block).not.toContain('source disagreement');
     expect(block).toContain('unresolved hazards: unresolved provider/runtime error captured');
   });
 
-  test('renders claims with the ownership caveat', () => {
+  test('renders active file coordinates without control-plane prose', () => {
     const block = renderContinuityReceiptControl(typedReceipt({
       editClaim: { supplied: true, claims: ['src/a.ts', 'src/b.ts'], editEvidenceFiles: [] },
     }));
-    expect(block).toContain('edit/claim state: 2 active claim(s): src/a.ts, src/b.ts; Active Edit Delta below governs ownership');
+    expect(block).toContain('active files · claims=src/a.ts, src/b.ts · recent edits=none');
   });
 });
 
 describe('cross-surface consistency (one receipt, many surfaces)', () => {
-  test('two surfaces rendering the same receipt agree on every line except their capsule policy', () => {
+  test('surface-specific request capsule hooks cannot reintroduce duplicate request bodies', () => {
     const receipt = typedReceipt({
       activeRequest: { text: 'x'.repeat(9_000), totalChars: 9_000 },
     });
@@ -357,29 +357,18 @@ describe('cross-surface consistency (one receipt, many surfaces)', () => {
     const surfaceB = renderContinuityReceiptControl(receipt, {
       formatActiveRequest: (text) => `active request (custom surface capsule, ${text.length} chars)`,
     });
-    const linesA = surfaceA.split('\n');
-    const linesB = surfaceB.split('\n');
-    // The capsule may span several lines (default elision); compare the
-    // authoritative head — every line BEFORE the active-request capsule —
-    // which is where cross-surface agreement must hold.
-    const headUntilCapsule = (lines: string[]) => {
-      const index = lines.findIndex((line) => line.startsWith('active request'));
-      return index === -1 ? lines : lines.slice(0, index);
-    };
-    expect(headUntilCapsule(linesA)).toEqual(headUntilCapsule(linesB));
-    expect(surfaceB).toContain('active request (custom surface capsule, 9000 chars)');
+    expect(surfaceA).toBe(surfaceB);
+    expect(surfaceB).not.toContain('active request');
+    expect(surfaceB).not.toContain('x'.repeat(100));
   });
 
-  test('typed receipt outranks stale prose-shaped fields on the same receipt object', () => {
-    // The renderer never consults prose when the typed fields exist: rail and
-    // nextAction come straight from the receipt even if the caller also had
-    // legacy prose at hand.
+  test('non-step rail telemetry stays out of successor-facing boundary text', () => {
     const receipt = typedReceipt({
       rail: { ...TYPED_RAIL, state: 'complete', doneSteps: 23, percentComplete: 100 },
     });
     const block = renderContinuityReceiptControl(receipt);
-    expect(block).toContain('— complete — 23/23 (100%)');
-    expect(block).not.toContain('— active — 14/23');
+    expect(block).not.toContain('complete');
+    expect(block).not.toContain('rail-9e2b1075');
   });
 });
 
@@ -391,6 +380,7 @@ describe('standalone scanners', () => {
 
   test('findLatestValidationFact strips the label and prefers the latest line', () => {
     expect(findLatestValidationFact(['validation state: first', 'Verification: last one'])).toBe('last one');
+    expect(findLatestValidationFact(['Validation passed: relay 297/297'])).toBe('relay 297/297');
     expect(findLatestValidationFact(['nothing here'])).toBeUndefined();
   });
 });

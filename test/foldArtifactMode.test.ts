@@ -4,10 +4,14 @@ import {
   buildArtifactModeBody,
   foldArtifactOnlyEnabled,
   foldContext,
+  extractCoordinateConservationCorpus,
   FoldSession,
+  COORDINATE_CONSERVATION_OVERLAY_END,
+  COORDINATE_CONSERVATION_OVERLAY_HEADER,
   FOLD_BLOCK_PREAMBLE_ARTIFACT,
   FOLD_BLOCK_PREAMBLE_SIGNATURE,
   FOLD_TOMBSTONE_PREFIX,
+  withArtifactModeConfig,
   type FoldConfig,
   type FoldMessage,
 } from '../src/index.ts';
@@ -71,13 +75,18 @@ function foldBlockText(messages: FoldMessage[], config: FoldConfig, turnsToFold 
 }
 
 describe('foldArtifactOnlyEnabled — env flag accessor', () => {
-  it('defaults to false when unset or unrecognized', () => {
+  it('defaults to true when unset, empty, or unrecognized', () => {
     vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '');
-    expect(foldArtifactOnlyEnabled()).toBe(false);
-    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
-    expect(foldArtifactOnlyEnabled()).toBe(false);
+    expect(foldArtifactOnlyEnabled()).toBe(true);
     vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', 'sometimes');
-    expect(foldArtifactOnlyEnabled()).toBe(false);
+    expect(foldArtifactOnlyEnabled()).toBe(true);
+  });
+
+  it('disables only explicit denylist values case-insensitively', () => {
+    for (const v of ['0', 'false', 'FALSE', 'off', 'no']) {
+      vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', v);
+      expect(foldArtifactOnlyEnabled(), v).toBe(false);
+    }
   });
 
   it('accepts 1/true/on/yes case-insensitively', () => {
@@ -85,6 +94,18 @@ describe('foldArtifactOnlyEnabled — env flag accessor', () => {
       vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', v);
       expect(foldArtifactOnlyEnabled(), v).toBe(true);
     }
+  });
+
+  it('withArtifactModeConfig: identity when off (byte-identity mechanism), decorated copy when on', () => {
+    const cfg: FoldConfig = { ...TEST_FOLD_CONFIG };
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
+    expect(withArtifactModeConfig(cfg)).toBe(cfg);
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '1');
+    const decorated = withArtifactModeConfig(cfg);
+    expect(decorated).not.toBe(cfg);
+    expect(decorated.artifactModeBody).toBe(buildArtifactModeBody);
+    expect(decorated.activeWindowTurns).toBe(cfg.activeWindowTurns);
+    expect(decorated.foldBlockPreamble).toBe(cfg.foldBlockPreamble);
   });
 });
 
@@ -116,13 +137,20 @@ describe('artifact-mode band body — flag on', () => {
 
     // Receipts + totality header.
     expect(artifactBlock).toContain('[Fold receipts — 3 tool call(s): 1 edit(s) · 1 test run(s)');
-    expect(artifactBlock).toContain('aggregated: 1 read/search');
+    expect(artifactBlock).toContain('aggregated: 1 read');
     // Chronological Provenance header.
     expect(artifactBlock).toContain('fold-artifact-band');
     expect(artifactBlock).toContain('synthesized-history');
     // Receipt lines carry source-time prefixes.
-    expect(artifactBlock).toContain('[8:05 AM] ✏️ src/a.ts');
-    expect(artifactBlock).toContain('[8:10 AM] 🧪 npx vitest run src/a.test.ts → Test Files  1 passed (1) · Tests  9 passed (9)');
+    expect(artifactBlock).toContain(
+      '[8:05 AM] ACTION kind=edit outcome=applied reconciliation-required=false '
+      + 'target="src/a.ts" action-id="tool-call:e1" — ✏️ src/a.ts',
+    );
+    expect(artifactBlock).toContain(
+      '[8:10 AM] ❔ VALIDATION freshness=unknown reason=validated-artifact-path-missing '
+      + 'scope="test-run:unknown" artifacts=none — 🧪 npx vitest run src/a.test.ts '
+      + '→ Test Files  1 passed (1) · Tests  9 passed (9) ↞ source=tool-call:t1',
+    );
     // Cognitive artifact from the 🏁 decision prose.
     expect(artifactBlock).toContain('cognitive-waypoints');
     // Conserved literal pool line.
@@ -142,6 +170,48 @@ describe('artifact-mode band body — flag on', () => {
     const first = foldBlockText(representativeFixture(), artifactConfig);
     const second = foldBlockText(representativeFixture(), artifactConfig);
     expect(second).toBe(first);
+  });
+
+  it('exposes typed artifact literals to cross-band coordinate dedupe', () => {
+    const result = foldContext(representativeFixture(), 3, artifactConfig);
+    const corpus = extractCoordinateConservationCorpus(result.messages);
+    expect(corpus).toContain('a1b2c3d4e5f6');
+  });
+
+  it('extracts only literal rows bounded by the coordinate overlay artifact', () => {
+    const corpus = extractCoordinateConservationCorpus([{
+      role: 'user',
+      content: [
+        '⌖ literals: outside-before-123456',
+        COORDINATE_CONSERVATION_OVERLAY_HEADER,
+        '⌖ literals: /repo/src/inside.ts · overlay-id-123456',
+        COORDINATE_CONSERVATION_OVERLAY_END,
+        '⌖ literals: outside-after-123456',
+      ].join('\n'),
+    }]);
+    expect(corpus).toContain('/repo/src/inside.ts');
+    expect(corpus).toContain('overlay-id-123456');
+    expect(corpus).not.toContain('outside-before-123456');
+    expect(corpus).not.toContain('outside-after-123456');
+  });
+
+  it('rejects an unterminated coordinate overlay artifact', () => {
+    const corpus = extractCoordinateConservationCorpus([{
+      role: 'user',
+      content: [
+        COORDINATE_CONSERVATION_OVERLAY_HEADER,
+        '⌖ literals: uncommitted-overlay-123456',
+      ].join('\n'),
+    }]);
+    expect(corpus).not.toContain('uncommitted-overlay-123456');
+  });
+
+  it('removes artifact literals already resident in an immutable prior band', () => {
+    const result = foldContext(representativeFixture(), 3, {
+      ...artifactConfig,
+      priorCoordinateCorpus: 'a1b2c3d4e5f6',
+    });
+    expect(extractCoordinateConservationCorpus(result.messages)).not.toContain('a1b2c3d4e5f6');
   });
 
   it('eviction re-compiles receipts over survivors and tombstones the evicted', () => {

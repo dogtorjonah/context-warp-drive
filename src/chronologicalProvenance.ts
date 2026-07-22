@@ -85,6 +85,57 @@ export interface ChronologicalPoint {
   readonly timestamp?: string;
 }
 
+/** A real source row together with the authoritative identity/time it carries. */
+export interface ChronologicalSourceRow<T> {
+  readonly row: T;
+  readonly sourceIdentity?: string;
+  readonly sourceTimestamp?: string;
+}
+
+export interface ResolvedChronologicalSourceRow<T> {
+  readonly row: T;
+  readonly rowIndex: number;
+  readonly sourceIdentity: string | null;
+  readonly sourceTimestamp: string | null;
+}
+
+/**
+ * Resolve one provenance point back to a real source row without guessing.
+ * Numeric and identity coordinates must agree when both are present; an
+ * authoritative timestamp on the point must match the row exactly. Duplicate
+ * identities are ambiguous and therefore fail closed.
+ */
+export function resolveChronologicalPointToSourceRow<T>(
+  point: ChronologicalPoint,
+  rows: readonly ChronologicalSourceRow<T>[],
+): ResolvedChronologicalSourceRow<T> | null {
+  if (point.index !== undefined
+    && (!Number.isInteger(point.index) || point.index < 0 || point.index >= rows.length)) return null;
+  if (point.id !== undefined && !point.id.trim()) return null;
+  if (!validTimestamp(point.timestamp)) return null;
+  const indexed = point.index ?? null;
+  const identity = point.id?.trim() || null;
+  const identityMatches = identity === null
+    ? []
+    : rows.flatMap((row, rowIndex) => row.sourceIdentity === identity ? [rowIndex] : []);
+  if (identityMatches.length > 1) return null;
+  const identified = identityMatches[0] ?? null;
+  if (indexed === null && identified === null) return null;
+  if (indexed !== null && identified !== null && indexed !== identified) return null;
+  const rowIndex = indexed ?? identified!;
+  const source = rows[rowIndex];
+  if (!source) return null;
+  if (!validTimestamp(source.sourceTimestamp)) return null;
+  if (identity !== null && source.sourceIdentity !== identity) return null;
+  if (point.timestamp !== undefined && source.sourceTimestamp !== point.timestamp) return null;
+  return {
+    row: source.row,
+    rowIndex,
+    sourceIdentity: source.sourceIdentity ?? null,
+    sourceTimestamp: source.sourceTimestamp ?? null,
+  };
+}
+
 export interface ChronologicalSpan {
   readonly start: ChronologicalPoint;
   /** Exclusive when numeric; the renderer prints `[start..end)`. */
@@ -212,7 +263,7 @@ function pointCoordinate(point: ChronologicalPoint): string {
 }
 
 function pointTimestamp(point: ChronologicalPoint): string {
-  return point.timestamp ? ` @ ${point.timestamp}` : '';
+  return ` @ ${point.timestamp ?? 'time unknown'}`;
 }
 
 function sourceText(span: ChronologicalSpan): string {
@@ -221,8 +272,14 @@ function sourceText(span: ChronologicalSpan): string {
   const count = span.count !== undefined ? ` n=${span.count}` : '';
   const firstTime = span.start.timestamp;
   const lastTime = span.lastTimestamp ?? span.endExclusive?.timestamp;
-  const time = firstTime || lastTime ? ` @ ${firstTime ?? '?'}..${lastTime ?? '?'}` : '';
+  const time = ` @ ${firstTime ?? 'time unknown'}..${lastTime ?? 'time unknown'}`;
   return `${start}..${end}${count}${time}`;
+}
+
+function supersessionText(envelope: ChronologicalProvenanceEnvelope): string {
+  return envelope.supersession === 'explicit' && envelope.supersededAt
+    ? `explicit:${pointCoordinate(envelope.supersededAt)}${pointTimestamp(envelope.supersededAt)}`
+    : envelope.supersession;
 }
 
 function boundedObjective(value: string | undefined, capChars = 300): string | undefined {
@@ -257,9 +314,7 @@ export function renderChronologicalProvenance(
   const rawFrontier = envelope.rawResumesAt
     ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)} (${envelope.topology.rawTailCount} exact)`
     : `none (0 exact)`;
-  const supersession = envelope.supersession === 'explicit' && envelope.supersededAt
-    ? `explicit:${pointCoordinate(envelope.supersededAt)}`
-    : envelope.supersession;
+  const supersession = supersessionText(envelope);
   return [
     CHRONOLOGICAL_PROVENANCE_PREFIX,
     `artifact=${envelope.artifact} class=${envelope.contentClass} authority=${envelope.authority} supersession=${supersession}`,
@@ -283,9 +338,9 @@ export function renderChronologicalProvenanceCompact(
   const validation = validateChronologicalProvenance(envelope);
   if (!validation.valid) return renderInvalidChronologicalProvenance(envelope, validation.errors);
   const rawFrontier = envelope.rawResumesAt
-    ? `${pointCoordinate(envelope.rawResumesAt)}(${envelope.topology.rawTailCount} exact)`
+    ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)}(${envelope.topology.rawTailCount} exact)`
     : 'none';
-  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${envelope.artifact} class=${envelope.contentClass} source=${sourceText(envelope.source)} created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)} authority=${envelope.authority} supersession=${envelope.supersession} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=${rawFrontier}`;
+  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${envelope.artifact} class=${envelope.contentClass} source=${sourceText(envelope.source)} created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)} authority=${envelope.authority} supersession=${supersessionText(envelope)} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=${rawFrontier}`;
 }
 
 export interface TailEpochProvenanceInput {
@@ -605,7 +660,9 @@ export function renderTailEpochProvenance(input: TailEpochProvenanceInput): stri
   };
   const rendered = renderChronologicalProvenance(envelope);
   const stack = renderTailEpochStackOrientation(input);
-  if (!rendered || !stack || !validateChronologicalProvenance(envelope).valid) return null;
+  if (!rendered) return null;
+  if (!validateChronologicalProvenance(envelope).valid) return rendered;
+  if (!stack) return null;
   const authorityOrder = renderTailEpochAuthorityOrder(input);
   const frame = input.sourceFrameId
     ? `coordinate-frame=${input.sourceFrameId} scope=pre-fold-snapshot comparable-within-frame-only`

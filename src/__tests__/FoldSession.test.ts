@@ -1,13 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   FoldSession,
   FOLD_TOMBSTONE_PREFIX,
+  USER_MESSAGE_VAULT_LIVE_MARKER,
   dedupeCoordinateClosetText,
   extractCoordinateConservationCorpus,
   type FoldConfig,
   type FoldMessage,
 } from '../index.ts';
+
+// This suite pins FoldSession's legacy skeleton/freeze contracts. Artifact-mode
+// rendering has its own dedicated battery; opt into it only in tests that are
+// specifically about the artifact/vault interaction.
+beforeEach(() => vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0'));
+afterEach(() => vi.unstubAllEnvs());
 
 const TEST_FOLD_CONFIG: FoldConfig = {
   activeWindowTurns: 0,
@@ -165,7 +172,11 @@ describe('FoldSession fidelity overrides', () => {
 });
 
 describe('FoldSession marathon pressure folding', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
   it('folds old real turns and the oversized active turn in one prepare epoch', () => {
+    // Asserts the LEGACY flat-closet seed section — restored via the
+    // VOXXO_REBIRTH_FLAT_CLOSET kill-switch (default off = inline placement).
+    vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1');
     const session = new FoldSession({
       foldConfig: {
         ...TEST_FOLD_CONFIG,
@@ -174,7 +185,9 @@ describe('FoldSession marathon pressure folding', () => {
       },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
       pressureCeiling: 80_000,
-      rawHardEpochSeedMaxChars: 9_000,
+      // Leave enough package room for both the expanded authoritative live-state
+      // receipt and the legacy flat closet this test explicitly opts into.
+      rawHardEpochSeedMaxChars: 16_000,
       now: () => 1_000,
     });
     const raw = hybridMarathonHistory();
@@ -187,11 +200,12 @@ describe('FoldSession marathon pressure folding', () => {
     const rawText = vaultText(raw);
     const preparedText = vaultText(prepared.messages);
     expect(preparedText.length).toBeLessThan(rawText.length);
-    expect(preparedText.length).toBeLessThan(12_000);
+    expect(preparedText.length).toBeLessThan(20_000);
     expect(preparedText).toContain('Continuity refresh: a same-instance hard epoch (context reset) just completed.');
     expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     expect(preparedText).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
-    expect(preparedText).toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
+    expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_27.ts');
+    expect(preparedText).not.toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
   });
 
   it('full-recomputes repeated over-ceiling calls instead of suppressing pressure epochs', () => {
@@ -274,7 +288,7 @@ Conserved high-value literals newest-first.
     );
   });
 
-  it('appends a folded tail epoch when the fallback modeled runway satisfies the 10k default floor', () => {
+  it('hot-reuses instead of appending when measured telemetry is absent', () => {
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -286,12 +300,30 @@ Conserved high-value literals newest-first.
     const appended = session.prepare(appendProfitableTail(first, 'tail one'));
 
     expect(epoch.cacheHot).toBe(false);
-    expect(appended.cacheHot).toBe(false);
+    expect(appended.cacheHot).toBe(true);
+    expect(appended.stats.epochReason).toBeUndefined();
+    expect(appended.stats.appendDecision).toBeUndefined();
+    expect(appended.messages.slice(0, epoch.messages.length)).toEqual(epoch.messages);
+    expect(session.telemetry.epochs).toBe(1);
+  });
+
+  it('routes a default single-ceiling P hit through the measured append predicate', () => {
+    const session = new FoldSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
+      pressureCeiling: 125_000,
+      now: () => 1_000,
+    });
+    const first = twoTurnHistory();
+    const baseline = session.prepare(first);
+    const appended = session.prepare(appendProfitableTail(first, 'at P'), {
+      measuredInputTokens: 125_000,
+    });
+
+    expect(appended.stats.pressureCeilingTriggered).toBe(true);
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(appended.stats.appendDecision).toBe('committed');
-    expect(appended.stats.appendSavedChars).toBeGreaterThan(0);
-    expect(appended.sealedBoundary).toBe(epoch.messages.length);
-    expect(session.telemetry.epochs).toBe(2);
+    expect(appended.messages.slice(0, baseline.messages.length)).toEqual(baseline.messages);
   });
 
   it('does not repeat frozen-prefix coordinates in a later appended closet', () => {
@@ -301,6 +333,7 @@ Conserved high-value literals newest-first.
       foldConfig: { ...TEST_FOLD_CONFIG, verbatimKeepChars: 4_000 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [
@@ -322,7 +355,7 @@ Conserved high-value literals newest-first.
         },
       );
     }
-    const appended = session.prepare(history);
+    const appended = session.prepare(history, { measuredInputTokens: 70_000 });
     expect(appended.stats.appendDecision).toBe('committed');
     const fullText = vaultText(appended.messages);
     const appendedBandText = vaultText(appended.messages.slice(baseline.messages.length));
@@ -336,6 +369,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory();
@@ -346,7 +380,7 @@ Conserved high-value literals newest-first.
       { role: 'assistant', content: `🏁 tail verdict survives ${'compressible detail '.repeat(300)}` },
       { role: 'user', content: 'next more tail' },
       { role: 'assistant', content: profitableTail('more tail') },
-    ]);
+    ], { measuredInputTokens: 70_000 });
 
     const joined = vaultText(appended.messages);
     expect(appended.stats.appendDecision).toBe('committed');
@@ -359,6 +393,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory();
@@ -372,7 +407,7 @@ Conserved high-value literals newest-first.
       { role: 'user', content: 'cycle one ask' },
       { role: 'assistant', content: `🏁 cycle-one verdict ${profitableTail('cycle one detail')}` },
     ];
-    const cycle1 = session.prepare(history);
+    const cycle1 = session.prepare(history, { measuredInputTokens: 70_000 });
     expect(cycle1.stats.appendDecision).toBe('committed');
     expect(cycle1.sealedBoundary).toBe(baseline.messages.length);
 
@@ -381,7 +416,7 @@ Conserved high-value literals newest-first.
       { role: 'user', content: 'cycle two ask' },
       { role: 'assistant', content: `⚠️ cycle-two hazard ${profitableTail('cycle two detail')}` },
     ];
-    const cycle2 = session.prepare(history);
+    const cycle2 = session.prepare(history, { measuredInputTokens: 70_000 });
     expect(cycle2.stats.appendDecision).toBe('committed');
     // No boundary drift: each cycle's seal point is exactly where the prior
     // cycle's view (prefix + its own baked [cognitive] block) left off.
@@ -392,7 +427,7 @@ Conserved high-value literals newest-first.
       { role: 'user', content: 'cycle three ask' },
       { role: 'assistant', content: `🏁 cycle-three verdict ${profitableTail('cycle three detail')}` },
     ];
-    const cycle3 = session.prepare(history);
+    const cycle3 = session.prepare(history, { measuredInputTokens: 70_000 });
     expect(cycle3.stats.appendDecision).toBe('committed');
     expect(cycle3.sealedBoundary).toBe(cycle2.messages.length);
 
@@ -421,9 +456,13 @@ Conserved high-value literals newest-first.
       .map((msg) => (typeof msg.content === 'string' ? msg.content : ''))
       .map(extractCognitiveBlock)
       .filter((text) => text.length > 0);
+    const cycleCognitiveBlocks = cognitiveBlocks.filter((text) =>
+      text.includes('🏁 cycle-one verdict')
+      || text.includes('⚠️ cycle-two hazard')
+      || text.includes('🏁 cycle-three verdict'));
     const countInCognitiveBlocks = (needle: string): number =>
       cognitiveBlocks.reduce((count, text) => count + text.split(needle).length - 1, 0);
-    expect(cognitiveBlocks).toHaveLength(3);
+    expect(cycleCognitiveBlocks).toHaveLength(3);
     expect(countInCognitiveBlocks('🏁 cycle-one verdict')).toBe(1);
     expect(countInCognitiveBlocks('⚠️ cycle-two hazard')).toBe(1);
     expect(countInCognitiveBlocks('🏁 cycle-three verdict')).toBe(1);
@@ -444,11 +483,12 @@ Conserved high-value literals newest-first.
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory();
     const epoch = session.prepare(first);
-    const skipped = session.prepare(appendTurn(first, 'tiny tail'));
+    const skipped = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 70_000 });
 
     expect(epoch.cacheHot).toBe(false);
     expect(skipped.cacheHot).toBe(true);
@@ -464,6 +504,7 @@ Conserved high-value literals newest-first.
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory();
@@ -472,7 +513,7 @@ Conserved high-value literals newest-first.
       ...first,
       { role: 'user', content: 'next tiny tail' },
       { role: 'assistant', content: '🏁 tiny verdict stays raw only' },
-    ]);
+    ], { measuredInputTokens: 70_000 });
 
     const joined = vaultText(skipped.messages);
     expect(skipped.stats.appendDecision).toBe('skipped');
@@ -486,6 +527,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory();
@@ -510,6 +552,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory();
@@ -530,6 +573,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [
@@ -554,6 +598,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
@@ -578,6 +623,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
@@ -597,6 +643,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
@@ -620,6 +667,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
@@ -642,6 +690,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
@@ -675,6 +724,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first: FoldMessage[] = [{ role: 'user', content: 'foundation request' }];
@@ -705,6 +755,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory();
@@ -717,7 +768,7 @@ Conserved high-value literals newest-first.
     expect(appended.stats.appendDecision).toBe('committed');
   });
 
-  it('hard-epochs a telemetryless tail epoch when fallback modeling leaves less than the 10k floor', () => {
+  it('never hard-epochs a telemetryless tail from modeled geometry', () => {
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -725,13 +776,14 @@ Conserved high-value literals newest-first.
       now: () => 1_000,
     });
     const first = twoTurnHistory();
-    session.prepare(first);
-    const recomputed = session.prepare(appendTurn(first, 'tail one'));
+    const epoch = session.prepare(first);
+    const reused = session.prepare(appendTurn(first, 'tail one'));
 
-    expect(recomputed.cacheHot).toBe(false);
-    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
-    expect(recomputed.messages).toHaveLength(1);
-    expect(session.telemetry.epochs).toBe(2);
+    expect(reused.cacheHot).toBe(true);
+    expect(reused.stats.epochReason).toBeUndefined();
+    expect(reused.messages.slice(0, epoch.messages.length)).toEqual(epoch.messages);
+    expect(vaultText(reused.messages)).toContain('tail one');
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   it('appends on the compact seed baseline after a hard epoch when measured runway holds', () => {
@@ -739,6 +791,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory('PRESEED_BODY_TOKEN_ALPHA');
@@ -762,37 +815,40 @@ Conserved high-value literals newest-first.
     expect(session.telemetry.epochs).toBe(2);
   });
 
-  it('keeps the hard-epoch baseline bypass only for telemetryless fallback routing', () => {
+  it('does not let a compact hard-epoch baseline bypass unknown telemetry', () => {
     const session = new FoldSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = twoTurnHistory('RESET_BODY_TOKEN');
-    // 1) Hard epoch arms the compact-baseline bypass.
+    // 1) Establish a compact hard-epoch baseline.
     const hardEpoch = session.prepare(first, {
       measuredInputTokens: 111_000,
       hardEpochSeed: 'RESET_HARD_EPOCH_SEED',
     });
     expect(hardEpoch.stats.epochReason).toBe('hard-epoch');
-    // 2) Without measured telemetry, the fallback modeled runway is pessimistic
-    // after the tiny seed. The legacy baseline bypass remains scoped here only.
+    // 2) Without measured telemetry, eligibility is unknown and the compact
+    // prefix is reused rather than authorizing either append or hard epoch.
     const bypassHistory = appendProfitableTail(first, 'armed tail');
     const ceilingHistory = appendProfitableTail(bypassHistory, 'ceiling grow');
     const resumedHistory = appendProfitableTail(ceilingHistory, 'post reset tail');
-    const bypassed = session.prepare(bypassHistory);
-    expect(bypassed.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
-    // 3) A later pressure ceiling hard-epochs again and re-arms the compact baseline.
+    const reused = session.prepare(bypassHistory);
+    expect(reused.cacheHot).toBe(true);
+    expect(reused.stats.epochReason).toBeUndefined();
+    // 3) A later measured pressure ceiling may still hard-epoch.
     const ceiling = session.prepare(ceilingHistory, {
       measuredInputTokens: 200_000,
     });
     expect(ceiling.stats.pressureCeilingTriggered).toBe(true);
     expect(ceiling.stats.epochReason).toBe('hard-epoch');
-    // 4) The re-armed compact baseline can append through the fallback bypass.
+    // 4) Telemetry absence remains unknown after that reset too.
     const resumed = session.prepare(resumedHistory);
-    expect(resumed.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
-    expect(resumed.sealedBoundary).toBe(ceiling.messages.length);
+    expect(resumed.cacheHot).toBe(true);
+    expect(resumed.stats.epochReason).toBeUndefined();
+    expect(resumed.messages.slice(0, ceiling.messages.length)).toEqual(ceiling.messages);
   });
 
   it('keeps appending while the trigger-anchored post-fold floor remains below trigger (CLI floor-gate parity)', () => {
@@ -804,6 +860,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
+      singleCeilingMode: false,
       tailEpochRunway: { foldTriggerTokens: 150_000, minRunwayTokens: 30_000 },
       now: () => 1_000,
     });
@@ -833,6 +890,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
+      singleCeilingMode: false,
       tailEpochRunway: { foldTriggerTokens: 150_000, minRunwayTokens: 30_000 },
       now: () => now,
     });
@@ -868,6 +926,7 @@ Conserved high-value literals newest-first.
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
+      singleCeilingMode: false,
       tailEpochRunway: { minRunwayTokens: 30_000 },
       now: () => 1_000,
     });
@@ -897,6 +956,7 @@ describe('FoldSession per-fold yield gate', () => {
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
+      singleCeilingMode: false,
       tailEpochRunway: YIELD_RUNWAY,
       now: () => 1_000,
     });
@@ -916,6 +976,7 @@ describe('FoldSession per-fold yield gate', () => {
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
+      singleCeilingMode: false,
       tailEpochRunway: YIELD_RUNWAY,
       now: () => 1_000,
     });
@@ -934,6 +995,7 @@ describe('FoldSession per-fold yield gate', () => {
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
+      singleCeilingMode: false,
       tailEpochRunway: YIELD_RUNWAY,
       now: () => 1_000,
     });
@@ -952,6 +1014,7 @@ describe('FoldSession per-fold yield gate', () => {
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
+      singleCeilingMode: false,
       tailEpochRunway: YIELD_RUNWAY,
       now: () => 1_000,
     });
@@ -1049,6 +1112,7 @@ function vaultSession(overrides: Record<string, unknown> = {}): FoldSession {
     foldConfig: TEST_FOLD_CONFIG,
     freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
     vault: true,
+    singleCeilingMode: false,
     now: () => 1_000,
     ...overrides,
   });
@@ -1083,6 +1147,25 @@ describe('FoldSession per-band vault sealing', () => {
     expect(vaultText(hot.messages).split('[User Message Vault]').length - 1).toBe(1);
   });
 
+  it('keeps a deferred opening request visible after it is answered but before the next epoch', () => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '1');
+    const session = vaultSession();
+    const question = 'OPERATOR-BETA-LIVE keep the repository question visible';
+    session.recordOperatorMessage(question, '2026-06-19T10:00:00Z');
+    const history = twoTurnHistory();
+
+    const live = session.prepare(history);
+    expect(vaultText(live.messages)).toContain(question);
+    expect(vaultText(live.messages)).toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
+
+    session.recordAssistantMessage('I am investigating now.', '2026-06-19T10:01:00Z');
+    const answeredHotReuse = session.prepare(history);
+
+    expect(answeredHotReuse.cacheHot).toBe(true);
+    expect(vaultText(answeredHotReuse.messages)).toContain(question);
+    expect(vaultText(answeredHotReuse.messages)).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
+  });
+
   it('seals only the delta into an appended band, never re-sealing prior rows', () => {
     const session = vaultSession({
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -1094,7 +1177,9 @@ describe('FoldSession per-band vault sealing', () => {
     const epoch = session.prepare(first);
     session.recordOperatorMessage('OPERATOR-DELTA second directive', '2026-06-19T10:05:00Z');
     session.recordAssistantMessage('🏁 second directive handled', '2026-06-19T10:06:00Z');
-    const appended = session.prepare(appendProfitableTail(first, 'tail one'));
+    const appended = session.prepare(appendProfitableTail(first, 'tail one'), {
+      measuredInputTokens: 70_000,
+    });
 
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     const boundary = appended.sealedBoundary as number;
@@ -1135,7 +1220,7 @@ describe('FoldSession per-band vault sealing', () => {
     expect(joined).toContain(directive);
   });
 
-  it('re-renders the full vault on a cold full recompute (sealed set reset)', () => {
+  it('re-renders the current-task vault on a cold full recompute (sealed set reset)', () => {
     let now = 1_000;
     const session = vaultSession({ now: () => now });
     session.recordOperatorMessage('OPERATOR-EPSILON one', '2026-06-19T10:00:00Z');
@@ -1149,7 +1234,10 @@ describe('FoldSession per-band vault sealing', () => {
 
     expect(recomputed.cacheHot).toBe(false);
     const joined = vaultText(recomputed.messages);
-    expect(joined).toContain('OPERATOR-EPSILON one');
+    // Recording ZETA advances the explicit task frontier, so a full render
+    // preserves the complete current task without resurrecting Epsilon's
+    // superseded task wording.
+    expect(joined).not.toContain('OPERATOR-EPSILON one');
     expect(joined).toContain('OPERATOR-ZETA two');
     // One full block, not a stale prefix delta plus a full render.
     expect(joined.split('[User Message Vault]').length - 1).toBe(1);
@@ -1194,21 +1282,23 @@ describe('FoldSession per-band vault sealing', () => {
     // with the LIVE marker instead of sealing into the cached band.
     session.recordOperatorMessage('OPERATOR-THETA live ask', '2026-06-19T10:05:00Z');
     const second = appendProfitableTail(first, 'tail one');
-    const live = session.prepare(second);
+    const live = session.prepare(second, { measuredInputTokens: 70_000 });
     expect(live.stats.epochReason).toBe('tail-epoch-append');
     const liveText = vaultText(live.messages);
     expect(liveText).toContain('OPERATOR-THETA live ask');
-    expect(liveText).toContain('⌖ LIVE');
+    expect(liveText).toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
 
     // Once answered, the row seals into the NEXT band — proving it was never
     // sealed while live (a sealed fingerprint would have deduped it out) —
     // and the LIVE marker vanishes from the view (never baked into a band).
     session.recordAssistantMessage('🏁 resolved the theta ask', '2026-06-19T10:06:00Z');
-    const answered = session.prepare(appendProfitableTail(second, 'tail two'));
+    const answered = session.prepare(appendProfitableTail(second, 'tail two'), {
+      measuredInputTokens: 70_000,
+    });
     expect(answered.stats.epochReason).toBe('tail-epoch-append');
     const boundary = answered.sealedBoundary as number;
     const bandText = vaultText(answered.messages.slice(boundary));
     expect(bandText).toContain('OPERATOR-THETA live ask');
-    expect(vaultText(answered.messages)).not.toContain('⌖ LIVE');
+    expect(vaultText(answered.messages)).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
   });
 });

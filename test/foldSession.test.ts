@@ -272,16 +272,17 @@ describe('FoldSession E10 sawtooth eviction', () => {
 });
 
 describe('FoldSession tail-epoch runway gate', () => {
-  test('appends a folded tail epoch when the fallback modeled runway satisfies the 10k default floor', () => {
+  test('appends a legacy tail epoch when measured runway satisfies the 10k floor', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = turn(0);
     const epoch = session.prepare(first);
-    const appended = session.prepare(appendProfitableTurns(first, 1));
+    const appended = session.prepare(appendProfitableTurns(first, 1), { measuredInputTokens: 70_000 });
 
     expect(epoch.cacheHot).toBe(false);
     expect(appended.cacheHot).toBe(false);
@@ -297,6 +298,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = turn(0);
@@ -312,7 +314,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       assistantMsg('live analysis after the operator directive'),
     ];
 
-    const appended = session.prepare(grown);
+    const appended = session.prepare(grown, { measuredInputTokens: 70_000 });
     const joined = appended.messages.map((message) => typeof message.content === 'string'
       ? message.content
       : JSON.stringify(message.content)).join('\n');
@@ -340,6 +342,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = turn(0);
@@ -347,7 +350,10 @@ describe('FoldSession tail-epoch runway gate', () => {
     // The cold append-band profile skeletonizes band bodies, so a full turn(1)
     // now folds profitably. A genuinely unprofitable band needs a tail smaller
     // than the band's fixed skeleton/closet overhead: one tiny exchange.
-    const skipped = session.prepare([...first, userMsg('q?'), assistantMsg('ok.')]);
+    const skipped = session.prepare(
+      [...first, userMsg('q?'), assistantMsg('ok.')],
+      { measuredInputTokens: 70_000 },
+    );
 
     expect(epoch.cacheHot).toBe(false);
     expect(skipped.cacheHot).toBe(true);
@@ -363,6 +369,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = turn(0);
@@ -380,6 +387,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = turn(0);
@@ -390,26 +398,21 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.appendDecision).toBe('committed');
   });
 
-  test('hard-epochs a telemetryless tail epoch when fallback modeling leaves less than the 10k floor', () => {
+  test('hot-reuses a telemetryless tail instead of guessing a hard epoch', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const first = turn(0);
     session.prepare(first);
-    const recomputed = session.prepare([...first, ...turn(1)]);
+    const reused = session.prepare([...first, ...turn(1)]);
 
-    expect(recomputed.cacheHot).toBe(false);
-    // Two-epoch law: the runway gate escalates straight to the seeded hard
-    // epoch — the retired in-place middle-tier re-fold no longer exists.
-    expect(recomputed.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
-    // Hard epoch replaces the view with a compact seed and re-seals around it:
-    // the one seed message IS the frozen prefix (boundary 1), not a bandless
-    // unsealed re-fold (the retired kind left sealedBoundary null).
-    expect(recomputed.sealedBoundary).toBe(1);
-    expect(session.telemetry.epochs).toBe(2);
+    expect(reused.cacheHot).toBe(true);
+    expect(reused.stats.epochReason).toBeUndefined();
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   test('computes a raw hard-epoch seed from local trace when no host seed is supplied', () => {
@@ -436,7 +439,8 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
     expect(body.split(HARD_EPOCH_CONTINUITY_DIRECTIVE)).toHaveLength(2);
     expect(body).toContain('RAW_PRIOR_TRACE_MARKER');
-    expect(body).toContain(HARD_EPOCH_LIVE_TURN_HEADER);
+    expect(body).not.toContain(HARD_EPOCH_LIVE_TURN_HEADER);
+    expect(body).toContain('👤 LAST USER MESSAGE (active request):');
     expect(body).toContain('LIVE_TRIGGER_MARKER current request');
     expect(body.match(/LIVE_TRIGGER_MARKER/g)).toHaveLength(1);
   });
@@ -446,6 +450,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 111_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const raw: FoldMessage[] = [
@@ -536,6 +541,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const raw = [...turn(0), ...turn(1), ...turn(2)];
@@ -555,35 +561,38 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(session.telemetry.epochs).toBe(2);
   });
 
-  test('keeps the hard-epoch baseline bypass only for telemetryless fallback routing', () => {
+  test('does not let a compact hard-epoch baseline bypass unknown telemetry', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
+      singleCeilingMode: false,
       now: () => 1_000,
     });
     const raw = [...turn(0), ...turn(1), ...turn(2)];
-    // 1) Hard epoch arms the compact-baseline bypass.
+    // 1) Establish a compact hard-epoch baseline.
     const hardEpoch = session.prepare(raw, {
       measuredInputTokens: 111_000,
       hardEpochSeed: 'STANDALONE_RESET_HARD_EPOCH_SEED',
     });
     expect(hardEpoch.stats.epochReason).toBe('hard-epoch');
-    // 2) Without measured telemetry, the fallback modeled runway is pessimistic
-    // after the tiny seed. The legacy baseline bypass remains scoped here only.
+    // 2) Without measured telemetry, eligibility is unknown and the compact
+    // prefix is reused rather than authorizing append or hard epoch.
     const bypassHistory = appendProfitableTurns(raw, 3);
     const ceilingHistory = appendProfitableTurns(bypassHistory, 6);
     const resumedHistory = appendProfitableTurns(ceilingHistory, 9);
-    const bypassed = session.prepare(bypassHistory);
-    expect(bypassed.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
-    // 3) A later pressure ceiling hard-epochs again and re-arms the compact baseline.
+    const reused = session.prepare(bypassHistory);
+    expect(reused.cacheHot).toBe(true);
+    expect(reused.stats.epochReason).toBeUndefined();
+    // 3) A later measured pressure ceiling may still hard-epoch.
     const ceiling = session.prepare(ceilingHistory, { measuredInputTokens: 200_000 });
     expect(ceiling.stats.pressureCeilingTriggered).toBe(true);
     expect(ceiling.stats.epochReason).toBe('hard-epoch');
-    // 4) The re-armed compact baseline can append through the fallback bypass.
+    // 4) Telemetry absence remains unknown after that reset too.
     const resumed = session.prepare(resumedHistory);
-    expect(resumed.stats.epochReason).toBe('tail-epoch-append+hard-epoch-baseline');
-    expect(resumed.sealedBoundary).toBe(ceiling.messages.length);
+    expect(resumed.cacheHot).toBe(true);
+    expect(resumed.stats.epochReason).toBeUndefined();
+    expect(resumed.messages.slice(0, ceiling.messages.length)).toEqual(ceiling.messages);
   });
 });
 
@@ -640,6 +649,7 @@ function makeVaultSession(overrides: Record<string, unknown> = {}): FoldSession 
     foldConfig: VAULT_FOLD_CONFIG,
     freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
     vault: true,
+    singleCeilingMode: false,
     now: () => 1_000,
     ...overrides,
   });
@@ -681,7 +691,9 @@ describe('FoldSession per-band vault sealing', () => {
     const epoch = session.prepare(first);
     session.recordOperatorMessage('OPERATOR-DELTA second directive', '2026-06-19T10:05:00Z');
     session.recordAssistantMessage('🏁 second directive handled', '2026-06-19T10:06:00Z');
-    const appended = session.prepare(vaultGrowProfitable(first, 'tail one'));
+    const appended = session.prepare(vaultGrowProfitable(first, 'tail one'), {
+      measuredInputTokens: 70_000,
+    });
 
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     const boundary = appended.sealedBoundary as number;
@@ -703,12 +715,16 @@ describe('FoldSession per-band vault sealing', () => {
     session.prepare(first);
     session.recordOperatorMessage('OPERATOR-ZETA two', '2026-06-19T10:05:00Z');
     session.recordAssistantMessage('🏁 zeta handled', '2026-06-19T10:06:00Z');
-    const recomputed = session.prepare(vaultGrow(first, 'tail one'));
+    const recomputed = session.prepare(vaultGrow(first, 'tail one'), {
+      measuredInputTokens: 90_000,
+    });
 
     // Two-epoch law: the runway gate escalates to the seeded hard epoch.
     expect(recomputed.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
     const joined = vaultJoin(recomputed.messages);
-    expect(joined).toContain('OPERATOR-EPSILON one');
+    // Recording ZETA advances the current-task frontier; the hard-epoch vault
+    // carries the current task without resurrecting superseded wording.
+    expect(joined).not.toContain('OPERATOR-EPSILON one');
     expect(joined).toContain('OPERATOR-ZETA two');
     expect(joined.split('[User Message Vault]').length - 1).toBe(1);
   });

@@ -22,7 +22,10 @@ import {
 export { flatCoordinateClosetEnabled };
 import { classifyMessageGlyph } from './foldEpisodes.ts';
 import { DEFAULT_CONTEXT_BUDGET_APPEND_BAND_TARGET_TOKENS } from './contextBudget.ts';
-import { renderContinuityPackageProvenance } from './chronologicalProvenance.ts';
+import {
+  renderContinuityPackageProvenance,
+  resolveChronologicalPointToSourceRow,
+} from './chronologicalProvenance.ts';
 import { foldArtifactOnlyEnabled } from './foldReceipts.ts';
 import {
   buildContinuityReceipt,
@@ -37,6 +40,10 @@ import {
   extractCognitiveArtifacts,
   formatCognitiveArtifactProvenance,
 } from './cognitiveArtifacts.ts';
+import {
+  isGenuineRebirthOperatorMessage,
+  selectRoleAwareRebirthDialogueWindow,
+} from './rebirthDialogue.ts';
 
 /**
  * Build a portable lineage glyph log from the message trace: scan assistant
@@ -370,6 +377,8 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly rawTraceCoordinateClosetChars?: number;
   readonly traceNeighborhoodChars?: number;
   readonly includeTrailingUserTurn?: boolean;
+  /** Exact active request kept outside the trace frontier but promoted into READ FIRST. */
+  readonly triggeringUserMessage?: string;
   readonly currentThreadMessageLimit?: number;
   readonly currentThreadMessageChars?: number;
   readonly activityMessageChars?: number;
@@ -425,6 +434,10 @@ interface BudgetedPromptSection {
 interface VisibleTraceMessage {
   readonly type: string;
   readonly text?: string | null;
+  /** Original message-array coordinate; survives filtered visible views. */
+  readonly sourceIndex?: number;
+  /** Stable identity supplied by the host for the original source row. */
+  readonly sourceIdentity?: string;
   /** Authoritative source-event time. Omitted when the provider supplied none. */
   readonly sourceTimestamp?: string;
 }
@@ -623,6 +636,21 @@ function enabled(input: RawRebirthSeedInput, sectionId: RawRebirthSeedSectionId 
   return input.sectionToggles?.[sectionId] !== false;
 }
 
+function truncateCoordinateSectionPreservingRecoveryReceipt(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const lines = text.split('\n');
+  const receiptIndex = lines.findIndex((line) => (
+    line.includes(`recover=${RAW_TRACE_COORDINATE_RECOVERY_ROUTE}`)
+  ));
+  if (receiptIndex < 0) return truncateWholeLines(text, maxChars);
+  const receipt = lines[receiptIndex]!;
+  const prefixBudget = Math.max(0, maxChars - countStringChars(receipt) - 1);
+  const prefix = truncateWholeLines(lines.slice(0, receiptIndex).join('\n'), prefixBudget);
+  // Auditability outranks the soft section cap: if even the receipt alone is
+  // larger, retain it whole rather than corrupting its exact count or route.
+  return [prefix, receipt].filter(Boolean).join('\n');
+}
+
 function allocateSectionBlocks(
   sections: readonly BudgetedPromptSection[],
   availableChars: number,
@@ -639,8 +667,10 @@ function allocateSectionBlocks(
     // conserve, so it truncates at whole-line boundaries. Other sections are
     // prose/log blocks where a mid-line char cut is acceptable.
     const rendered = section.key === 'rawTraceCoordinateCloset'
-      ? truncateWholeLines(section.block, limit)
-      : truncate(section.block, limit);
+      ? truncateCoordinateSectionPreservingRecoveryReceipt(section.block, limit)
+      : section.key === 'currentThread'
+        ? truncateMiddle(section.block, limit)
+        : truncate(section.block, limit);
     allocations.set(section.key, rendered);
     remainingChars -= rendered.length;
   }
@@ -692,7 +722,7 @@ function formatForkContextLines(forkContext: RawRebirthForkContext | undefined):
   }
 
   const lines = [
-    '🌱 Fresh-fork provenance — the lifecycle identity contract is authoritative in Live Continuity State below.',
+    '🌱 Fresh-fork provenance — the lifecycle identity contract is recorded in the Continuity Boundary below.',
     'The copied pre-fork transcript is inherited reference context. Claims, edits, and actions after the fork belong to this instance only.',
   ];
 
@@ -828,42 +858,6 @@ function formatSummonVaultLedger(input: RawRebirthSeedInput): string {
   ].join('\n');
 }
 
-/**
- * Control-capsule active-request cap. Matches the relay's last_user_active
- * surface budget (6000 chars) so the portable seed preserves the same
- * operator requests byte-complete; the old 1500-char cap silently excerpted
- * mid-length requests while the label still claimed 'verbatim'.
- */
-const CONTROL_ACTIVE_REQUEST_MAX_CHARS = 6_000;
-
-function renderUserMessageForRebirth(
-  text: string,
-  options: { preserveBoundaryWhitespace?: boolean } = {},
-): string {
-  const normalized = options.preserveBoundaryWhitespace ? text : text.trim();
-  if (!normalized.trim()) return '';
-  return truncateMiddle(normalized, CONTROL_ACTIVE_REQUEST_MAX_CHARS);
-}
-
-/**
- * AI-only remainder of the combined Last User + AI block. When a bundled
- * trigger renders the user's message as the control capsule's authoritative
- * active request, re-rendering the combined block would duplicate it — but
- * dropping the whole block loses the freshest AI message, which can be the
- * ONLY copy of the predecessor's last words when Current Thread is empty.
- * Splits on the builder's optional `[timestamp] 🤖 LAST AI MESSAGE` line marker
- * and keeps everything from that line onward; returns '' when no AI half exists.
- */
-function extractLastAiOnlyBlock(lastUserAiMessages: string | null | undefined): string {
-  const text = lastUserAiMessages?.trim();
-  if (!text) return '';
-  const markers = [...text.matchAll(/^(?:\[[^\n\]]*\]\s*)?🤖 LAST AI MESSAGE(?:\s+⟦m\d+⟧)?:\s*$/gmu)];
-  const errorMarkers = [...text.matchAll(/^(?:\[[^\n\]]*\]\s*)?⚠️ UNRESOLVED PROVIDER\/RUNTIME ERROR(?:\s+⟦m\d+⟧)?\s+\(not assistant speech\):\s*$/gmu)];
-  const marker = markers.at(-1) ?? errorMarkers.at(-1);
-  if (!marker) return '';
-  return text.slice(marker.index).trim();
-}
-
 // ── portable cross-section containment dedupe ────
 // Suppress episodic cards / glyph-log entries whose body is verbatim in the
 // Current Thread. Pure string containment, no I/O. Never drops the only copy.
@@ -990,35 +984,18 @@ function resolveLifecycleBoundary(input: RawRebirthSeedInput): RawRebirthLifecyc
 
 function formatLifecycleHeader(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
   if (boundary === 'same_instance_hard_epoch') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption. Continue silently; do not produce wake-up commentary.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "${input.predecessorName}". Read the latest user + AI handoff first, then use the compact Continuity Boundary for recovery coordinates. Continue silently; do not produce wake-up commentary.`;
   }
   if (boundary === 'fresh_fork') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: fresh_fork from "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: fresh_fork from "${input.predecessorName}". Read the latest user + AI handoff first, then use the compact Continuity Boundary for recovery coordinates.`;
   }
   if (boundary === 'resurrection') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: resurrection for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: resurrection for "${input.predecessorName}". Read the latest user + AI handoff first, then use the compact Continuity Boundary for recovery coordinates.`;
   }
   if (boundary === 'brain_merge') {
-    return `[CONTEXT REBIRTH] Lifecycle boundary: brain_merge for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
+    return `[CONTEXT REBIRTH] Lifecycle boundary: brain_merge for "${input.predecessorName}". Read the latest user + AI handoff first, then use the compact Continuity Boundary for recovery coordinates.`;
   }
-  return `[CONTEXT REBIRTH] Lifecycle boundary: continuation for "${input.predecessorName}". The authoritative Live Continuity State after the historical sections governs resumption.`;
-}
-
-/**
- * Control-capsule active request with an honest label. Cap matches the
- * relay's last_user_active surface (6000 chars) so operator requests survive
- * byte-complete far past the old 1500-char cap. 'verbatim' appears ONLY when
- * the rendered body is byte-identical to the full request; an excerpt is
- * labeled as such with the true size and a tap pointer.
- */
-function formatControlActiveRequest(activeRequest: string): string {
-  const rendered = renderUserMessageForRebirth(activeRequest, {
-    preserveBoundaryWhitespace: true,
-  });
-  if (rendered === activeRequest) {
-    return `active request (verbatim; sole authoritative body):\n${rendered}`;
-  }
-  return `active request (EXCERPT — ${activeRequest.length} chars total, middle elided; full text via tap_instance_messages; sole authoritative body):\n${rendered}`;
+  return `[CONTEXT REBIRTH] Lifecycle boundary: continuation for "${input.predecessorName}". Read the latest user + AI handoff first, then use the compact Continuity Boundary for recovery coordinates.`;
 }
 
 function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLifecycleBoundary): string {
@@ -1039,7 +1016,7 @@ function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLi
         lastUserAiMessages: input.lastUserAiMessages,
         activeRequestText: input.triggeringUserMessage?.trim() ? input.triggeringUserMessage : undefined,
       });
-  return renderContinuityReceiptControl(receipt, { formatActiveRequest: formatControlActiveRequest });
+  return renderContinuityReceiptControl(receipt);
 }
 
 export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
@@ -1077,24 +1054,37 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     input,
     'lastUserAiMessages',
     (() => {
-      const combined = input.lastUserAiMessages?.trim();
-      // append Resume Point to Last User + AI block.
-      const resumeSuffix = input.resumePoint?.trim() ? `\n\n${input.resumePoint.trim()}` : '';
-      if (combined && !input.triggeringUserMessage?.trim()) {
-        return `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. These are the freshest human and AI messages available at rebirth.***\n\n${combined}${resumeSuffix}`;
-      }
-      // Bundled trigger: keep only the AI half — the user half is the control
-      // capsule's authoritative active request, and the AI half can be the
-      // sole copy of the freshest assistant state when Current Thread is empty.
-      const aiOnly = combined ? extractLastAiOnlyBlock(combined) : '';
-      if (aiOnly) {
-        const errorOnly = aiOnly.includes('⚠️ UNRESOLVED PROVIDER/RUNTIME ERROR')
-          && !aiOnly.includes('🤖 LAST AI MESSAGE');
-        return errorOnly
-          ? `\n── Unresolved Provider/Runtime Error (READ FIRST) ──\n***READ THIS FIRST. No genuine assistant remainder followed the active request; this provider/runtime failure was unresolved at the package boundary.***\n\n${aiOnly}${resumeSuffix}`
-          : `\n── Last AI Message (READ FIRST) ──\n***READ THIS FIRST. This is the freshest AI message available at rebirth; the freshest user message is the active request in Live Continuity State.***\n\n${aiOnly}${resumeSuffix}`;
-      }
-      return input.resumePoint?.trim() ? `\n${input.resumePoint.trim()}` : undefined;
+      const supplied = input.lastUserAiMessages?.trim() ? input.lastUserAiMessages : '';
+      const activeRequest = input.triggeringUserMessage?.trim()
+        ? input.triggeringUserMessage
+        : '';
+      const remainder = (() => {
+        if (!activeRequest) return '';
+        const headerEnd = supplied.indexOf('\n');
+        if (headerEnd >= 0 && supplied.slice(0, headerEnd).includes('👤 LAST USER MESSAGE')) {
+          const bodyStart = headerEnd + 1;
+          if (supplied.slice(bodyStart).startsWith(activeRequest)) {
+            const remainderStart = bodyStart + activeRequest.length;
+            if (supplied.startsWith('\n\n', remainderStart)) return supplied.slice(remainderStart + 2);
+            if (remainderStart === supplied.length) return '';
+          }
+        }
+        const boundary = /(?:^|\n\n)(?=(?:\[[^\n]+\]\s+)?(?:🤖 LAST AI MESSAGE|⚠️ UNRESOLVED PROVIDER\/RUNTIME ERROR))/gu;
+        let lastBoundary = -1;
+        for (const match of supplied.matchAll(boundary)) {
+          lastBoundary = (match.index ?? 0) + match[0].length;
+        }
+        return lastBoundary >= 0 ? supplied.slice(lastBoundary) : '';
+      })();
+      const combined = activeRequest
+        ? [
+            `👤 LAST USER MESSAGE (active request):\n${activeRequest}`,
+            remainder,
+          ].filter(Boolean).join('\n\n')
+        : supplied;
+      return combined
+        ? `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. These are the freshest genuine user and AI messages available at rebirth.***\n\n${combined}`
+        : undefined;
     })(),
   );
 
@@ -1113,7 +1103,9 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     input,
     'rawTraceCoordinateCloset',
     input.rawTraceCoordinateCloset?.trim()
-      ? `\n── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──\n${input.rawTraceCoordinateCloset.trim()}`
+      ? `\n── ${input.rawTraceCoordinateCloset.trimStart().startsWith('⌖c')
+          ? 'Compact Provenance Appendix (resolve ⌖cN refs here)'
+          : 'Raw Trace Coordinate Closet (ids/paths/values preserved from full trace)'} ──\n${input.rawTraceCoordinateCloset.trim()}`
       : undefined,
   );
   pushSection(
@@ -1127,12 +1119,6 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
       : undefined,
   );
   pushSection(budgetedSections, input, 'activeEditDelta', input.activeEditDelta ? `\n── Active Edit Delta ──\n${input.activeEditDelta}` : undefined);
-  pushSection(
-    budgetedSections,
-    input,
-    'taskRailContext',
-    input.taskRailContext?.trim() ? `\n── Task Rail Context (process truth) ──\n${input.taskRailContext.trim()}` : undefined,
-  );
   // cross-section containment dedupe for portable path.
   // Suppress episodic cards and glyph-log entries whose body is verbatim in the
   // Current Thread. Gate behind VOXXO_REBIRTH_SEED_DEDUPE (default on).
@@ -1207,31 +1193,10 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
     'lifetimeChangelogArc',
     input.lifetimeChangelogArc ? `\n── Lifetime Changelog Arc ──\n${input.lifetimeChangelogArc}` : undefined,
   );
-  pushSection(
-    budgetedSections,
-    input,
-    'chatroomMembership',
-    input.chatroomMembership ? `\n── Chatroom Membership (rooms only; not squad membership) ──\n${input.chatroomMembership}` : undefined,
-  );
-  const delegatedBody = formatDelegatedWorkSection(input.delegatedWork);
-  pushSection(budgetedSections, input, 'delegatedWork', delegatedBody ? `\n── Delegated Work ──\n${delegatedBody}` : undefined);
-  pushSection(
-    budgetedSections,
-    input,
-    'coordinationState',
-    input.coordinationState ? `\n── Coordination State ──\n${input.coordinationState}` : undefined,
-  );
-  pushSection(
-    budgetedSections,
-    input,
-    'squadThoughts',
-    input.squadThoughts ? `\n── Squad Awareness ──\n${input.squadThoughts}` : undefined,
-  );
-
   const footer = input.footerOverride !== undefined
     ? input.footerOverride
     : input.userMessageTriggered === true
-      ? 'The active user message appears once in Live Continuity State as the authoritative request body — respond to it directly.'
+      ? 'The active user message appears in Last User + AI Messages (READ FIRST) — respond to it directly.'
       : input.predecessorStatus === 'idle'
         ? 'Predecessor was idle with no active task — default to waiting for the next request; do not invent work or re-investigate the codebase from scratch. But if Last User + AI Messages or Current Thread shows a user request that was never answered or was cut off mid-work, treat that as your active task and engage with it directly rather than sitting idle.'
         : 'Resume the active task. The Activity Log + Active Edit Delta are your primary context. Evaluate predecessor work on its merits before diverging — if the approach is flawed, refactor it rather than discarding (see Core Principle 15). Continue using atlas_query as your primary codebase investigation tool — the File Context above is a handoff snapshot, not a substitute for live Atlas queries when exploring new files or verifying current state. Self-tap only if the package is insufficient or contradictory.';
@@ -1261,6 +1226,7 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
 
 interface PreparedTraceMessage {
   readonly sourceIndex: number;
+  readonly sourceIdentity?: string;
   readonly role: string;
   readonly text: string;
   readonly sourceText: string;
@@ -1273,8 +1239,28 @@ export interface RawTraceCoordinate {
   readonly index: number;
   readonly sourceIndex: number | null;
   readonly sourceRole: string | null;
+  /** Stable identity of the real source row; absent when the host supplied none. */
+  readonly sourceIdentity?: string;
   /** Authoritative source-event time, never ingestion or render time. */
   readonly sourceTimestamp?: string;
+}
+
+/** Machine-checkable route named by every compact appendix elision receipt. */
+export const RAW_TRACE_COORDINATE_RECOVERY_ROUTE = 'raw-trace-coordinate-replay/v1' as const;
+
+export interface RecoveredRawTraceCoordinate {
+  readonly route: typeof RAW_TRACE_COORDINATE_RECOVERY_ROUTE;
+  readonly coordinate: RawTraceCoordinate;
+  readonly sourceRow: FoldMessage;
+  readonly sourceIndex: number;
+  readonly sourceIdentity: string | null;
+  readonly sourceTimestamp: string | null;
+}
+
+export interface RawTraceCoordinateRecoveryReport {
+  readonly route: typeof RAW_TRACE_COORDINATE_RECOVERY_ROUTE;
+  readonly totalCoordinates: number;
+  readonly recovered: RecoveredRawTraceCoordinate[];
 }
 
 export type RawTraceCoordinatePlacementReason =
@@ -1308,6 +1294,12 @@ export interface RawTraceCoordinatePlacement {
 export interface InlineRawTraceCoordinatePlacementResult {
   readonly artifacts: RawTraceCoordinateArtifact[];
   readonly placements: RawTraceCoordinatePlacement[];
+  /** Bounded full provenance for the compact refs attached to artifacts. */
+  readonly appendix: string;
+  readonly totalCoordinates: number;
+  readonly renderedCoordinates: number;
+  readonly elidedCoordinates: number;
+  readonly recoveryRoute: typeof RAW_TRACE_COORDINATE_RECOVERY_ROUTE;
 }
 
 interface FittedRawTraceCoordinates {
@@ -1317,9 +1309,18 @@ interface FittedRawTraceCoordinates {
 }
 
 function rawTraceCoordinateOrigin(coordinate: RawTraceCoordinate): string {
-  return coordinate.sourceIndex === null
+  const source = coordinate.sourceIndex === null
     ? 'source=unknown'
     : `source=${coordinate.sourceRole ?? 'unknown-role'} message ${coordinate.sourceIndex + 1}`;
+  return `${source}; source-id=${coordinate.sourceIdentity?.trim() || 'unknown'}`;
+}
+
+function rawTraceCoordinateElisionLine(
+  elided: number,
+  total: number,
+  rendered: number,
+): string {
+  return `…${elided} more provenance coordinate(s) elided (total=${total}; rendered=${rendered}); recover=${RAW_TRACE_COORDINATE_RECOVERY_ROUTE}`;
 }
 
 function fitRawTraceCoordinates(
@@ -1342,13 +1343,13 @@ function fitRawTraceCoordinates(
 
   let elided = entries.length - fitted.length;
   if (elided > 0) {
-    let tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
+    let tail = `- ${rawTraceCoordinateElisionLine(elided, entries.length, fitted.length)}`;
     while (fitted.length > 1 && usedChars + countStringChars(tail) + 1 > maxChars) {
       const removed = fitted.pop();
       if (removed) {
         usedChars -= countStringChars(removed.line) + 1;
         elided += 1;
-        tail = `- …${elided} more coordinates elided — recover via fold recall or self-tap`;
+        tail = `- ${rawTraceCoordinateElisionLine(elided, entries.length, fitted.length)}`;
       }
     }
   }
@@ -1378,7 +1379,10 @@ function prepareVisibleTraceMessages(
       ? `${scrubbed.slice(0, RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE)}\n... [message source truncated for closet nomination]`
       : scrubbed;
     return [{
-      sourceIndex,
+      sourceIndex: Number.isInteger(message.sourceIndex) && message.sourceIndex! >= 0
+        ? message.sourceIndex!
+        : sourceIndex,
+      sourceIdentity: message.sourceIdentity?.trim() || undefined,
       role,
       text: bounded,
       sourceText: `${role}:\n${bounded}`,
@@ -1418,7 +1422,7 @@ function collectRawTraceCoordinates(
     if (!admitClosetLiteral(admitted, literal)) continue;
   }
 
-  return admitted.flatMap((literal): RawTraceCoordinate[] => {
+  const coordinates = admitted.flatMap((literal): RawTraceCoordinate[] => {
     const label = extractVerbatimContextLabel(fullText, literal);
     if (label === 'bare' && /^[0-9a-f]{6,}$/i.test(literal)) return [];
     const labelled = label ? `${literal} (${label})` : literal;
@@ -1436,9 +1440,71 @@ function collectRawTraceCoordinates(
       index: Math.max(0, fullText.lastIndexOf(literal)),
       sourceIndex: origin?.sourceIndex ?? null,
       sourceRole: origin?.role ?? null,
+      sourceIdentity: origin?.sourceIdentity,
       sourceTimestamp: origin?.sourceTimestamp,
     }];
   });
+  return foldArtifactOnlyEnabled()
+    ? rankRawArtifactCoordinates(coordinates)
+    : coordinates;
+}
+
+function foldMessageSourceTimestamp(message: FoldMessage): string | undefined {
+  if (typeof message.tsMs !== 'number' || !Number.isFinite(message.tsMs)) return undefined;
+  const timestamp = new Date(message.tsMs);
+  return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : undefined;
+}
+
+/** Resolve one emitted coordinate to the exact source row it names. */
+export function resolveRawTraceCoordinateSource(
+  coordinate: RawTraceCoordinate,
+  messages: readonly FoldMessage[],
+): RecoveredRawTraceCoordinate | null {
+  const resolved = resolveChronologicalPointToSourceRow({
+    unit: 'message',
+    index: coordinate.sourceIndex ?? undefined,
+    id: coordinate.sourceIdentity,
+    timestamp: coordinate.sourceTimestamp,
+  }, messages.map((message) => ({
+    row: message,
+    sourceIdentity: message.sourceIdentity?.trim() || undefined,
+    sourceTimestamp: foldMessageSourceTimestamp(message),
+  })));
+  if (!resolved) return null;
+  return {
+    route: RAW_TRACE_COORDINATE_RECOVERY_ROUTE,
+    coordinate,
+    sourceRow: resolved.row,
+    sourceIndex: resolved.rowIndex,
+    sourceIdentity: resolved.sourceIdentity,
+    sourceTimestamp: resolved.sourceTimestamp,
+  };
+}
+
+/**
+ * Replay the exact coordinate harvester over raw source rows. This is the
+ * executable recovery route named by appendix elision receipts.
+ */
+export function replayRawTraceCoordinateRecovery(
+  messages: readonly FoldMessage[],
+  includeTrailingUserTurn = true,
+): RawTraceCoordinateRecoveryReport {
+  const visibleMessages = withoutTaskRailProviderMessages(messages).messages;
+  const coordinates = collectRawTraceCoordinates(prepareVisibleTraceMessages(
+    visibleTraceMessagesFromFoldMessages(visibleMessages, includeTrailingUserTurn),
+  ));
+  const recovered = coordinates.map((coordinate) => {
+    const resolution = resolveRawTraceCoordinateSource(coordinate, messages);
+    if (!resolution) {
+      throw new Error(`unresolvable raw trace coordinate: ${coordinate.literal}`);
+    }
+    return resolution;
+  });
+  return {
+    route: RAW_TRACE_COORDINATE_RECOVERY_ROUTE,
+    totalCoordinates: coordinates.length,
+    recovered,
+  };
 }
 
 /**
@@ -1551,58 +1617,12 @@ export function routeRawTraceCoordinates(
   return placements;
 }
 
-function rewriteCoordinateOccurrences(
-  text: string,
-  literal: string,
-  artifactId: string,
-  keepFirst: boolean,
-): { text: string; kept: boolean } {
-  if (!text || !literal) return { text, kept: false };
-  const escaped = literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`(^|[^A-Za-z0-9])${escaped}(?=[^A-Za-z0-9]|$)`, 'gu');
-  let kept = false;
-  const rewritten = text.replace(pattern, (match, prefix: string) => {
-    if (keepFirst && !kept) {
-      kept = true;
-      return match;
-    }
-    return `${prefix}〔⌖→${artifactId}〕`;
-  });
-  return { text: rewritten, kept };
-}
-
 /**
- * True when `inner` occurs inside `outer` aligned to the same token boundaries
- * `rewriteCoordinateOccurrences` treats as edges (non-alphanumeric on both sides,
- * or string start/end). Such an `inner` literal is part of `outer`'s own spelling
- * — e.g. `X.ts` inside `X.ts-2834` — so rewriting its occurrences would corrupt
- * the longer coordinate and break the closet's verbatim-conservation guarantee.
+ * Artifact mode (VOXXO_FOLD_ARTIFACT_ONLY): maximum provenance references
+ * associated with any one artifact. Rows beyond the cap collapse into one
+ * appendix elision note and remain recoverable through exact trace tools.
  */
-function literalIsBoundaryAlignedSubToken(inner: string, outer: string): boolean {
-  if (!inner || !outer || inner.length >= outer.length) return false;
-  const isBoundary = (char: string): boolean => char === '' || /[^A-Za-z0-9]/u.test(char);
-  for (let index = outer.indexOf(inner); index !== -1; index = outer.indexOf(inner, index + 1)) {
-    const before = index === 0 ? '' : outer[index - 1]!;
-    const afterIndex = index + inner.length;
-    const after = afterIndex >= outer.length ? '' : outer[afterIndex]!;
-    if (isBoundary(before) && isBoundary(after)) return true;
-  }
-  return false;
-}
-
-/**
- * Render router output inline without leaving duplicate literal spellings in
- * sibling artifacts. Coordinate rows are prepended so normal tail truncation
- * cannot split them; each row keeps the original source identity/time and the
- * router reason. Pointer substitutions retain the chosen stable artifact id.
- */
-/**
- * Artifact mode (VOXXO_FOLD_ARTIFACT_ONLY): maximum ⌖ placement rows prepended
- * to any one artifact section. Rows beyond the cap collapse into a single
- * elision note — the full coordinate set stays recoverable via
- * tap_instance_messages and fold recall.
- */
-export const RAW_ARTIFACT_MODE_ANCHOR_CAP = 25;
+export const RAW_ARTIFACT_MODE_ANCHOR_CAP = 36;
 
 /**
  * Artifact-mode anchor worthiness: a ⌖ placement row earns its bytes only when
@@ -1619,101 +1639,130 @@ export function rawAnchorWorthyForArtifactMode(literal: string): boolean {
   if (t.startsWith('verbatim:')) return true;
   if (/^spool:/i.test(t) || /-spool\b/i.test(t)) return true;
   if (/^rail-[0-9a-f]{6,}/i.test(t)) return true;
+  if (/^(?:sig|msg|inst|task|thread|summon|fork|group|epoch|tool|call)[-_][A-Za-z0-9][A-Za-z0-9_.:-]{5,}$/i.test(t)) return true;
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t)) return true;
+  if (/^[A-Za-z_][\w.-]{0,40}[=:][^\s]{2,}$/u.test(t)) return true;
   return false;
+}
+
+/** Semantic value score used before artifact anchor caps are applied. */
+export function rawArtifactAnchorValueScore(literal: string, artifactId?: string): number {
+  const t = literal.trim();
+  const activeArtifact = artifactId === 'active-edit-delta' || artifactId === 'task-rail-context';
+  if (t.includes('/')) return 600 + (activeArtifact ? 200 : 0);
+  if (/^rail-[0-9a-f]{6,}/i.test(t)) return 580 + (activeArtifact ? 100 : 0);
+  if (t.startsWith('verbatim:')) return 560;
+  if (/^spool:/i.test(t) || /(?:tool-result-spool|rebirth-spool|-spool\b)/i.test(t)) return 540;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t)) return 520;
+  if (/^(?:sig|msg|inst|task|thread|summon|fork|group|epoch|tool|call)[-_]/i.test(t)) return 500;
+  if (/^[A-Za-z_][\w.-]{0,40}[=:][^\s]{2,}$/u.test(t)) return 440;
+  return 0;
+}
+
+function compareRawArtifactCoordinates(left: RawTraceCoordinate, right: RawTraceCoordinate): number {
+  const valueDifference = rawArtifactAnchorValueScore(right.literal) - rawArtifactAnchorValueScore(left.literal);
+  if (valueDifference !== 0) return valueDifference;
+  const leftTime = authoritativeTimestampMs(left.sourceTimestamp);
+  const rightTime = authoritativeTimestampMs(right.sourceTimestamp);
+  if (leftTime !== null && rightTime !== null && leftTime !== rightTime) return rightTime - leftTime;
+  if (left.sourceIndex !== null && right.sourceIndex !== null && left.sourceIndex !== right.sourceIndex) {
+    return right.sourceIndex - left.sourceIndex;
+  }
+  return right.index - left.index || left.literal.localeCompare(right.literal);
+}
+
+export function rankRawArtifactCoordinates(
+  coordinates: readonly RawTraceCoordinate[],
+): RawTraceCoordinate[] {
+  return [...coordinates].sort(compareRawArtifactCoordinates);
 }
 
 export function placeRawTraceCoordinatesInline(
   coordinates: readonly RawTraceCoordinate[],
   artifacts: readonly RawTraceCoordinateArtifact[],
+  options: { readonly maxAppendixChars?: number } = {},
 ): InlineRawTraceCoordinatePlacementResult {
   const placements = routeRawTraceCoordinates(coordinates, artifacts);
-  const mutable = artifacts.map((artifact) => ({ ...artifact }));
-  const byId = new Map(mutable.map((artifact) => [artifact.id, artifact]));
-  const rowsByArtifact = new Map<string, string[]>();
-  const elidedByArtifact = new Map<string, number>();
-  const keptInHomeByLiteral = new Map<string, boolean>();
   const artifactOnly = foldArtifactOnlyEnabled();
-
-  // Rewrite longest literals first so a shorter coordinate never pointerizes the
-  // boundary-aligned prefix of a longer one before that longer literal has been
-  // conserved (e.g. `X.ts` must not consume the `X.ts` head of `X.ts-2834`).
-  const longestFirst = [...placements].sort((left, right) => (
-    right.coordinate.literal.length - left.coordinate.literal.length
-    || (left.coordinate.literal < right.coordinate.literal ? -1
-      : left.coordinate.literal > right.coordinate.literal ? 1 : 0)
-  ));
-
-  for (const placement of longestFirst) {
-    let keptInHome = false;
-    for (const artifact of mutable) {
-      const rewritten = rewriteCoordinateOccurrences(
-        artifact.text,
-        placement.coordinate.literal,
-        placement.artifactId,
-        artifact.id === placement.artifactId,
-      );
-      artifact.text = rewritten.text;
-      if (artifact.id === placement.artifactId && rewritten.kept) keptInHome = true;
-    }
-    keptInHomeByLiteral.set(placement.coordinate.literal, keptInHome);
-  }
-
-  for (const placement of placements) {
-    if (keptInHomeByLiteral.get(placement.coordinate.literal) === true) continue;
-    let labelled = placement.coordinate.labelled;
-    for (const other of longestFirst) {
-      if (other.coordinate.literal === placement.coordinate.literal) continue;
-      // A literal that is a boundary-aligned sub-token of this coordinate's own
-      // literal is part of its identity, not an independent mention — rewriting
-      // it would corrupt the longer literal, so never dedupe it here.
-      if (literalIsBoundaryAlignedSubToken(other.coordinate.literal, placement.coordinate.literal)) continue;
-      labelled = rewriteCoordinateOccurrences(
-        labelled,
-        other.coordinate.literal,
-        other.artifactId,
-        false,
-      ).text;
-    }
+  const renderPlacements = artifactOnly
+    ? [...placements].sort((left, right) => (
+        rawArtifactAnchorValueScore(right.coordinate.literal, right.artifactId)
+        - rawArtifactAnchorValueScore(left.coordinate.literal, left.artifactId)
+        || compareRawArtifactCoordinates(left.coordinate, right.coordinate)
+        || left.artifactId.localeCompare(right.artifactId)
+      ))
+    : [...placements];
+  const perArtifactCounts = new Map<string, number>();
+  const candidates: RawTraceCoordinatePlacement[] = [];
+  let elided = 0;
+  for (const placement of renderPlacements) {
     if (artifactOnly && !rawAnchorWorthyForArtifactMode(placement.coordinate.literal)) {
-      elidedByArtifact.set(placement.artifactId, (elidedByArtifact.get(placement.artifactId) ?? 0) + 1);
+      elided += 1;
       continue;
     }
-    const sourceTime = placement.coordinate.sourceTimestamp ?? 'unknown';
-    const rows = rowsByArtifact.get(placement.artifactId) ?? [];
-    if (artifactOnly && rows.length >= RAW_ARTIFACT_MODE_ANCHOR_CAP) {
-      elidedByArtifact.set(placement.artifactId, (elidedByArtifact.get(placement.artifactId) ?? 0) + 1);
+    const artifactCount = perArtifactCounts.get(placement.artifactId) ?? 0;
+    if (artifactOnly && artifactCount >= RAW_ARTIFACT_MODE_ANCHOR_CAP) {
+      elided += 1;
       continue;
     }
-    rows.push(
-      `⌖ ${labelled} @ ${rawTraceCoordinateOrigin(placement.coordinate)}; source-time=${sourceTime}; route=${placement.reason}`,
-    );
-    rowsByArtifact.set(placement.artifactId, rows);
+    perArtifactCounts.set(placement.artifactId, artifactCount + 1);
+    candidates.push(placement);
   }
 
-  for (const [artifactId, rows] of rowsByArtifact) {
-    const artifact = byId.get(artifactId);
-    if (!artifact) continue;
-    const elided = elidedByArtifact.get(artifactId) ?? 0;
-    const elisionNote = elided > 0
-      ? [`⌖ …${elided} more anchor(s) elided (artifact mode) — recover via tap_instance_messages or fold recall`]
-      : [];
-    artifact.text = [...rows, ...elisionNote, artifact.text].filter(Boolean).join('\n');
+  const maxAppendixChars = Math.max(
+    0,
+    Math.floor(options.maxAppendixChars
+      ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset),
+  );
+  const kept = candidates.map((placement, index) => {
+    const ref = `⌖c${index + 1}`;
+    const sourceTime = placement.coordinate.sourceTimestamp ?? 'unknown';
+    return {
+      placement,
+      ref,
+      row: `${ref} ${placement.coordinate.labelled} @ ${rawTraceCoordinateOrigin(placement.coordinate)}; source-time=${sourceTime}; route=${placement.reason}; artifact=${placement.artifactId}`,
+    };
+  });
+  const renderAppendix = (): string => [
+    ...kept.map((entry) => entry.row),
+    ...(elided > 0
+      ? [rawTraceCoordinateElisionLine(elided, placements.length, kept.length)]
+      : []),
+  ].join('\n');
+  let appendix = renderAppendix();
+  while (appendix.length > maxAppendixChars && kept.length > 0) {
+    kept.pop();
+    elided += 1;
+    appendix = renderAppendix();
   }
-  // Artifacts whose every placement was elided never entered rowsByArtifact —
-  // they still get the elision note so the drop is visible, not silent.
-  if (artifactOnly) {
-    for (const [artifactId, elided] of elidedByArtifact) {
-      if (rowsByArtifact.has(artifactId)) continue;
-      const artifact = byId.get(artifactId);
-      if (!artifact) continue;
-      artifact.text = [
-        `⌖ …${elided} anchor(s) elided (artifact mode) — recover via tap_instance_messages or fold recall`,
-        artifact.text,
-      ].filter(Boolean).join('\n');
-    }
+  // The exact count and recovery route are an audit receipt. If the caller's
+  // cap is smaller than that one line, preserve the receipt rather than
+  // silently clipping the very proof needed to recover omitted coordinates.
+
+  const refsByArtifact = new Map<string, string[]>();
+  for (const entry of kept) {
+    const refs = refsByArtifact.get(entry.placement.artifactId) ?? [];
+    refs.push(entry.ref);
+    refsByArtifact.set(entry.placement.artifactId, refs);
   }
-  return { artifacts: mutable, placements };
+  // Conversation stays byte-for-byte immutable. Other sections receive one
+  // compact suffix line; filenames, notes, and prose are never rewritten.
+  const immutableArtifacts = new Set(['current-thread', 'last-user-ai']);
+  const renderedArtifacts = artifacts.map((artifact) => {
+    const refs = refsByArtifact.get(artifact.id);
+    if (!refs?.length || immutableArtifacts.has(artifact.id)) return { ...artifact };
+    const suffix = `Provenance: ${refs.join(' ')}`;
+    return { ...artifact, text: [artifact.text, suffix].filter(Boolean).join('\n') };
+  });
+  return {
+    artifacts: renderedArtifacts,
+    placements,
+    appendix,
+    totalCoordinates: placements.length,
+    renderedCoordinates: kept.length,
+    elidedCoordinates: elided,
+    recoveryRoute: RAW_TRACE_COORDINATE_RECOVERY_ROUTE,
+  };
 }
 
 export function buildRawTraceCoordinateCloset(
@@ -1727,7 +1776,11 @@ export function buildRawTraceCoordinateCloset(
   const fitted = fitRawTraceCoordinates(coordinates, maxChars);
   const fittedLines = [...fitted.lines];
   if (fitted.elided > 0) {
-    fittedLines.push(`- …${fitted.elided} more coordinates elided — recover via fold recall or self-tap`);
+    fittedLines.push(`- ${rawTraceCoordinateElisionLine(
+      fitted.elided,
+      fitted.coordinates.length + fitted.elided,
+      fitted.coordinates.length,
+    )}`);
   }
 
   if (fittedLines.length === 0) return '';
@@ -1973,6 +2026,109 @@ function providerMessageToTraceText(message: FoldMessage | undefined): string {
   return lines.join('\n');
 }
 
+function isTaskRailProviderName(value: unknown): boolean {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return normalized === 'task_rail'
+    || normalized.endsWith('__task_rail')
+    || normalized.endsWith('/task_rail')
+    || normalized.endsWith('.task_rail');
+}
+
+function recordContainsTaskRailName(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(recordContainsTaskRailName);
+  if (value === null || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if ([record.name, record.tool_name, record.canonicalToolName, record.rawToolName]
+    .some(isTaskRailProviderName)) return true;
+  return Object.values(record).some(recordContainsTaskRailName);
+}
+
+function collectTaskRailProviderIds(value: unknown, ids: Set<string>): void {
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectTaskRailProviderIds(entry, ids));
+    return;
+  }
+  if (value === null || typeof value !== 'object') return;
+  const record = value as Record<string, unknown>;
+  if (recordContainsTaskRailName(record)) {
+    for (const key of ['id', 'tool_call_id', 'toolCallId', 'tool_use_id']) {
+      const id = typeof record[key] === 'string' ? record[key].trim() : '';
+      if (id) ids.add(id);
+    }
+  }
+  Object.values(record).forEach((entry) => collectTaskRailProviderIds(entry, ids));
+}
+
+function referencesTaskRailProviderId(value: unknown, ids: ReadonlySet<string>): boolean {
+  if (Array.isArray(value)) return value.some((entry) => referencesTaskRailProviderId(entry, ids));
+  if (value === null || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  for (const key of ['tool_call_id', 'toolCallId', 'tool_use_id']) {
+    const id = typeof record[key] === 'string' ? record[key].trim() : '';
+    if (id && ids.has(id)) return true;
+  }
+  return Object.values(record).some((entry) => referencesTaskRailProviderId(entry, ids));
+}
+
+function stripTaskRailProviderValue(value: unknown, ids: ReadonlySet<string>): unknown {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => stripTaskRailProviderValue(entry, ids))
+      .filter((entry) => entry !== undefined);
+  }
+  if (value === null || typeof value !== 'object') return value;
+  if (recordContainsTaskRailName(value) || referencesTaskRailProviderId(value, ids)) return undefined;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .map(([key, entry]) => [key, stripTaskRailProviderValue(entry, ids)] as const)
+      .filter(([, entry]) => entry !== undefined),
+  );
+}
+
+function withoutTaskRailProviderMessages(messages: readonly FoldMessage[]): {
+  messages: FoldMessage[];
+  excludedIndexes: Set<number>;
+} {
+  const ids = new Set<string>();
+  messages.forEach((message) => collectTaskRailProviderIds(message, ids));
+  const excludedIndexes = new Set<number>();
+  const sanitized = messages.map((message, index) => {
+    if (isTaskRailProviderName(message.name)
+      || referencesTaskRailProviderId({
+        tool_call_id: message.tool_call_id,
+        content: message.content,
+        parts: (message as FoldMessage & { parts?: unknown }).parts,
+      }, ids)) {
+      excludedIndexes.add(index);
+      return {
+        ...message,
+        content: '',
+        name: undefined,
+        tool_call_id: undefined,
+        tool_calls: undefined,
+        ...(Object.prototype.hasOwnProperty.call(message, 'parts') ? { parts: undefined } : {}),
+      } as FoldMessage;
+    }
+    const next = {
+      ...message,
+      content: stripTaskRailProviderValue(message.content, ids),
+      tool_calls: stripTaskRailProviderValue(message.tool_calls, ids),
+      ...(Object.prototype.hasOwnProperty.call(message, 'parts')
+        ? { parts: stripTaskRailProviderValue((message as FoldMessage & { parts?: unknown }).parts, ids) }
+        : {}),
+    } as FoldMessage;
+    const hasPayload = [
+      messageValueToText(next.content),
+      messagePartsToText(next),
+      messageValueToText(next.tool_calls),
+      messageValueToText(next.reasoning_content),
+    ].some((part) => part.trim().length > 0);
+    if (!hasPayload) excludedIndexes.add(index);
+    return next;
+  });
+  return { messages: sanitized, excludedIndexes };
+}
+
 function messageLabel(message: FoldMessage): string {
   if (message.role === 'user') return '👤 USER';
   if (message.role === 'assistant') return '🤖 YOU';
@@ -2026,16 +2182,35 @@ function buildCurrentThreadFromMessages(
   perMessageChars: number,
   excludedMessageIndexes: ReadonlySet<number>,
 ): string {
-  const start = Math.max(0, traceEnd - messageLimit);
-  const parts: string[] = [];
-  for (let i = start; i < traceEnd; i += 1) {
-    if (excludedMessageIndexes.has(i)) continue;
-    const message = messages[i];
-    if (!message) continue;
-    const body = truncateMiddle(providerMessageToTraceText(message), perMessageChars);
-    parts.push(`[message ${i}] ${messageLabel(message)}:\n${body}`);
-  }
-  return parts.join('\n\n');
+  const roleLimit = Math.max(1, Math.floor(messageLimit / 2));
+  const candidates = messages.slice(0, traceEnd).flatMap((message, sourceIndex) => {
+    if (excludedMessageIndexes.has(sourceIndex)) return [];
+    const text = providerMessageToTraceText(message);
+    const userIsGenuine = message.role === 'user' && isPortableGenuineOperatorFoldMessage(message);
+    const type = message.role === 'user'
+      ? userIsGenuine ? 'user' : 'system_reminder'
+      : message.role === 'assistant' || message.role === 'model'
+        ? 'assistant_text'
+        : message.role;
+    return [{
+      id: `message-${sourceIndex}`,
+      type,
+      text,
+      sourceIndex,
+      message,
+      ...(typeof message.tsMs === 'number' && Number.isFinite(message.tsMs)
+        ? { created_at: new Date(message.tsMs).toISOString() }
+        : {}),
+    }];
+  });
+  const selected = selectRoleAwareRebirthDialogueWindow(candidates, {
+    recentUserMessages: roleLimit,
+    recentAssistantMessages: roleLimit,
+    recentAmbientMessages: 0,
+  }).messages;
+  return selected.map(({ message, sourceIndex, text }) => (
+    `[message ${sourceIndex}] ${messageLabel(message)}:\n${truncateMiddle(text, perMessageChars)}`
+  )).join('\n\n');
 }
 
 function buildActivityLogFromMessages(
@@ -2065,11 +2240,7 @@ function buildActivityLogFromMessages(
 export function isPortableGenuineOperatorMessage(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
-  if (trimmed.includes('[CONTEXT REBIRTH]')) return false;
-  if (trimmed.includes(CHRONOLOGICAL_PROVENANCE_PREFIX)) return false;
-  if (/^@\w+/.test(trimmed) && trimmed.length < 200) return false;
-  if (trimmed.startsWith('[DIGEST DELTA') || trimmed.startsWith('[Digest Delta')) return false;
-  if (trimmed.startsWith('[Control Signals]') || trimmed.startsWith('[System]')) return false;
+  if (!isGenuineRebirthOperatorMessage(trimmed)) return false;
   // Strip known ephemeral coordination markers
   const stripped = trimmed
     .replace(/\[DIGEST DELTA[^\]]*\][\s\S]*?\[END DIGEST DELTA\]/g, '')
@@ -2077,6 +2248,17 @@ export function isPortableGenuineOperatorMessage(text: string): boolean {
     .trim();
   if (stripped.length === 0) return false;
   return true;
+}
+
+function isPortableGenuineOperatorFoldMessage(message: FoldMessage): boolean {
+  if (message.role !== 'user') return false;
+  if (Array.isArray(message.content) && message.content.some((block) => (
+    block !== null
+    && typeof block === 'object'
+    && 'type' in block
+    && block.type === 'tool_result'
+  ))) return false;
+  return isPortableGenuineOperatorMessage(messageContentAndPartsToText(message));
 }
 
 function hasMicroSeedTrajectory(messages: readonly FoldMessage[]): boolean {
@@ -2100,14 +2282,12 @@ function buildLastUserAiMessagesFromMessages(
   messages: readonly FoldMessage[],
   traceEnd: number,
   excludedMessageIndexes: ReadonlySet<number>,
+  triggeringUserMessage?: string,
 ): string {
   let lastUser = '';
   let lastUserIndex = -1;
-  // glyph-aware ranking for AI messages.
-  // Collect all assistant messages, score by glyph weight, pick the best.
-  let bestAssistant = '';
-  let bestAssistantWeight = 0;
-  let bestAssistantIndex = -1;
+  let lastAssistant = '';
+  let lastAssistantIndex = -1;
   for (let i = 0; i < traceEnd; i++) {
     if (excludedMessageIndexes.has(i)) continue;
     const message = messages[i];
@@ -2116,7 +2296,7 @@ function buildLastUserAiMessagesFromMessages(
     // digest deltas, and ephemeral-only turns. The newest genuine operator
     // message wins (iterate forward, overwrite — latest by index wins).
     if (message.role === 'user') {
-      if (isPortableGenuineOperatorMessage(messageContentAndPartsToText(message))) {
+      if (isPortableGenuineOperatorFoldMessage(message)) {
         lastUser = providerMessageToTraceText(message);
         lastUserIndex = i;
       }
@@ -2124,18 +2304,8 @@ function buildLastUserAiMessagesFromMessages(
     if (message.role === 'assistant' || message.role === 'model') {
       const text = providerMessageToTraceText(message);
       if (text) {
-        const glyph = classifyMessageGlyph(text);
-        const weight = glyph === 'verdict' ? 10
-          : glyph === 'hazard' ? 8
-          : glyph === 'blocked' ? 6
-          : glyph === 'working' ? 2
-          : 1;
-        // Prefer higher weight; on tie, prefer more recent (higher index)
-        if (weight > bestAssistantWeight || (weight === bestAssistantWeight && i > bestAssistantIndex)) {
-          bestAssistant = text;
-          bestAssistantWeight = weight;
-          bestAssistantIndex = i;
-        }
+        lastAssistant = text;
+        lastAssistantIndex = i;
       }
     }
   }
@@ -2144,18 +2314,18 @@ function buildLastUserAiMessagesFromMessages(
   // index is the shared coordinate space, so no new numbering is introduced.
   // Flag-off (or index unknown) renders the historical marker-free output.
   const markersEnabled = typeof process !== 'undefined' && process.env?.VOXXO_REBIRTH_SEED_MSG_MARKERS !== '0';
-  const userMarker = markersEnabled && lastUserIndex >= 0 ? ` [message ${lastUserIndex}]` : '';
-  const aiMarker = markersEnabled && bestAssistantIndex >= 0 ? ` [message ${bestAssistantIndex}]` : '';
-  const threadPointer = aiMarker
-    ? `[Full text appears below in Current Thread at${aiMarker}.]`
-    : '[Full text appears below in Current Thread.]';
-  const renderedAssistant = bestAssistant
-    ? bestAssistant.length > 360
-      ? `${truncate(bestAssistant, 360)}\n${threadPointer}`
-      : bestAssistant
-    : '';
+  const activeRequest = triggeringUserMessage?.trim() || '';
+  if (activeRequest) {
+    lastUser = activeRequest;
+    lastUserIndex = -1;
+  }
+  const userMarker = activeRequest
+    ? ' (active request)'
+    : markersEnabled && lastUserIndex >= 0 ? ` [message ${lastUserIndex}]` : '';
+  const aiMarker = markersEnabled && lastAssistantIndex >= 0 ? ` [message ${lastAssistantIndex}]` : '';
+  const renderedAssistant = lastAssistant;
   return [
-    lastUser ? `👤 LAST USER MESSAGE${userMarker}:\n${truncateMiddle(lastUser, 6_000)}` : '',
+    lastUser ? `👤 LAST USER MESSAGE${userMarker}:\n${lastUser}` : '',
     renderedAssistant ? `🤖 LAST AI MESSAGE${aiMarker}:\n${renderedAssistant}` : '',
   ].filter(Boolean).join('\n\n');
 }
@@ -2171,9 +2341,9 @@ function visibleTraceMessagesFromFoldMessages(
     return [{
       type: message.role === 'assistant' ? 'assistant_text' : message.role,
       text: providerMessageToTraceText(message),
-      sourceTimestamp: typeof message.tsMs === 'number' && Number.isFinite(message.tsMs)
-        ? new Date(message.tsMs).toISOString()
-        : undefined,
+      sourceIndex: offset,
+      sourceIdentity: message.sourceIdentity?.trim() || undefined,
+      sourceTimestamp: foldMessageSourceTimestamp(message),
     }];
   });
 }
@@ -2196,16 +2366,26 @@ export function buildRawRebirthSeedFromMessages(
   const predecessorName = options.predecessorName ?? 'predecessor';
   const includeTrailingUserTurn = options.includeTrailingUserTurn !== false;
   const traceEnd = findRawRebirthSeedTraceEnd(messages, includeTrailingUserTurn);
-  const excluded = excludedTrailingStringUserIndexes(messages, includeTrailingUserTurn);
+  const taskRailSanitized = withoutTaskRailProviderMessages(messages);
+  const visibleMessages = taskRailSanitized.messages;
+  const excluded = new Set([
+    ...excludedTrailingStringUserIndexes(messages, includeTrailingUserTurn),
+    ...taskRailSanitized.excludedIndexes,
+  ]);
   let currentThread = buildCurrentThreadFromMessages(
-    messages,
+    visibleMessages,
     traceEnd,
     Math.max(1, Math.floor(options.currentThreadMessageLimit ?? 30)),
     Math.max(200, Math.floor(options.currentThreadMessageChars ?? 1_600)),
     excluded,
   );
-  let lastUserAiMessages = buildLastUserAiMessagesFromMessages(messages, traceEnd, excluded);
-  const visibleTraceMessages = visibleTraceMessagesFromFoldMessages(messages, includeTrailingUserTurn);
+  let lastUserAiMessages = buildLastUserAiMessagesFromMessages(
+    visibleMessages,
+    traceEnd,
+    excluded,
+    options.triggeringUserMessage,
+  );
+  const visibleTraceMessages = visibleTraceMessagesFromFoldMessages(visibleMessages, includeTrailingUserTurn);
   // Coordinate placement: build the artifact sections FIRST so every harvested
   // literal can be checked against the corpus it would live in. Conserved
   // literals stay inline with their artifact; only orphans spend neighborhood
@@ -2213,14 +2393,14 @@ export function buildRawRebirthSeedFromMessages(
   // the VOXXO_REBIRTH_FLAT_CLOSET kill-switch.
   let starredMoments = options.starredMoments === undefined
     ? buildStarredMomentsFromMessages(
-        messages,
+        visibleMessages,
         options.sectionMaxChars?.starredMoments
           ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.starredMoments,
       )
     : options.starredMoments;
-  let openQuestions = options.openQuestions ?? buildOpenQuestionsFromMessages(messages);
+  let openQuestions = options.openQuestions ?? buildOpenQuestionsFromMessages(visibleMessages);
   let thinkingTrail = buildActivityLogFromMessages(
-    messages,
+    visibleMessages,
     traceEnd,
     Math.max(200, Math.floor(options.activityMessageChars ?? 1_000)),
     excluded,
@@ -2231,8 +2411,8 @@ export function buildRawRebirthSeedFromMessages(
   let lineageGlyphLog = options.lineageGlyphLog ?? '';
   let resumePoint = options.resumePoint ?? '';
   const legacyLayout = flatCoordinateClosetEnabled();
-  const rawTraceCoordinateCloset = legacyLayout
-    ? buildRawTraceCoordinateClosetFromMessages(messages, {
+  let rawTraceCoordinateCloset = legacyLayout
+    ? buildRawTraceCoordinateClosetFromMessages(visibleMessages, {
         includeTrailingUserTurn,
         rawTraceCoordinateClosetChars: options.rawTraceCoordinateClosetChars,
       })
@@ -2244,45 +2424,43 @@ export function buildRawRebirthSeedFromMessages(
           currentThread,
           lastUserAiMessages,
           activeEditDelta,
-          taskRailContext,
         ],
       })
     : options.traceNeighborhoods ?? '';
 
   if (!legacyLayout) {
     const prepared = prepareVisibleTraceMessages(visibleTraceMessages);
-    const coordinates = fitRawTraceCoordinates(
-      collectRawTraceCoordinates(prepared),
-      options.rawTraceCoordinateClosetChars
-        ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset,
-    ).coordinates;
+    // The appendix owns its own bounded rendering and exact elision receipt.
+    // Passing the full set prevents an earlier fit from hiding coordinates
+    // before the appendix can count and name their recovery route.
+    const coordinates = collectRawTraceCoordinates(prepared);
     const newestSourceTimestamp = [...prepared].reverse()
       .find((message) => message.sourceTimestamp)?.sourceTimestamp;
     const artifacts: RawTraceCoordinateArtifact[] = [
-      { id: 'task-rail-context', text: taskRailContext, placementPriority: 0 },
       { id: 'active-edit-delta', text: activeEditDelta, placementPriority: 1 },
       { id: 'starred-moments', text: starredMoments, placementPriority: 2 },
       { id: 'lineage-glyph-log', text: lineageGlyphLog, placementPriority: 3 },
       { id: 'episodic-cross-ref', text: episodicCrossRef, placementPriority: 4 },
-      { id: 'resume-point', text: resumePoint, placementPriority: 5 },
       { id: 'current-thread', text: currentThread, sourceTimestamp: newestSourceTimestamp, placementPriority: 6 },
       { id: 'last-user-ai', text: lastUserAiMessages, sourceTimestamp: newestSourceTimestamp, placementPriority: 7 },
       { id: 'open-questions', text: openQuestions, placementPriority: 8 },
       { id: 'activity-log', text: thinkingTrail, sourceTimestamp: newestSourceTimestamp, placementPriority: 9 },
     ].filter((artifact) => artifact.text.trim().length > 0);
     if (coordinates.length > 0 && artifacts.length > 0) {
-      const placed = placeRawTraceCoordinatesInline(coordinates, artifacts);
+      const placed = placeRawTraceCoordinatesInline(coordinates, artifacts, {
+        maxAppendixChars: options.rawTraceCoordinateClosetChars
+          ?? DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset,
+      });
+      rawTraceCoordinateCloset = placed.appendix;
       const placedById = new Map(placed.artifacts.map((artifact) => [artifact.id, artifact.text]));
       currentThread = placedById.get('current-thread') ?? currentThread;
       lastUserAiMessages = placedById.get('last-user-ai') ?? lastUserAiMessages;
       activeEditDelta = placedById.get('active-edit-delta') ?? activeEditDelta;
-      taskRailContext = placedById.get('task-rail-context') ?? taskRailContext;
       episodicCrossRef = placedById.get('episodic-cross-ref') ?? episodicCrossRef;
       lineageGlyphLog = placedById.get('lineage-glyph-log') ?? lineageGlyphLog;
       starredMoments = placedById.get('starred-moments') ?? starredMoments;
       openQuestions = placedById.get('open-questions') ?? openQuestions;
       thinkingTrail = placedById.get('activity-log') ?? thinkingTrail;
-      resumePoint = placedById.get('resume-point') ?? resumePoint;
     }
     traceNeighborhoods = '';
   }
@@ -2363,6 +2541,7 @@ export function buildRawRebirthSeedFromMessages(
     sectionToggles: options.sectionToggles,
     lastUserAiMessages,
     currentThread,
+    triggeringUserMessage: options.triggeringUserMessage,
     rawTraceCoordinateCloset,
     traceNeighborhoods,
     activeEditDelta,
@@ -2377,7 +2556,7 @@ export function buildRawRebirthSeedFromMessages(
     thinkingTrail,
     predecessorStatus: options.predecessorStatus,
     lifecycleBoundary: options.lifecycleBoundary,
-    userMessageTriggered: options.userMessageTriggered,
+    userMessageTriggered: options.userMessageTriggered ?? Boolean(options.triggeringUserMessage?.trim()),
     headerOverride: options.headerOverride,
     footerOverride: options.footerOverride,
   });

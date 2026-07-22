@@ -29,11 +29,6 @@
  * Pure module: no I/O, no timers, no environment access. GOD RULE 2 safe.
  */
 
-import {
-  REBIRTH_CONTROL_AUTHORITY_HORIZON,
-  REBIRTH_CONTROL_DYNAMIC_TRUTH_ORDER,
-} from './chronologicalProvenance.ts';
-
 export const CONTINUITY_RECEIPT_VERSION = 1 as const;
 
 export type ContinuityReceiptBoundary =
@@ -312,6 +307,13 @@ function buildReceiptLiveState(args: {
   const captureSource = (kind: string, id = captureId, options: { coordinate?: string; sourceTimestamp?: string } = {}) => (
     liveSource(capturedAt, kind, id, options)
   );
+  // A triggering operator message can arrive at the rebirth boundary before
+  // its canonical event row is visible to the snapshot. Preserve a stable
+  // boundary-scoped provenance identity instead of claiming the source is
+  // "unknown"; source time remains explicitly unknown unless supplied.
+  const activeRequestSourceId = activeRequest
+    ? parts.activeRequestSourceId?.trim() || `${captureId}:embedded-active-request`
+    : 'none';
   const rail = parts.rail;
   const railSource = rail
     ? captureSource('task-rail', rail.railId || 'legacy-rail', {
@@ -361,9 +363,9 @@ function buildReceiptLiveState(args: {
     },
     request: {
       status: activeRequest ? 'current' : 'unknown',
-      source: captureSource('operator-message', activeRequest ? parts.activeRequestSourceId ?? 'unknown' : 'none', {
-        ...(parts.activeRequestSourceCoordinate
-          ? { coordinate: parts.activeRequestSourceCoordinate }
+      source: captureSource('operator-message', activeRequestSourceId, {
+        ...(activeRequest
+          ? { coordinate: parts.activeRequestSourceCoordinate ?? 'embedded-active-request' }
           : {}),
         ...(parts.activeRequestSourceTimestamp
           ? { sourceTimestamp: parts.activeRequestSourceTimestamp }
@@ -464,7 +466,7 @@ export function detectContinuityHazards(sources: readonly string[]): string[] {
     : [];
 }
 
-const VALIDATION_FACT_PATTERN = /^(?:validation|verification)(?:\s+(?:state|fact|facts))?\s*:/iu;
+const VALIDATION_FACT_PATTERN = /^(?:validation|verification)(?:\s+(?:passed|state|fact|facts))?\s*:/iu;
 
 /**
  * Latest explicit validation/verification fact across prose blobs, latest line
@@ -827,105 +829,23 @@ export function normalizeContinuityReceiptRail(value: unknown): ContinuityReceip
 
 export interface RenderContinuityReceiptControlOptions {
   /**
-   * Surface-specific active-request capsule renderer. Receives the full
-   * request text and returns the complete `active request (...)` line(s).
-   * Each surface injects its own budget policy so the capsule stays
-   * byte-compatible with what it renders today.
+   * Deprecated compatibility hook. Active request text now has one readable
+   * home in Last User + AI Messages (READ FIRST), so the continuity boundary
+   * deliberately never invokes this renderer.
    */
   readonly formatActiveRequest?: (text: string) => string;
 }
 
-const DEFAULT_ACTIVE_REQUEST_MAX_CHARS = 6_000;
-
-/**
- * Default active-request capsule for hosts without a surface policy: verbatim
- * when it fits, honest middle elision with true size and a tap pointer
- * otherwise. Self-contained so the shared module has no rendering imports.
- */
-function defaultFormatActiveRequest(activeRequest: string): string {
-  if (activeRequest.length <= DEFAULT_ACTIVE_REQUEST_MAX_CHARS) {
-    return `active request (verbatim; sole authoritative body):\n${activeRequest}`;
-  }
-  const headChars = Math.floor(DEFAULT_ACTIVE_REQUEST_MAX_CHARS * 0.6);
-  const tailChars = DEFAULT_ACTIVE_REQUEST_MAX_CHARS - headChars;
-  const rendered = `${activeRequest.slice(0, headChars)}\n[… ${activeRequest.length - headChars - tailChars} chars elided …]\n${activeRequest.slice(activeRequest.length - tailChars)}`;
-  return `active request (EXCERPT — ${activeRequest.length} chars total, middle elided; full text via tap_instance_messages; sole authoritative body):\n${rendered}`;
-}
-
-function formatReceiptRailLine(rail: ContinuityReceiptRail | undefined): string {
-  if (!rail) return 'unknown';
-  if (!rail.railId) return rail.rawLine ?? 'unknown';
-  const done = rail.doneSteps !== undefined ? String(rail.doneSteps) : '?';
-  const total = rail.totalSteps !== undefined ? String(rail.totalSteps) : '?';
-  const percent = rail.percentComplete !== undefined ? String(rail.percentComplete) : '?';
-  return `📋 ${rail.title} (${rail.railId}) — ${rail.state} — ${done}/${total} (${percent}%)`;
-}
-
-function formatReceiptActiveStepLine(rail: ContinuityReceiptRail | undefined): string {
-  const activeStep = rail?.activeStep;
-  if (activeStep) return `▶ Active: ${activeStep.id} [${activeStep.status}] — ${activeStep.title}`;
-  return rail?.activeStepRawLine ?? 'unknown';
-}
-
-function formatReceiptEditClaimLine(editClaim: ContinuityReceiptEditClaim): string {
-  if (!editClaim.supplied) return 'edit/claim state: not supplied';
-  const evidence = editClaim.editEvidenceFiles.length > 0
-    ? `; recent edit evidence covers ${editClaim.editEvidenceFiles.length} file(s)`
-    : '';
-  if (editClaim.claims.length > 0) {
-    return `edit/claim state: ${editClaim.claims.length} active claim(s): ${editClaim.claims.join(', ')}${evidence}; Active Edit Delta below governs ownership`;
-  }
-  return `edit/claim state: no active claims declared${evidence}; recent edits are evidence, not ownership`;
-}
-
-export const LIVE_CONTINUITY_STATE_HEADER = '── Live Continuity State (AUTHORITATIVE) ──';
-export const LEGACY_REBIRTH_CONTROL_HEADER = '── Rebirth Control (AUTHORITATIVE) ──';
-
-function formatLiveSource(source: ContinuityLiveFieldSource): string {
-  const coordinate = source.coordinate ? ` coordinate=${source.coordinate}` : '';
-  const sourceTime = source.sourceTimestamp ? ` source-time=${source.sourceTimestamp}` : ' source-time=unknown';
-  return `source=${source.kind}:${source.id}${coordinate}${sourceTime} captured=${source.capturedAt}`;
-}
-
-function formatLiveField<T>(
-  label: string,
-  field: ContinuityLiveField<T>,
-  value: string,
-): string {
-  const note = field.note ? `; ${field.note}` : '';
-  return `${label} [${field.status}] ${formatLiveSource(field.source)}: ${value}${note}`;
-}
+export const LIVE_CONTINUITY_STATE_HEADER = '── Continuity Boundary (RECOVERY COORDINATES) ──';
+export const LEGACY_REBIRTH_CONTROL_HEADER = LIVE_CONTINUITY_STATE_HEADER;
 
 function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
 }
 
-function renderLiveList(value: unknown, empty: string): string {
+function renderLiveList(value: unknown, empty = 'none'): string {
   const list = stringList(value);
   return list.length > 0 ? list.join(', ') : empty;
-}
-
-function renderLiveInstance(value: unknown): string {
-  if (!isRecord(value)) return 'unknown';
-  const instanceId = typeof value.instanceId === 'string' ? value.instanceId : 'unknown';
-  const instanceName = typeof value.instanceName === 'string' ? value.instanceName : 'unknown';
-  const runtimeStatus = typeof value.runtimeStatus === 'string' ? value.runtimeStatus : 'unknown';
-  const lineage = [
-    typeof value.creationCause === 'string' ? `cause=${value.creationCause}` : '',
-    typeof value.parentInstanceId === 'string' ? `parent=${value.parentInstanceId}` : '',
-    typeof value.replacesInstanceId === 'string' ? `replaces=${value.replacesInstanceId}` : '',
-    typeof value.originEventId === 'string' ? `origin=${value.originEventId}` : '',
-    typeof value.originSourceTimestamp === 'string' ? `origin-source-time=${value.originSourceTimestamp}` : '',
-  ].filter(Boolean);
-  return `id=${instanceId} name=${instanceName} runtime=${runtimeStatus}${lineage.length > 0 ? ` ${lineage.join(' ')}` : ''}`;
-}
-
-function renderLiveStep(value: unknown): string {
-  if (!isRecord(value)) return 'none';
-  const id = typeof value.id === 'string' ? value.id : 'unknown';
-  const status = typeof value.status === 'string' ? value.status : 'unknown';
-  const title = typeof value.title === 'string' ? value.title : 'unknown';
-  return `${id} [${status}] — ${title}`;
 }
 
 function renderLiveFrontier(value: unknown): string {
@@ -939,50 +859,55 @@ function renderLiveFrontier(value: unknown): string {
   return `${traceId}@${coordinate} (${exactCount} exact row${exactCount === 1 ? '' : 's'} after frontier)`;
 }
 
+function renderCurrentTaskRailStep(
+  value: unknown,
+  updatedAt?: string,
+  rawLine?: string,
+): string[] {
+  if (!isRecord(value)
+    || typeof value.id !== 'string'
+    || typeof value.title !== 'string'
+    || typeof value.status !== 'string') {
+    const fallback = rawLine?.trim();
+    return fallback ? [`current task-rail step · ${truncateContinuity(fallback, 320)}`] : [];
+  }
+  const position = typeof value.position === 'number'
+    ? `${value.position}${typeof value.totalSteps === 'number' ? `/${value.totalSteps}` : ''} · `
+    : '';
+  const timestamp = updatedAt?.trim() ? ` · updated=${updatedAt.trim()}` : '';
+  const lines = [
+    `current task-rail step · ${position}${truncateContinuity(value.id, 80)} [${truncateContinuity(value.status, 40)}] · ${truncateContinuity(value.title, 200)}${timestamp}`,
+  ];
+  if (typeof value.instruction === 'string' && value.instruction.trim()) {
+    lines.push(`step instruction=${truncateContinuity(value.instruction.trim(), 360)}`);
+  }
+  return lines;
+}
+
 function renderContinuityLiveState(
   receipt: ContinuityReceipt,
   liveState: ContinuityReceiptLiveState,
-  formatActiveRequest: (text: string) => string,
 ): string {
-  const rail = normalizeContinuityReceiptRail(liveState.rail.value);
   const validation = isRecord(liveState.validation.value) && typeof liveState.validation.value.fact === 'string'
     ? truncateContinuity(liveState.validation.value.fact, 240)
-    : 'none';
-  const review = isRecord(liveState.review.value) && typeof liveState.review.value.state === 'string'
-    ? liveState.review.value.state
-    : 'unknown';
-  const request = isRecord(liveState.request.value) && typeof liveState.request.value.text === 'string'
-    ? liveState.request.value.text
-    : undefined;
-  const requestChars = isRecord(liveState.request.value) && typeof liveState.request.value.totalChars === 'number'
-    ? liveState.request.value.totalChars
-    : 0;
+    : '';
+  const instance = isRecord(liveState.instance.value) ? liveState.instance.value : undefined;
+  const runtimeStatus = typeof instance?.runtimeStatus === 'string'
+    ? instance.runtimeStatus
+    : receipt.sourceStatus ?? 'unknown';
+  const activeStepLines = renderCurrentTaskRailStep(
+    liveState.step.value,
+    liveState.step.source.sourceTimestamp,
+  );
 
   return [
     LIVE_CONTINUITY_STATE_HEADER,
-    `capture frontier: ${liveState.capturedAt}; historical sections above remain immutable evidence`,
-    `boundary: ${receipt.boundary}; identity: ${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)}`,
-    formatLiveField('instance', liveState.instance, renderLiveInstance(liveState.instance.value)),
-    formatLiveField('request', liveState.request, request ? `${requestChars} chars bundled below` : 'none'),
-    formatLiveField('rail', liveState.rail, rail ? formatReceiptRailLine(rail) : 'none'),
-    formatLiveField('step', liveState.step, renderLiveStep(liveState.step.value)),
-    `immediate next action: ${receipt.nextAction ?? 'unknown'}`,
-    ...(rail?.queuedStepTitle ? [`queued after current: ${rail.queuedStepTitle}`] : []),
-    formatLiveField('claims', liveState.claims, renderLiveList(liveState.claims.value, 'none')),
-    formatLiveField('edits', liveState.edits, renderLiveList(liveState.edits.value, 'none')),
-    formatLiveField('validation', liveState.validation, validation),
-    formatLiveField('review', liveState.review, review),
-    formatLiveField('blockers', liveState.blockers, renderLiveList(liveState.blockers.value, 'none')),
-    formatLiveField('rooms', liveState.rooms, renderLiveList(liveState.rooms.value, 'none')),
-    formatLiveField('subscriptions', liveState.subscriptions, renderLiveList(liveState.subscriptions.value, 'none')),
-    formatLiveField('raw-tail frontier', liveState.rawTailFrontier, renderLiveFrontier(liveState.rawTailFrontier.value)),
-    receipt.disagreements.length > 0
-      ? `source disagreement: ${receipt.disagreements.join('; ')}`
-      : 'source disagreement: none detected among bundled explicit sources',
+    `boundary=${receipt.boundary} · identity=${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)} · runtime=${runtimeStatus}`,
+    `captured=${liveState.capturedAt} · frontier=${renderLiveFrontier(liveState.rawTailFrontier.value)}`,
+    ...activeStepLines,
+    `active files · claims=${renderLiveList(liveState.claims.value)} · recent edits=${renderLiveList(liveState.edits.value)}`,
+    ...(validation ? [`validation=${validation}`] : []),
     ...(receipt.hazards.length > 0 ? [`unresolved hazards: ${receipt.hazards.join('; ')}`] : []),
-    REBIRTH_CONTROL_AUTHORITY_HORIZON,
-    REBIRTH_CONTROL_DYNAMIC_TRUTH_ORDER,
-    request ? formatActiveRequest(request) : 'active request: none bundled',
   ].join('\n');
 }
 
@@ -994,33 +919,28 @@ function renderContinuityLiveState(
  */
 export function renderContinuityReceiptControl(
   receipt: ContinuityReceipt,
-  options: RenderContinuityReceiptControlOptions = {},
+  _options: RenderContinuityReceiptControlOptions = {},
 ): string {
-  const formatActiveRequest = options.formatActiveRequest ?? defaultFormatActiveRequest;
   if (receipt.liveState) {
-    return renderContinuityLiveState(receipt, receipt.liveState, formatActiveRequest);
+    return renderContinuityLiveState(receipt, receipt.liveState);
   }
+  const canonical = receipt.canonicalRange
+    ? `${receipt.canonicalRange.traceId}@event#${receipt.canonicalRange.eventCount}`
+    : 'unknown';
+  const activeStepLines = renderCurrentTaskRailStep(
+    receipt.rail?.activeStep,
+    receipt.rail?.updatedAt,
+    receipt.rail?.activeStepRawLine,
+  );
   return [
     LEGACY_REBIRTH_CONTROL_HEADER,
-    `boundary: ${receipt.boundary}`,
-    `identity: ${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)}`,
-    `source status: ${receipt.sourceStatus ?? 'unknown'}`,
-    `rail: ${formatReceiptRailLine(receipt.rail)}`,
-    `active rail step: ${formatReceiptActiveStepLine(receipt.rail)}`,
-    `immediate next action: ${receipt.nextAction ?? 'unknown'}`,
-    ...(receipt.rail?.queuedStepTitle ? [`queued after current: ${receipt.rail.queuedStepTitle}`] : []),
-    formatReceiptEditClaimLine(receipt.editClaim),
+    `boundary=${receipt.boundary} · identity=${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)} · runtime=${receipt.sourceStatus ?? 'unknown'}`,
+    `frontier=${canonical}`,
+    ...activeStepLines,
+    `active files · claims=${receipt.editClaim.claims.join(', ') || 'none'} · recent edits=${receipt.editClaim.editEvidenceFiles.join(', ') || 'none'}`,
     receipt.validation.fact !== undefined
-      ? `validation state (explicit): ${truncateContinuity(receipt.validation.fact, 240)}`
-      : 'validation state: no explicit validation fact bundled; step status alone is not proof',
-    receipt.disagreements.length > 0
-      ? `source disagreement: ${receipt.disagreements.join('; ')}`
-      : 'source disagreement: none detected among bundled explicit sources',
+      ? `validation=${truncateContinuity(receipt.validation.fact, 240)}`
+      : '',
     ...(receipt.hazards.length > 0 ? [`unresolved hazards: ${receipt.hazards.join('; ')}`] : []),
-    REBIRTH_CONTROL_AUTHORITY_HORIZON,
-    REBIRTH_CONTROL_DYNAMIC_TRUTH_ORDER,
-    receipt.activeRequest
-      ? formatActiveRequest(receipt.activeRequest.text)
-      : 'active request: none bundled',
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }

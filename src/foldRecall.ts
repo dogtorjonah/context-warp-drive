@@ -34,7 +34,8 @@
  * Pure CPU, zero I/O, zero LLM calls, no clock reads. Deterministic by
  * construction: identical inputs produce byte-identical output, and no
  * Set/Map iteration order is observable in any rendered string (entries are
- * explicitly ordered: tier asc, tier-2 relevance desc, recency desc, id asc).
+ * explicitly ordered: tier asc, signal class, optional intent relevance,
+ * legacy tier-2 relevance, recency desc, id asc).
  *
  * Kill switch: WARP_FOLD_RECALL=0. Recall only ever runs when fold mode is
  * 'on' and the fold freeze is active — no fold, no index, no recall.
@@ -49,6 +50,7 @@ import {
   extractAssistantText,
   extractPath,
   extractToolPathSet,
+  foldMessageSourceIdentities,
   isSyntheticContextText,
   nominateVerbatim,
   normalizeToolPath,
@@ -66,6 +68,10 @@ import {
   foldMessageTimestampBounds,
   renderChronologicalProvenanceCompact,
 } from './chronologicalProvenance.ts';
+import {
+  extractCognitiveSupersessionPointers,
+  type CognitiveSupersessionPointer,
+} from './glyphs.ts';
 
 // ══════════════════════════════════════════════════════════════════════
 // Config
@@ -93,6 +99,10 @@ export interface FoldRecallConfig {
    * claim tiers still outrank.
    */
   verbatimRecallEnabled: boolean;
+  /** Exact normalized error-signature recall. Default ON; explicit off restores legacy. */
+  errorRecallEnabled?: boolean;
+  /** Emit asynchronous spool RecallIntents for strong triggers. Default ON. */
+  autonomicSpoolRecallEnabled?: boolean;
   /**
    * Curated Code Radar — source-highlight guideposts (WARP_FOLD_RECALL_HIGHLIGHTS).
    * Prepends Atlas-curated `⌖ label (a–b)` lines to a recall card so the agent
@@ -141,6 +151,8 @@ export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
   ttlPasses: 4,
   termRecallEnabled: true,
   verbatimRecallEnabled: true,
+  errorRecallEnabled: true,
+  autonomicSpoolRecallEnabled: true,
   highlightsEnabled: true,
   hazardsEnabled: true,
   episodesEnabled: true,
@@ -149,6 +161,91 @@ export const DEFAULT_FOLD_RECALL_CONFIG: FoldRecallConfig = {
 
 /** Hints injected per pass never exceed this, regardless of pressure. */
 const MAX_HINTS_PER_PASS = 4;
+
+/** Normative recall-coverage contract shared by ambient and explicit recall. */
+export const FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION = 'fold-recall-completeness/v1' as const;
+
+export type FoldRecallCompletenessRoute =
+  | 'ambient-signal'
+  | 'explicit-range'
+  | 'explicit-path'
+  | 'explicit-term'
+  | 'explicit-waypoint'
+  | 'explicit-episode'
+  | 'host-hydration-intent';
+
+export interface FoldRecallCompletenessGuarantee {
+  id: 'C1' | 'C2' | 'C3' | 'C4';
+  retrievableClass: 'folded-turn' | 'folded-tool-result' | 'spooled-artifact' | 'episode-ledger';
+  granularity: string;
+  freshness: string;
+  routes: readonly FoldRecallCompletenessRoute[];
+  budget:
+    | 'active-config-bounded; shipped-defaults=3-items/12000-total/6000-body/4-hints; explicit-may-only-lower'
+    | 'metadata-only-until-host-hydration; active-config-bounded';
+}
+
+/**
+ * Executable half of the normative matrix in
+ * docs/design/fold-atlas-hardening-contract.md. These are the only classes the
+ * recall API guarantees. Optional host overlays remain explicitly outside it.
+ */
+export const FOLD_RECALL_COMPLETENESS_GUARANTEES = [
+  {
+    id: 'C1',
+    retrievableClass: 'folded-turn',
+    granularity: 'one indexed inter-turn raw-message range',
+    freshness: 'index-membership-at-last-build; body-from-current-raw-reference-at-query',
+    routes: ['ambient-signal', 'explicit-range', 'explicit-path', 'explicit-term', 'explicit-waypoint'],
+    budget: 'active-config-bounded; shipped-defaults=3-items/12000-total/6000-body/4-hints; explicit-may-only-lower',
+  },
+  {
+    id: 'C2',
+    retrievableClass: 'folded-tool-result',
+    granularity: 'one indexed provider tool-result identity',
+    freshness: 'index-membership-at-last-build; body-from-current-raw-reference-at-query',
+    routes: ['ambient-signal', 'explicit-range', 'explicit-path', 'explicit-term'],
+    budget: 'active-config-bounded; shipped-defaults=3-items/12000-total/6000-body/4-hints; explicit-may-only-lower',
+  },
+  {
+    id: 'C3',
+    retrievableClass: 'spooled-artifact',
+    granularity: 'one indexed artifact metadata-and-recovery handle; body only after host hydration',
+    freshness: 'metadata-at-index-build; hydrated bytes require host hash verification',
+    routes: ['ambient-signal', 'explicit-path', 'explicit-term', 'host-hydration-intent'],
+    budget: 'metadata-only-until-host-hydration; active-config-bounded',
+  },
+  {
+    id: 'C4',
+    retrievableClass: 'episode-ledger',
+    granularity: 'one deduplicated path-and-chapter episode voice row',
+    freshness: 'last-host-enrichment-snapshot; endedAt-is-source-time-not-freshness-time',
+    routes: ['ambient-signal', 'explicit-episode'],
+    budget: 'active-config-bounded; shipped-defaults=3-items/12000-total/6000-body/4-hints; explicit-may-only-lower',
+  },
+] as const satisfies readonly FoldRecallCompletenessGuarantee[];
+
+/** Claims intentionally excluded from v1; callers must not infer them. */
+export const FOLD_RECALL_COMPLETENESS_NON_GUARANTEES = [
+  'raw-tail-requery',
+  'unindexed-or-unidentified-event-range',
+  'semantic-waypoint-understanding',
+  'synchronous-spooled-body-read',
+  'optional-host-enrichment-availability',
+  'invented-source-time',
+  'field-level-withholding-inside-a-mixed-superseded-entry',
+  'live-working-tree-source-freshness-without-a-source-delta',
+] as const;
+/**
+ * A negative-feedback dismissal spans two recall pass coordinates. With the
+ * shipped four-pass card TTL, the same exact entry can become eligible again
+ * at pass +2 while its replaced residency would otherwise remain live until
+ * pass +4. The window is deliberately fixed and shorter than residency: a
+ * caller cannot turn feedback into the old long, unconditional dead zone.
+ */
+export const FOLD_RECALL_DISMISSAL_WINDOW_PASSES = 2;
+/** Bound delayed UI feedback without retaining an unbounded exposure ledger. */
+const MAX_FOLD_RECALL_CARD_EXPOSURES = 64;
 /** Minimum remaining char budget worth spending on a card; below this, downgrade to hint. */
 export const MIN_USEFUL_CARD_CHARS = 400;
 /** Bounded lowercased per-turn digest length (reserved for deferred tier-2 term matching). */
@@ -337,6 +434,8 @@ warnFoldGeometryViolations(
  *   WARP_FOLD_RECALL_TTL_PASSES=<n>       → residency TTL in passes (default 4)
  *   WARP_FOLD_RECALL_TERMS=0|false|off|no → disable tier-2 term matching (default ON)
  *   WARP_FOLD_RECALL_VERBATIM=0|false|off|no → disable exact verbatim-token tier (default ON)
+ *   WARP_FOLD_RECALL_ERRORS=0|false|off|no → disable exact error-signature tier (default ON)
+ *   WARP_FOLD_RECALL_AUTONOMIC_SPOOL=0|false|off|no → keep hints but disable hydration intents
  *   WARP_FOLD_RECALL_HIGHLIGHTS=0|false|off|no → disable source-highlight radar (default ON)
  *   WARP_FOLD_RECALL_HAZARDS=0|false|off|no → disable hazard radar (default ON)
  *   WARP_FOLD_RECALL_EPISODES=0|false|off|no → disable episodic voice (default ON)
@@ -354,6 +453,8 @@ export function resolveFoldRecallConfig(
   const enabled = raw === '' || (raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no');
   const termRaw = normalizedEnv('_TERMS');
   const verbatimRaw = normalizedEnv('_VERBATIM');
+  const errorRaw = normalizedEnv('_ERRORS');
+  const autonomicSpoolRaw = normalizedEnv('_AUTONOMIC_SPOOL');
   const highlightsRaw = normalizedEnv('_HIGHLIGHTS');
   const hazardsRaw = normalizedEnv('_HAZARDS');
   const episodesRaw = normalizedEnv('_EPISODES');
@@ -371,6 +472,10 @@ export function resolveFoldRecallConfig(
     // Default ON (operator-blessed); only explicit disable values turn it off.
     verbatimRecallEnabled:
       verbatimRaw === '' || (verbatimRaw !== '0' && verbatimRaw !== 'false' && verbatimRaw !== 'off' && verbatimRaw !== 'no'),
+    errorRecallEnabled:
+      errorRaw === '' || (errorRaw !== '0' && errorRaw !== 'false' && errorRaw !== 'off' && errorRaw !== 'no'),
+    autonomicSpoolRecallEnabled:
+      autonomicSpoolRaw === '' || (autonomicSpoolRaw !== '0' && autonomicSpoolRaw !== 'false' && autonomicSpoolRaw !== 'off' && autonomicSpoolRaw !== 'no'),
     // Curated Code Radar (operator-blessed, Jonah 2026-06-17): both default ON;
     // only explicit 0/false/off/no disable. Same idiom as verbatimRecallEnabled.
     highlightsEnabled:
@@ -439,8 +544,12 @@ export function extractPathSpellingsFromBashCommand(command: string): string[] {
   for (const raw of tokens) {
     if (result.length >= 4) break;
     const token = raw.replace(/[;:,)"']+$/, '');
-    if (!token || !token.includes('/') || token.includes('://') || token.startsWith('-')) continue;
-    if (/[<>]/.test(token) || token.length > 256) continue;
+    if (!token) continue;
+    if (!token.includes('/')) continue;
+    if (token.includes('://')) continue;
+    if (token.startsWith('-')) continue;
+    if (/[<>]/.test(token)) continue;
+    if (token.length > 256) continue;
     if (token === '/dev' || token.startsWith('/dev/')) continue;
     if (!seen.has(token)) {
       seen.add(token);
@@ -459,6 +568,8 @@ export function extractPathSpellingsFromBashCommand(command: string): string[] {
  * punctuation (;:,)"') is stripped before qualifying. First-occurrence order,
  * deduped, capped at 4 paths per command. Each result is normalized with
  * normalizeToolPath — identical to structured-tool path normalization.
+ * The raw parser above remains available so repo-qualified absolute identity
+ * survives beside this compatibility alias.
  */
 export function extractPathsFromBashCommand(command: string): string[] {
   const seen = new Set<string>();
@@ -481,7 +592,9 @@ function sourceAbsolutePathsFromInput(input: Record<string, unknown>): string[] 
     if (path.startsWith('/')) source.add(path);
   };
   add(input.file_path ?? input.path ?? input.filePath ?? input.file);
-  if (Array.isArray(input.paths)) for (const path of input.paths) add(path);
+  if (Array.isArray(input.paths)) {
+    for (const path of input.paths) add(path);
+  }
   if (typeof input.command === 'string') {
     for (const path of extractPathSpellingsFromBashCommand(input.command)) add(path);
   }
@@ -528,7 +641,9 @@ function extractSourcePathsFromMessages(messages: readonly FoldMessage[]): strin
   for (const msg of messages) {
     if (msg.role !== 'assistant' && msg.role !== 'model') continue;
     if (Array.isArray(msg.content)) {
-      for (const block of msg.content as any[]) if (block?.type === 'tool_use') addInput(block.input);
+      for (const block of msg.content as any[]) {
+        if (block?.type === 'tool_use') addInput(block.input);
+      }
     }
     if (Array.isArray((msg as any).tool_calls)) {
       for (const tc of (msg as any).tool_calls as any[]) {
@@ -671,7 +786,65 @@ export interface IntraTurnIndexEntry {
   chars: number;
 }
 
-export type FoldIndexEntry = InterTurnIndexEntry | IntraTurnIndexEntry;
+/**
+ * Spool entry — an oversized tool result the RELAY evicted before it ever
+ * reached the transcript (relay/src/codexSession/toolResultSpool.ts). Unlike a
+ * fold entry, the bytes are NOT in raw history: they are on disk, addressed by
+ * an opaque artifact id, and recoverable only via an explicit read tool call.
+ *
+ * That makes spool entries fundamentally HINT-ONLY here. Card rendering pages a
+ * body in from raw (findToolResultText); there is no raw copy to page. This
+ * module stays pure — it advertises the artifact's existence and its recovery
+ * handle, and never touches the filesystem to fetch it.
+ */
+export interface SpoolIndexEntry {
+  kind: 'spool';
+  /** Deterministic id: `spool:<artifactId>`. */
+  id: string;
+  /** Opaque artifact id — the ONLY valid recovery handle for the read tool. */
+  artifactId: string;
+  /** Source label from the digest header, e.g. "Codex", "Forge", "Relay". */
+  source: string;
+  /**
+   * Authoritative spool category emitted by the writer. Older envelopes omit
+   * it; absence stays unknown rather than being inferred from the disk path or
+   * mutable source label.
+   */
+  category?: string;
+  /** Short tool name from the originating tool_use, '' when unresolvable. */
+  tool: string;
+  /**
+   * Normalized TARGET path of the originating tool call (what the tool read or
+   * edited) — resolved from the tool_use block, never from the envelope's
+   * `path:` line. That line is the spool file's own location on disk (/tmp/…);
+   * indexing it would never match a touched source path and would pollute path
+   * residency with transport coordinates.
+   */
+  path: string;
+  /** Original repo-qualified target spelling recovered from the raw tool call. */
+  sourcePath?: string;
+  /** Spool file location on disk (telemetry only; NOT a recovery handle). */
+  spoolPath: string;
+  /** Content hash of the spooled bytes, for optional read-time verification. */
+  sha256: string;
+  /**
+   * Measured timestamp of the original tool-result message. It is deliberately
+   * optional: callers must preserve an unavailable source time as unknown.
+   */
+  sourceTimestamp?: string;
+  /** Recency coordinate (raw message index of the spooled result). */
+  recency: number;
+  /** Original size in chars, parsed from the digest. */
+  chars: number;
+  /** Bounded pushed capsule text used only for pure term/error/identifier cues. */
+  digest?: string;
+  /** Exact identifiers nominated from the pushed capsule, sorted and bounded. */
+  verbatimTokens?: string[];
+  /** Conservative normalized failures nominated from the pushed capsule. */
+  errorSignatures?: string[];
+}
+
+export type FoldIndexEntry = InterTurnIndexEntry | IntraTurnIndexEntry | SpoolIndexEntry;
 
 export interface FoldRecallIndex {
   /** Raw history length at build time — staleness guard against rewinds. */
@@ -692,6 +865,16 @@ export interface FoldRecallIndex {
    * manually-built indexes.
    */
   visiblePovText?: string;
+  /**
+   * Exact source-row identities for each entry. Present only when the provider
+   * supplied authoritative identities; absence stays unknown.
+   */
+  sourceIdentitiesByEntryId?: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Append-only cognitive supersession edges visible in the folded view.
+   * These alter recall rendering, never the frozen strata that carry them.
+   */
+  supersessions?: readonly CognitiveSupersessionPointer[];
 }
 
 /** Provider-view text retained for literal information-residency checks. */
@@ -709,6 +892,27 @@ export function normalizeFoldRecallPovText(text: string): string {
   return normalized ? ` ${normalized} ` : '';
 }
 
+function collectCognitiveSupersessions(
+  messages: readonly FoldMessage[],
+  syntheticContext: SyntheticContextOptions,
+): CognitiveSupersessionPointer[] {
+  const bySource = new Map<string, string>();
+  for (const message of messages) {
+    const trustedSynthetic = message.contextWarpSynthetic === 'folded-context'
+      || message.contextWarpSynthetic === 'cognitive-overlay';
+    if (message.role !== 'assistant' && message.role !== 'model' && !trustedSynthetic) continue;
+    for (const text of collectMessageTextFragments(message)) {
+      if (!isSyntheticContextText(text, syntheticContext)) continue;
+      for (const pointer of extractCognitiveSupersessionPointers(text)) {
+        bySource.set(pointer.sourceIdentity, pointer.supersededByIdentity);
+      }
+    }
+  }
+  return [...bySource.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([sourceIdentity, supersededByIdentity]) => ({ sourceIdentity, supersededByIdentity }));
+}
+
 /** Matches the folded view's fold-block header: "[Conversation Context — N turns folded, …". */
 const FOLD_BLOCK_COUNT_RE = /^\[Conversation Context — (\d+) turns folded,/;
 /** Whole-content intra-fold marker (generic replacement by foldSummaryText). */
@@ -719,6 +923,140 @@ const INTRA_ATLAS_MARKER_RE = /\n## Source \[Folded: (\S+)(?: (.+?))? — ([\d,]
 function parseMarkerChars(raw: string): number {
   const n = Number.parseInt(raw.replace(/,/g, ''), 10);
   return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// ── Relay tool-result spool envelopes ──
+// Shape emitted by relay/src/codexSession/toolResultSpool.ts formatSpoolDigest:
+//   [<Source> tool-result spool]
+//   Full raw output scheduled for internal spool: <id>.
+//   path: <spool file path>
+//   sha256: <hex>
+//   chars: 16,439
+//   bytes: 16,439
+//   <blank>
+//   <compacted text>
+// Anchored to line starts so compacted BODY text quoting these words cannot
+// forge an entry (the body is arbitrary tool output and must never be trusted
+// to mint page-table entries).
+const SPOOL_HEADER_RE = /^\[([A-Za-z][\w-]*) tool-result spool\]$/m;
+const SPOOL_ID_RE = /^Full raw output scheduled for internal spool: (\S+?)\.$/m;
+const SPOOL_PATH_RE = /^path: (.+)$/m;
+const SPOOL_CATEGORY_RE = /^category: ([a-z0-9][a-z0-9-]{0,79})$/m;
+const SPOOL_SHA_RE = /^sha256: ([0-9a-f]{16,64})$/m;
+const SPOOL_CHARS_RE = /^chars: ([\d,]+)$/m;
+const SPOOL_DIGEST_MAX_CHARS = 2_000;
+
+interface ParsedSpoolEnvelope {
+  source: string;
+  artifactId: string;
+  category?: string;
+  spoolPath: string;
+  sha256: string;
+  chars: number;
+  digest: string;
+}
+
+/**
+ * Conservative, exact-match failure signatures. This intentionally ignores a
+ * bare use of the word "error" and accepts only typed exceptions, errno-style
+ * codes, or a failure word followed by a concrete message delimiter.
+ */
+export function extractRecallErrorSignatures(text: string): string[] {
+  const signatures = new Set<string>();
+  const add = (raw: string): void => {
+    const normalized = raw
+      .normalize('NFKC')
+      .replace(/\s+/gu, ' ')
+      .trim()
+      .toLowerCase()
+      .slice(0, 180);
+    if (normalized.length >= 8) signatures.add(normalized);
+  };
+  for (const rawLine of text.split(/\r?\n/u).slice(0, 400)) {
+    const line = rawLine.trim();
+    if (!line || line.length > 1_000) continue;
+    const typed = /\b(?:[A-Z][A-Za-z0-9]*(?:Error|Exception)|E[A-Z]{2,})\b(?::\s*[^\n]+)?/u.exec(line);
+    if (typed) add(typed[0]);
+    const delimited = /\b(?:error|exception|failed|failure|panic|fatal)\s*[:\-]\s*[^\n]{4,}/iu.exec(line);
+    if (delimited) add(delimited[0]);
+    if (signatures.size >= 12) break;
+  }
+  return [...signatures].sort();
+}
+
+/**
+ * Parse a spool digest envelope. Requires the header AND an artifact id: the id
+ * is the only usable recovery handle, so an envelope without one is bookkeeping
+ * noise rather than an indexable artifact.
+ */
+function parseSpoolEnvelope(content: string): ParsedSpoolEnvelope | null {
+  const header = SPOOL_HEADER_RE.exec(content);
+  if (!header) return null;
+  const id = SPOOL_ID_RE.exec(content);
+  if (!id) return null;
+  const separator = content.indexOf('\n\n');
+  const digest = separator >= 0 ? content.slice(separator + 2, separator + 2 + SPOOL_DIGEST_MAX_CHARS) : '';
+  return {
+    source: header[1],
+    artifactId: id[1],
+    ...(SPOOL_CATEGORY_RE.exec(content)?.[1] ? { category: SPOOL_CATEGORY_RE.exec(content)![1] } : {}),
+    spoolPath: SPOOL_PATH_RE.exec(content)?.[1]?.trim() ?? '',
+    sha256: SPOOL_SHA_RE.exec(content)?.[1] ?? '',
+    chars: parseMarkerChars(SPOOL_CHARS_RE.exec(content)?.[1] ?? ''),
+    digest,
+  };
+}
+
+interface ToolCallMeta {
+  tool: string;
+  path: string;
+  sourcePath?: string;
+}
+
+/**
+ * Map tool id → originating call's short name and TARGET path, across both
+ * provider shapes (Anthropic assistant tool_use blocks, OpenAI assistant
+ * tool_calls). Spool entries need this because the digest envelope records the
+ * spool file's own disk path, not the path the tool actually operated on.
+ */
+function buildToolCallMeta(rawHistory: readonly FoldMessage[]): Map<string, ToolCallMeta> {
+  const meta = new Map<string, ToolCallMeta>();
+  for (const msg of rawHistory) {
+    if (msg.role !== 'assistant') continue;
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content as any[]) {
+        if (block?.type !== 'tool_use' || typeof block.id !== 'string' || meta.has(block.id)) continue;
+        const input = (block.input && typeof block.input === 'object' ? block.input : {}) as Record<string, unknown>;
+        const sourcePath = sourceAbsolutePathsFromInput(input)[0];
+        meta.set(block.id, {
+          tool: shortRecallToolName(String(block.name ?? '')),
+          path: extractPath(input),
+          ...(sourcePath ? { sourcePath } : {}),
+        });
+      }
+    }
+    const toolCalls = (msg as any).tool_calls;
+    if (Array.isArray(toolCalls)) {
+      for (const call of toolCalls as any[]) {
+        if (typeof call?.id !== 'string' || meta.has(call.id)) continue;
+        let input: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(String(call.function?.arguments ?? '{}'));
+          if (parsed && typeof parsed === 'object') input = parsed as Record<string, unknown>;
+        } catch {
+          // Malformed arguments are a path miss, not an index failure: the entry
+          // still indexes on tool name and stays term/recency reachable.
+        }
+        const sourcePath = sourceAbsolutePathsFromInput(input)[0];
+        meta.set(call.id, {
+          tool: shortRecallToolName(String(call.function?.name ?? '')),
+          path: extractPath(input),
+          ...(sourcePath ? { sourcePath } : {}),
+        });
+      }
+    }
+  }
+  return meta;
 }
 
 /** Join an Anthropic tool_result block's content into plain text (mirrors rollingFold). */
@@ -1032,30 +1370,6 @@ function buildToolResultPositions(rawHistory: readonly FoldMessage[]): Map<strin
   return positions;
 }
 
-function buildToolSourcePaths(rawHistory: readonly FoldMessage[]): Map<string, string> {
-  const paths = new Map<string, string>();
-  for (const msg of rawHistory) {
-    if (msg.role !== 'assistant' && msg.role !== 'model') continue;
-    if (Array.isArray(msg.content)) {
-      for (const block of msg.content as any[]) {
-        if (block?.type !== 'tool_use' || typeof block.id !== 'string') continue;
-        const source = sourceAbsolutePathsFromInput((block.input ?? {}) as Record<string, unknown>)[0];
-        if (source && !paths.has(block.id)) paths.set(block.id, source);
-      }
-    }
-    if (Array.isArray((msg as any).tool_calls)) {
-      for (const call of (msg as any).tool_calls as any[]) {
-        if (typeof call?.id !== 'string') continue;
-        let input: Record<string, unknown> = {};
-        try { input = JSON.parse(call.function?.arguments ?? '{}'); } catch { /* skip */ }
-        const source = sourceAbsolutePathsFromInput(input)[0];
-        if (source && !paths.has(call.id)) paths.set(call.id, source);
-      }
-    }
-  }
-  return paths;
-}
-
 /**
  * Build the fold index (page table) from the raw history and the freshly
  * recomputed folded view. Call ONLY at fold-freeze epoch commits — the fold
@@ -1105,6 +1419,7 @@ export function buildFoldIndex(
 ): FoldRecallIndex {
   const entries: FoldIndexEntry[] = [];
   const visibleRecallCards = collectVisibleRecallCards(foldedView);
+  const supersessions = collectCognitiveSupersessions(foldedView, syntheticContext);
 
   // ── Inter-turn entries: replay turn detection over raw, count from the view's fold blocks ──
   // FC append-only tail epochs seal one fold block PER BAND, so a folded view
@@ -1160,7 +1475,7 @@ export function buildFoldIndex(
 
   // ── Intra-turn entries: scan the view for fold markers, anchor to raw by tool id ──
   const rawPositions = buildToolResultPositions(rawHistory);
-  const toolSourcePaths = buildToolSourcePaths(rawHistory);
+  const toolCallMeta = buildToolCallMeta(rawHistory);
   for (const msg of foldedView) {
     if (msg.role === 'user' && Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
@@ -1172,13 +1487,14 @@ export function buildFoldIndex(
         if (rawIndex === undefined) continue; // cannot recall what raw no longer holds
         const id = `tool:${block.tool_use_id}`;
         if (entries.some(e => e.id === id)) continue;
+        const meta = toolCallMeta.get(block.tool_use_id);
         entries.push({
           kind: 'tool',
           id,
           toolId: block.tool_use_id,
           tool: marker.tool,
           path: marker.path,
-          ...(toolSourcePaths.get(block.tool_use_id) ? { sourcePath: toolSourcePaths.get(block.tool_use_id) } : {}),
+          ...(meta?.sourcePath ? { sourcePath: meta.sourcePath } : {}),
           recency: rawIndex,
           chars: marker.chars,
         });
@@ -1192,17 +1508,78 @@ export function buildFoldIndex(
       if (rawIndex === undefined) continue;
       const id = `tool:${toolId}`;
       if (entries.some(e => e.id === id)) continue;
+      const meta = toolCallMeta.get(toolId);
       entries.push({
         kind: 'tool',
         id,
         toolId,
         tool: marker.tool,
         path: marker.path,
-        ...(toolSourcePaths.get(toolId) ? { sourcePath: toolSourcePaths.get(toolId) } : {}),
+        ...(meta?.sourcePath ? { sourcePath: meta.sourcePath } : {}),
         recency: rawIndex,
         chars: marker.chars,
       });
     }
+  }
+
+  // ── Spool entries: scan RAW for relay spool digests, anchor by tool id ──
+  // Raw rather than the view on purpose. A spool digest still visible in the
+  // view is only half-invisible (the model can read the artifact id off it);
+  // one that has since been FOLDED out of view is invisible twice over — the
+  // bytes were never in the transcript AND the recovery handle is now gone from
+  // the model's POV. Indexing raw covers both, and raw position doubles as the
+  // recency coordinate.
+  const addSpoolEntry = (toolId: string, text: string, rawIndex: number, sourceTimestamp?: string): void => {
+    const parsed = parseSpoolEnvelope(text);
+    if (!parsed) return;
+    const id = `spool:${parsed.artifactId}`;
+    if (entries.some(e => e.id === id)) return;
+    const meta = toolCallMeta.get(toolId);
+    entries.push({
+      kind: 'spool',
+      id,
+      artifactId: parsed.artifactId,
+      source: parsed.source,
+      ...(parsed.category ? { category: parsed.category } : {}),
+      tool: meta?.tool ?? '',
+      path: meta?.path ?? '',
+      ...(meta?.sourcePath ? { sourcePath: meta.sourcePath } : {}),
+      spoolPath: parsed.spoolPath,
+      sha256: parsed.sha256,
+      ...(sourceTimestamp ? { sourceTimestamp } : {}),
+      recency: rawIndex,
+      chars: parsed.chars,
+      ...(parsed.digest ? {
+        digest: parsed.digest,
+        verbatimTokens: nominateVerbatim(parsed.digest).sort(),
+        errorSignatures: extractRecallErrorSignatures(parsed.digest),
+      } : {}),
+    });
+  };
+  for (let i = 0; i < rawHistory.length; i++) {
+    const msg = rawHistory[i];
+    const sourceTimestamp = foldMessageTimestampBounds([msg]).firstTimestamp;
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      for (const block of msg.content as any[]) {
+        if (block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+        addSpoolEntry(block.tool_use_id, blockContentText(block.content), i, sourceTimestamp);
+      }
+    }
+    if (msg.role === 'tool' && typeof (msg as any).tool_call_id === 'string' && typeof msg.content === 'string') {
+      addSpoolEntry((msg as any).tool_call_id as string, msg.content, i, sourceTimestamp);
+    }
+  }
+
+  const sourceIdentitiesByEntryId: Record<string, readonly string[]> = {};
+  for (const entry of entries) {
+    const bounds = entry.kind === 'turn'
+      ? { start: entry.rawStart, endExclusive: entry.rawEnd }
+      : { start: entry.recency, endExclusive: entry.recency + 1 };
+    const identities = new Set<string>();
+    for (const message of rawHistory.slice(bounds.start, bounds.endExclusive)) {
+      for (const identity of foldMessageSourceIdentities(message)) identities.add(identity);
+    }
+    if (identities.size > 0) sourceIdentitiesByEntryId[entry.id] = [...identities].sort();
   }
 
   return {
@@ -1210,6 +1587,8 @@ export function buildFoldIndex(
     entries,
     visibleRecallCards,
     visiblePovText: collectProviderViewText(foldedView),
+    ...(Object.keys(sourceIdentitiesByEntryId).length > 0 ? { sourceIdentitiesByEntryId } : {}),
+    ...(supersessions.length > 0 ? { supersessions } : {}),
   };
 }
 
@@ -1312,6 +1691,40 @@ export interface ResidencyRecord {
   indexSignature?: string;
 }
 
+/** Typed handle returned with each rendered full card for negative feedback. */
+export interface FoldRecallCardExposure {
+  exposureId: string;
+  entryId: string;
+  matchedPath: string;
+  passSeq: number;
+}
+
+/** Session-local evidence needed to apply one exposure's dismissal safely. */
+export interface FoldRecallCardExposureRecord extends FoldRecallCardExposure {
+  entryKey: string;
+  residencyId: string;
+  indexSignature: string;
+  residencyExpiresAtPass: number;
+  renderedCard: string;
+  dismissedAtPass?: number;
+}
+
+/** Append-only overlay over one structural entry; it never mutates the index. */
+export interface FoldRecallDismissalRecord {
+  entryKey: string;
+  entryId: string;
+  matchedPath: string;
+  exposureId: string;
+  dismissedAtPass: number;
+  expiresAtPass: number;
+}
+
+export type FoldRecallDismissalOutcome =
+  | { status: 'recorded'; record: FoldRecallDismissalRecord }
+  | { status: 'already-dismissed'; record: FoldRecallDismissalRecord | null }
+  | { status: 'unknown-exposure'; exposureId: string }
+  | { status: 'stale-exposure'; exposureId: string; entryId: string };
+
 export interface FoldRecallState {
   index: FoldRecallIndex | null;
   /** entryId → residency. Map iteration order is never observable in output. */
@@ -1330,6 +1743,12 @@ export interface FoldRecallState {
    * indexes and same-index immediate repeats.
    */
   residentPaths: Map<string, ResidencyRecord>;
+  /** Bounded rendered-card handles awaiting optional caller feedback. */
+  cardExposures?: Map<string, FoldRecallCardExposureRecord>;
+  /** Structural entry key → fixed-window, non-sliding dismissal overlay. */
+  dismissedEntries?: Map<string, FoldRecallDismissalRecord>;
+  /** Lifetime count of newly recorded dismissals (idempotent repeats excluded). */
+  dismissalsRecorded?: number;
   /**
    * Curated Code Radar carriers, keyed by normalized workspace-relative path
    * (== Atlas file_path == index entry path). Populated OFF-THREAD by the relay
@@ -1394,6 +1813,9 @@ export function createFoldRecallState(): FoldRecallState {
     resident: new Map(),
     pathCardShowCounts: new Map(),
     residentPaths: new Map(),
+    cardExposures: new Map(),
+    dismissedEntries: new Map(),
+    dismissalsRecorded: 0,
     pathHighlights: new Map(),
     pathHazards: new Map(),
     pathSourceDeltas: new Map(),
@@ -1428,6 +1850,8 @@ export interface RecallSignals {
   terms?: string[];
   /** Exact verbatim identifiers seen in the active window, sorted. Drives the verbatim-token tier; omitted unless supplied. */
   verbatimTokens?: string[];
+  /** Exact conservative failure signatures seen in the active window, sorted. */
+  errorSignatures?: string[];
   /**
    * Paths whose Curated Code Radar is suppressed because the current boundary's
    * tool is an Atlas read (lookup/brief/snippet) of them — the agent is seeing
@@ -1436,6 +1860,68 @@ export interface RecallSignals {
    * folded card BODY still pages in, and tier matching is unaffected.
   */
   atlasReadPaths?: string[];
+  /**
+   * Optional caller-owned intent context used ONLY to order already-eligible
+   * candidates within their existing recall tier. It never creates a match,
+   * bypasses residency, changes pressure budgets, or crosses tier boundaries.
+   */
+  ranking?: RecallRankingContext;
+}
+
+export interface RecallRankingContext {
+  /** Current task/rail objective text, bounded and source-authoritative. */
+  objective: string;
+  /** Current active-step title/instruction/scope text. */
+  activeStep: string;
+  /** Caller-scoped claimed files plus files edited at this boundary. */
+  activeFiles: string[];
+}
+
+export interface RecallIntentRelevance {
+  /** Fraction of bounded objective terms recovered by the candidate digest. */
+  objectiveCoverage: number;
+  /** Fraction of bounded active-step terms recovered by the candidate digest. */
+  activeStepCoverage: number;
+  /** Fraction of bounded active files carried by the candidate. */
+  activeFileCoverage: number;
+  /** Mean of the non-empty component coverages, always within [0, 1]. */
+  score: number;
+}
+
+const RECALL_RANKING_TEXT_MAX_CHARS = 12_000;
+const RECALL_RANKING_TERM_CAP = 96;
+const RECALL_RANKING_ACTIVE_FILE_CAP = 64;
+
+/**
+ * Normalize host-owned ranking inputs once at the relay seam. Empty context is
+ * represented by undefined so standalone callers retain byte-identical legacy
+ * ordering without manufacturing an objective from prompt prose.
+ */
+export function buildRecallRankingContext(input: {
+  objective?: string | null;
+  activeStep?: string | null;
+  activeFiles?: readonly string[];
+}): RecallRankingContext | undefined {
+  const boundedText = (value: string | null | undefined): string => (
+    typeof value === 'string'
+      ? value.normalize('NFKC').replace(/\s+/gu, ' ').trim().slice(0, RECALL_RANKING_TEXT_MAX_CHARS)
+      : ''
+  );
+  const objective = boundedText(input.objective);
+  const activeStep = boundedText(input.activeStep);
+  const activeFiles = [...new Set((input.activeFiles ?? [])
+    .map((path) => {
+      const normalized = path.normalize('NFKC').trim();
+      // Preserve repo-qualified identity when the host has it. Relative paths
+      // remain the compatibility key; absolute paths are compared exactly
+      // before any legacy alias fallback during scoring.
+      return normalized.startsWith('/') ? normalized : normalizeToolPath(normalized);
+    })
+    .filter(Boolean))]
+    .sort()
+    .slice(0, RECALL_RANKING_ACTIVE_FILE_CAP);
+  if (!objective && !activeStep && activeFiles.length === 0) return undefined;
+  return { objective, activeStep, activeFiles };
 }
 
 /**
@@ -1598,12 +2084,14 @@ export function extractRecallSignals(
   }
   const termText = typeof activeText === 'string' ? activeText : activeText.join('\n');
   const terms = extractDistinctiveTerms(termText);
+  const errorSignatures = extractRecallErrorSignatures(termText);
   return {
     touchedPaths: Array.from(touched).sort(),
     ...(sourceTouched.size > 0 ? { sourceTouchedPaths: Array.from(sourceTouched).sort() } : {}),
     claimedPaths: Array.from(claimed).sort(),
     ...(sourceClaimed.size > 0 ? { sourceClaimedPaths: Array.from(sourceClaimed).sort() } : {}),
     ...(terms.length > 0 ? { terms } : {}),
+    ...(errorSignatures.length > 0 ? { errorSignatures } : {}),
   };
 }
 
@@ -1624,13 +2112,14 @@ export function deriveBoundaryRecallSignals(
   config: FoldRecallConfig,
   syntheticContext: SyntheticContextOptions = {},
 ): { signals: RecallSignals; proceed: boolean } {
-  const needActive = config.termRecallEnabled || config.verbatimRecallEnabled;
+  const needActive = config.termRecallEnabled || config.verbatimRecallEnabled || config.errorRecallEnabled !== false;
   const activeText = needActive ? extractActiveWindowText(rawHistory, foldedRawCount, syntheticContext) : '';
   const signals = extractRecallSignals(toolInput, claimedPaths, activeText);
   // extractRecallSignals always derives terms from activeText; but the verbatim
   // tier also needs activeText, so when term recall is OFF keep terms OUT of the
   // signal (planRecall ignores them anyway) — byte-identical term behavior.
   if (!config.termRecallEnabled) delete signals.terms;
+  if (config.errorRecallEnabled === false) delete signals.errorSignatures;
   // Exact verbatim-token signal: hashes/ids re-surfacing in the active window.
   // Flag-gated; nominateVerbatim is bounded (cap 40), sorted for firstIntersection.
   if (config.verbatimRecallEnabled && activeText) {
@@ -1639,8 +2128,13 @@ export function deriveBoundaryRecallSignals(
   }
   const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
   const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
+  const hasErrorSignals = config.errorRecallEnabled !== false && (signals.errorSignatures?.length ?? 0) > 0;
   const proceed =
-    signals.touchedPaths.length > 0 || signals.claimedPaths.length > 0 || hasTermSignals || hasVerbatimSignals;
+    signals.touchedPaths.length > 0
+    || signals.claimedPaths.length > 0
+    || hasTermSignals
+    || hasVerbatimSignals
+    || hasErrorSignals;
   return { signals, proceed };
 }
 
@@ -1650,6 +2144,52 @@ export function deriveBoundaryRecallSignals(
 
 export type RecallTier = 0 | 1 | 2;
 
+/** Resolution requested from cold spool storage by the pure recall planner. */
+export type RecallResolution = 'hint' | 'excerpt' | 'full';
+
+/** Explainable trigger family that earned an autonomic spool walk-back. */
+export type RecallIntentReason =
+  | 'path-touch'
+  | 'claim'
+  | 'error-signature'
+  | 'verbatim-token'
+  | 'term-overlap';
+
+/**
+ * A bounded exact slice requested from an immutable spool artifact. Ranges are
+ * character coordinates in the decoded artifact; match queries ask the worker
+ * for trigger-centered neighborhoods without exposing storage paths.
+ */
+export type RecallSliceRequest =
+  | { kind: 'head'; maxChars: number }
+  | { kind: 'tail'; maxChars: number }
+  | { kind: 'range'; offset: number; maxChars: number }
+  | { kind: 'match'; query: string; maxChars: number; maxMatches: number };
+
+/**
+ * Pure, deterministic request for asynchronous host hydration. This carries no
+ * storage path and performs no I/O; a relay/standalone host may resolve it off
+ * thread and later inject the verified result. `sourceTimestamp` is copied only
+ * from authoritative source material and remains absent when unknown.
+ */
+export interface RecallIntent {
+  kind: 'spool-artifact';
+  version: 1;
+  /** Stable deterministic identity for residency and in-flight deduplication. */
+  intentId: string;
+  artifactId: string;
+  category?: string;
+  expectedSha256?: string;
+  sourceTimestamp?: string;
+  path: string;
+  tool: string;
+  reason: RecallIntentReason;
+  trigger: string;
+  resolution: RecallResolution;
+  requestedSlices: readonly RecallSliceRequest[];
+  characterBudget: number;
+}
+
 export interface RecallPlanItem {
   entry: FoldIndexEntry;
   tier: RecallTier;
@@ -1658,14 +2198,25 @@ export interface RecallPlanItem {
   trigger: string;
   /** Tier-2 relevance only; path tiers continue to sort by recency. */
   relevanceScore?: number;
+  /** Within-tier objective/step/active-file score; absent preserves legacy order. */
+  intentRelevance?: RecallIntentRelevance;
   /** Planned render level before measured char budgeting. */
   render: 'card' | 'hint';
   /** True when a resident HINT is being escalated by a fresh hard trigger. */
   escalatedFromHint: boolean;
+  /**
+   * Structural replacement pointers for a stale historical entry. Such items
+   * render a pointer-only hint; their historical body is deliberately withheld.
+   */
+  supersessions?: readonly FoldRecallSupersessionResolution[];
+  /** Separate residency identity for a supersession correction notice. */
+  residencyId?: string;
 }
 
 export interface RecallPlan {
   items: RecallPlanItem[];
+  /** Strong spool triggers eligible for asynchronous exact-body hydration. */
+  intents: RecallIntent[];
   /** Entries suppressed by card residency (or non-escalatable hint residency). */
   suppressed: number;
   /** Live residency records that caused suppression and should slide forward. */
@@ -1674,9 +2225,79 @@ export interface RecallPlan {
 
 export interface RecallSuppressedResidency {
   entryId: string;
+  residencyId?: string;
   matchedPath: string;
   refreshEntry: boolean;
   refreshPath: boolean;
+}
+
+export interface FoldRecallSupersessionResolution {
+  sourceIdentity: string;
+  supersededByIdentity: string;
+  terminalIdentity: string;
+  chain: readonly string[];
+}
+
+function resolveSupersessionTerminal(
+  sourceIdentity: string,
+  edgeBySource: ReadonlyMap<string, string>,
+): FoldRecallSupersessionResolution | null {
+  const chain = [sourceIdentity];
+  const seen = new Set(chain);
+  let current = sourceIdentity;
+  let firstTarget: string | null = null;
+  while (true) {
+    const next = edgeBySource.get(current);
+    if (!next) break;
+    firstTarget ??= next;
+    if (next === current || seen.has(next)) return null;
+    chain.push(next);
+    seen.add(next);
+    current = next;
+  }
+  if (!firstTarget) return null;
+  return {
+    sourceIdentity,
+    supersededByIdentity: firstTarget,
+    terminalIdentity: current,
+    chain,
+  };
+}
+
+/**
+ * Resolve exact source-identity supersession for one recall entry. Cycles,
+ * self-links, unknown identities, and entries that already include their own
+ * terminal replacement do not suppress historical content.
+ */
+export function resolveFoldRecallEntrySupersessions(
+  index: FoldRecallIndex,
+  entry: FoldIndexEntry,
+): FoldRecallSupersessionResolution[] {
+  const sourceIdentities = index.sourceIdentitiesByEntryId?.[entry.id] ?? [];
+  const pointers = index.supersessions ?? [];
+  if (sourceIdentities.length === 0 || pointers.length === 0) return [];
+  const edgeBySource = new Map(
+    pointers.map((pointer) => [pointer.sourceIdentity, pointer.supersededByIdentity] as const),
+  );
+  const entryIdentities = new Set(sourceIdentities);
+  const resolutions: FoldRecallSupersessionResolution[] = [];
+  for (const sourceIdentity of [...sourceIdentities].sort()) {
+    const resolution = resolveSupersessionTerminal(sourceIdentity, edgeBySource);
+    if (!resolution || entryIdentities.has(resolution.terminalIdentity)) continue;
+    resolutions.push(resolution);
+  }
+  return resolutions;
+}
+
+function supersessionResidencyId(
+  entry: FoldIndexEntry,
+  resolutions: readonly FoldRecallSupersessionResolution[],
+): string {
+  const signature = resolutions
+    .map((resolution) => resolution.chain.join('>'))
+    .sort()
+    .join('|');
+  return 'supersession:' + entry.id + ':' + hashVisibleCard(signature);
 }
 
 interface PressureBudget {
@@ -1697,6 +2318,95 @@ function pressureBudget(level: ContextUtilizationLevel, config: FoldRecallConfig
   }
 }
 
+const STRONG_SPOOL_TERM_COUNT = 3;
+
+function recallIntentReason(item: RecallPlanItem): RecallIntentReason | null {
+  if (item.trigger.startsWith('path-touch ')) return 'path-touch';
+  if (item.trigger.startsWith('claim ')) return 'claim';
+  if (item.trigger.startsWith('error-signature ')) return 'error-signature';
+  if (item.trigger.startsWith('verbatim-token ')) return 'verbatim-token';
+  if (item.trigger.startsWith('term-overlap ')) return 'term-overlap';
+  return null;
+}
+
+/**
+ * Translate a matched spool hint into a deterministic, bounded hydration plan.
+ * The pushed capsule already carries head/tail/salient evidence, so path and
+ * claim triggers preferentially request the dormant middle. Exact error/token
+ * cues request trigger-centered neighborhoods. Auto-compact pressure never
+ * schedules cold I/O; a visible hint remains the pressure-safe fallback.
+ */
+function buildSpoolRecallIntent(
+  item: RecallPlanItem,
+  budget: PressureBudget,
+  utilization: ContextUtilizationLevel,
+  config: FoldRecallConfig,
+): RecallIntent | null {
+  if (item.entry.kind !== 'spool' || config.autonomicSpoolRecallEnabled === false) return null;
+  if (item.escalatedFromHint) return null;
+  if (utilization === 'auto_compact') return null;
+  const reason = recallIntentReason(item);
+  if (!reason) return null;
+  if (reason === 'term-overlap') {
+    const termCount = item.matchedPath.slice('term:'.length).split('+').filter(Boolean).length;
+    if (termCount < STRONG_SPOOL_TERM_COUNT) return null;
+  }
+  const characterBudget = Math.min(config.maxCardChars, budget.charBudget);
+  if (characterBudget < MIN_USEFUL_CARD_CHARS) return null;
+
+  const entry = item.entry;
+  const requestedSlices: RecallSliceRequest[] = [];
+  const exactQuery = reason === 'error-signature'
+    ? item.matchedPath.slice('error:'.length)
+    : reason === 'verbatim-token'
+      ? item.matchedPath.slice('verbatim:'.length)
+      : reason === 'term-overlap'
+        ? item.matchedPath.slice('term:'.length).split('+').join(' ')
+        : '';
+  if (exactQuery) {
+    const matchBudget = Math.max(1, Math.floor(characterBudget * 0.7));
+    requestedSlices.push({ kind: 'match', query: exactQuery, maxChars: matchBudget, maxMatches: 3 });
+    const middleBudget = characterBudget - matchBudget;
+    if (middleBudget > 0) {
+      requestedSlices.push({
+        kind: 'range',
+        offset: Math.max(0, Math.floor((entry.chars - middleBudget) / 2)),
+        maxChars: middleBudget,
+      });
+    }
+  } else {
+    const middleBudget = Math.max(1, Math.floor(characterBudget * 0.8));
+    const edgeBudget = characterBudget - middleBudget;
+    requestedSlices.push({
+      kind: 'range',
+      offset: Math.max(0, Math.floor((entry.chars - middleBudget) / 2)),
+      maxChars: middleBudget,
+    });
+    if (edgeBudget > 0) {
+      const headBudget = Math.floor(edgeBudget / 2);
+      if (headBudget > 0) requestedSlices.push({ kind: 'head', maxChars: headBudget });
+      if (edgeBudget - headBudget > 0) requestedSlices.push({ kind: 'tail', maxChars: edgeBudget - headBudget });
+    }
+  }
+
+  return {
+    kind: 'spool-artifact',
+    version: 1,
+    intentId: `spool:${entry.artifactId}:${reason}:${item.matchedPath}`,
+    artifactId: entry.artifactId,
+    ...(entry.category ? { category: entry.category } : {}),
+    ...(/^[a-f0-9]{64}$/u.test(entry.sha256) ? { expectedSha256: entry.sha256 } : {}),
+    ...(entry.sourceTimestamp ? { sourceTimestamp: entry.sourceTimestamp } : {}),
+    path: entry.path,
+    tool: entry.tool,
+    reason,
+    trigger: item.trigger,
+    resolution: 'excerpt',
+    requestedSlices,
+    characterBudget,
+  };
+}
+
 export function foldIndexEntryPaths(entry: FoldIndexEntry): readonly string[] {
   const aliases = entry.kind === 'turn' ? entry.paths : entry.path ? [entry.path] : [];
   const source = entry.kind === 'turn'
@@ -1712,7 +2422,9 @@ export function foldIndexEntryPaths(entry: FoldIndexEntry): readonly string[] {
 const entryPaths = foldIndexEntryPaths;
 
 function isSyntheticRecallKey(matchedPath: string): boolean {
-  return matchedPath.startsWith('verbatim:') || matchedPath.startsWith('term:');
+  return matchedPath.startsWith('verbatim:')
+    || matchedPath.startsWith('error:')
+    || matchedPath.startsWith('term:');
 }
 
 /** Maximum number of zone paths that participate in enrichment (radar + source deltas). */
@@ -1852,18 +2564,20 @@ function firstIntersection(sortedA: readonly string[], sortedB: readonly string[
   return null;
 }
 
-function turnTerms(entry: FoldIndexEntry): string[] {
-  return entry.kind === 'turn' ? extractDistinctiveTerms(entry.digest) : [];
+function entryDigestTerms(entry: FoldIndexEntry): string[] {
+  if (entry.kind === 'turn') return extractDistinctiveTerms(entry.digest);
+  if (entry.kind === 'spool' && entry.digest) return extractDistinctiveTerms(entry.digest);
+  return [];
 }
 
-function idfForTurnDigests(
+function idfForEntryDigests(
   entries: readonly FoldIndexEntry[],
-  getTerms: (entry: FoldIndexEntry) => string[] = turnTerms,
+  getTerms: (entry: FoldIndexEntry) => string[] = entryDigestTerms,
 ): Map<string, number> {
   const df = new Map<string, number>();
   let total = 0;
   for (const entry of entries) {
-    if (entry.kind !== 'turn') continue;
+    if (entry.kind !== 'turn' && entry.kind !== 'spool') continue;
     const terms = getTerms(entry);
     if (terms.length === 0) continue;
     total++;
@@ -1875,11 +2589,118 @@ function idfForTurnDigests(
 }
 
 /**
+ * Positive smoothed IDF for ranking coverage. Tier-2 eligibility intentionally
+ * permits zero/negative weights to reject corpus-common terms; ranking cannot
+ * reuse that gate because `ln(2 / (1 + 1)) === 0` would erase a term carried by
+ * exactly one of two candidates. Adding one preserves rarity ordering while
+ * keeping every observed overlap measurable.
+ */
+function rankingIdfForEntryDigests(
+  entries: readonly FoldIndexEntry[],
+  getTerms: (entry: FoldIndexEntry) => string[] = entryDigestTerms,
+): Map<string, number> {
+  const idf = idfForEntryDigests(entries, getTerms);
+  for (const [term, weight] of idf) {
+    idf.set(term, Math.max(Number.EPSILON, weight + 1));
+  }
+  return idf;
+}
+
+function normalizedIntentTermCoverage(
+  queryTerms: readonly string[],
+  candidateTerms: readonly string[],
+  idf: ReadonlyMap<string, number>,
+): number {
+  if (queryTerms.length === 0 || candidateTerms.length === 0) return 0;
+  const overlap = scoreTermOverlap(queryTerms, candidateTerms, idf, {
+    idfFloor: 0,
+    unseenIdf: 1,
+  });
+  const totalQueryWeight = [...new Set(queryTerms)].reduce(
+    (sum, term) => sum + (idf.get(term) ?? 1),
+    0,
+  );
+  return totalQueryWeight > 0 ? Math.min(1, overlap.score / totalQueryWeight) : 0;
+}
+
+function entryCarriesActiveFile(entry: FoldIndexEntry, activeFile: string): boolean {
+  const aliases = entry.kind === 'turn' ? entry.paths : entry.path ? [entry.path] : [];
+  const sources = entry.kind === 'turn'
+    ? (entry.sourcePaths ?? [])
+    : entry.sourcePath ? [entry.sourcePath] : [];
+  const normalized = normalizeToolPath(activeFile);
+  if (activeFile.startsWith('/')) {
+    // Exact source identity wins whenever this entry carries it. Fall back to
+    // the alias only for legacy entries that predate sourcePaths/sourcePath.
+    return sources.length > 0
+      ? sources.includes(activeFile)
+      : aliases.some((path) => normalizeToolPath(path) === normalized);
+  }
+  return aliases.some((path) => normalizeToolPath(path) === normalized)
+    || sources.some((path) => normalizeToolPath(path) === normalized);
+}
+
+/**
+ * Score intent relevance without changing eligibility. Components are
+ * normalized independently and averaged only when their input is present, so
+ * no arbitrary source-specific multiplier can dominate the ordering.
+ */
+function scorePreparedRecallIntentRelevance(
+  entry: FoldIndexEntry,
+  context: RecallRankingContext,
+  idf: ReadonlyMap<string, number>,
+  candidateTerms: readonly string[],
+  objectiveTerms: readonly string[],
+  activeStepTerms: readonly string[],
+): RecallIntentRelevance {
+  const activeFiles = context.activeFiles;
+  const activeFileMatches = activeFiles.reduce(
+    (count, path) => count + (entryCarriesActiveFile(entry, path) ? 1 : 0),
+    0,
+  );
+  const objectiveCoverage = normalizedIntentTermCoverage(objectiveTerms, candidateTerms, idf);
+  const activeStepCoverage = normalizedIntentTermCoverage(activeStepTerms, candidateTerms, idf);
+  const activeFileCoverage = activeFiles.length > 0 ? activeFileMatches / activeFiles.length : 0;
+  const components = [
+    ...(objectiveTerms.length > 0 ? [objectiveCoverage] : []),
+    ...(activeStepTerms.length > 0 ? [activeStepCoverage] : []),
+    ...(activeFiles.length > 0 ? [activeFileCoverage] : []),
+  ];
+  const score = components.length > 0
+    ? components.reduce((sum, component) => sum + component, 0) / components.length
+    : 0;
+  return {
+    objectiveCoverage: Number(objectiveCoverage.toFixed(4)),
+    activeStepCoverage: Number(activeStepCoverage.toFixed(4)),
+    activeFileCoverage: Number(activeFileCoverage.toFixed(4)),
+    score: Number(score.toFixed(4)),
+  };
+}
+
+export function scoreRecallIntentRelevance(
+  entry: FoldIndexEntry,
+  context: RecallRankingContext | undefined,
+  idf: ReadonlyMap<string, number>,
+  cachedEntryTerms?: readonly string[],
+): RecallIntentRelevance | undefined {
+  if (!context) return undefined;
+  return scorePreparedRecallIntentRelevance(
+    entry,
+    context,
+    idf,
+    cachedEntryTerms ?? entryDigestTerms(entry),
+    extractDistinctiveTerms(context.objective, { cap: RECALL_RANKING_TERM_CAP }),
+    extractDistinctiveTerms(context.activeStep, { cap: RECALL_RANKING_TERM_CAP }),
+  );
+}
+
+/**
  * Plan which folded entries to page back in this pass. Pure — reads residency,
- * never mutates. Ordering is fully deterministic: tier asc, tier-2 relevance
- * desc, recency desc, id asc. Path tiers keep their recency ordering; only
- * fuzzy/exact tier-2 matches spend card budget by relevance before falling
- * back to recency. Residency: resident cards suppress (by entry id AND by
+ * never mutates. Ordering is fully deterministic: tier asc; exact tier-2
+ * signal class; optional within-tier intent relevance; legacy tier-2 relevance;
+ * recency desc; id asc. With no ranking context the order is byte-identical to
+ * the legacy tier/relevance/recency pipeline. Residency: resident cards suppress
+ * (by entry id AND by
  * content path — path residency survives index rebuilds); resident hints
  * escalate to card-eligible on a fresh hard trigger (tiers 0-1 are both hard
  * in v1) and suppress otherwise.
@@ -1892,12 +2713,14 @@ export function planRecall(
   signals: RecallSignals,
   utilization: ContextUtilizationLevel,
   config: FoldRecallConfig,
+  dismissedEntries: ReadonlyMap<string, FoldRecallDismissalRecord> = new Map(),
 ): RecallPlan {
   const budget = pressureBudget(utilization, config);
   const matched: RecallPlanItem[] = [];
   const suppressedResidencies: RecallSuppressedResidency[] = [];
   const queryTerms = config.termRecallEnabled ? (signals.terms ?? []) : [];
   const queryTokens = config.verbatimRecallEnabled ? (signals.verbatimTokens ?? []) : [];
+  const queryErrors = config.errorRecallEnabled !== false ? (signals.errorSignatures ?? []) : [];
   const sourceTouches = signals.sourceTouchedPaths ?? [];
   const sourceClaims = signals.sourceClaimedPaths ?? [];
   const touchSignals = sourceTouches.length > 0 && !indexContainsAnySourcePath(index, sourceTouches)
@@ -1910,18 +2733,27 @@ export function planRecall(
   // and the tier-2 match loop below would otherwise tokenize each turn digest
   // twice. Pure cache keyed by entry.id — identical content per entry, so plan
   // output stays byte-identical.
-  const turnTermsCache = new Map<string, string[]>();
-  const getTurnTerms = (entry: FoldIndexEntry): string[] => {
-    let terms = turnTermsCache.get(entry.id);
+  const entryTermsCache = new Map<string, string[]>();
+  const getEntryTerms = (entry: FoldIndexEntry): string[] => {
+    let terms = entryTermsCache.get(entry.id);
     if (terms === undefined) {
-      terms = turnTerms(entry);
-      turnTermsCache.set(entry.id, terms);
+      terms = entryDigestTerms(entry);
+      entryTermsCache.set(entry.id, terms);
     }
     return terms;
   };
   const termIdf = queryTerms.length >= TERM_RECALL_MIN_DISTINCTIVE_COUNT
-    ? idfForTurnDigests(index.entries, getTurnTerms)
+    ? idfForEntryDigests(index.entries, getEntryTerms)
     : null;
+  const intentIdf = signals.ranking
+    ? rankingIdfForEntryDigests(index.entries, getEntryTerms)
+    : null;
+  const intentObjectiveTerms = signals.ranking
+    ? extractDistinctiveTerms(signals.ranking.objective, { cap: RECALL_RANKING_TERM_CAP })
+    : [];
+  const intentActiveStepTerms = signals.ranking
+    ? extractDistinctiveTerms(signals.ranking.activeStep, { cap: RECALL_RANKING_TERM_CAP })
+    : [];
   let suppressed = 0;
 
   for (const entry of index.entries) {
@@ -1930,12 +2762,20 @@ export function planRecall(
     // Exact verbatim-token re-surface: a single kept hash/id matching the active
     // window pages this turn in. Stronger than fuzzy term overlap (evaluated
     // first within tier 2), but path-touch/claim still outrank.
-    const tokenEligible =
-      queryTokens.length > 0 && entry.kind === 'turn' && (entry.verbatimTokens?.length ?? 0) > 0;
+    const tokenEligible = queryTokens.length > 0
+      && (entry.kind === 'turn' || entry.kind === 'spool')
+      && (entry.verbatimTokens?.length ?? 0) > 0;
     const tokenHit = tokenEligible
       ? firstIntersection(entry.verbatimTokens ?? [], queryTokens)
       : null;
-    if (paths.length === 0 && (termIdf === null || entry.kind !== 'turn') && tokenHit === null) continue;
+    const errorEligible = queryErrors.length > 0
+      && entry.kind === 'spool'
+      && (entry.errorSignatures?.length ?? 0) > 0;
+    const errorHit = errorEligible
+      ? firstIntersection(entry.errorSignatures ?? [], queryErrors)
+      : null;
+    const digestEligible = entry.kind === 'turn' || entry.kind === 'spool';
+    if (paths.length === 0 && (termIdf === null || !digestEligible) && tokenHit === null && errorHit === null) continue;
     let tier: RecallTier | null = null;
     let matchedPath: string | null = null;
     let trigger: string | null = null;
@@ -1951,13 +2791,18 @@ export function planRecall(
         tier = 1;
         matchedPath = claim;
         trigger = `claim ${normalizeToolPath(matchedPath)}`;
+      } else if (errorHit !== null) {
+        tier = 2;
+        matchedPath = `error:${errorHit}`;
+        trigger = `error-signature ${errorHit}`;
+        relevanceScore = Number.POSITIVE_INFINITY;
       } else if (tokenHit !== null) {
         tier = 2;
         matchedPath = `verbatim:${tokenHit}`;
         trigger = `verbatim-token ${tokenHit}`;
         relevanceScore = Number.POSITIVE_INFINITY;
-      } else if (termIdf !== null && entry.kind === 'turn') {
-        const overlap = scoreTermOverlap(queryTerms, getTurnTerms(entry), termIdf);
+      } else if (termIdf !== null && digestEligible) {
+        const overlap = scoreTermOverlap(queryTerms, getEntryTerms(entry), termIdf);
         if (overlap.distinctiveCount >= TERM_RECALL_MIN_DISTINCTIVE_COUNT) {
           tier = 2;
           const matchedTerms = overlap.matched.map((m) => m.term);
@@ -1968,6 +2813,53 @@ export function planRecall(
       }
     }
     if (tier === null || matchedPath === null || trigger === null) continue;
+
+    const supersessions = resolveFoldRecallEntrySupersessions(index, entry);
+    if (supersessions.length > 0) {
+      const residencyId = supersessionResidencyId(entry, supersessions);
+      const correctionRecord = resident.get(residencyId);
+      const correctionLive = correctionRecord !== undefined
+        && passSeq < correctionRecord.expiresAtPass;
+      if (correctionLive) {
+        suppressed++;
+        suppressedResidencies.push({
+          entryId: entry.id,
+          residencyId,
+          matchedPath,
+          refreshEntry: true,
+          refreshPath: false,
+        });
+        continue;
+      }
+      matched.push({
+        entry,
+        tier,
+        matchedPath,
+        trigger,
+        relevanceScore,
+        render: 'hint',
+        escalatedFromHint: false,
+        supersessions,
+        residencyId,
+      });
+      continue;
+    }
+
+    // A dismissal is exact-entry and non-sliding. It is checked after the
+    // supersession branch so a later structural safety correction can never be
+    // hidden by negative feedback on the stale card it replaces. New entries
+    // on the same path carry a different structural key and remain eligible.
+    const dismissal = dismissedEntries.get(foldRecallEntryKey(index, entry));
+    if (dismissal !== undefined && passSeq < dismissal.expiresAtPass) {
+      suppressed++;
+      suppressedResidencies.push({
+        entryId: entry.id,
+        matchedPath,
+        refreshEntry: false,
+        refreshPath: false,
+      });
+      continue;
+    }
 
     // Content-level suppression operates on TWO independent residency maps:
     //
@@ -2027,6 +2919,18 @@ export function planRecall(
       matchedPath,
       trigger,
       relevanceScore,
+      ...(intentIdf && signals.ranking
+        ? {
+            intentRelevance: scorePreparedRecallIntentRelevance(
+              entry,
+              signals.ranking,
+              intentIdf,
+              getEntryTerms(entry),
+              intentObjectiveTerms,
+              intentActiveStepTerms,
+            ),
+          }
+        : {}),
       render: 'card',
       escalatedFromHint,
     });
@@ -2034,6 +2938,16 @@ export function planRecall(
 
   matched.sort((a, b) => {
     if (a.tier !== b.tier) return a.tier - b.tier;
+    const aCorrection = a.supersessions && a.supersessions.length > 0 ? 1 : 0;
+    const bCorrection = b.supersessions && b.supersessions.length > 0 ? 1 : 0;
+    if (aCorrection !== bCorrection) return bCorrection - aCorrection;
+    if (a.tier === 2 && b.tier === 2) {
+      const aExact = a.relevanceScore === Number.POSITIVE_INFINITY ? 1 : 0;
+      const bExact = b.relevanceScore === Number.POSITIVE_INFINITY ? 1 : 0;
+      if (aExact !== bExact) return bExact - aExact;
+    }
+    const intentDelta = (b.intentRelevance?.score ?? 0) - (a.intentRelevance?.score ?? 0);
+    if (intentDelta !== 0) return intentDelta;
     if (a.tier === 2 && b.tier === 2 && a.relevanceScore !== b.relevanceScore) {
       return (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0);
     }
@@ -2043,6 +2957,7 @@ export function planRecall(
 
   // Assign planned render levels against the pressure card budget.
   const items: RecallPlanItem[] = [];
+  const intents: RecallIntent[] = [];
   let cards = 0;
   let hints = 0;
   // Tier-0 pressure floor: under auto_compact (cardBudget: 0) the budget loop
@@ -2054,6 +2969,27 @@ export function planRecall(
   const tier0Floor = budget.cardBudget === 0 && matched.length > 0 && matched[0].tier === 0 ? 1 : 0;
   const effectiveCardBudget = budget.cardBudget + tier0Floor;
   for (const item of matched) {
+    if (item.supersessions && item.supersessions.length > 0) {
+      // Safety corrections outrank the ordinary hint-count gate. The measured
+      // character budget still caps emitted bytes; any correction that cannot
+      // fit remains non-resident and therefore eligible on the following pass.
+      items.push({ ...item, render: 'hint' });
+      hints++;
+      continue;
+    }
+    // Spool entries can only ever render as hints: card rendering pages a body
+    // in from raw history, and a spool artifact has no raw copy to page. They
+    // must not consume a card slot either, or an unpageable artifact would
+    // starve a genuinely recoverable fold entry out of the card budget.
+    if (item.entry.kind === 'spool') {
+      if (hints < MAX_HINTS_PER_PASS) {
+        items.push({ ...item, render: 'hint' });
+        const intent = buildSpoolRecallIntent(item, budget, utilization, config);
+        if (intent) intents.push(intent);
+        hints++;
+      }
+      continue;
+    }
     if (cards < effectiveCardBudget) {
       items.push(item);
       cards++;
@@ -2064,7 +3000,7 @@ export function planRecall(
     // Overflow beyond cards+hints is silently omitted (re-eligible next pass).
   }
 
-  return { items, suppressed, suppressedResidencies };
+  return { items, intents, suppressed, suppressedResidencies };
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2217,6 +3153,10 @@ function describeEntry(entry: FoldIndexEntry): string {
   if (entry.kind === 'tool') {
     return entry.path ? `${entry.tool} ${entry.path}` : entry.tool;
   }
+  if (entry.kind === 'spool') {
+    const what = entry.tool ? (entry.path ? `${entry.tool} ${entry.path}` : entry.tool) : entry.spoolPath || entry.artifactId;
+    return `${entry.source} spool ${what}`;
+  }
   const preview = entry.paths.slice(0, 3).join(', ');
   const more = entry.paths.length > 3 ? `, +${entry.paths.length - 3} more` : '';
   return preview ? `${entry.category} turn (${preview}${more})` : `${entry.category} turn`;
@@ -2257,6 +3197,33 @@ function recallEpisodeToolLabels(messages: readonly FoldMessage[]): string[] {
 }
 
 function renderHint(item: RecallPlanItem): string {
+  if (item.supersessions && item.supersessions.length > 0) {
+    const pointers = item.supersessions
+      .slice(0, 3)
+      .map((resolution) => {
+        const terminal = resolution.terminalIdentity === resolution.supersededByIdentity
+          ? ''
+          : ' terminal=' + resolution.terminalIdentity;
+        return 'source-id=' + resolution.sourceIdentity
+          + ' superseded-by=' + resolution.supersededByIdentity
+          + terminal;
+      })
+      .join(' ; ');
+    const omitted = item.supersessions.length > 3
+      ? ' ; +' + (item.supersessions.length - 3) + ' more'
+      : '';
+    return RECALL_HINT_PREFIX + ' ' + describeEntry(item.entry)
+      + ' superseded; historical body withheld | trigger: ' + item.trigger
+      + ' | ' + pointers + omitted + ']';
+  }
+  // Spool artifacts are NOT self-tap recoverable: the bytes never entered raw
+  // history, so there is nothing for the fold to page back in. The only handle
+  // that works is the opaque artifact id via read_spooled_artifact — and the
+  // envelope's `path:` is deliberately NOT offered here, because it looks more
+  // actionable than the id while being the wrong argument to reach for.
+  if (item.entry.kind === 'spool') {
+    return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} spooled out of context (${formatChars(item.entry.chars)} chars, never in transcript) | trigger: ${item.trigger} | read_spooled_artifact artifact_id: ${item.entry.artifactId}]`;
+  }
   return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} folded earlier (${formatChars(item.entry.chars)} chars) | trigger: ${item.trigger} | self-tap to recover]`;
 }
 
@@ -2314,6 +3281,11 @@ function renderEntryBody(
     }
     return { body: historical, applied };
   }
+  // Spool artifacts have no body to render: the bytes live on disk, not in raw
+  // history, and this module is pure (zero I/O). planRecall forces them to hint
+  // render, so reaching here means a caller bypassed the plan — refuse rather
+  // than fabricate a body. null is the established "cannot render" signal.
+  if (entry.kind === 'spool') return null;
   if (entry.rawStart < 0 || entry.rawEnd > rawHistory.length || entry.rawStart >= entry.rawEnd) return null;
   const slice = rawHistory.slice(entry.rawStart, entry.rawEnd);
   const parts: string[] = [];
@@ -2835,6 +3807,8 @@ export interface RecallCompositionStats {
 }
 
 export interface FoldRecallOutcome {
+  /** Normative coverage/freshness contract governing this outcome. */
+  contractVersion: typeof FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION;
   /** Rendered body-only recall block, or null when nothing injects. */
   text: string | null;
   cards: number;
@@ -2844,6 +3818,8 @@ export interface FoldRecallOutcome {
   /** Bounded paths/source-coordinates-only account of bodies withheld this pass. */
   suppressedManifest?: string;
   triggers: string[];
+  /** Pure hydration requests for strong spool triggers; host resolution is async. */
+  recallIntents?: RecallIntent[];
   /**
    * Additive per-pass card composition breakdown — answers "where did the
    * injected chars go, and were any bodies swapped to current source?".
@@ -2851,9 +3827,19 @@ export interface FoldRecallOutcome {
    * standalone hosts consuming FoldRecallOutcome are unaffected.
    */
   composition?: RecallCompositionStats;
+  /** Typed handles for full cards rendered by this pass; omitted for hints/empty passes. */
+  exposures?: FoldRecallCardExposure[];
 }
 
-const EMPTY_OUTCOME: FoldRecallOutcome = { text: null, cards: 0, hints: 0, chars: 0, suppressed: 0, triggers: [] };
+const EMPTY_OUTCOME: FoldRecallOutcome = {
+  contractVersion: FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION,
+  text: null,
+  cards: 0,
+  hints: 0,
+  chars: 0,
+  suppressed: 0,
+  triggers: [],
+};
 
 function hashVisibleCard(text: string): string {
   let hash = 2166136261;
@@ -2870,7 +3856,124 @@ function foldIndexSignature(index: FoldRecallIndex): string {
   const cardSig = cards === undefined
     ? 'legacy'
     : `${cards.length}:${cards.map(hashVisibleCard).join(',')}`;
-  return `${index.rawCount}|${entries[0]?.id ?? ''}|${entries[entries.length - 1]?.id ?? ''}|${cardSig}`;
+  const supersessionSig = (index.supersessions ?? [])
+    .map((pointer) => pointer.sourceIdentity + '>' + pointer.supersededByIdentity)
+    .join(',');
+  return [
+    index.rawCount,
+    entries[0]?.id ?? '',
+    entries[entries.length - 1]?.id ?? '',
+    cardSig,
+    hashVisibleCard(supersessionSig),
+  ].join('|');
+}
+
+/**
+ * Stable identity for dismissal. Unlike `entry.id`, this cannot alias a new
+ * body that happens to reuse the same raw start after a rebuild/rewind.
+ */
+function foldRecallEntryKey(index: FoldRecallIndex, entry: FoldIndexEntry): string {
+  const sourceIdentities = index.sourceIdentitiesByEntryId?.[entry.id] ?? [];
+  if (entry.kind === 'turn') {
+    return JSON.stringify([
+      'turn/v1', entry.rawStart, entry.rawEnd, entry.chars, entry.digest,
+      entry.paths, entry.sourcePaths ?? [], sourceIdentities,
+    ]);
+  }
+  if (entry.kind === 'tool') {
+    return JSON.stringify([
+      'tool/v1', entry.toolId, entry.tool, entry.path, entry.sourcePath ?? '',
+      entry.recency, entry.chars, sourceIdentities,
+    ]);
+  }
+  return JSON.stringify([
+    'spool/v1', entry.artifactId, entry.sha256, entry.path,
+    entry.sourcePath ?? '', entry.recency, entry.chars, sourceIdentities,
+  ]);
+}
+
+function cardExposureMap(state: FoldRecallState): Map<string, FoldRecallCardExposureRecord> {
+  return state.cardExposures ??= new Map();
+}
+
+function dismissalMap(state: FoldRecallState): Map<string, FoldRecallDismissalRecord> {
+  return state.dismissedEntries ??= new Map();
+}
+
+function recordCardExposure(
+  state: FoldRecallState,
+  exposure: FoldRecallCardExposureRecord,
+): void {
+  const exposures = cardExposureMap(state);
+  exposures.set(exposure.exposureId, exposure);
+  while (exposures.size > MAX_FOLD_RECALL_CARD_EXPOSURES) {
+    const oldest = exposures.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    exposures.delete(oldest);
+  }
+}
+
+/**
+ * Record negative feedback for one rendered full-card exposure. The overlay is
+ * idempotent and non-sliding: repeating feedback for the same exposure cannot
+ * extend the window. The card's ordinary residency is removed, so after the
+ * shorter dismissal expires a relevant signal can re-show it before the
+ * original TTL would have elapsed. New structural entries are never hidden.
+ */
+export function dismissFoldRecallCard(
+  state: FoldRecallState,
+  exposureId: string,
+): FoldRecallDismissalOutcome {
+  const normalizedExposureId = exposureId.trim();
+  const exposure = state.cardExposures?.get(normalizedExposureId);
+  if (!exposure) return { status: 'unknown-exposure', exposureId: normalizedExposureId };
+
+  const existing = state.dismissedEntries?.get(exposure.entryKey) ?? null;
+  if (exposure.dismissedAtPass !== undefined) {
+    return { status: 'already-dismissed', record: existing };
+  }
+
+  // Feedback for an older rendering must not erase residency established by a
+  // later rendering of the same structural entry. Exposure retention is
+  // bounded, so this latest-render check is bounded as well.
+  const supersededExposure = [...(state.cardExposures?.values() ?? [])].some(
+    (candidate) => candidate.entryKey === exposure.entryKey && candidate.passSeq > exposure.passSeq,
+  );
+  if (supersededExposure) {
+    return { status: 'stale-exposure', exposureId: normalizedExposureId, entryId: exposure.entryId };
+  }
+
+  const currentEntry = state.index?.entries.find(
+    (entry) => foldRecallEntryKey(state.index!, entry) === exposure.entryKey,
+  );
+  if (!currentEntry) {
+    return { status: 'stale-exposure', exposureId: normalizedExposureId, entryId: exposure.entryId };
+  }
+
+  const record: FoldRecallDismissalRecord = {
+    entryKey: exposure.entryKey,
+    entryId: currentEntry.id,
+    matchedPath: exposure.matchedPath,
+    exposureId: normalizedExposureId,
+    dismissedAtPass: state.passSeq,
+    expiresAtPass: Math.min(
+      state.passSeq + FOLD_RECALL_DISMISSAL_WINDOW_PASSES,
+      exposure.residencyExpiresAtPass,
+    ),
+  };
+  dismissalMap(state).set(record.entryKey, record);
+  exposure.dismissedAtPass = state.passSeq;
+
+  // Replace the ordinary residency with the shorter feedback overlay. Remove
+  // path residency only when it still belongs to this exact rendered card, so
+  // delayed feedback cannot erase a newer card on the same path.
+  state.resident.delete(exposure.residencyId);
+  const pathRecord = state.residentPaths.get(exposure.matchedPath);
+  if (pathRecord?.renderedCard === exposure.renderedCard) {
+    state.residentPaths.delete(exposure.matchedPath);
+  }
+  state.dismissalsRecorded = (state.dismissalsRecorded ?? 0) + 1;
+  return { status: 'recorded', record };
 }
 
 function refreshResidency(
@@ -3076,11 +4179,13 @@ export function buildFoldRecallContext(
 
   const hasTermSignals = config.termRecallEnabled && (signals.terms?.length ?? 0) > 0;
   const hasVerbatimSignals = config.verbatimRecallEnabled && (signals.verbatimTokens?.length ?? 0) > 0;
+  const hasErrorSignals = config.errorRecallEnabled !== false && (signals.errorSignatures?.length ?? 0) > 0;
   if (
     signals.touchedPaths.length === 0 &&
     signals.claimedPaths.length === 0 &&
     !hasTermSignals &&
-    !hasVerbatimSignals
+    !hasVerbatimSignals &&
+    !hasErrorSignals
   ) {
     return EMPTY_OUTCOME;
   }
@@ -3089,13 +4194,25 @@ export function buildFoldRecallContext(
   const passSeq = state.passSeq;
   const refreshedExpiresAtPass = passSeq + config.ttlPasses;
 
-  // Deterministic sweep of expired/view-absent residency (bounds both maps).
+  // Deterministic sweep of expired residency and fixed-window feedback.
   for (const [id, record] of state.resident) {
     if (passSeq >= record.expiresAtPass) state.resident.delete(id);
   }
+  for (const [entryKey, record] of state.dismissedEntries ?? []) {
+    if (passSeq >= record.expiresAtPass) state.dismissedEntries!.delete(entryKey);
+  }
   sweepPathResidencyByView(state.residentPaths, state.index, rawHistory, currentIndexSignature, passSeq, refreshedExpiresAtPass);
 
-  const plan = planRecall(state.index, state.resident, state.residentPaths, passSeq, signals, utilization, config);
+  const plan = planRecall(
+    state.index,
+    state.resident,
+    state.residentPaths,
+    passSeq,
+    signals,
+    utilization,
+    config,
+    state.dismissedEntries,
+  );
   let suppressed = plan.suppressed;
   const suppressedCoordinates = new Map<string, SuppressedRecallCoordinate>();
   const recordSuppressed = (entry: FoldIndexEntry, matchedPath: string): void => {
@@ -3107,7 +4224,13 @@ export function buildFoldRecallContext(
   for (const residency of plan.suppressedResidencies) {
     const entry = entriesById.get(residency.entryId);
     if (entry) recordSuppressed(entry, residency.matchedPath);
-    if (residency.refreshEntry) refreshResidency(state.resident, residency.entryId, refreshedExpiresAtPass);
+    if (residency.refreshEntry) {
+      refreshResidency(
+        state.resident,
+        residency.residencyId ?? residency.entryId,
+        refreshedExpiresAtPass,
+      );
+    }
     if (residency.refreshPath) refreshResidency(state.residentPaths, residency.matchedPath, refreshedExpiresAtPass);
   }
   const budget = pressureBudget(utilization, config);
@@ -3134,6 +4257,7 @@ export function buildFoldRecallContext(
   let cards = 0;
   let hints = 0;
   let composition: RecallCompositionStats | null = null;
+  const exposures: FoldRecallCardExposure[] = [];
   const emittedCardContentKeys = new Set<string>();
   // Radar dedup: paths the current Atlas-read tool already rendered live, whose
   // radar would duplicate the tool output (empty set ⇒ byte-identical).
@@ -3148,6 +4272,11 @@ export function buildFoldRecallContext(
     let rendered: string | null = null;
     let cardStats: RecallCompositionStats | null = null;
     let cardContentKey: string | null = null;
+
+    if (item.supersessions && item.supersessions.length > 0) {
+      level = 'hint';
+      rendered = renderHint(item);
+    }
 
     if (level === 'card') {
       const uncappedBodyBudget = Math.min(config.maxCardChars, remaining - RECALL_BODY_RESERVED_GAP_CHARS);
@@ -3235,7 +4364,8 @@ export function buildFoldRecallContext(
         refreshResidency(state.resident, item.entry.id, refreshedExpiresAtPass);
         continue;
       }
-      if (hints >= MAX_HINTS_PER_PASS) continue;
+      const safetyCorrection = (item.supersessions?.length ?? 0) > 0;
+      if (hints >= MAX_HINTS_PER_PASS && !safetyCorrection) continue;
       rendered ??= renderHint(item);
       if (rendered.length > remaining) continue;
     }
@@ -3253,7 +4383,7 @@ export function buildFoldRecallContext(
     }
     blocks.push(rendered);
     triggers.push(item.trigger);
-    injected.push({ id: item.entry.id, level });
+    injected.push({ id: item.residencyId ?? item.entry.id, level });
     if (level === 'card') {
       if (cardContentKey) emittedCardContentKeys.add(cardContentKey);
       // Content-level residency: keep this path quiet across index rebuilds.
@@ -3263,6 +4393,21 @@ export function buildFoldRecallContext(
       );
       // Lifetime repeat counter (rail-c63e326e s6) — never expires/clears, unlike residency.
       state.pathCardShowCounts.set(item.matchedPath, (state.pathCardShowCounts.get(item.matchedPath) ?? 0) + 1);
+      const entryKey = foldRecallEntryKey(state.index, item.entry);
+      const exposureId = `fold-recall-exposure/v1:${passSeq}:${item.entry.id}:${hashVisibleCard(`${currentIndexSignature}\u0000${entryKey}\u0000${item.matchedPath}`)}`;
+      const exposure: FoldRecallCardExposureRecord = {
+        exposureId,
+        entryId: item.entry.id,
+        entryKey,
+        matchedPath: item.matchedPath,
+        residencyId: item.residencyId ?? item.entry.id,
+        indexSignature: currentIndexSignature,
+        residencyExpiresAtPass: passSeq + config.ttlPasses,
+        renderedCard: rendered,
+        passSeq,
+      };
+      recordCardExposure(state, exposure);
+      exposures.push({ exposureId, entryId: item.entry.id, matchedPath: item.matchedPath, passSeq });
     }
     charsUsed += separatorChars + rendered.length;
     if (level === 'card') cards++;
@@ -3299,9 +4444,16 @@ export function buildFoldRecallContext(
   state.recallChars += charsUsed;
   state.suppressed += suppressed;
 
-  if (blocks.length === 0) return { ...EMPTY_OUTCOME, suppressed };
+  if (blocks.length === 0) {
+    return {
+      ...EMPTY_OUTCOME,
+      suppressed,
+      ...(plan.intents.length > 0 ? { recallIntents: plan.intents } : {}),
+    };
+  }
   const text = blocks.join('\n\n');
   return {
+    contractVersion: FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION,
     text,
     cards,
     hints,
@@ -3309,6 +4461,600 @@ export function buildFoldRecallContext(
     suppressed,
     ...(suppressedManifest ? { suppressedManifest } : {}),
     triggers,
+    ...(plan.intents.length > 0 ? { recallIntents: plan.intents } : {}),
     ...(composition !== null ? { composition } : {}),
+    ...(exposures.length > 0 ? { exposures } : {}),
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Explicit recall (pure, append-only host surface)
+// ══════════════════════════════════════════════════════════════════════
+
+/** First-class drill-downs over material already represented by the fold index. */
+export type ExplicitFoldRecallQuery =
+  | { kind: 'range'; startEvent: number; endEventExclusive: number }
+  | { kind: 'path'; path: string }
+  | { kind: 'term'; term: string }
+  | { kind: 'waypoint'; waypoint: string }
+  | { kind: 'episode'; chapterId: number };
+
+export interface ExplicitFoldRecallOptions {
+  /**
+   * Caller-requested total ceiling. The ambient config remains authoritative:
+   * this value can lower, never raise, FoldRecallConfig.maxTotalChars.
+   */
+  maxTotalChars?: number;
+  /**
+   * Caller-requested per-result body ceiling. This can lower, never raise,
+   * FoldRecallConfig.maxCardChars.
+   */
+  maxResultChars?: number;
+  /**
+   * Caller-requested result count. This can lower, never raise,
+   * FoldRecallConfig.maxCards.
+   */
+  maxResults?: number;
+}
+
+export type ExplicitFoldRecallStratum =
+  | 'folded-turn'
+  | 'folded-tool-result'
+  | 'spooled-artifact'
+  | 'episode-ledger';
+
+export interface ExplicitFoldRecallSource {
+  /** Raw message coordinates backing the result; absent for episode-ledger rows. */
+  startMessage: number | null;
+  endMessageExclusive: number | null;
+  /** Exact source-row identities carried by the raw messages. Never synthesized. */
+  sourceIdentities: string[];
+  /** Measured source-time bounds. Unknown remains null. */
+  firstSourceTime: string | null;
+  lastSourceTime: string | null;
+}
+
+export interface ExplicitFoldRecallMatch {
+  id: string;
+  stratum: ExplicitFoldRecallStratum;
+  source: ExplicitFoldRecallSource;
+  provenance: string;
+  body: string;
+  /** Exact replacement pointers when the historical body was withheld. */
+  supersessions?: readonly FoldRecallSupersessionResolution[];
+}
+
+export interface ExplicitFoldRecallOutcome {
+  /** Normative coverage/freshness contract governing this outcome. */
+  contractVersion: typeof FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION;
+  status: 'matched' | 'empty' | 'unavailable';
+  query: ExplicitFoldRecallQuery;
+  text: string;
+  chars: number;
+  totalMatches: number;
+  returnedMatches: number;
+  omittedMatches: number;
+  truncated: boolean;
+  /**
+   * Host contract: the returned text is suitable only for a newly appended
+   * tool-result/context message. The query path never requests an epoch.
+   */
+  injection: 'append-only';
+  frozenPrefixMutated: false;
+  epochTriggered: false;
+  matches: ExplicitFoldRecallMatch[];
+}
+
+/** Match bare and namespaced bridge names without coupling to a host canonicalizer. */
+export function isExplicitFoldRecallToolName(toolName: string | null | undefined): boolean {
+  if (!toolName) return false;
+  return toolName === 'fold_recall' || toolName.endsWith('__fold_recall');
+}
+
+interface ExplicitFoldRecallCandidate extends ExplicitFoldRecallMatch {
+  recency: number;
+}
+
+function explicitQueryLabel(query: ExplicitFoldRecallQuery): string {
+  switch (query.kind) {
+    case 'range':
+      return `range:event#${query.startEvent}..event#${query.endEventExclusive}`;
+    case 'path':
+      return `path:${normalizeToolPath(query.path.trim())}`;
+    case 'term':
+      return `term:${query.term.trim()}`;
+    case 'waypoint':
+      return `waypoint:${query.waypoint.trim()}`;
+    case 'episode':
+      return `episode:chapter#${query.chapterId}`;
+  }
+}
+
+function validateExplicitFoldRecallQuery(query: ExplicitFoldRecallQuery): void {
+  switch (query.kind) {
+    case 'range':
+      if (
+        !Number.isSafeInteger(query.startEvent)
+        || !Number.isSafeInteger(query.endEventExclusive)
+        || query.startEvent < 0
+        || query.endEventExclusive <= query.startEvent
+      ) {
+        throw new RangeError('Explicit recall range requires 0 <= startEvent < endEventExclusive.');
+      }
+      return;
+    case 'path':
+      if (!normalizeToolPath(query.path.trim())) throw new Error('Explicit recall path must be non-empty.');
+      return;
+    case 'term':
+      if (!query.term.trim()) throw new Error('Explicit recall term must be non-empty.');
+      return;
+    case 'waypoint':
+      if (!query.waypoint.trim()) throw new Error('Explicit recall waypoint must be non-empty.');
+      return;
+    case 'episode':
+      if (!Number.isSafeInteger(query.chapterId) || query.chapterId < 0) {
+        throw new RangeError('Explicit recall chapterId must be a non-negative integer.');
+      }
+  }
+}
+
+function explicitEntryBounds(entry: FoldIndexEntry): { start: number; endExclusive: number } {
+  return entry.kind === 'turn'
+    ? { start: entry.rawStart, endExclusive: entry.rawEnd }
+    : { start: entry.recency, endExclusive: entry.recency + 1 };
+}
+
+function explicitEntrySlice(
+  entry: FoldIndexEntry,
+  rawHistory: readonly FoldMessage[],
+): readonly FoldMessage[] {
+  const bounds = explicitEntryBounds(entry);
+  if (
+    bounds.start < 0
+    || bounds.start >= bounds.endExclusive
+    || bounds.endExclusive > rawHistory.length
+  ) return [];
+  return rawHistory.slice(bounds.start, bounds.endExclusive);
+}
+
+function explicitSourceIdentities(messages: readonly FoldMessage[]): string[] {
+  const identities = new Set<string>();
+  for (const message of messages) {
+    for (const identity of foldMessageSourceIdentities(message)) identities.add(identity);
+  }
+  return [...identities];
+}
+
+function explicitEventCoordinate(sourceIdentity: string | undefined): number | null {
+  if (!sourceIdentity) return null;
+  const match = /(?:^|[:/])event(?:#|:)(\d+)(?:\b|$)/u.exec(sourceIdentity);
+  if (!match) return null;
+  const value = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function explicitSupersessionPoint(sourceIdentity: string) {
+  const match = /^(.*):event#(\d+)$/u.exec(sourceIdentity);
+  const index = match ? Number.parseInt(match[2], 10) : Number.NaN;
+  return match?.[1] && Number.isSafeInteger(index)
+    ? { traceId: match[1], unit: 'event' as const, index }
+    : { unit: 'event' as const, id: sourceIdentity };
+}
+
+function explicitEntrySearchText(
+  entry: FoldIndexEntry,
+  rawHistory: readonly FoldMessage[],
+): string {
+  const parts = [entry.id];
+  if (entry.kind === 'turn') parts.push(entry.digest, ...entry.paths, ...(entry.sourcePaths ?? []));
+  else {
+    parts.push(entry.tool, entry.path, entry.sourcePath ?? '');
+    if (entry.kind === 'spool') {
+      parts.push(entry.artifactId, entry.digest ?? '', ...(entry.verbatimTokens ?? []));
+    }
+  }
+  for (const message of explicitEntrySlice(entry, rawHistory)) {
+    parts.push(...foldMessageSourceIdentities(message), ...collectMessageTextFragments(message));
+  }
+  return parts.join('\n');
+}
+
+function explicitEntryStratum(entry: FoldIndexEntry): ExplicitFoldRecallStratum {
+  if (entry.kind === 'turn') return 'folded-turn';
+  if (entry.kind === 'tool') return 'folded-tool-result';
+  return 'spooled-artifact';
+}
+
+function explicitEntryProvenance(
+  entry: FoldIndexEntry,
+  rawHistory: readonly FoldMessage[],
+  rawTailStart: number,
+  supersessions: readonly FoldRecallSupersessionResolution[] = [],
+): { source: ExplicitFoldRecallSource; rendered: string } {
+  const bounds = explicitEntryBounds(entry);
+  const messages = explicitEntrySlice(entry, rawHistory);
+  const times = foldMessageTimestampBounds(messages);
+  const sourceIdentities = explicitSourceIdentities(messages);
+  const rawTailCount = Math.max(0, rawHistory.length - rawTailStart);
+  const rendered = renderChronologicalProvenanceCompact({
+    artifact: `explicit-fold-recall#${entry.id}`,
+    contentClass: 'retrieved-history',
+    source: {
+      start: { unit: 'message', index: bounds.start, timestamp: times.firstTimestamp },
+      endExclusive: { unit: 'message', index: bounds.endExclusive },
+      count: bounds.endExclusive - bounds.start,
+      lastTimestamp: times.lastTimestamp,
+    },
+    transformedAt: { unit: 'message', index: rawHistory.length },
+    ...(rawTailCount > 0
+      ? { rawResumesAt: { unit: 'message', index: rawTailStart } as const }
+      : {}),
+    authority: 'historical-background',
+    supersession: supersessions.length > 0
+      ? 'explicit'
+      : rawTailCount > 0 ? 'later-raw-wins' : 'none-known',
+    ...(supersessions[0]
+      ? { supersededAt: explicitSupersessionPoint(supersessions[0].terminalIdentity) }
+      : {}),
+    topology: {
+      host: 'dedicated-synthetic-message',
+      previous: 'raw-history',
+      next: rawTailCount > 0 ? 'raw-tail' : 'none',
+      representation: 'canonical',
+      rawTailCount,
+    },
+  });
+  const identityLine = sourceIdentities.length > 0
+    ? `source-identities=${sourceIdentities.join(',')}`
+    : 'source-identities=unknown';
+  const supersessionLines = supersessions.map((resolution) => (
+    'supersession=explicit:' + resolution.terminalIdentity
+      + ' source-id=' + resolution.sourceIdentity
+      + ' superseded-by=' + resolution.supersededByIdentity
+  ));
+  return {
+    source: {
+      startMessage: bounds.start,
+      endMessageExclusive: bounds.endExclusive,
+      sourceIdentities,
+      firstSourceTime: times.firstTimestamp ?? null,
+      lastSourceTime: times.lastTimestamp ?? null,
+    },
+    rendered: [rendered, identityLine, ...supersessionLines].filter(Boolean).join('\n'),
+  };
+}
+
+function explicitEntryBody(
+  entry: FoldIndexEntry,
+  rawHistory: readonly FoldMessage[],
+): string | null {
+  if (entry.kind === 'spool') {
+    return [
+      `Spool artifact ${entry.artifactId} is not resident in raw history.`,
+      `tool=${entry.tool || 'unknown'} path=${entry.path || 'unknown'} chars=${entry.chars}`,
+      `recovery=read_spooled_artifact artifact_id=${entry.artifactId} sha256=${entry.sha256}`,
+    ].join('\n');
+  }
+  const paths = entry.kind === 'turn'
+    ? entry.paths
+    : entry.path ? [entry.path] : [];
+  return renderEntryBody(entry, paths, rawHistory, {}, new Map(), false)?.body ?? null;
+}
+
+function explicitEntryMatches(
+  entry: FoldIndexEntry,
+  rawHistory: readonly FoldMessage[],
+  query: ExplicitFoldRecallQuery,
+  exactSourcePathOnly = false,
+): boolean {
+  if (query.kind === 'episode') return false;
+  if (query.kind === 'range') {
+    return explicitEntrySlice(entry, rawHistory).some((message) => {
+      return foldMessageSourceIdentities(message).some((sourceIdentity) => {
+        const coordinate = explicitEventCoordinate(sourceIdentity);
+        return coordinate !== null
+          && coordinate >= query.startEvent
+          && coordinate < query.endEventExclusive;
+      });
+    });
+  }
+  if (query.kind === 'path') {
+    const spelling = query.path.trim();
+    const sourcePaths = entry.kind === 'turn'
+      ? entry.sourcePaths ?? []
+      : entry.sourcePath ? [entry.sourcePath] : [];
+    if (exactSourcePathOnly) return sourcePaths.includes(spelling);
+    const target = normalizeToolPath(spelling);
+    const aliases = foldIndexEntryPaths(entry);
+    return aliases.includes(target)
+      || sourcePaths.includes(spelling);
+  }
+  const needle = (query.kind === 'term' ? query.term : query.waypoint).trim().toLowerCase();
+  return explicitEntrySearchText(entry, rawHistory).toLowerCase().includes(needle);
+}
+
+function collectExplicitEntryCandidates(
+  state: FoldRecallState,
+  rawHistory: readonly FoldMessage[],
+  query: ExplicitFoldRecallQuery,
+): ExplicitFoldRecallCandidate[] {
+  const index = state.index;
+  if (!index || query.kind === 'episode') return [];
+  const exactPathSpelling = query.kind === 'path' ? query.path.trim() : null;
+  const exactSourcePathOnly = exactPathSpelling !== null && index.entries.some((entry) => {
+    const bounds = explicitEntryBounds(entry);
+    if (explicitEntrySlice(entry, rawHistory).length !== bounds.endExclusive - bounds.start) return false;
+    return entry.kind === 'turn'
+      ? (entry.sourcePaths ?? []).includes(exactPathSpelling)
+      : entry.sourcePath === exactPathSpelling;
+  });
+  const candidates: ExplicitFoldRecallCandidate[] = [];
+  for (const entry of index.entries) {
+    const bounds = explicitEntryBounds(entry);
+    if (explicitEntrySlice(entry, rawHistory).length !== bounds.endExclusive - bounds.start) continue;
+    if (!explicitEntryMatches(entry, rawHistory, query, exactSourcePathOnly)) continue;
+    const supersessions = resolveFoldRecallEntrySupersessions(index, entry);
+    const body = supersessions.length > 0
+      ? [
+          'Historical body withheld because its exact source identity is superseded.',
+          ...supersessions.map((resolution) => (
+            'source-id=' + resolution.sourceIdentity
+              + ' superseded-by=' + resolution.supersededByIdentity
+              + ' terminal=' + resolution.terminalIdentity
+          )),
+        ].join('\n')
+      : explicitEntryBody(entry, rawHistory);
+    if (!body) continue;
+    const provenance = explicitEntryProvenance(entry, rawHistory, index.rawCount, supersessions);
+    candidates.push({
+      id: entry.id,
+      stratum: explicitEntryStratum(entry),
+      source: provenance.source,
+      provenance: provenance.rendered,
+      body,
+      ...(supersessions.length > 0 ? { supersessions } : {}),
+      recency: entry.recency,
+    });
+  }
+  return candidates.sort((a, b) => {
+    if (query.kind === 'range') {
+      const aStart = a.source.startMessage ?? Number.MAX_SAFE_INTEGER;
+      const bStart = b.source.startMessage ?? Number.MAX_SAFE_INTEGER;
+      if (aStart !== bStart) return aStart - bStart;
+    }
+    return b.recency - a.recency || a.id.localeCompare(b.id);
+  });
+}
+
+function collectExplicitEpisodeCandidates(
+  state: FoldRecallState,
+  query: ExplicitFoldRecallQuery,
+): ExplicitFoldRecallCandidate[] {
+  if (query.kind !== 'episode') return [];
+  const candidates: ExplicitFoldRecallCandidate[] = [];
+  const dedupe = new Set<string>();
+  const entries = [...state.pathEpisodes.entries()].sort(([a], [b]) => a.localeCompare(b));
+  for (const [path, voices] of entries) {
+    for (const voice of voices) {
+      if (!voice.chapterIds.includes(query.chapterId)) continue;
+      const signature = `${path}\u0000${voice.endedAt}\u0000${voice.chapterIds.join(',')}\u0000${voice.voiceLines.join('\n')}`;
+      if (dedupe.has(signature)) continue;
+      dedupe.add(signature);
+      const id = `episode:${query.chapterId}:${path}`;
+      candidates.push({
+        id,
+        stratum: 'episode-ledger',
+        source: {
+          startMessage: null,
+          endMessageExclusive: null,
+          sourceIdentities: [`fold-episode:chapter#${query.chapterId}`],
+          firstSourceTime: voice.endedAt || null,
+          lastSourceTime: voice.endedAt || null,
+        },
+        provenance: [
+          '[Chronological Provenance v1]',
+          `artifact=explicit-fold-recall#${id} class=retrieved-history`,
+          `source=fold-episode:chapter#${query.chapterId} source-time=${voice.endedAt || 'time unknown'}`,
+          'authority=historical-background supersession=later-raw-wins stratum=episode-ledger',
+        ].join('\n'),
+        body: [
+          `path=${path}`,
+          `chapters=${voice.chapterIds.join(',')}`,
+          voice.intent ? `intent=${voice.intent}` : null,
+          ...voice.voiceLines,
+        ].filter((line): line is string => line !== null).join('\n'),
+        recency: Date.parse(voice.endedAt) || 0,
+      });
+    }
+  }
+  return candidates.sort((a, b) => b.recency - a.recency || a.id.localeCompare(b.id));
+}
+
+function clampExplicitLimit(requested: number | undefined, ceiling: number): number {
+  const boundedCeiling = Number.isFinite(ceiling) ? Math.max(0, Math.floor(ceiling)) : 0;
+  if (requested === undefined || !Number.isFinite(requested)) return boundedCeiling;
+  return Math.max(0, Math.min(boundedCeiling, Math.floor(requested)));
+}
+
+function truncateExplicitBody(body: string, maxChars: number): { text: string; truncated: boolean } {
+  if (body.length <= maxChars) return { text: body, truncated: false };
+  const longReceipt = '\n…[explicit recall body elided by budget]…\n';
+  const shortReceipt = '…[body-elided]…';
+  const receipt = maxChars >= longReceipt.length ? longReceipt : shortReceipt;
+  if (maxChars <= receipt.length) {
+    return { text: charSafeSlice(receipt, 0, maxChars), truncated: true };
+  }
+  const available = maxChars - receipt.length;
+  const headChars = Math.floor(available * 0.7);
+  const tailChars = available - headChars;
+  return {
+    text: `${charSafeSlice(body, 0, headChars)}${receipt}${charSafeSlice(body, body.length - tailChars, body.length)}`,
+    truncated: true,
+  };
+}
+
+function explicitEmptyOutcome(
+  query: ExplicitFoldRecallQuery,
+  status: 'empty' | 'unavailable',
+  reason: string,
+  maxTotalChars: number,
+): ExplicitFoldRecallOutcome {
+  const fullText = [
+    '[Explicit Fold Recall v1]',
+    `status=${status} query=${explicitQueryLabel(query)}`,
+    `reason=${reason}`,
+    'injection=append-only frozen-prefix-mutated=false epoch-triggered=false',
+    '[End explicit fold recall]',
+  ].join('\n');
+  const text = charSafeSlice(fullText, 0, maxTotalChars);
+  return {
+    contractVersion: FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION,
+    status,
+    query,
+    text,
+    chars: text.length,
+    totalMatches: 0,
+    returnedMatches: 0,
+    omittedMatches: 0,
+    truncated: text.length < fullText.length,
+    injection: 'append-only',
+    frozenPrefixMutated: false,
+    epochTriggered: false,
+    matches: [],
+  };
+}
+
+/** Build the same typed fail-closed response for hosts without a live fold index. */
+export function buildExplicitFoldRecallUnavailableOutcome(
+  query: ExplicitFoldRecallQuery,
+  reason = 'host-does-not-expose-fold-index',
+  maxTotalChars = DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars,
+): ExplicitFoldRecallOutcome {
+  validateExplicitFoldRecallQuery(query);
+  return explicitEmptyOutcome(
+    query,
+    'unavailable',
+    reason,
+    clampExplicitLimit(maxTotalChars, DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars),
+  );
+}
+
+/**
+ * Query folded material directly without waiting for an ambient tool-boundary
+ * trigger. Pure: it reads the current index/raw reference and returns a body
+ * for the host to append as the current tool result. It never mutates recall
+ * residency, the frozen prefix, raw history, or epoch state.
+ */
+export function buildExplicitFoldRecallContext(
+  state: FoldRecallState,
+  rawHistory: readonly FoldMessage[] | null | undefined,
+  query: ExplicitFoldRecallQuery,
+  config: FoldRecallConfig,
+  options: ExplicitFoldRecallOptions = {},
+): ExplicitFoldRecallOutcome {
+  validateExplicitFoldRecallQuery(query);
+  const maxTotalChars = clampExplicitLimit(options.maxTotalChars, config.maxTotalChars);
+  const maxResultChars = clampExplicitLimit(options.maxResultChars, config.maxCardChars);
+  const maxResults = clampExplicitLimit(options.maxResults, config.maxCards);
+  if (!config.enabled) {
+    return explicitEmptyOutcome(query, 'unavailable', 'fold-recall-disabled', maxTotalChars);
+  }
+  if (!state.index || !rawHistory || rawHistory.length < state.index.rawCount) {
+    return explicitEmptyOutcome(query, 'unavailable', 'no-current-fold-index', maxTotalChars);
+  }
+
+  const candidates = query.kind === 'episode'
+    ? collectExplicitEpisodeCandidates(state, query)
+    : collectExplicitEntryCandidates(state, rawHistory, query);
+  if (candidates.length === 0) {
+    return explicitEmptyOutcome(query, 'empty', 'no-folded-match', maxTotalChars);
+  }
+
+  const selected = candidates.slice(0, maxResults);
+  const fullHeader = [
+    '[Explicit Fold Recall v1]',
+    `status=matched query=${explicitQueryLabel(query)} total-matches=${candidates.length}`,
+    'injection=append-only frozen-prefix-mutated=false epoch-triggered=false',
+  ].join('\n');
+  const header = charSafeSlice(fullHeader, 0, maxTotalChars);
+  if (header.length < fullHeader.length) {
+    return {
+      contractVersion: FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION,
+      status: 'matched',
+      query,
+      text: header,
+      chars: header.length,
+      totalMatches: candidates.length,
+      returnedMatches: 0,
+      omittedMatches: candidates.length,
+      truncated: true,
+      injection: 'append-only',
+      frozenPrefixMutated: false,
+      epochTriggered: false,
+      matches: [],
+    };
+  }
+  const blocks: string[] = [header];
+  const matches: ExplicitFoldRecallMatch[] = [];
+  let used = header.length;
+  let truncated = candidates.length > selected.length;
+
+  for (const candidate of selected) {
+    const bounded = truncateExplicitBody(candidate.body, maxResultChars);
+    const prefix = [
+      `[Explicit recall result ${matches.length + 1}]`,
+      `id=${candidate.id} stratum=${candidate.stratum}`,
+      candidate.provenance,
+      '',
+    ].join('\n');
+    const suffix = '\n[End explicit recall result]';
+    const separatorChars = 2;
+    const remaining = maxTotalChars - used - separatorChars;
+    if (remaining <= prefix.length + suffix.length) {
+      truncated = true;
+      break;
+    }
+    const allowedBodyChars = Math.min(
+      bounded.text.length,
+      remaining - prefix.length - suffix.length,
+    );
+    const fitted = allowedBodyChars < bounded.text.length
+      ? truncateExplicitBody(candidate.body, allowedBodyChars)
+      : bounded;
+    const block = `${prefix}${fitted.text}${suffix}`;
+    blocks.push(block);
+    used += separatorChars + block.length;
+    truncated ||= fitted.truncated;
+    matches.push({
+      id: candidate.id,
+      stratum: candidate.stratum,
+      source: candidate.source,
+      provenance: candidate.provenance,
+      body: fitted.text,
+      ...(candidate.supersessions ? { supersessions: candidate.supersessions } : {}),
+    });
+  }
+
+  const omittedMatches = candidates.length - matches.length;
+  const receipt = omittedMatches > 0
+    ? `[Explicit recall elision] omitted-matches=${omittedMatches} recovery=repeat-query-with-narrower-selector`
+    : '[End explicit fold recall]';
+  if (used + 2 + receipt.length <= maxTotalChars) blocks.push(receipt);
+  else truncated = true;
+  const text = blocks.join('\n\n');
+  return {
+    contractVersion: FOLD_RECALL_COMPLETENESS_CONTRACT_VERSION,
+    status: 'matched',
+    query,
+    text,
+    chars: text.length,
+    totalMatches: candidates.length,
+    returnedMatches: matches.length,
+    omittedMatches,
+    truncated,
+    injection: 'append-only',
+    frozenPrefixMutated: false,
+    epochTriggered: false,
+    matches,
   };
 }

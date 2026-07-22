@@ -2,13 +2,47 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CARD_GLYPHS,
+  COGNITIVE_SUPERSEDED_GLYPH,
   REGISTER_GLYPHS,
   REGISTER_GLYPH_PROMPT_SNIPPET,
   buildRegisterGlyphPromptSnippet,
   classifyAssistantRegister,
+  extractCognitiveSupersessionPointers,
   parseRegisterGlyph,
   stripRegisterGlyph,
 } from '../glyphs.ts';
+
+describe('cognitive supersession pointer grammar', () => {
+  it('extracts only explicit structured supersession rows and uses the newest edge', () => {
+    const text = [
+      '[cognitive — historical waypoints from the folded window, NOT your current state]',
+      '[Chronological Provenance v1] artifact=cognitive-waypoints class=synthesized-history',
+      '↞ msg#1 · in_progress · source-id=event:old · current=superseded · superseded-by=event:middle (msg#2)',
+      COGNITIVE_SUPERSEDED_GLYPH + ' old working belief',
+      'plain prose says event:old was superseded-by=event:fake',
+      '↞ msg#3 · verdict · source-id=event:old · current=superseded · superseded-by=event:new (msg#4)',
+      '↞ msg#5 · verdict · source-id=event:self · current=superseded · superseded-by=event:self (msg#5)',
+    ].join('\n');
+
+    expect(extractCognitiveSupersessionPointers(text)).toEqual([
+      { sourceIdentity: 'event:old', supersededByIdentity: 'event:new' },
+    ]);
+  });
+
+  it('ignores current, unresolved, malformed, and quoted lookalike rows', () => {
+    expect(extractCognitiveSupersessionPointers([
+      '[cognitive]',
+      '[Chronological Provenance v1] artifact=cognitive-waypoints class=synthesized-history',
+      '↞ msg#1 · verdict · source-id=event:current · current=current',
+      '↞ msg#2 · in_progress · source-id=event:unknown',
+      '↞ msg#3 · current=superseded · superseded-by=event:missing-source',
+      '> ↞ msg#4 · source-id=event:quoted · current=superseded · superseded-by=event:new',
+      '```text',
+      '↞ msg#5 · source-id=event:fenced · current=superseded · superseded-by=event:new',
+      '```',
+    ].join('\n'))).toEqual([]);
+  });
+});
 
 describe('register glyph grammar', () => {
   it('parses executing as a transient register and accepts the VS16 variant', () => {

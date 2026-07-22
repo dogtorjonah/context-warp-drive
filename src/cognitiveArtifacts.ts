@@ -42,7 +42,7 @@ import {
   CARD_GLYPHS,
   type AssistantRegister,
 } from './glyphs.ts';
-import type { FoldMessage } from './rollingFold.ts';
+import { foldMessageSourceIdentities, type FoldMessage } from './rollingFold.ts';
 import { renderEmbeddedContinuityArtifactProvenance } from './chronologicalProvenance.ts';
 
 // ══════════════════════════════════════════════════════════════════════
@@ -81,6 +81,8 @@ export interface CognitiveArtifact {
   sourceTimestamp?: string;
   /** Stable provider call id or deterministic fold-window coordinate. */
   sourceIdentity: string;
+  /** Exact only when the identity came from a persisted source row/provider call. */
+  sourceIdentityAuthority: 'exact' | 'synthetic-position';
   /** Whether this is a pointer or an observation; neither proves completion. */
   authorityClass: CognitiveArtifactAuthorityClass;
   /** A single cognitive waypoint cannot establish completion on its own. */
@@ -175,6 +177,7 @@ function foldArtifactContract(
 ): Pick<
   CognitiveArtifact,
   | 'sourceIdentity'
+  | 'sourceIdentityAuthority'
   | 'sourceTimestamp'
   | 'authorityClass'
   | 'completionSupport'
@@ -182,6 +185,9 @@ function foldArtifactContract(
 > {
   return {
     sourceIdentity: sourceIdentity ?? `fold-window:message:${messageIndex}`,
+    sourceIdentityAuthority: sourceIdentity && !sourceIdentity.startsWith('fold-window:message:')
+      ? 'exact'
+      : 'synthetic-position',
     sourceTimestamp,
     authorityClass,
     completionSupport: 'insufficient_alone',
@@ -520,6 +526,9 @@ export function extractCognitiveArtifacts(
     const rawMsg = msg as FoldMessage & { parts?: unknown };
     const rawText = flattenContent(msg.content, rawMsg.parts);
     const compact = splitCompactToolTraces(rawText);
+    const messageSourceIdentities = foldMessageSourceIdentities(msg);
+    const messageSourceIdentity = msg.sourceIdentity?.trim()
+      || (messageSourceIdentities.length === 1 ? messageSourceIdentities[0] : undefined);
     const uniqueToolWaypoints = new Map<string, ExtractedToolWaypoint>();
     for (const waypoint of [
       ...extractStructuredToolWaypoints(msg),
@@ -543,6 +552,7 @@ export function extractCognitiveArtifacts(
             'pointer',
             sourceTimestamp,
             waypoint.sourceIdentity
+              ?? messageSourceIdentity
               ?? `fold-window:message:${i}/tap_star:${waypoint.category}/${encodeURIComponent(headline)}`,
           ),
           register: 'tap_star',
@@ -560,6 +570,7 @@ export function extractCognitiveArtifacts(
             'historical_observation',
             sourceTimestamp,
             waypoint.sourceIdentity
+              ?? messageSourceIdentity
               ?? `fold-window:message:${i}/${waypoint.tool}/${encodeURIComponent(headline)}`,
           ),
           register: 'untagged',
@@ -577,7 +588,7 @@ export function extractCognitiveArtifacts(
     if (parseResult.ok && DURABLE_REGISTERS.has(parseResult.register)) {
       const headline = extractHeadline(parseResult.body);
       durable.push({
-        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp),
+        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp, messageSourceIdentity),
         register: parseResult.register,
         glyph: REGISTER_GLYPHS[parseResult.register],
         headline,
@@ -593,7 +604,7 @@ export function extractCognitiveArtifacts(
     if (parseResult.ok && TRANSIENT_REGISTERS.has(parseResult.register)) {
       const headline = extractHeadline(parseResult.body);
       flowNotes.push({
-        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp),
+        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp, messageSourceIdentity),
         register: parseResult.register,
         glyph: REGISTER_GLYPHS[parseResult.register],
         headline,
@@ -615,7 +626,7 @@ export function extractCognitiveArtifacts(
     ) {
       const headline = extractHeadline(text);
       flowNotes.push({
-        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp),
+        ...foldArtifactContract(i, 'historical_observation', sourceTimestamp, messageSourceIdentity),
         register: 'untagged',
         glyph: UNTAGGED_GLYPH,
         headline,
@@ -796,6 +807,7 @@ export function formatCognitiveArtifactProvenance(
     `completion=${completionSupport}`,
     `source-time=${artifact.sourceTimestamp ?? 'unknown'}`,
     `source-id=${sourceIdentity}`,
+    `source-identity=${artifact.sourceIdentityAuthority ?? 'synthetic-position'}`,
   ].join(' · ') + current + supersession;
 }
 
@@ -859,5 +871,8 @@ export function mergeBlockIntoViewTail<T extends FoldMessage>(
   } else {
     content = block;
   }
-  return [...view.slice(0, -1), { ...last, content }] as T[];
+  return [
+    ...view.slice(0, -1),
+    { ...last, content, contextWarpSynthetic: 'cognitive-overlay' },
+  ] as T[];
 }

@@ -19,6 +19,22 @@ export interface FoldMessage {
   tool_calls?: unknown;
   tool_call_id?: unknown;
   name?: unknown;
+  /** Stable identity of the source row represented by this message. Hosts that
+   * lack one leave it absent and downstream artifacts mark source as unknown. */
+  sourceIdentity?: string;
+  /**
+   * All exact persisted source-row identities represented by this message.
+   * Internal-only metadata: provider adapters must strip it from outbound
+   * payloads. Unlike symbol/non-enumerable metadata, this survives the
+   * structured-clone boundary used by atomic fold publication.
+   */
+  sourceIdentities?: readonly string[];
+  /**
+   * Marks fold-engine-authored synthetic context. Raw provider/user messages
+   * never set this flag; it lets provenance consumers distinguish a trusted
+   * folded carrier from prompt text that merely copies the same envelope.
+   */
+  contextWarpSynthetic?: 'folded-context' | 'cognitive-overlay';
   /**
    * Epoch-millisecond timestamp of the original message creation time. When
    * present, folded-turn skeletons render a [HH:MM AM/PM] prefix so the band
@@ -27,6 +43,102 @@ export interface FoldMessage {
    * paths that don't populate it produce identical (timestampless) output.
    */
   tsMs?: number;
+}
+
+function normalizeFoldMessageSourceIdentities(
+  identities: readonly (string | null | undefined)[],
+): string[] {
+  const normalized = new Set<string>();
+  for (const identity of identities) {
+    const value = identity?.trim();
+    if (value) normalized.add(value);
+  }
+  return [...normalized];
+}
+
+/** Read every exact persisted source-row identity carried by a message. */
+export function foldMessageSourceIdentities(message: FoldMessage): string[] {
+  return normalizeFoldMessageSourceIdentities([
+    message.sourceIdentity,
+    ...(message.sourceIdentities ?? []),
+  ]);
+}
+
+/**
+ * Attach clone-safe internal provenance metadata without changing message
+ * content or provider role. The primary identity is kept only when exact;
+ * callers with an ambiguous many-row carrier should omit it.
+ */
+export function attachFoldMessageSourceIdentities<T extends FoldMessage>(
+  message: T,
+  identities: readonly (string | null | undefined)[],
+  primaryIdentity?: string | null,
+): T {
+  const sourceIdentities = normalizeFoldMessageSourceIdentities(identities);
+  const primary = primaryIdentity?.trim();
+  return {
+    ...message,
+    ...(primary ? { sourceIdentity: primary } : {}),
+    ...(sourceIdentities.length > 0 ? { sourceIdentities } : {}),
+  };
+}
+
+function structuredAssistantToolSourceIdentities(message: FoldMessage): string[] {
+  if (message.role !== 'assistant' && message.role !== 'model') return [];
+  const identities: string[] = [];
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  for (const call of toolCalls) {
+    if (!call || typeof call !== 'object') continue;
+    const identity = (call as { id?: unknown }).id;
+    if (typeof identity === 'string') identities.push(identity);
+  }
+  const content = Array.isArray(message.content) ? message.content : [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const record = block as { type?: unknown; id?: unknown };
+    if (record.type === 'tool_use' && typeof record.id === 'string') identities.push(record.id);
+  }
+  const parts = Array.isArray((message as { parts?: unknown }).parts)
+    ? (message as { parts: unknown[] }).parts
+    : [];
+  for (const part of parts) {
+    if (!part || typeof part !== 'object') continue;
+    const functionCall = (part as { functionCall?: unknown }).functionCall;
+    if (!functionCall || typeof functionCall !== 'object') continue;
+    const identity = (functionCall as { id?: unknown }).id;
+    if (typeof identity === 'string') identities.push(identity);
+  }
+  return normalizeFoldMessageSourceIdentities(identities);
+}
+
+/**
+ * Shared live-host seam: preserve inherited identities and derive exact
+ * provider call identities before any fold transformation can detach them.
+ */
+export function annotateFoldMessageSourceIdentities<T extends FoldMessage>(messages: T[]): T[] {
+  return messages.map((message) => {
+    const carried = foldMessageSourceIdentities(message);
+    const structured = structuredAssistantToolSourceIdentities(message);
+    const identities = normalizeFoldMessageSourceIdentities([...carried, ...structured]);
+    const primary = message.sourceIdentity?.trim()
+      || (structured.length === 1 ? structured[0] : undefined)
+      || (identities.length === 1 ? identities[0] : undefined);
+    return attachFoldMessageSourceIdentities(message, identities, primary);
+  });
+}
+
+/** Remove internal fold metadata before serializing a provider request. */
+export function stripFoldMessageInternalMetadata<T extends FoldMessage>(messages: readonly T[]): T[] {
+  return messages.map((message) => {
+    const {
+      tsMs: _tsMs,
+      sourceIdentity: _sourceIdentity,
+      sourceIdentities: _sourceIdentities,
+      contextWarpSynthetic: _contextWarpSynthetic,
+      ...providerMessage
+    } = message;
+    return providerMessage as T;
+  });
 }
 
 export type TurnCategory = 'research' | 'action' | 'decision' | 'navigation' | 'error' | 'coordination';
@@ -715,12 +827,45 @@ export const FOLD_BLOCK_PREAMBLE_ARTIFACT = '(Context note: older turns were aut
 export const FOLD_BLOCK_PREAMBLE_POINTER = '(Context note: turns below were compacted — closet/recall/claim mechanics per the full context note in the earliest surviving fold block above; docs/context-folding.md)';
 export const COORDINATE_CLOSET_MARKER = '⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖';
 const RAW_TRACE_COORDINATE_CLOSET_PREFIX = '── Raw Trace Coordinate Closet';
+const ARTIFACT_LITERAL_POOL_PREFIX = '⌖ literals:';
+export const COORDINATE_CONSERVATION_OVERLAY_HEADER = '[Coordinate Conservation Overlay v1]';
+export const COORDINATE_CONSERVATION_OVERLAY_END = '[End Coordinate Conservation Overlay]';
+const FOLD_BLOCK_HEADER_PREFIX = '[Conversation Context — ';
+const FOLD_BLOCK_END_MARKER = '[End Folded Context]';
+
+interface InlineCoordinateSuffix {
+  prefix: string;
+  items: string[];
+}
+
+function parseInlineCoordinateSuffix(segment: string): InlineCoordinateSuffix | null {
+  const glyphIndex = segment.lastIndexOf(' ⌖ ');
+  if (glyphIndex < 0) return null;
+  const items = segment.slice(glyphIndex + 3).split(' · ').map(item => item.trim());
+  if (items.length === 0 || items.some(item => item.length === 0)) return null;
+  for (const item of items) {
+    const bare = item.replace(/\s+⟦[^⟧]*⟧$/u, '').trim();
+    if (!bare || !nominateVerbatim(bare, 8).includes(bare)) return null;
+  }
+  return { prefix: segment.slice(0, glyphIndex), items };
+}
+
+function isFoldSkeletonLine(rawLine: string, line: string, inFoldBlock: boolean): boolean {
+  return inFoldBlock
+    && rawLine === rawLine.trimStart()
+    && line.length > 0
+    && !line.startsWith('[')
+    && !line.startsWith('(')
+    && !line.startsWith(FOLD_TOMBSTONE_PREFIX)
+    && !line.startsWith(COORDINATE_CLOSET_MARKER);
+}
 
 /**
  * Extract only resident coordinate-carrying text from a frozen view. This keeps
  * cross-band admission bounded to closet material instead of rescanning the
- * entire immutable prompt for every nominated literal. Both the rolling-fold
- * inline closet and the rebirth package's bullet-form raw closet are supported.
+ * entire immutable prompt for every nominated literal. The rolling-fold
+ * inline closet, typed artifact literal pool, bounded coordinate overlay, and
+ * rebirth package's bullet-form raw closet are supported.
  */
 export function extractCoordinateConservationCorpus(messages: readonly FoldMessage[]): string {
   const conserved: string[] = [];
@@ -728,9 +873,28 @@ export function extractCoordinateConservationCorpus(messages: readonly FoldMessa
     if (typeof message.content !== 'string') continue;
     let inRawTraceCloset = false;
     let sawRawTraceLiteral = false;
+    let inFoldBlock = false;
+    let pendingCoordinateOverlay: string[] | null = null;
     for (const rawLine of message.content.split('\n')) {
       const line = rawLine.trim();
-      if (line.includes(COORDINATE_CLOSET_MARKER)) {
+      if (line.startsWith(FOLD_BLOCK_HEADER_PREFIX)) {
+        inFoldBlock = true;
+        continue;
+      }
+      if (line === FOLD_BLOCK_END_MARKER) {
+        inFoldBlock = false;
+        continue;
+      }
+      if (line === COORDINATE_CONSERVATION_OVERLAY_HEADER) {
+        pendingCoordinateOverlay = [];
+        continue;
+      }
+      if (line === COORDINATE_CONSERVATION_OVERLAY_END) {
+        if (pendingCoordinateOverlay) conserved.push(...pendingCoordinateOverlay);
+        pendingCoordinateOverlay = null;
+        continue;
+      }
+      if (line.startsWith(COORDINATE_CLOSET_MARKER)) {
         conserved.push(line);
         inRawTraceCloset = false;
         sawRawTraceLiteral = false;
@@ -741,25 +905,27 @@ export function extractCoordinateConservationCorpus(messages: readonly FoldMessa
         sawRawTraceLiteral = false;
         continue;
       }
-      // Inline placement (flat closet dissolved): skeleton lines carry
-      // conserved literals as ` ⌖ item · item` suffix segments, and a
-      // collapse-merged line can hold several (`… ⌖ a → … ⌖ b`). Collect
-      // every segment item so cross-band admission sees prior-band inline
-      // coordinates; the ⟦label⟧ form keeps its bare value recoverable.
-      // The context-note preamble mentions the glyph in prose — skip it.
-      if (!line.startsWith('(Context note')) {
-        let searchFrom = 0;
-        for (;;) {
-          const glyphIndex = line.indexOf(' ⌖ ', searchFrom);
-          if (glyphIndex < 0) break;
-          // ' ⌖ ' is 3 UTF-16 units (space, U+2316, space) — items start at +3.
-          const segmentEnd = line.indexOf(' → ', glyphIndex + 3);
-          const segment = line.slice(glyphIndex + 3, segmentEnd < 0 ? undefined : segmentEnd);
-          for (const item of segment.split(' · ')) {
-            const bare = item.replace(/\s+⟦[^⟧]*⟧$/u, '').trim();
-            if (bare) conserved.push(bare);
+      if ((inFoldBlock || pendingCoordinateOverlay) && line.startsWith(ARTIFACT_LITERAL_POOL_PREFIX)) {
+        const serialized = line.slice(ARTIFACT_LITERAL_POOL_PREFIX.length).trim();
+        for (const item of serialized.split(' · ')) {
+          const literal = item.trim();
+          if (!literal) continue;
+          if (pendingCoordinateOverlay) pendingCoordinateOverlay.push(literal);
+          else conserved.push(literal);
+        }
+        continue;
+      }
+      // Inline placement (flat closet dissolved) is structural fold syntax,
+      // never a free-form glyph search. Only unindented skeleton rows inside a
+      // rendered fold block qualify, and each collapse segment must end in a
+      // suffix made entirely of literals the ordinary harvester recognizes.
+      if (isFoldSkeletonLine(rawLine, line, inFoldBlock)) {
+        for (const segment of line.split(' → ')) {
+          const parsed = parseInlineCoordinateSuffix(segment);
+          if (!parsed) continue;
+          for (const item of parsed.items) {
+            conserved.push(item.replace(/\s+⟦[^⟧]*⟧$/u, '').trim());
           }
-          searchFrom = glyphIndex + 3;
         }
       }
       if (!inRawTraceCloset) continue;
@@ -785,40 +951,33 @@ export function extractCoordinateConservationCorpus(messages: readonly FoldMessa
 export function dedupeCoordinateClosetText(text: string, priorCoordinateCorpus: string): string {
   if (!priorCoordinateCorpus) return text;
   if (!text.includes(COORDINATE_CLOSET_MARKER) && !text.includes(' ⌖ ')) return text;
+  let inFoldBlock = false;
   return text
     .split('\n')
     .map((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith(FOLD_BLOCK_HEADER_PREFIX)) {
+        inFoldBlock = true;
+        return line;
+      }
+      if (trimmed === FOLD_BLOCK_END_MARKER) {
+        inFoldBlock = false;
+        return line;
+      }
       const markerIndex = line.indexOf(COORDINATE_CLOSET_MARKER);
       if (markerIndex < 0) {
-        // Inline placement layout: filter ` ⌖ item · item` suffix segments
-        // per skeleton line. Collapse merge arrows (` → `) delimit segments
-        // and are never consumed, so emptied segments drop cleanly.
-        if (line.startsWith('(Context note') || !line.includes(' ⌖ ')) return line;
-        let rebuilt = '';
-        let cursor = 0;
-        for (;;) {
-          const glyphIndex = line.indexOf(' ⌖ ', cursor);
-          if (glyphIndex < 0) {
-            rebuilt += line.slice(cursor);
-            break;
-          }
-          // ' ⌖ ' is 3 UTF-16 units (space, U+2316, space) — items start at +3.
-          const segmentStart = glyphIndex + 3;
-          const arrowIndex = line.indexOf(' → ', segmentStart);
-          const segmentEnd = arrowIndex < 0 ? line.length : arrowIndex;
-          const kept = line
-            .slice(segmentStart, segmentEnd)
-            .split(' · ')
-            .filter(Boolean)
-            .filter((item) => {
-              const bare = item.replace(/\s+⟦[^⟧]*⟧$/u, '').trim();
-              return !isConservedIn(priorCoordinateCorpus, bare);
-            });
-          rebuilt += line.slice(cursor, glyphIndex) + (kept.length > 0 ? ` ⌖ ${kept.join(' · ')}` : '');
-          cursor = segmentEnd;
-        }
-        return rebuilt;
+        if (!isFoldSkeletonLine(line, trimmed, inFoldBlock) || !line.includes(' ⌖ ')) return line;
+        return line.split(' → ').map((segment) => {
+          const parsed = parseInlineCoordinateSuffix(segment);
+          if (!parsed) return segment;
+          const kept = parsed.items.filter((item) => {
+            const bare = item.replace(/\s+⟦[^⟧]*⟧$/u, '').trim();
+            return !isConservedIn(priorCoordinateCorpus, bare);
+          });
+          return kept.length > 0 ? `${parsed.prefix} ⌖ ${kept.join(' · ')}` : parsed.prefix;
+        }).join(' → ');
       }
+      if (line.slice(0, markerIndex).trim().length > 0) return line;
       const itemsIndex = line.indexOf(': ', markerIndex + COORDINATE_CLOSET_MARKER.length);
       if (itemsIndex < 0) return line;
       const kept = line
@@ -1131,8 +1290,8 @@ export interface ExtractedToolCall {
    *  source pointer. Falls back to the call-site message when the result
    *  hasn't arrived (pending call). */
   messageIndex: number;
-  /** Source time of the outcome message when the window carries tsMs.
-   *  Undefined stays explicitly unknown — never substituted with fold time. */
+  /** Source time of the outcome message when the result carries tsMs.
+   *  Undefined stays explicitly unknown — never substituted with call/fold time. */
   tsMs?: number;
 }
 
@@ -1187,7 +1346,7 @@ export function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall
               : Array.isArray(block.content)
                 ? block.content.map((b: any) => typeof b === 'string' ? b : b?.text ?? JSON.stringify(b)).join('\n')
                 : JSON.stringify(block.content ?? '');
-            calls.push({ name: p.name, input: p.input, resultText: rt, toolId: block.tool_use_id, messageIndex, tsMs: msg.tsMs ?? p.callTsMs });
+            calls.push({ name: p.name, input: p.input, resultText: rt, toolId: block.tool_use_id, messageIndex, tsMs: msg.tsMs });
             pending.delete(block.tool_use_id);
           }
         }
@@ -1200,7 +1359,7 @@ export function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall
       const p = pending.get(tcId);
       if (p) {
         const rt = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        calls.push({ name: p.name, input: p.input, resultText: rt, toolId: tcId, messageIndex, tsMs: msg.tsMs ?? p.callTsMs });
+        calls.push({ name: p.name, input: p.input, resultText: rt, toolId: tcId, messageIndex, tsMs: msg.tsMs });
         pending.delete(tcId);
       }
     }
@@ -1217,7 +1376,7 @@ export function extractToolCalls(turnMessages: FoldMessage[]): ExtractedToolCall
             const rt = typeof respObj.result === 'string'
               ? respObj.result
               : JSON.stringify(respObj.result ?? respObj);
-            calls.push({ name: p.name, input: p.input, resultText: rt, toolId: tcId, messageIndex, tsMs: msg.tsMs ?? p.callTsMs });
+            calls.push({ name: p.name, input: p.input, resultText: rt, toolId: tcId, messageIndex, tsMs: msg.tsMs });
             pending.delete(tcId);
           }
         }
@@ -1930,10 +2089,78 @@ const COORDINATION_TOOLS = new Set([
   'mcp__brain-mcp__brain_rebirth', 'mcp__brain-mcp__brain_handoff', 'Agent',
 ]);
 
-const MUTATING_BASH_RE = /\b(npm run build|npm install|git commit|git push|rm |mkdir |mv |cp |chmod|make |cargo build|pip install|docker )\b/;
+/**
+ * Quoted spans are data, not shell structure. Masking them before classification
+ * stops a search *pattern* from faking shell syntax: `rg "npm install|docker
+ * build"` must not read as a pipeline into a mutation, and `echo "a > b"` must
+ * not read as a redirect. Commands that genuinely execute a quoted string
+ * (`sh -c`, `node -e`) are matched on the introducer instead, so masking never
+ * hides a real effect. Unbalanced quotes are left untouched.
+ */
+function maskQuotedSpans(command: string): string {
+  return command.replace(/'[^']*'|"[^"]*"/g, (span) => ' '.repeat(span.length));
+}
+
+/**
+ * Shell positions where a new command verb can begin: string start, after a
+ * separator, or after a wrapper that takes a command as its argument. Anchoring
+ * verbs here rather than bracketing them with `\b` is load-bearing — the prior
+ * pattern matched `rm ` with a trailing space followed by `\b`, which requires a
+ * *word* character after the space, so every real invocation (`rm -rf x`,
+ * `cp -r a b`, `mv /a /b`) fell through to the read lane while only toy forms
+ * like `mkdir newdir` matched.
+ */
+const CMD_POSITION = String.raw`(?:^|[\n;&|(){}\`]|-exec\b|-execdir\b)\s*(?:(?:sudo|nohup|time|command|xargs|env)\s+|\w+=\S*\s+)*`;
+
+/**
+ * Verbs that mutate the filesystem, processes, services, or remote state.
+ * Deliberately biased toward recall: a mis-promoted read renders a receipt that
+ * still carries its full command text, whereas a missed mutation collapses into
+ * a contentless read aggregate and the deletion becomes invisible to a
+ * successor. Bare verbs match on any argument shape; families whose verbs are
+ * usually read-only (`git`, `docker`, `kubectl`) are gated on the mutating
+ * subcommand so `git status` and `docker ps` stay reads.
+ */
+const MUTATION_VERB_SOURCES: readonly string[] = [
+  // Filesystem writes and deletions.
+  String.raw`(?:rm|rmdir|unlink|mv|cp|mkdir|touch|ln|truncate|dd|shred|tee|patch)\b`,
+  // Permissions and ownership.
+  String.raw`(?:chmod|chown|chgrp|setfacl)\b`,
+  // Process and service control.
+  String.raw`(?:kill|pkill|killall|pm2|systemctl|service|launchctl|supervisorctl)\b`,
+  // In-place stream editors (`sed -i`, `perl -pi -e`).
+  String.raw`(?:sed|perl|ruby)\s+(?:-[\w-]+\s+)*-[\w]*i`,
+  // Inline code execution — arbitrary effects, so mutation is the honest default.
+  String.raw`(?:(?:ba|z)?sh\s+-c|(?:node|tsx|python3?|perl|ruby|deno|bun)\s+-(?:e|c))\b`,
+  // Version control state changes (reads like status/log/diff stay reads).
+  String.raw`git\s+(?:commit|push|add|rm|mv|reset|checkout|switch|restore|merge|rebase|stash|cherry-pick|revert|tag|branch|clean|apply|am|init|clone|remote|fetch|pull|submodule|worktree|gc|prune|filter-branch)\b`,
+  // Package manager mutations.
+  String.raw`(?:npm|pnpm|yarn|bun)\s+(?:install|ci|add|remove|rm|uninstall|update|upgrade|link|unlink|publish|prune|dedupe|i|run\s+build)\b`,
+  String.raw`(?:pip|pip3|uv|poetry|pipenv)\s+(?:install|uninstall|add|remove|sync|lock)\b`,
+  String.raw`(?:apt|apt-get|dnf|yum|zypper|pacman|apk|brew|port)\s+(?:install|remove|purge|upgrade|update|autoremove)\b`,
+  // Build and toolchain mutation.
+  String.raw`(?:make|ninja|gradle|gradlew|mvn|bazel|cmake)\b`,
+  String.raw`cargo\s+(?:build|install|publish|clean|add|remove|update|fix)\b`,
+  String.raw`go\s+(?:build|install|get|mod|generate|clean)\b`,
+  // Containers, clusters, remote sync.
+  String.raw`(?:docker|podman|nerdctl)\s+(?:run|build|rm|rmi|push|pull|create|start|stop|kill|restart|exec|compose|tag|commit|volume|network|system|prune)\b`,
+  String.raw`kubectl\s+(?:apply|create|delete|patch|replace|scale|rollout|edit|annotate|label|cordon|drain|taint)\b`,
+  String.raw`rclone\s+(?:copy|copyto|move|moveto|sync|delete|purge|mkdir|rmdir|deletefile|touch)\b`,
+  String.raw`(?:rsync|scp|sftp)\b`,
+];
+
+const MUTATING_COMMAND_RE = new RegExp(`${CMD_POSITION}(?:${MUTATION_VERB_SOURCES.join('|')})`);
+
+/**
+ * Shell redirection that writes a file. Excludes descriptor duplication
+ * (`2>&1`, `>&2`), comparison/arrow syntax (`=>`, `->`, `<>`), and discards to
+ * `/dev/null`, none of which change durable state.
+ */
+const REDIRECT_WRITE_RE = /(?:^|[^0-9>=<-])>>?\s*(?!&|\/dev\/null\b)[^\s;&|<>()]/;
 
 export function isMutatingBash(input: Record<string, unknown>): boolean {
-  return MUTATING_BASH_RE.test(String(input.command ?? ''));
+  const command = maskQuotedSpans(String(input.command ?? ''));
+  return MUTATING_COMMAND_RE.test(command) || REDIRECT_WRITE_RE.test(command);
 }
 
 export function classifyTurn(turnMessages: FoldMessage[]): TurnCategory {
@@ -2832,7 +3059,25 @@ export function foldContext(
     // them. `collapsed` still returns for foldSummaries metadata.
     if (config.artifactModeBody) {
       const rawSurvivors = survivors.flatMap(b => turns[b.ordinal]?.messages ?? []);
-      const { bodyLines, blockChars: artifactChars } = config.artifactModeBody(rawSurvivors);
+      const artifactBody = config.artifactModeBody(rawSurvivors);
+      const bodyLines = priorCoordinateCorpus
+        ? artifactBody.bodyLines.flatMap((rawLine) => {
+            const line = rawLine.trim();
+            if (!line.startsWith(ARTIFACT_LITERAL_POOL_PREFIX)) return [rawLine];
+            const retained = line
+              .slice(ARTIFACT_LITERAL_POOL_PREFIX.length)
+              .trim()
+              .split(' · ')
+              .map(item => item.trim())
+              .filter(item => item.length > 0 && !isConservedIn(priorCoordinateCorpus, item));
+            return retained.length > 0
+              ? [`${ARTIFACT_LITERAL_POOL_PREFIX} ${retained.join(' · ')}`]
+              : [];
+          })
+        : artifactBody.bodyLines;
+      const artifactChars = bodyLines === artifactBody.bodyLines
+        ? artifactBody.blockChars
+        : bodyLines.reduce((sum, line) => sum + line.length + 1, 0);
       const blockChars = artifactChars
         + foldBlockPreamble.length
         + tombstoneLines.reduce((s, line) => s + line.length, 0);
@@ -2915,9 +3160,11 @@ export function foldContext(
       }
     }
     // Coordinate placement — the flat-closet dissolve. Each admitted literal
-    // is attached to its EARLIEST nominating survivor turn — the artifact
-    // whose skeleton dropped it — and rendered as a ` ⌖ ` suffix on that
-    // turn's skeleton line. The suffix rides through collapseSequences, so a
+    // is attached to the earliest source-timed causal survivor when source
+    // time exists. Equal-time candidates use stable ordinal identity; when no
+    // causal candidate has source time, ordinal is only a deterministic
+    // unknown-time fallback (never represented as inferred chronology). The
+    // suffix rides through collapseSequences, so a
     // conserved literal renders inline with its causal turn (its blast
     // radius) instead of in a flat block-tail list. Mapping (never mutating
     // builtTurns) keeps eviction re-runs of assembleBlock idempotent.
@@ -2932,13 +3179,18 @@ export function foldContext(
     } else if (admittedCoords.length > 0) {
       const coordsByOrdinal = new Map<number, string[]>();
       for (const { lit, rendered } of admittedCoords) {
-        let home: number | undefined;
-        for (const built of survivors) {
-          if (built.nominationText.includes(lit) || built.userNominationText.includes(lit)) {
-            home = built.ordinal;
-            break; // survivors ascend in raw order: earliest origin is the artifact of record.
-          }
-        }
+        const causal = survivors.filter(built =>
+          built.nominationText.includes(lit) || built.userNominationText.includes(lit));
+        const sourceTimed = causal
+          .map(built => ({ built, sourceMs: built.folded.skeletonTimestamp
+            ? Date.parse(built.folded.skeletonTimestamp)
+            : Number.NaN }))
+          .filter(candidate => Number.isFinite(candidate.sourceMs))
+          .sort((a, b) => a.sourceMs - b.sourceMs || a.built.ordinal - b.built.ordinal);
+        const home = sourceTimed[0]?.built.ordinal
+          ?? causal.reduce<number | undefined>((lowest, built) => (
+            lowest === undefined || built.ordinal < lowest ? built.ordinal : lowest
+          ), undefined);
         // Fallback: the freshest surviving artifact. Nominations are drawn
         // from the survivors themselves, so a missing home should not occur;
         // attach rather than drop so every admitted literal is placed once.
@@ -3038,7 +3290,11 @@ export function foldContext(
     blockChars: block.blockChars,
   }, block.closetLine, block.tombstoneLines, counterStamp, foldBlockPreamble, block.bodyLines);
 
-  const foldedMessage: FoldMessage = { role: 'user', content: foldedBlockText };
+  const foldedMessage: FoldMessage = {
+    role: 'user',
+    content: foldedBlockText,
+    contextWarpSynthetic: 'folded-context',
+  };
   const ackMessage: FoldMessage = {
     role: 'assistant',
     content: 'Acknowledged. Continuing with the folded context from prior turns.',

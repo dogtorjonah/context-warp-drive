@@ -12,6 +12,11 @@ import {
   findRawRebirthSeedTraceEnd,
   renderRawRebirthSeed,
   placeRawTraceCoordinatesInline,
+  rawArtifactAnchorValueScore,
+  RAW_ARTIFACT_MODE_ANCHOR_CAP,
+  RAW_TRACE_COORDINATE_RECOVERY_ROUTE,
+  replayRawTraceCoordinateRecovery,
+  resolveRawTraceCoordinateSource,
   routeRawTraceCoordinates,
 } from '../src/rawRebirthSeed.ts';
 import type { RawTraceCoordinate, RawTraceCoordinateArtifact } from '../src/rawRebirthSeed.ts';
@@ -53,13 +58,7 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).toContain('source=source-agent:event#0..source-agent:event#42 n=42');
     expect(seed).toContain('topology=raw-history>artifact>seam>none host=continuity-package');
     expect(seed).toContain('raw-resumes=none (0 exact)');
-    expect(seed).toContain('── Rebirth Control (AUTHORITATIVE) ──');
-    expect(seed).toContain(
-      'authority horizon: authoritative at package creation; later unanswered operator messages, current live Task Rail state, and newer tail bands supersede conflicting fields without mutating this frozen block',
-    );
-    expect(seed).toContain(
-      'truth order after creation: later unanswered operator message > current live Task Rail state > newest tail band > this frozen control snapshot',
-    );
+    expect(seed).toContain('── Continuity Boundary (RECOVERY COORDINATES) ──');
     expect(seed).toContain('── Runtime Model ──');
     expect(seed).toContain('Predecessor trace: 42 events');
 
@@ -69,7 +68,6 @@ describe('raw rebirth seed renderer', () => {
     const closetIdx = seed.indexOf('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
     const neighborhoodsIdx = seed.indexOf('── Coordinate Blast Radius (harvested literals live with their cognitive artifacts; orphan literals get deterministic exact-match source excerpts, never LLM summaries) ──');
     const editIdx = seed.indexOf('── Active Edit Delta ──');
-    const railIdx = seed.indexOf('── Task Rail Context (process truth) ──');
     const workspaceIdx = seed.indexOf('── Workspace Context ──');
     const activityIdx = seed.indexOf('── Activity Log (canonical events and thought bubbles) ──');
     const orientationIdx = seed.indexOf('── Orientation ──');
@@ -80,13 +78,14 @@ describe('raw rebirth seed renderer', () => {
     expect(closetIdx).toBeGreaterThan(starIdx);
     expect(neighborhoodsIdx).toBeGreaterThan(closetIdx);
     expect(editIdx).toBeGreaterThan(neighborhoodsIdx);
-    expect(railIdx).toBeGreaterThan(editIdx);
-    expect(workspaceIdx).toBeGreaterThan(railIdx);
+    expect(workspaceIdx).toBeGreaterThan(editIdx);
     expect(activityIdx).toBeGreaterThan(workspaceIdx);
     expect(orientationIdx).toBeGreaterThan(activityIdx);
+    expect(seed).not.toContain('── Task Rail Context');
+    expect(seed).not.toContain('Standalone Raw Rebirth Seed API');
   });
 
-  test('renders the current Resume Point next action and preserves legacy fallback', () => {
+  test('retains the current resume-point step while excluding the remaining rail telemetry', () => {
     const current = renderRawRebirthSeed({
       predecessorName: 'source-agent',
       resumePoint: [
@@ -96,14 +95,17 @@ describe('raw rebirth seed renderer', () => {
         '↪ After active step: queued [pending] — Run parity',
       ].join('\n'),
     });
-    expect(current).toContain('immediate next action: ⏭ Next action: Apply the exact active instruction');
-    expect(current).not.toContain('immediate next action: unknown');
+    expect(current).toContain('── Continuity Boundary (RECOVERY COORDINATES) ──');
+    expect(current).toContain('current task-rail step · ▶ Active: reconcile [active] — Reconcile authoritative state');
+    expect(current).not.toContain('Task queue (continuity-state)');
+    expect(current).not.toContain('Apply the exact active instruction');
+    expect(current).not.toContain('Run parity');
 
     const legacy = renderRawRebirthSeed({
       predecessorName: 'source-agent',
       resumePoint: '⏭ Next: Continue from the legacy package',
     });
-    expect(legacy).toContain('immediate next action: ⏭ Next: Continue from the legacy package');
+    expect(legacy).not.toContain('Continue from the legacy package');
   });
 
   test('renders one authoritative active request body and suppresses lower-tier duplicates', () => {
@@ -118,9 +120,10 @@ describe('raw rebirth seed renderer', () => {
 
     expect(seed.match(new RegExp(activeRequest, 'g'))).toHaveLength(1);
     expect(seed).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
-    expect(seed).toContain('raw-resumes=source-agent:event#live-frontier (1 exact)');
-    expect(seed).toContain('active request (verbatim; sole authoritative body):');
-    expect(seed).not.toContain('── Last User + AI Messages (READ FIRST) ──');
+    expect(seed).toContain('raw-resumes=source-agent:event#live-frontier @ time unknown (1 exact)');
+    expect(seed).toContain('── Last User + AI Messages (READ FIRST) ──');
+    expect(seed).toContain(`👤 LAST USER MESSAGE (active request):\n${activeRequest}`);
+    expect(seed).not.toContain('active request (verbatim; sole authoritative body)');
   });
 
   test('keeps a hazard-only predecessor remainder separate from assistant speech', () => {
@@ -136,15 +139,14 @@ describe('raw rebirth seed renderer', () => {
       userMessageTriggered: true,
     });
 
-    expect(seed).toContain('── Unresolved Provider/Runtime Error (READ FIRST) ──');
+    expect(seed).toContain('── Last User + AI Messages (READ FIRST) ──');
+    expect(seed).toContain('⚠️ UNRESOLVED PROVIDER/RUNTIME ERROR (not assistant speech):');
     expect(seed).toContain(providerError);
     expect(seed).not.toContain('── Last AI Message (READ FIRST) ──');
     expect(seed.match(new RegExp(activeRequest, 'g'))).toHaveLength(1);
   });
 
-  test('keeps a mid-length active request byte-complete under the verbatim label', () => {
-    // 2000+ chars: the old 1500-char cap silently excerpted this while the
-    // label still claimed 'verbatim'; the 6000-char cap carries it whole.
+  test('keeps a mid-length active request byte-complete in READ FIRST', () => {
     const midRequest = `MID_HEAD_${'B'.repeat(2_000)}_MID_TAIL`;
     const seed = renderRawRebirthSeed({
       predecessorName: 'source-agent',
@@ -152,11 +154,27 @@ describe('raw rebirth seed renderer', () => {
       userMessageTriggered: true,
     });
 
-    expect(seed).toContain(`active request (verbatim; sole authoritative body):\n${midRequest}`);
-    expect(seed).not.toContain('active request (EXCERPT');
+    expect(seed).toContain(`👤 LAST USER MESSAGE (active request):\n${midRequest}`);
+    expect(seed).not.toContain('chars omitted');
   });
 
-  test('labels an over-cap active request as an honest excerpt, never verbatim', () => {
+  test('replaces a stale supplied user block with the authoritative active request', () => {
+    const seed = renderRawRebirthSeed({
+      predecessorName: 'source-agent',
+      lastUserAiMessages: [
+        '👤 LAST USER MESSAGE [message 4]:\nStale predecessor request.',
+        '🤖 LAST AI MESSAGE [message 5]:\nExact predecessor handoff.',
+      ].join('\n\n'),
+      triggeringUserMessage: 'Newest active request.',
+      userMessageTriggered: true,
+    });
+
+    expect(seed).toContain('👤 LAST USER MESSAGE (active request):\nNewest active request.');
+    expect(seed).toContain('🤖 LAST AI MESSAGE [message 5]:\nExact predecessor handoff.');
+    expect(seed).not.toContain('Stale predecessor request.');
+  });
+
+  test('keeps a formerly over-cap active request byte-complete in READ FIRST', () => {
     const hugeRequest = `HEAD_${'C'.repeat(7_000)}_TAIL`;
     const seed = renderRawRebirthSeed({
       predecessorName: 'source-agent',
@@ -164,16 +182,11 @@ describe('raw rebirth seed renderer', () => {
       userMessageTriggered: true,
     });
 
-    expect(seed).not.toContain('active request (verbatim');
-    expect(seed).toContain(
-      `active request (EXCERPT — ${hugeRequest.length} chars total, middle elided; full text via tap_instance_messages; sole authoritative body):`,
-    );
-    expect(seed).toContain('chars omitted');
-    expect(seed).toContain('HEAD_');
-    expect(seed).toContain('_TAIL');
+    expect(seed).toContain(`👤 LAST USER MESSAGE (active request):\n${hugeRequest}`);
+    expect(seed).not.toContain('chars omitted');
   });
 
-  test('preserves boundary whitespace before calling an active request verbatim', () => {
+  test('preserves active-request boundary whitespace in READ FIRST', () => {
     const whitespaceRequest = '\n  preserve this indentation\n  and trailing spaces  \n';
     const seed = renderRawRebirthSeed({
       predecessorName: 'source-agent',
@@ -181,9 +194,7 @@ describe('raw rebirth seed renderer', () => {
       userMessageTriggered: true,
     });
 
-    expect(seed).toContain(
-      `active request (verbatim; sole authoritative body):\n${whitespaceRequest}`,
-    );
+    expect(seed).toContain(`👤 LAST USER MESSAGE (active request):\n${whitespaceRequest}`);
   });
 
   test('uses the final AI header when the active request quotes an AI marker', () => {
@@ -195,16 +206,14 @@ describe('raw rebirth seed renderer', () => {
       lastUserAiMessages: `👤 LAST USER MESSAGE (active request):\n${trigger}\n\n🤖 LAST AI MESSAGE:\nActual predecessor state.`,
     });
 
-    const aiRemainder = seed.split('── Last AI Message (READ FIRST) ──')[1] ?? '';
-    const aiSection = aiRemainder.split('\n── ', 1)[0] ?? '';
+    const aiSection = seed.split('── Last User + AI Messages (READ FIRST) ──')[1]
+      ?.split('\n── ', 1)[0] ?? '';
     expect(aiSection).toContain('🤖 LAST AI MESSAGE:\nActual predecessor state.');
-    expect(aiSection).not.toContain('not the assistant boundary');
+    expect(aiSection.lastIndexOf('🤖 LAST AI MESSAGE:'))
+      .toBeGreaterThan(aiSection.indexOf('not the assistant boundary'));
   });
 
-  test('preserves the last AI message when a bundled trigger suppresses the user half', () => {
-    // The user half duplicates the control capsule's authoritative active
-    // request, so it is stripped — but the AI half must survive: with no
-    // current thread it is the only copy of the predecessor's last words.
+  test('preserves both halves of the bundled user and AI handoff', () => {
     const trigger = 'TRIGGER_TOKEN_ZK41 please fix the flaky retry test';
     const seed = renderRawRebirthSeed({
       predecessorName: 'source-agent',
@@ -213,10 +222,9 @@ describe('raw rebirth seed renderer', () => {
       lastUserAiMessages: `👤 LAST USER MESSAGE:\n${trigger}\n\n🤖 LAST AI MESSAGE:\nPatched the retry backoff; validating now.`,
     });
 
-    expect(seed).toContain('── Last AI Message (READ FIRST) ──');
+    expect(seed).toContain('── Last User + AI Messages (READ FIRST) ──');
     expect(seed).toContain('Patched the retry backoff; validating now.');
-    expect(seed).not.toContain('👤 LAST USER MESSAGE');
-    // The active request body appears exactly once — in the control capsule.
+    expect(seed).toContain('👤 LAST USER MESSAGE');
     expect(seed.split('TRIGGER_TOKEN_ZK41').length - 1).toBe(1);
   });
 
@@ -248,7 +256,7 @@ describe('raw rebirth seed renderer', () => {
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.thinkingTrail).toBe(40_000);
   });
 
-  test('allocates tight budgets with relay priority even when render order differs', () => {
+  test('omits coordination, squad, and delegated process surfaces', () => {
     const baseLength = renderRawRebirthSeed({
       predecessorName: 'priority-agent',
     }).length;
@@ -265,8 +273,8 @@ describe('raw rebirth seed renderer', () => {
       delegatedWork: `DELEGATED_PRIORITY_MARKER ${'d'.repeat(200)}`,
     });
 
-    expect(seed).toContain('COORDINATION_PRIORITY_MARKER');
-    expect(seed).toContain('SQUAD_PRIORITY_MARKER');
+    expect(seed).not.toContain('COORDINATION_PRIORITY_MARKER');
+    expect(seed).not.toContain('SQUAD_PRIORITY_MARKER');
     expect(seed).not.toContain('DELEGATED_PRIORITY_MARKER');
   });
 
@@ -282,6 +290,7 @@ describe('raw rebirth seed renderer', () => {
   });
 
   test('builds the raw trace Coordinate Closet newest-first from visible trace text', () => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
     const closet = buildRawTraceCoordinateCloset([
       { type: 'assistant_text', text: 'older path /repo/src/old.ts and rail-old-123456' },
       { type: 'tool_result', text: 'newer path /repo/src/new.ts and rail-new-abcdef' },
@@ -372,7 +381,7 @@ describe('raw rebirth seed renderer', () => {
     ], { maxNeighborhoods: 0 })).toBe('');
   });
 
-  test('keeps active edit and task rail process truth ahead of trace neighborhoods under budget pressure', () => {
+  test('keeps active edits while omitting task-rail process truth under budget pressure', () => {
     const seed = renderRawRebirthSeed({
       predecessorName: 'priority-agent',
       packageBudget: 10_000,
@@ -384,7 +393,7 @@ describe('raw rebirth seed renderer', () => {
     });
 
     expect(seed).toContain('ACTIVE_PROCESS_TRUTH');
-    expect(seed).toContain('TASK_RAIL_PROCESS_TRUTH');
+    expect(seed).not.toContain('TASK_RAIL_PROCESS_TRUTH');
     expect(seed).toContain('artifact=continuity-package#custom class=reconstructed-state');
     expect(seed.length).toBeLessThanOrEqual(10_000);
   });
@@ -461,7 +470,8 @@ describe('raw rebirth seed renderer', () => {
     });
   });
 
-  test('renders each routed literal once and leaves stable artifact pointers at duplicate sites', () => {
+  test('keeps artifact prose immutable and resolves compact refs in one appendix', () => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
     const coordinate: RawTraceCoordinate = {
       literal: 'rail-inline-once-123456',
       labelled: 'rail-inline-once-123456 (rail)',
@@ -478,11 +488,15 @@ describe('raw rebirth seed renderer', () => {
       },
       { id: 'artifact-sibling', text: 'first rail-inline-once-123456 and duplicate rail-inline-once-123456' },
     ]);
-    const rendered = placed.artifacts.map((artifact) => artifact.text).join('\n');
-
-    expect(rendered.match(/rail-inline-once-123456/gu)).toHaveLength(1);
-    expect(rendered.match(/〔⌖→artifact-home〕/gu)).toHaveLength(2);
-    expect(rendered).toContain('source-time=2026-07-19T10:00:00.000Z; route=structural');
+    expect(placed.artifacts[0]!.text).toBe('structural home without the literal\nProvenance: ⌖c1');
+    expect(placed.artifacts[1]!.text).toBe(
+      'first rail-inline-once-123456 and duplicate rail-inline-once-123456',
+    );
+    expect(placed.appendix).toContain('⌖c1 rail-inline-once-123456 (rail) @');
+    expect(placed.appendix).toContain(
+      'source-time=2026-07-19T10:00:00.000Z; route=structural; artifact=artifact-home',
+    );
+    expect(placed.artifacts.map((artifact) => artifact.text).join('\n')).not.toContain('〔⌖→');
   });
 
   test('conserves a hyphen-suffixed coordinate verbatim when a bare-path prefix is placed elsewhere', () => {
@@ -512,15 +526,163 @@ describe('raw rebirth seed renderer', () => {
     ]);
     const rendered = placed.artifacts.map((artifact) => artifact.text).join('\n');
 
-    // The hyphen-suffixed literal survives verbatim and is never corrupted into a pointer tail.
-    expect(rendered).toContain('relay/src/rebirthPackageBuilder.ts-2834');
-    expect(rendered).not.toMatch(/〔⌖→[^〕]+〕-2834/u);
-    // Both coordinates still render as their own inline rows.
-    expect(rendered).toMatch(/⌖ relay\/src\/rebirthPackageBuilder\.ts @ /u);
-    expect(rendered).toMatch(/⌖ relay\/src\/rebirthPackageBuilder\.ts-2834 @ /u);
+    expect(rendered).not.toContain('〔⌖→');
+    expect(placed.appendix).toContain('relay/src/rebirthPackageBuilder.ts-2834');
+    expect(placed.appendix).toMatch(/⌖c\d+ relay\/src\/rebirthPackageBuilder\.ts @ /u);
+    expect(placed.appendix).toMatch(/⌖c\d+ relay\/src\/rebirthPackageBuilder\.ts-2834 @ /u);
   });
 
-  test('routes carried and orphan coordinates inline exactly once with no residual blast list', () => {
+  test('artifact anchor caps rank active paths and durable ids ahead of newer key/value literals', () => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '1');
+    const coordinate = (literal: string, index: number): RawTraceCoordinate => ({
+      literal,
+      labelled: literal,
+      index,
+      sourceIndex: index,
+      sourceRole: 'assistant',
+      sourceTimestamp: '2026-07-20T08:00:00.000Z',
+    });
+    const lowValue = Array.from({ length: RAW_ARTIFACT_MODE_ANCHOR_CAP + 4 }, (_, index) => (
+      coordinate(`key${index}=value${index}`, index + 10)
+    ));
+    const activePath = coordinate('/repo/src/active-now.ts', 0);
+    const uuid = coordinate('1543b10b-91e7-49e9-b237-5b63d59731b3', 1);
+    const placed = placeRawTraceCoordinatesInline(
+      [...lowValue, activePath, uuid],
+      [{ id: 'active-edit-delta', text: 'active edit body' }],
+    );
+    const text = placed.artifacts[0]!.text;
+
+    expect(rawArtifactAnchorValueScore(activePath.literal, 'active-edit-delta'))
+      .toBeGreaterThan(rawArtifactAnchorValueScore('key39=value39', 'active-edit-delta'));
+    expect(text).toBe('active edit body\nProvenance: ' + Array.from(
+      { length: RAW_ARTIFACT_MODE_ANCHOR_CAP },
+      (_, index) => `⌖c${index + 1}`,
+    ).join(' '));
+    expect(placed.appendix).toContain('/repo/src/active-now.ts @');
+    expect(placed.appendix).toContain('1543b10b-91e7-49e9-b237-5b63d59731b3 @');
+    expect(placed.appendix).toContain('6 more provenance coordinate(s) elided');
+  });
+
+  test('states exact appendix elision and replays the named route to source identity and time', () => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '1');
+    const messages: FoldMessage[] = Array.from(
+      { length: RAW_ARTIFACT_MODE_ANCHOR_CAP + 6 },
+      (_unused, index) => ({
+        role: 'assistant',
+        content: `Inspect /repo/src/recover-${index}.ts`,
+        sourceIdentity: `instance-a:event#${index}`,
+        tsMs: Date.parse(`2026-07-21T22:00:${String(index).padStart(2, '0')}.000Z`),
+      }),
+    );
+    const replay = replayRawTraceCoordinateRecovery(messages);
+    const pathCoordinates = replay.recovered
+      .filter((entry) => entry.coordinate.literal.startsWith('/repo/'));
+
+    expect(replay.route).toBe(RAW_TRACE_COORDINATE_RECOVERY_ROUTE);
+    expect(pathCoordinates).toHaveLength(RAW_ARTIFACT_MODE_ANCHOR_CAP + 6);
+    for (const recovered of pathCoordinates) {
+      expect(recovered.sourceRow).toBe(messages[recovered.sourceIndex]);
+      expect(recovered.sourceIdentity).toBe(messages[recovered.sourceIndex]!.sourceIdentity);
+      expect(recovered.sourceTimestamp).toBe(new Date(messages[recovered.sourceIndex]!.tsMs!).toISOString());
+      expect(resolveRawTraceCoordinateSource(recovered.coordinate, messages)).toEqual(recovered);
+    }
+
+    const placed = placeRawTraceCoordinatesInline(
+      pathCoordinates.map((entry) => entry.coordinate),
+      [{ id: 'active-edit-delta', text: 'active edit body' }],
+      { maxAppendixChars: 100_000 },
+    );
+    expect(placed).toMatchObject({
+      totalCoordinates: RAW_ARTIFACT_MODE_ANCHOR_CAP + 6,
+      renderedCoordinates: RAW_ARTIFACT_MODE_ANCHOR_CAP,
+      elidedCoordinates: 6,
+      recoveryRoute: RAW_TRACE_COORDINATE_RECOVERY_ROUTE,
+    });
+    expect(placed.appendix).toContain(
+      `…6 more provenance coordinate(s) elided (total=${RAW_ARTIFACT_MODE_ANCHOR_CAP + 6}; rendered=${RAW_ARTIFACT_MODE_ANCHOR_CAP}); recover=${RAW_TRACE_COORDINATE_RECOVERY_ROUTE}`,
+    );
+    expect(placed.appendix).toMatch(/source-id=instance-a:event#\d+; source-time=2026-07-21T22:00:/u);
+
+    const receiptOnly = placeRawTraceCoordinatesInline(
+      pathCoordinates.map((entry) => entry.coordinate),
+      [{ id: 'active-edit-delta', text: 'active edit body' }],
+      { maxAppendixChars: 1 },
+    );
+    expect(receiptOnly.renderedCoordinates).toBe(0);
+    expect(receiptOnly.elidedCoordinates).toBe(RAW_ARTIFACT_MODE_ANCHOR_CAP + 6);
+    expect(receiptOnly.appendix).toBe(
+      `…${RAW_ARTIFACT_MODE_ANCHOR_CAP + 6} more provenance coordinate(s) elided (total=${RAW_ARTIFACT_MODE_ANCHOR_CAP + 6}; rendered=0); recover=${RAW_TRACE_COORDINATE_RECOVERY_ROUTE}`,
+    );
+
+    const budgetedSeed = buildRawRebirthSeedFromMessages(messages, {
+      predecessorName: 'receipt-budget-agent',
+      rawTraceCoordinateClosetChars: 1,
+      sectionMaxChars: { rawTraceCoordinateCloset: 80 },
+      packageBudget: 30_000,
+    });
+    expect(budgetedSeed).toContain(
+      `…${replay.totalCoordinates} more provenance coordinate(s) elided (total=${replay.totalCoordinates}; rendered=0); recover=${RAW_TRACE_COORDINATE_RECOVERY_ROUTE}`,
+    );
+
+    const filteredReplay = replayRawTraceCoordinateRecovery([
+      ...messages,
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{
+          id: 'call_task_rail_replay',
+          function: { name: 'mcp__voxxo__task_rail', arguments: '{}' },
+        }],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_task_rail_replay',
+        content: 'hidden control coordinate /repo/src/task-rail-only.ts',
+      },
+    ]);
+    expect(filteredReplay.totalCoordinates).toBe(replay.totalCoordinates);
+    expect(filteredReplay.recovered.some((entry) => (
+      entry.coordinate.literal.includes('task-rail-only')
+    ))).toBe(false);
+
+    const unknownTimeReplay = replayRawTraceCoordinateRecovery([{
+      role: 'assistant',
+      content: 'Inspect /repo/src/invalid-provider-time.ts',
+      sourceIdentity: 'instance-a:event#invalid-time',
+      tsMs: Number.MAX_VALUE,
+    }]);
+    expect(unknownTimeReplay.recovered).toHaveLength(1);
+    expect(unknownTimeReplay.recovered[0]).toMatchObject({
+      sourceIdentity: 'instance-a:event#invalid-time',
+      sourceTimestamp: null,
+    });
+    expect(unknownTimeReplay.recovered[0]!.coordinate.sourceTimestamp).toBeUndefined();
+
+    expect(resolveRawTraceCoordinateSource({
+      ...pathCoordinates[0]!.coordinate,
+      sourceIdentity: 'different-instance:event#0',
+    }, messages)).toBeNull();
+
+    const invalidTimeMessages: FoldMessage[] = [{
+      role: 'assistant',
+      content: 'Inspect /repo/src/unknown-time.ts',
+      sourceIdentity: 'instance-a:event#unknown-time',
+      tsMs: Number.MAX_VALUE,
+    }];
+    const invalidTimeReplay = replayRawTraceCoordinateRecovery(invalidTimeMessages);
+    const invalidTimePath = invalidTimeReplay.recovered.find(
+      (entry) => entry.coordinate.literal === '/repo/src/unknown-time.ts',
+    );
+    expect(invalidTimePath).toMatchObject({
+      sourceIndex: 0,
+      sourceIdentity: 'instance-a:event#unknown-time',
+      sourceTimestamp: null,
+    });
+  });
+
+  test('routes carried and orphan coordinates through compact refs and one appendix', () => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
     const messages: FoldMessage[] = [
       { role: 'user', content: 'Investigate rail-buried-context-123456.' },
       { role: 'assistant', content: 'The relevant implementation is /repo/src/buried.ts.' },
@@ -538,17 +700,16 @@ describe('raw rebirth seed renderer', () => {
       packageBudget: 30_000,
     });
 
-    // Every harvested coordinate is re-homed to one artifact row; duplicate
-    // spellings in sibling sections become stable pointers.
+    // Readable sections are never rewritten; compact refs resolve in one
+    // bounded appendix instead of raw coordinate rows flooding prose.
     expect(seed).toContain('rail-buried-context-123456');
     expect(seed).toContain('preserve the retry invariant');
     expect(seed).not.toContain('── Coordinate Blast Radius');
-    expect(seed.match(/rail-buried-context-123456/gu)).toHaveLength(1);
-    expect(seed.match(/\/repo\/src\/buried\.ts/gu)).toHaveLength(1);
-    expect(seed.match(/retryLimit=7/gu)).toHaveLength(1);
+    expect(seed).toContain('── Compact Provenance Appendix (resolve ⌖cN refs here) ──');
+    expect(seed).not.toContain('〔⌖→');
 
     // An orphan coordinate truncated out of every artifact still receives a
-    // deterministic inline placement without synthesizing source chronology.
+    // deterministic appendix entry without synthesizing source chronology.
     const orphanId = 'e5f6a7b8c9d0';
     const orphanMessages: FoldMessage[] = [
       { role: 'user', content: 'Investigate the deploy failure.' },
@@ -565,8 +726,8 @@ describe('raw rebirth seed renderer', () => {
       packageBudget: 30_000,
     });
     expect(orphanSeed).toContain(orphanId);
-    expect(orphanSeed.match(new RegExp(orphanId, 'gu'))).toHaveLength(1);
     expect(orphanSeed).toContain('source-time=unknown; route=unknown-time-fallback');
+    expect(orphanSeed).toContain('── Compact Provenance Appendix');
     expect(orphanSeed).not.toContain('── Coordinate Blast Radius');
 
     const orphanIds = Array.from({ length: 8 }, (_unused, index) => `rail-orphan-${index}-123456`);
@@ -584,8 +745,10 @@ describe('raw rebirth seed renderer', () => {
       packageBudget: 40_000,
     });
     for (const id of orphanIds) {
-      expect(manyOrphanSeed.match(new RegExp(id, 'gu'))).toHaveLength(1);
+      expect(manyOrphanSeed.match(new RegExp(id, 'gu'))?.length ?? 0).toBeGreaterThanOrEqual(1);
     }
+    expect(manyOrphanSeed).toContain('── Compact Provenance Appendix');
+    expect(manyOrphanSeed).not.toContain('〔⌖→');
     expect(manyOrphanSeed).not.toContain('── Coordinate Blast Radius');
 
     const suppressed = buildRawRebirthSeedFromMessages(messages, {
@@ -671,10 +834,11 @@ describe('raw rebirth seed renderer', () => {
     ], 1_000);
 
     expect(closetEntries(closet).filter((entry) => entry.includes('home/jonah/voxxo-swarm/relay/src/instanceManagerImpl.ts')))
-      .toEqual([`${absolutePath} @ source=assistant message 1`]);
+      .toEqual([`${absolutePath} @ source=assistant message 1; source-id=unknown`]);
   });
 
   test('rejects closet noise fixtures while keeping durable coordinate fixtures', () => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
     const noise = [
       'n/g',
       'b/g',
@@ -791,6 +955,88 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).not.toContain('LIVE_TRIGGER_MARKER current request');
   });
 
+  test('removes task-rail provider calls and paired results from every raw-seed surface', () => {
+    const messages: FoldMessage[] = [
+      { role: 'user', content: 'Inspect the implementation.' },
+      {
+        role: 'assistant',
+        content: 'Checking internal progress.',
+        tool_calls: [{ id: 'call_task_rail_hidden', function: { name: 'mcp__voxxo__task_rail' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_task_rail_hidden', content: '[Task rail] rail-hidden-123456 step 2/5' },
+      {
+        role: 'assistant',
+        content: 'Reading the implementation.',
+        tool_calls: [{ id: 'call_read_visible', function: { name: 'Read' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_read_visible', content: '/repo/src/visible.ts' },
+      { role: 'assistant', content: 'Latest genuine assistant handoff.' },
+    ];
+    const seed = buildRawRebirthSeedFromMessages(
+      messages,
+      { predecessorName: 'rail-filter-agent', packageBudget: 30_000 },
+    );
+    const replay = replayRawTraceCoordinateRecovery(messages);
+    const replayLiterals = replay.recovered.map((entry) => entry.coordinate.literal);
+
+    expect(seed).not.toContain('task_rail');
+    expect(seed).not.toContain('Task rail');
+    expect(seed).not.toContain('rail-hidden-123456');
+    expect(seed).toContain('/repo/src/visible.ts');
+    expect(seed).toContain('Latest genuine assistant handoff.');
+    expect(replayLiterals).not.toContain('rail-hidden-123456');
+    expect(replayLiterals).toContain('/repo/src/visible.ts');
+  });
+
+  test('keeps the latest 15 genuine users and 15 assistants across a 5,000-row tool-heavy trace', () => {
+    const messages: FoldMessage[] = [];
+    for (let i = 1; i <= 16; i += 1) {
+      const suffix = i === 16 ? ' and I quoted [CONTEXT REBIRTH] for diagnosis' : '';
+      messages.push({ role: 'user', content: `operator-${String(i).padStart(2, '0')}${suffix}` });
+      messages.push({ role: 'assistant', content: `assistant-${String(i).padStart(2, '0')}` });
+      for (let j = 0; j < 20; j += 1) {
+        messages.push({ role: 'tool', content: `tool-noise-${i}-${j}` });
+      }
+    }
+    messages.push({ role: 'user', content: '[CONTEXT REBIRTH] injected control frame' });
+    while (messages.length < 5_000) {
+      messages.push({ role: 'tool', content: `tail-tool-noise-${messages.length}` });
+    }
+
+    const seed = buildRawRebirthSeedFromMessages(messages, {
+      predecessorName: 'long-trace-agent',
+      packageBudget: 100_000,
+    });
+    const thread = seed.split('── Current Thread ──')[1]!.split('\n── ', 1)[0]!;
+
+    expect(thread).not.toContain('operator-01');
+    expect(thread).not.toContain('assistant-01');
+    for (let i = 2; i <= 16; i += 1) {
+      expect(thread).toContain(`operator-${String(i).padStart(2, '0')}`);
+      expect(thread).toContain(`assistant-${String(i).padStart(2, '0')}`);
+    }
+    expect(thread).toContain('I quoted [CONTEXT REBIRTH] for diagnosis');
+    expect(thread).not.toContain('injected control frame');
+    expect(thread).not.toContain('tool-noise-16-19');
+    expect(thread).not.toContain('tail-tool-noise-');
+  });
+
+  test('uses the actual latest assistant as LAST AI instead of an older weighted glyph', () => {
+    const seed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: 'Please continue.' },
+      { role: 'assistant', content: '🏁 older verdict that is no longer the frontier' },
+      { role: 'assistant', content: 'Newest plain assistant frontier.' },
+    ], {
+      predecessorName: 'latest-ai-agent',
+      packageBudget: 30_000,
+    });
+    const lastAi = seed.split('── Last User + AI Messages (READ FIRST) ──')[1]!
+      .split('\n── ', 1)[0]!;
+
+    expect(lastAi).toContain('Newest plain assistant frontier.');
+    expect(lastAi).not.toContain('older verdict that is no longer the frontier');
+  });
+
   test('kill-switch restores the complete legacy raw closet and neighborhood layout', () => {
     vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1');
     const messages: FoldMessage[] = [
@@ -820,7 +1066,7 @@ describe('raw rebirth seed renderer', () => {
     expect(neighborhoods).not.toContain('⌖ literal: /repo/current.ts');
   });
 
-  test('compacts a long AI message to head+pointer in LAST AI MESSAGE, matching relay behavior', () => {
+  test('keeps a long AI message exact in READ FIRST', () => {
     const longAiMessage = 'A'.repeat(400);
     const messages: FoldMessage[] = [
       { role: 'user', content: 'Do the thing' },
@@ -839,10 +1085,8 @@ describe('raw rebirth seed renderer', () => {
     const currentThreadStart = seed.indexOf('── Current Thread ──');
     // Isolate just the LAST AI MESSAGE section (before Current Thread)
     const lastAiSection = seed.slice(lastAiStart, currentThreadStart);
-    // Should contain the pointer (with or without a [message N] coordinate)
-    expect(lastAiSection).toContain('[Full text appears below in Current Thread');
-    // Should not dump all 400 chars in the READ FIRST section
-    expect(lastAiSection.indexOf('A'.repeat(400))).toBe(-1);
+    expect(lastAiSection).toContain('A'.repeat(400));
+    expect(lastAiSection).not.toContain('[Full text appears below in Current Thread');
     // Full text should appear in Current Thread
     expect(seed.slice(currentThreadStart)).toContain('A'.repeat(400));
   });
@@ -1078,7 +1322,7 @@ describe('portable citation markers ([message N] refs)', () => {
     expect(seed).toContain('[message 1] 🤖 YOU:');
   });
 
-  test('truncated AI body pointer carries the [message N] coordinate', () => {
+  test('exact AI body retains the [message N] coordinate', () => {
     const longBody = `🏁 Verified the fold engine end to end. ${'The rolling fold preserves continuity across epochs and the freeze layer caches rendered bands. '.repeat(6)}`;
     const messages: FoldMessage[] = [
       { role: 'user', content: 'Run the full fold verification pass.' },
@@ -1093,7 +1337,8 @@ describe('portable citation markers ([message N] refs)', () => {
     });
 
     expect(seed).toContain('🤖 LAST AI MESSAGE [message 1]:');
-    expect(seed).toContain('[Full text appears below in Current Thread at [message 1].]');
+    expect(seed).toContain(longBody);
+    expect(seed).not.toContain('[Full text appears below in Current Thread');
   });
 
   test('VOXXO_REBIRTH_SEED_MSG_MARKERS=0 renders marker-free headers', () => {

@@ -3,13 +3,105 @@ import { describe, expect, it } from 'vitest';
 import {
   renderContinuityPackageProvenance,
   renderChronologicalProvenance,
+  renderChronologicalProvenanceCompact,
   renderTailEpochAliasProvenance,
   renderTailEpochProvenance,
+  resolveChronologicalPointToSourceRow,
   selectPairingSafeRawTailStart,
 } from '../chronologicalProvenance.ts';
 import { isSyntheticContextText, type FoldMessage } from '../rollingFold.ts';
 
 describe('chronological provenance', () => {
+  it('resolves a coordinate only when source row identity and time agree', () => {
+    const sourceRow = { role: 'assistant', content: 'source row' };
+    const rows = [{
+      row: sourceRow,
+      sourceIdentity: 'instance-a:event#17',
+      sourceTimestamp: '2026-07-21T22:00:00.000Z',
+    }];
+    const point = {
+      unit: 'message' as const,
+      index: 0,
+      id: 'instance-a:event#17',
+      timestamp: '2026-07-21T22:00:00.000Z',
+    };
+
+    expect(resolveChronologicalPointToSourceRow(point, rows)).toEqual({
+      row: sourceRow,
+      rowIndex: 0,
+      sourceIdentity: 'instance-a:event#17',
+      sourceTimestamp: '2026-07-21T22:00:00.000Z',
+    });
+    expect(resolveChronologicalPointToSourceRow(
+      { ...point, id: 'instance-b:event#17' },
+      rows,
+    )).toBeNull();
+    expect(resolveChronologicalPointToSourceRow(
+      { ...point, timestamp: '2026-07-21T22:00:01.000Z' },
+      rows,
+    )).toBeNull();
+    expect(resolveChronologicalPointToSourceRow(
+      { ...point, index: 99 },
+      rows,
+    )).toBeNull();
+    expect(resolveChronologicalPointToSourceRow(
+      { ...point, timestamp: 'not-a-source-time' },
+      rows,
+    )).toBeNull();
+    expect(resolveChronologicalPointToSourceRow(
+      { unit: 'message', id: 'instance-a:event#17' },
+      [...rows, rows[0]!],
+    )).toBeNull();
+  });
+
+  it('renders every missing source time explicitly without borrowing another clock', () => {
+    const envelope = {
+      artifact: 'timeless-recall',
+      contentClass: 'retrieved-history' as const,
+      source: {
+        start: { traceId: 'trace-time', unit: 'event' as const, index: 2 },
+        endExclusive: { traceId: 'trace-time', unit: 'event' as const, index: 5 },
+        count: 3,
+      },
+      transformedAt: { traceId: 'trace-time', unit: 'event' as const, index: 8 },
+      rawResumesAt: { traceId: 'trace-time', unit: 'event' as const, index: 5 },
+      authority: 'historical-background' as const,
+      supersession: 'explicit' as const,
+      supersededAt: { traceId: 'trace-time', unit: 'event' as const, index: 9 },
+      topology: {
+        host: 'dedicated-synthetic-message' as const,
+        previous: 'raw-history' as const,
+        next: 'raw-tail' as const,
+        representation: 'canonical' as const,
+        rawTailCount: 3,
+      },
+    };
+
+    for (const rendered of [
+      renderChronologicalProvenance(envelope),
+      renderChronologicalProvenanceCompact(envelope),
+    ]) {
+      expect(rendered).toContain(
+        'source=trace-time:event#2..trace-time:event#5 n=3 @ time unknown..time unknown',
+      );
+      expect(rendered).toContain('created=trace-time:event#8 @ time unknown');
+      expect(rendered).toContain('supersession=explicit:trace-time:event#9 @ time unknown');
+      expect(rendered).toContain('raw-resumes=trace-time:event#5 @ time unknown');
+    }
+
+    const partial = renderChronologicalProvenance({
+      ...envelope,
+      source: {
+        ...envelope.source,
+        start: { ...envelope.source.start, timestamp: '2026-07-20T08:00:00.000Z' },
+      },
+    });
+    expect(partial).toContain(
+      'source=trace-time:event#2..trace-time:event#5 n=3 @ 2026-07-20T08:00:00.000Z..time unknown',
+    );
+    expect(partial).not.toContain('2026-07-20T08:00:00.000Z..2026-07-20T08:00:00.000Z');
+  });
+
   it('renders source, transformation, authority, topology, and exact raw resumption', () => {
     const rendered = renderTailEpochProvenance({
       traceId: 'instance-1',
@@ -31,7 +123,7 @@ describe('chronological provenance', () => {
     expect(rendered).toContain('source=instance-1:message#12..instance-1:message#18 n=6');
     expect(rendered).toContain('created=instance-1:message#? @ 2026-07-11T04:06:00.000Z');
     expect(rendered).toContain('topology=frozen-prefix>artifact>seam>raw-tail host=dedicated-synthetic-message representation=canonical');
-    expect(rendered).toContain('raw-resumes=instance-1:message#18 (4 exact)');
+    expect(rendered).toContain('raw-resumes=instance-1:message#18 @ time unknown (4 exact)');
     expect(rendered).toContain(
       'stack=frozen-prefix>tail-epoch#3[message:12..18)>seam@2026-07-11T04:06:00.000Z>raw-tail@message#18(+4)',
     );
@@ -87,7 +179,7 @@ describe('chronological provenance', () => {
     expect(rendered).toContain('source=instance-1:event#0..instance-1:event#42 n=42');
     expect(rendered).toContain('created=instance-1:event#42');
     expect(rendered).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
-    expect(rendered).toContain('raw-resumes=instance-1:event#42 (1 exact)');
+    expect(rendered).toContain('raw-resumes=instance-1:event#42 @ time unknown (1 exact)');
   });
 
   it('makes a transient boundary notice an explicit alias of the canonical epoch', () => {
@@ -100,7 +192,7 @@ describe('chronological provenance', () => {
     expect(rendered).toContain('artifact=tail-epoch#4 class=boundary');
     expect(rendered).toContain('source=instance-1:event#canonical-source..instance-1:event#canonical-seam');
     expect(rendered).toContain('host=embedded-message-suffix representation=alias');
-    expect(rendered).toContain('raw-resumes=instance-1:event#this-message(2 exact)');
+    expect(rendered).toContain('raw-resumes=instance-1:event#this-message @ time unknown(2 exact)');
   });
 
   it('moves a raw-tail boundary left rather than orphaning a tool result', () => {

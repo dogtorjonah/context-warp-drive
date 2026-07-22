@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -18,8 +18,10 @@ import { fileURLToPath } from 'node:url';
  *     `trim`/`derived` informational only. Skipped when the monorepo relay
  *     tree is absent (standalone checkout).
  *  2. package ↔ standalone repo: every paired file — source AND tests —
- *     byte-compared. Only the declared allowlists (package-only artifacts,
- *     expected standalone identity drift) are exempt; anything else fails.
+ *     byte-compared. Explicit path-pairs cover tests that the standalone
+ *     publishes under `test/` instead of the package's `src/__tests__/`.
+ *     Only documented identity/host-enrichment variants and package-only
+ *     artifacts are exempt; anything else fails.
  *
  * The allowlists below intentionally mirror the Forge server's declarations;
  * both surfaces must agree on what is exempt.
@@ -32,7 +34,7 @@ const RELAY_ROOT = join(REPO_ROOT, 'relay');
 const STANDALONE_ROOT =
   process.env.VOXXO_CONTEXT_WARP_STANDALONE_ROOT ?? '/home/jonah/context-warp-drive';
 
-type ManifestMode = 'identical' | 'shim' | 'trim' | 'derived';
+type ManifestMode = 'identical' | 'shim' | 'shim-host' | 'trim' | 'derived';
 interface ManifestEntry {
   pkg: string;
   src: string;
@@ -41,14 +43,24 @@ interface ManifestEntry {
 
 // Same declarations as relay/data/mcp-forge/context-warp-parity MANIFEST.
 const MANIFEST: ManifestEntry[] = [
+  { pkg: 'src/boundaryAuction.ts', src: 'relay/src/boundaryAuction.ts', mode: 'shim' },
+  { pkg: 'src/chronologicalProvenance.ts', src: 'relay/src/chronologicalProvenance.ts', mode: 'shim' },
+  // Relay re-exports the core and adds async Atlas snapshot hydration.
+  { pkg: 'src/cognitiveArtifacts.ts', src: 'relay/src/cognitiveArtifacts.ts', mode: 'shim-host' },
+  { pkg: 'src/contextBudget.ts', src: 'relay/src/contextBudget.ts', mode: 'shim' },
   { pkg: 'src/rollingFold.ts', src: 'relay/src/rollingFold.ts', mode: 'shim' },
+  { pkg: 'src/foldBirthHydration.ts', src: 'relay/src/foldBirthHydration.ts', mode: 'shim' },
   { pkg: 'src/foldFreeze.ts', src: 'relay/src/foldFreeze.ts', mode: 'shim' },
   { pkg: 'src/foldRecall.ts', src: 'relay/src/foldRecall.ts', mode: 'shim' },
+  { pkg: 'src/foldRecallUsage.ts', src: 'relay/src/foldRecallUsage.ts', mode: 'shim' },
+  { pkg: 'src/foldRailPrefetch.ts', src: 'relay/src/foldRailPrefetch.ts', mode: 'shim' },
+  { pkg: 'src/foldReceipts.ts', src: 'relay/src/foldReceipts.ts', mode: 'shim' },
   { pkg: 'src/foldTerms.ts', src: 'relay/src/foldTerms.ts', mode: 'shim' },
   { pkg: 'src/contextWindow.ts', src: 'relay/src/contextWindow.ts', mode: 'identical' },
   { pkg: 'src/foldEpisodes.ts', src: 'relay/src/foldEpisodes.ts', mode: 'shim' },
   { pkg: 'src/foldEpisodeCapture.ts', src: 'relay/src/foldEpisodeCapture.ts', mode: 'shim' },
   { pkg: 'src/foldPathCanon.ts', src: 'relay/src/foldPathCanon.ts', mode: 'shim' },
+  { pkg: 'src/microRebirthSeed.ts', src: 'relay/src/microRebirthSeed.ts', mode: 'shim' },
   { pkg: 'src/overwatch.ts', src: 'relay/src/overwatch.ts', mode: 'shim' },
   { pkg: 'src/persistence/sparseVector.ts', src: 'relay/src/persistence/sparseVector.ts', mode: 'identical' },
   { pkg: 'src/persistence/transcriptTypes.ts', src: 'relay/src/persistence/transcriptTypes.ts', mode: 'trim' },
@@ -58,12 +70,15 @@ const MANIFEST: ManifestEntry[] = [
 // Same declarations as the Forge server's standalone carve-outs.
 const EXPECTED_STANDALONE_DRIFT = new Set([
   '.gitignore',
+  'LICENSE',
   'README.md',
   'docs/architecture.md',
   'docs/context-folding.md',
   'examples/anthropic-loop.ts',
   'examples/openai-loop.ts',
   'package.json',
+  'src/__tests__/cognitiveArtifacts.test.ts',
+  'src/cognitiveArtifacts.ts',
   'src/index.ts',
   'tsup.config.ts',
 ]);
@@ -77,6 +92,40 @@ const EXPECTED_PACKAGE_ONLY = new Set([
   'scripts/build-synonym-map.py',
   'src/__tests__/overwatch.test.ts',
   'src/overwatch.ts',
+]);
+
+/** Package tests whose standalone mirror intentionally lives under `test/`. */
+const RELOCATED_STANDALONE_PAIRS = new Map<string, string>([
+  ['src/__tests__/foldArtifactMode.test.ts', 'test/foldArtifactMode.test.ts'],
+  ['src/__tests__/foldReconciliation.test.ts', 'test/foldReconciliation.test.ts'],
+  ['src/__tests__/foldReceipts.test.ts', 'test/foldReceipts.test.ts'],
+]);
+
+/**
+ * Normalize only the documented identity differences in relocated tests.
+ * Their shared test bodies must still compare byte-for-byte after normalization.
+ */
+const RELOCATED_TEST_NORMALIZERS = new Map<string, (source: string) => string>([
+  [
+    'src/__tests__/foldArtifactMode.test.ts',
+    (source) => source.replace("} from '../index.ts';", "} from '../src/index.ts';"),
+  ],
+  [
+    'src/__tests__/foldReconciliation.test.ts',
+    (source) => source
+      .replace("} from '../foldReconciliation.ts';", "} from '<fold-reconciliation>';")
+      .replace("} from '../src/foldReconciliation.ts';", "} from '<fold-reconciliation>';")
+      .replace("from '../foldReceipts.ts';", "from '<fold-receipts>';")
+      .replace("from '../src/foldReceipts.ts';", "from '<fold-receipts>';"),
+  ],
+  [
+    'src/__tests__/foldReceipts.test.ts',
+    (source) => source
+      .replace("} from '../index.ts';", "} from '<fold-receipts>';")
+      .replace("} from '../src/foldReceipts.ts';", "} from '<fold-receipts>';")
+      .replace("import type { FoldMessage } from '../index.ts';", "import type { FoldMessage } from '<rolling-fold>';")
+      .replace("import type { FoldMessage } from '../src/rollingFold.ts';", "import type { FoldMessage } from '<rolling-fold>';"),
+  ],
 ]);
 
 const IGNORE_DIRS = new Set(['.atlas', '.git', 'node_modules', 'dist', 'coverage', '.turbo', '.next']);
@@ -106,9 +155,9 @@ function walkFiles(root: string): string[] {
 }
 
 describe('relay ↔ package manifest parity (monorepo only)', () => {
-  it.skipIf(!existsSync(RELAY_ROOT))('shim files stay thin re-exports of the package copy', () => {
+  it.skipIf(!existsSync(RELAY_ROOT))('shim files re-export the package copy and only declared host shims carry integration logic', () => {
     const failures: string[] = [];
-    for (const entry of MANIFEST.filter((e) => e.mode === 'shim')) {
+    for (const entry of MANIFEST.filter((e) => e.mode === 'shim' || e.mode === 'shim-host')) {
       const relayAbs = join(REPO_ROOT, entry.src);
       const pkgAbs = join(PKG_ROOT, entry.pkg);
       if (!existsSync(pkgAbs)) {
@@ -121,9 +170,13 @@ describe('relay ↔ package manifest parity (monorepo only)', () => {
       }
       const text = readFileSync(relayAbs, 'utf8');
       const lines = text.split('\n').filter((l) => l.trim().length > 0);
-      if (!text.includes('export * from')) {
+      const match = text.match(/export\s+\*\s+from\s+['"]([^'"]+)['"]/);
+      const expectedTarget = relative(dirname(relayAbs), pkgAbs).replace(/\\/g, '/');
+      if (!match) {
         failures.push(`${entry.src}: no \`export * from\` re-export — shim replaced by a divergent copy?`);
-      } else if (lines.length > 10) {
+      } else if (match[1] !== expectedTarget) {
+        failures.push(`${entry.src}: re-export points at ${match[1]}, expected ${expectedTarget}`);
+      } else if (entry.mode === 'shim' && lines.length > 10) {
         failures.push(`${entry.src}: shim unexpectedly large (${lines.length}L) — body added alongside the re-export?`);
       }
     }
@@ -154,15 +207,22 @@ describe('package ↔ standalone mirror parity', () => {
     const standaloneFiles = new Set(existsSync(STANDALONE_ROOT) ? walkFiles(STANDALONE_ROOT) : []);
     for (const rel of packageFiles) {
       if (EXPECTED_PACKAGE_ONLY.has(rel)) continue;
-      if (!standaloneFiles.has(rel)) {
-        failures.push(`${rel}: present in package, missing in standalone`);
+      const standaloneRel = RELOCATED_STANDALONE_PAIRS.get(rel) ?? rel;
+      if (!standaloneFiles.has(standaloneRel)) {
+        failures.push(`${rel}: present in package, missing standalone pair ${standaloneRel}`);
         continue;
       }
       if (EXPECTED_STANDALONE_DRIFT.has(rel)) continue;
       const pkgBuf = readFileSync(join(PKG_ROOT, rel));
-      const standaloneBuf = readFileSync(join(STANDALONE_ROOT, rel));
-      if (!pkgBuf.equals(standaloneBuf)) {
-        failures.push(`${rel}: byte drift (package=${pkgBuf.length}B standalone=${standaloneBuf.length}B)`);
+      const standaloneBuf = readFileSync(join(STANDALONE_ROOT, standaloneRel));
+      const normalize = RELOCATED_TEST_NORMALIZERS.get(rel);
+      const comparablePkg = normalize ? Buffer.from(normalize(pkgBuf.toString('utf8'))) : pkgBuf;
+      const comparableStandalone = normalize
+        ? Buffer.from(normalize(standaloneBuf.toString('utf8')))
+        : standaloneBuf;
+      if (!comparablePkg.equals(comparableStandalone)) {
+        const driftKind = normalize ? 'normalized byte drift' : 'byte drift';
+        failures.push(`${rel} ↔ ${standaloneRel}: ${driftKind} (package=${pkgBuf.length}B standalone=${standaloneBuf.length}B)`);
       }
     }
     expect(failures).toEqual([]);

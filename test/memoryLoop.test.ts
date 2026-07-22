@@ -104,6 +104,31 @@ describe('MemoryLoop.prepare host-forced hard epoch forwarding', () => {
     expect(turnEntries.every((e) => e.kind === 'turn')).toBe(true);
   });
 
+  it.each([
+    'tail-runway-gate+hard-epoch',
+    'restore-integrity-failed',
+  ])('treats %s as a markerless hard epoch', async (epochReason) => {
+    const { loop, session } = createLoop();
+    const raw = history();
+    const hardOutcome = session.prepare(raw, { hardEpoch: true });
+
+    vi.spyOn(session, 'prepare').mockReturnValue({
+      ...hardOutcome,
+      stats: {
+        ...hardOutcome.stats,
+        epochReason,
+      },
+    });
+
+    const outcome = await loop.prepare(raw);
+    expect(outcome.fold.stats.epochReason).toBe(epochReason);
+
+    const index = loop.getRecallState().index;
+    expect(index).not.toBeNull();
+    expect(index!.rawCount).toBe(raw.length);
+    expect(index!.entries.filter((entry) => entry.kind === 'turn')).toHaveLength(2);
+  });
+
   it('does not force a hard epoch when hardEpoch is omitted and no pressure ceiling is configured', async () => {
     const { loop, session } = createLoop();
     const prepareSpy = vi.spyOn(session, 'prepare');

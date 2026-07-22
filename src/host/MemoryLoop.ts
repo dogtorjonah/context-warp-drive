@@ -179,13 +179,11 @@ export class MemoryLoop {
     const { session, recallConfig, recallState, syntheticContext } = this;
 
     // ── Step 1: FoldSession.prepare ──
-    // Build a portable hard-epoch seed with episodic sections ONLY when a hard
-    // epoch is imminent (pressure ceiling triggered). Building the seed every
-    // turn is wasteful — glyph log scans the entire history, episode recall hits
-    // the store, and the seed render is O(n) — but the seed is only consumed
-    // when FoldSession fires the hard-epoch path. When pressure is not triggered,
-    // let FoldSession compute its own lightweight fallback seed if one is ever
-    // needed (it won't be — the seed path only runs on pressure trigger).
+    // Build a portable hard-epoch seed with episodic sections only when a hard
+    // epoch is possible (an explicit reset or pressure-ceiling handling). In
+    // single-ceiling mode a pressure hit may append instead, but the prepared
+    // seed must still be available if the append gate falls back to a reset.
+    // Building it on every turn would scan the full history and episode store.
     const needsPortableSeed = context.hardEpochSeed == null
       && (context.hardEpoch === true
         || session.willTriggerPressureCeiling(context.measuredInputTokens));
@@ -221,7 +219,12 @@ export class MemoryLoop {
       // recall-addressable against the retained raw backing store. Parity with
       // the relay portable-reset commit (fcBaseSession) and the CLI engines'
       // isHardEpoch branches.
-      const isHardEpoch = foldOutcome.stats.epochReason === 'hard-epoch';
+      // Runway/yield fallbacks carry the gate in a compound reason, while a
+      // restored-state integrity failure has its own structural reason. Both
+      // replace the provider view with the same markerless hard-epoch seed.
+      const epochReason = foldOutcome.stats.epochReason;
+      const isHardEpoch = epochReason === 'restore-integrity-failed'
+        || (epochReason?.endsWith('hard-epoch') ?? false);
       recallState.index = buildFoldIndex(
         rawHistory,
         foldedView,
@@ -324,7 +327,8 @@ export class MemoryLoop {
   /**
    * Build a portable hard-epoch seed with lineage glyph log (verdict/hazard
    * trail) + trace-derived episodic cross-ref. Only called when a hard epoch
-   * is imminent (pressure ceiling triggered), to avoid wasting work every turn.
+   * is possible (explicit reset or pressure handling), avoiding work on turns
+   * that cannot enter the reset path.
    */
   private buildPortableHardEpochSeed(
     rawHistory: FoldMessage[],

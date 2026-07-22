@@ -14,8 +14,9 @@ import { contextWindowForModel } from './contextWindow.ts';
 //   M = 40K folded memory after a hard epoch
 //   P = THE ceiling — the only fold trigger. Uniform 180K base default; the
 //       per-engine/model tuning tables below (ENGINE/MODEL_PRESSURE_CEILING_
-//       DEFAULTS, Jonah 2026-07-10) raise the CLI surfaces: Codex CLI and the
-//       Claude Code CLI/tmux surfaces run P=220K. Below P nothing folds: no
+//       DEFAULTS, Jonah 2026-07-10) raise Codex CLI and the Claude Code
+//       CLI/tmux surfaces to P=220K; a surface-specific exception gives Fable 5 on
+//       Claude API its operator-selected P=250K. Below P nothing folds: no
 //       tail-size char gate, no calm-seal/warning override, no sub-ceiling
 //       deterministic trigger. Sessions hot-reuse the frozen prefix and ride a
 //       raw, full-fidelity live tail all the way up to P.
@@ -77,6 +78,251 @@ export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_RUNWAY_TOKENS = 10_000;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS = 30_000;
 export const DEFAULT_CONTEXT_BUDGET_CODEX_CLI_RECONSTRUCT_RUNWAY_TOKENS =
   DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS;
+
+export const SINGLE_CEILING_BAND_PROJECTION_FRACTION = 0.18;
+export const SINGLE_CEILING_APPEND_BAND_CAP_TOKENS = 25_000;
+
+/**
+ * Project the next single-ceiling append band from provider-measured occupancy.
+ * The fixed append target is only a clamp; callers must never use this fallback
+ * as pressure evidence when measuredInputTokens is absent.
+ */
+export function projectSingleCeilingAppendBandTokens(
+  measuredInputTokens: number | null | undefined,
+  postFoldFloorTokens: number | null | undefined,
+  appendBandTargetTokens: number,
+): number {
+  const bandFloor = Math.max(1, Math.floor(appendBandTargetTokens));
+  const measured = typeof measuredInputTokens === 'number'
+    && Number.isFinite(measuredInputTokens)
+    && measuredInputTokens > 0
+      ? Math.floor(measuredInputTokens)
+      : null;
+  if (measured === null) return bandFloor;
+  const floor = typeof postFoldFloorTokens === 'number'
+    && Number.isFinite(postFoldFloorTokens)
+    && postFoldFloorTokens > 0
+      ? Math.floor(postFoldFloorTokens)
+      : null;
+  const effectiveFloor = floor === null || measured <= floor ? 0 : floor;
+  const projected = Math.round(
+    (measured - effectiveFloor) * SINGLE_CEILING_BAND_PROJECTION_FRACTION,
+  );
+  return Math.min(
+    SINGLE_CEILING_APPEND_BAND_CAP_TOKENS,
+    Math.max(bandFloor, projected),
+  );
+}
+
+export type MeasuredEpochEligibilityDecision =
+  | 'reuse'
+  | 'append'
+  | 'hard-epoch'
+  | 'unknown';
+
+export type MeasuredEpochEligibilityReason =
+  | 'telemetry-unavailable'
+  | 'pressure-disabled'
+  | 'below-single-ceiling'
+  | 'no-tail-epoch'
+  | 'append-disabled'
+  | 'governor-pressure'
+  | 'pressure-ceiling'
+  | 'runway-holds'
+  | 'runway-exhausted';
+
+export interface MeasuredEpochEligibilityInput {
+  /** Provider/relay measured prompt occupancy. Missing or invalid means unknown. */
+  readonly measuredInputTokens?: number | null;
+  /** Resolved pressure ceiling P; null disables pressure routing. */
+  readonly pressureCeilingTokens: number | null;
+  /**
+   * Optional measured-pressure suppression result. It may suppress a raw
+   * ceiling hit, but can never manufacture one below the measured ceiling.
+   */
+  readonly pressureCeilingTriggered?: boolean;
+  /** Resolved fold boundary. In single-ceiling mode this is P, never legacy TRIG. */
+  readonly foldTriggerTokens?: number | null;
+  /** Provider-measured frozen-prefix resting occupancy after the previous append. */
+  readonly postFoldFloorTokens?: number | null;
+  /** Committed appends since the last hard epoch; arms the floor gate at one. */
+  readonly appendEpochsSinceHardReset?: number;
+  /** The fold/freeze layer found an appendable tail epoch at this boundary. */
+  readonly tailEpochRequested: boolean;
+  readonly appendOnlyTailEpochEnabled?: boolean;
+  readonly singleCeilingMode?: boolean;
+  /** A measured governor decision requiring topology reset. */
+  readonly pressureActionForcesHardEpoch?: boolean;
+  /** Resolved token targets only; no text-derived values are accepted. */
+  readonly appendBandTargetTokens: number;
+  readonly tailEpochMinRunwayTokens: number;
+}
+
+export interface MeasuredEpochEligibility {
+  readonly decision: MeasuredEpochEligibilityDecision;
+  readonly reason: MeasuredEpochEligibilityReason;
+  readonly measuredInputTokens: number | null;
+  readonly pressureCeilingTriggered: boolean;
+  readonly runwayBasis: 'measured' | 'floor' | 'disabled' | 'unknown';
+  readonly postAppendRunwayTokens: number | null;
+  readonly projectedAppendBandTokens: number | null;
+  readonly tailEpochRunwayWouldHold: boolean | null;
+}
+
+/**
+ * Canonical pressure eligibility law for reuse → append → hard epoch.
+ *
+ * Every live pressure conclusion comes from provider/relay measured tokens plus
+ * resolved token budgets. Missing telemetry is an explicit unknown and can
+ * authorize neither an append nor a hard epoch; callers must preserve the
+ * current provider-visible shape until a measurement arrives. Structural hard
+ * epochs (explicit operator request, integrity failure, cold-gap rebuild) stay
+ * outside this pressure predicate.
+ */
+export function resolveMeasuredEpochEligibility(
+  input: MeasuredEpochEligibilityInput,
+): MeasuredEpochEligibility {
+  const measured = typeof input.measuredInputTokens === 'number'
+    && Number.isFinite(input.measuredInputTokens)
+    && input.measuredInputTokens > 0
+      ? Math.floor(input.measuredInputTokens)
+      : null;
+  if (measured === null) {
+    return {
+      decision: 'unknown',
+      reason: 'telemetry-unavailable',
+      measuredInputTokens: null,
+      pressureCeilingTriggered: false,
+      runwayBasis: 'unknown',
+      postAppendRunwayTokens: null,
+      projectedAppendBandTokens: null,
+      tailEpochRunwayWouldHold: null,
+    };
+  }
+
+  const ceiling = typeof input.pressureCeilingTokens === 'number'
+    && Number.isFinite(input.pressureCeilingTokens)
+    && input.pressureCeilingTokens > 0
+      ? Math.floor(input.pressureCeilingTokens)
+      : null;
+  const rawPressureCeilingTriggered = ceiling !== null && measured >= ceiling;
+  const pressureCeilingTriggered = rawPressureCeilingTriggered
+    && (input.pressureCeilingTriggered ?? true);
+  const appendEnabled = input.appendOnlyTailEpochEnabled ?? true;
+  const singleCeilingMode = input.singleCeilingMode ?? false;
+  const base = {
+    measuredInputTokens: measured,
+    pressureCeilingTriggered,
+    projectedAppendBandTokens: null,
+  } as const;
+
+  if (ceiling === null) {
+    const append = input.tailEpochRequested && appendEnabled;
+    return {
+      ...base,
+      decision: append ? 'append' : 'reuse',
+      reason: append ? 'pressure-disabled' : 'no-tail-epoch',
+      runwayBasis: 'disabled',
+      postAppendRunwayTokens: null,
+      tailEpochRunwayWouldHold: true,
+    };
+  }
+
+  if (singleCeilingMode && !pressureCeilingTriggered) {
+    return {
+      ...base,
+      decision: 'reuse',
+      reason: 'below-single-ceiling',
+      runwayBasis: 'measured',
+      postAppendRunwayTokens: ceiling - measured,
+      tailEpochRunwayWouldHold: true,
+    };
+  }
+
+  if (!singleCeilingMode && input.pressureActionForcesHardEpoch) {
+    return {
+      ...base,
+      decision: 'hard-epoch',
+      reason: 'governor-pressure',
+      runwayBasis: 'measured',
+      postAppendRunwayTokens: ceiling - measured,
+      tailEpochRunwayWouldHold: false,
+    };
+  }
+  if (!singleCeilingMode && pressureCeilingTriggered) {
+    return {
+      ...base,
+      decision: 'hard-epoch',
+      reason: 'pressure-ceiling',
+      runwayBasis: 'measured',
+      postAppendRunwayTokens: ceiling - measured,
+      tailEpochRunwayWouldHold: false,
+    };
+  }
+  if (!input.tailEpochRequested || !appendEnabled) {
+    const hardAtSingleCeiling = singleCeilingMode && pressureCeilingTriggered;
+    return {
+      ...base,
+      decision: hardAtSingleCeiling ? 'hard-epoch' : 'reuse',
+      reason: appendEnabled ? 'no-tail-epoch' : 'append-disabled',
+      runwayBasis: 'measured',
+      postAppendRunwayTokens: ceiling - measured,
+      tailEpochRunwayWouldHold: hardAtSingleCeiling ? false : true,
+    };
+  }
+
+  const floor = typeof input.postFoldFloorTokens === 'number'
+    && Number.isFinite(input.postFoldFloorTokens)
+    && input.postFoldFloorTokens > 0
+      ? Math.floor(input.postFoldFloorTokens)
+      : null;
+  const trigger = typeof input.foldTriggerTokens === 'number'
+    && Number.isFinite(input.foldTriggerTokens)
+    && input.foldTriggerTokens > 0
+      ? Math.floor(input.foldTriggerTokens)
+      : null;
+  const floorGateArmed = (input.appendEpochsSinceHardReset ?? 0) >= 1;
+  let runwayBasis: MeasuredEpochEligibility['runwayBasis'] = 'measured';
+  let postAppendRunwayTokens = ceiling - measured;
+  let projectedAppendBandTokens: number | null = null;
+  let runwayWouldHold: boolean;
+
+  if (singleCeilingMode) {
+    if (floor !== null && floorGateArmed) {
+      runwayBasis = 'floor';
+      projectedAppendBandTokens = projectSingleCeilingAppendBandTokens(
+        measured,
+        floor,
+        input.appendBandTargetTokens,
+      );
+      // Single-ceiling geometry has exactly one active boundary: P. Ignore
+      // foldTriggerTokens here even when a stale legacy caller supplies TRIG.
+      postAppendRunwayTokens = ceiling - (floor + projectedAppendBandTokens);
+      runwayWouldHold = postAppendRunwayTokens >= input.tailEpochMinRunwayTokens;
+    } else {
+      // The first append after a hard epoch always gets one chance to establish
+      // a measured floor. This is the instant-loop guard.
+      runwayWouldHold = true;
+    }
+  } else if (floor !== null && trigger !== null && floorGateArmed) {
+    runwayBasis = 'floor';
+    postAppendRunwayTokens = trigger - floor;
+    runwayWouldHold = postAppendRunwayTokens > 0;
+  } else {
+    runwayWouldHold = postAppendRunwayTokens >= input.tailEpochMinRunwayTokens;
+  }
+
+  return {
+    ...base,
+    decision: runwayWouldHold ? 'append' : 'hard-epoch',
+    reason: runwayWouldHold ? 'runway-holds' : 'runway-exhausted',
+    runwayBasis,
+    postAppendRunwayTokens,
+    projectedAppendBandTokens,
+    tailEpochRunwayWouldHold: runwayWouldHold,
+  };
+}
+
 /**
  * Legacy hybrid fold TRIGGER default. Under single-ceiling mode this is an
  * inert compatibility/kill-switch value; P is the only active fold boundary.
@@ -112,8 +358,9 @@ export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
  * deliberately raised from the 2026-07-04 uniform 150K; do not "fix" this
  * back to 150K). Since 2026-07-10 (Jonah) the CLI surfaces carry per-engine
  * defaults ABOVE this base — Codex CLI and the Claude Code CLI/tmux surfaces
- * run 220K via ENGINE_PRESSURE_CEILING_DEFAULTS — while FC engines stay on
- * this uniform base. Explicit per-session overrides and the
+ * run 220K via ENGINE_PRESSURE_CEILING_DEFAULTS. Fable 5 on Claude API has a
+ * narrower engine+model exception at 250K; other FC models stay on the uniform
+ * base. Explicit per-session overrides and the
  * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env still win over every table
  * entry. On 200K windows the resolved default rides at messageCeiling
  * (window − output 16K − emergency 4K = 180K), which always bounds it.
@@ -129,8 +376,8 @@ export const DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS =
  * ── Per-model / per-engine pressure-ceiling tuning tables ───────────────────
  * THE easy knob for tuning the fold pressure ceiling of every spawnable model
  * (Jonah, 2026-07-10). defaultPressureCeilingTokensForModelEngine resolves:
- *   1. MODEL_PRESSURE_CEILING_DEFAULTS — exact model match (lowercase keys)
- *   2. MODEL_PRESSURE_CEILING_DEFAULTS — longest model-prefix match
+ *   1. Surface-specific model exceptions (Fable 5 on Claude API)
+ *   2. MODEL_PRESSURE_CEILING_DEFAULTS — exact/longest-prefix model match
  *   3. ENGINE_PRESSURE_CEILING_DEFAULTS — engine match (lowercase keys)
  *   4. DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS — uniform 180K base
  * These are DEFAULTS, not caps: an explicit input.pressureCeilingTokens
@@ -154,6 +401,7 @@ export const ENGINE_PRESSURE_CEILING_DEFAULTS: Record<string, number> = {
   'claude-cli': 220_000,
   'claude-interactive': 220_000,
 };
+const FABLE_API_PRESSURE_CEILING_TOKENS = 250_000;
 /**
  * Exact/prefix model-level ceiling overrides, consulted BEFORE the engine
  * table. Keys must be lowercase. Add an entry here when a single model needs
@@ -490,16 +738,24 @@ function isGeminiCliEngine(engine: string): boolean {
   return engine.trim().toLowerCase() === 'gemini';
 }
 
+function isFableFiveModel(modelLower: string): boolean {
+  return modelLower === 'claude-fable-5' || modelLower.startsWith('claude-fable-5-');
+}
+
 /**
  * Default pressure ceiling for a given model/engine pair. Resolution order:
- * model exact match → longest model-prefix match → engine match → uniform
- * base (see the tuning-table doc above ENGINE_PRESSURE_CEILING_DEFAULTS).
+ * Fable API exact/prefix match → model exact/prefix match → engine match →
+ * uniform base (see the tuning-table doc above ENGINE_PRESSURE_CEILING_DEFAULTS).
  * Explicit input.pressureCeilingTokens and the
  * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env override this default, and the
  * caller window-clamps then messageCeiling-clamps whatever this returns.
  */
 function defaultPressureCeilingTokensForModelEngine(model: string, engine: string): number {
   const modelLower = model.trim().toLowerCase();
+  const engineLower = engine.trim().toLowerCase();
+  if (engineLower === 'claude-api' && isFableFiveModel(modelLower)) {
+    return FABLE_API_PRESSURE_CEILING_TOKENS;
+  }
   if (modelLower) {
     const exact = MODEL_PRESSURE_CEILING_DEFAULTS[modelLower];
     if (exact !== undefined) return exact;
@@ -513,7 +769,7 @@ function defaultPressureCeilingTokensForModelEngine(model: string, engine: strin
     }
     if (bestValue !== undefined) return bestValue;
   }
-  const engineDefault = ENGINE_PRESSURE_CEILING_DEFAULTS[engine.trim().toLowerCase()];
+  const engineDefault = ENGINE_PRESSURE_CEILING_DEFAULTS[engineLower];
   if (engineDefault !== undefined) return engineDefault;
   return DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS;
 }

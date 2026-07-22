@@ -17,7 +17,7 @@
 // package's own devDeps first:
 //   npm install && npm test
 // ─────────────────────────────────────────────────────────────────────────────
-import { describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import {
   classifyTurn,
@@ -37,6 +37,8 @@ import {
   nominateVerbatim,
   normalizeNumericForm,
   isConservedIn,
+  extractCoordinateConservationCorpus,
+  dedupeCoordinateClosetText,
   extractVerbatimContextLabel,
   LABEL_MAX_CHARS,
   isSyntheticContextText,
@@ -1676,6 +1678,11 @@ describe('isConservedIn — boundary-aware (P1/s5)', () => {
 // ══════════════════════════════════════════════════════════════════════
 
 describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
+  // These assertions pin the LEGACY flat-closet block-tail layout, restored
+  // via the VOXXO_REBIRTH_FLAT_CLOSET kill-switch (default off = inline
+  // per-turn placement, covered by the placement suite below).
+  beforeEach(() => { vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1'); });
+  afterEach(() => { vi.unstubAllEnvs(); });
   /** Build a minimal set of messages with n full turns then an active window. */
   function buildTurnsWithResult(resultTexts: string[], activeWindowTurns = 1): FoldMessage[] {
     const msgs: FoldMessage[] = [];
@@ -1974,6 +1981,203 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
       typeof m.content === 'string' && m.content.includes('[Conversation Context'),
     )!.content) as string;
     expect(content).not.toContain('⌖⌖⌖ COORDINATE CLOSET');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// Coordinate Blast Radius — inline per-turn placement (flat closet dissolved)
+// ══════════════════════════════════════════════════════════════════════
+
+describe('foldContext — Coordinate Blast Radius inline placement (default)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const UUID = '550e8400-e29b-41d4-a716-446655440000';
+  const RAIL_HEX = 'a1b2c3d4';
+
+  function twoReadTurns(): FoldMessage[] {
+    return [
+      userMsg('first'),
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_p1'),
+      anthropicToolResult('toolu_p1', `found ${UUID} in config`),
+      assistantMsg('noted'),
+      userMsg('second'),
+      anthropicToolUse('Read', { file_path: 'relay/src/b.ts' }, 'toolu_p2'),
+      anthropicToolResult('toolu_p2', `references rail-${RAIL_HEX} and also ${UUID} again`),
+      assistantMsg('confirmed'),
+      userMsg('active'),
+      assistantMsg('active turn'),
+    ];
+  }
+  const CFG: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 4000 };
+  const foldBlockOf = (msgs: FoldMessage[], folds: number): string => {
+    const result = foldContext(msgs, folds, CFG);
+    const fb = result.messages.find(m =>
+      typeof m.content === 'string' && m.content.includes('[Conversation Context'),
+    );
+    expect(fb).toBeDefined();
+    return fb!.content as string;
+  };
+
+  test('flat tail list is gone; each admitted literal rides its causal turn skeleton segment exactly once', () => {
+    const content = foldBlockOf(twoReadTurns(), 2);
+    // No flat block-tail closet anywhere in the block.
+    expect(content).not.toContain('⌖⌖⌖ COORDINATE CLOSET');
+    // Each conserved literal renders exactly once in the whole block.
+    expect(content.split(UUID).length - 1).toBe(1);
+    expect(content.split(RAIL_HEX).length - 1).toBe(1);
+    const line = content.split('\n').find(l => l.includes(UUID))!;
+    expect(line).toContain(' ⌖ ');
+    // Placement geometry on the collapse-merged line: the uuid attaches to
+    // the a.ts segment (its FIRST sighting — turn 2 re-nominates it but the
+    // earliest nominating turn is the artifact of record), the rail hex to
+    // the b.ts segment where it was nominated.
+    expect(line.indexOf(UUID)).toBeLessThan(line.indexOf('relay/src/b.ts'));
+    expect(line.indexOf(RAIL_HEX)).toBeGreaterThan(line.indexOf('relay/src/b.ts'));
+  });
+
+  test('source time selects the causal artifact while unknown-time ties remain stable', () => {
+    const sourceTimed: FoldMessage[] = [
+      { ...userMsg('first'), tsMs: Date.parse('2026-07-19T02:00:00.000Z') },
+      anthropicToolUse('Read', { file_path: 'relay/src/a.ts' }, 'toolu_t1'),
+      anthropicToolResult('toolu_t1', `found ${UUID} in config`),
+      assistantMsg('noted'),
+      { ...userMsg('second'), tsMs: Date.parse('2026-07-19T01:00:00.000Z') },
+      anthropicToolUse('Read', { file_path: 'relay/src/b.ts' }, 'toolu_t2'),
+      anthropicToolResult('toolu_t2', `found ${UUID} again`),
+      assistantMsg('confirmed'),
+      userMsg('active'),
+      assistantMsg('active turn'),
+    ];
+    const sourceTimedLine = foldBlockOf(sourceTimed, 2).split('\n').find(line => line.includes(UUID))!;
+    expect(sourceTimedLine.indexOf(UUID)).toBeGreaterThan(sourceTimedLine.indexOf('relay/src/b.ts'));
+
+    // With no authoritative source timestamps, the same input remains
+    // deterministic and the earliest causal ordinal is the stable fallback.
+    const unknownTimeLine = foldBlockOf(twoReadTurns(), 2).split('\n').find(line => line.includes(UUID))!;
+    expect(unknownTimeLine.indexOf(UUID)).toBeLessThan(unknownTimeLine.indexOf('relay/src/b.ts'));
+  });
+
+  test('timestamp-less fold metadata stays explicitly unknown and deterministic', () => {
+    const first = foldContext(twoReadTurns(), 2, CFG);
+    const second = foldContext(twoReadTurns(), 2, CFG);
+
+    expect(first.foldSummaries.every((summary) => summary.timestamp === '')).toBe(true);
+    expect(second.foldSummaries).toEqual(first.foldSummaries);
+    expect(second.messages).toEqual(first.messages);
+  });
+
+  test('kill-switch VOXXO_REBIRTH_FLAT_CLOSET=1 restores the legacy flat tail list', () => {
+    vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1');
+    const content = foldBlockOf(twoReadTurns(), 2);
+    const closetLine = content.split('\n').find(l => l.startsWith('⌖⌖⌖ COORDINATE CLOSET'));
+    expect(closetLine).toBeDefined();
+    expect(closetLine).toContain(UUID);
+    expect(closetLine).toContain(RAIL_HEX);
+    // Skeleton carries no inline suffixes in the legacy layout.
+    const skeletonLine = content.split('\n').find(l => l.includes('relay/src/a.ts'))!;
+    expect(skeletonLine).not.toContain(' ⌖ ');
+  });
+
+  test('belted literals never earn a suffix — skeleton carriage stays the only copy', () => {
+    const msgs: FoldMessage[] = [
+      userMsg('first'),
+      anthropicToolUse('Bash', { command: 'deploy' }, 'toolu_b1'),
+      anthropicToolResult('toolu_b1', `job id: ${UUID}`),
+      assistantMsg('ok'),
+      userMsg('second'),
+      anthropicToolUse('Bash', { command: 'status' }, 'toolu_b2'),
+      anthropicToolResult('toolu_b2', 'plain result'),
+      assistantMsg('done'),
+      userMsg('active'),
+      assistantMsg('active turn'),
+    ];
+    const content = foldBlockOf(msgs, 2);
+    expect(content).toContain(UUID); // belt carries it in the skeleton
+    expect(content).not.toContain('⌖⌖⌖ COORDINATE CLOSET');
+    const skeletonLine = content.split('\n').find(l => l.includes('deploy'))!;
+    expect(skeletonLine).not.toContain(' ⌖ ');
+  });
+
+  test('inline placement is byte-identical across runs', () => {
+    expect(foldBlockOf(twoReadTurns(), 2)).toBe(foldBlockOf(twoReadTurns(), 2));
+  });
+
+  test('preamble matches the rendered layout', () => {
+    const inline = foldBlockOf(twoReadTurns(), 2);
+    expect(inline).toContain('ride inline as ⌖ suffixes');
+    expect(inline).not.toContain('COORDINATE CLOSET block below');
+    vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1');
+    const flat = foldBlockOf(twoReadTurns(), 2);
+    expect(flat).toContain('COORDINATE CLOSET block below');
+    expect(flat).not.toContain('ride inline as ⌖ suffixes');
+  });
+});
+
+describe('coordinate conservation corpus — inline suffix extraction', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440000';
+  const foldBlock = (line: string): string => `[Conversation Context — 2 turns folded, 2K → 1K chars]\n\n${FOLD_BLOCK_PREAMBLE}\n\n${line}\n\n[End Folded Context]`;
+
+  test('extracts inline ⌖ suffix items from dissolved-layout skeleton lines (merged line, multiple segments)', () => {
+    const frozen = `🔬 Investigated (2 turns): 📖 relay/src/a.ts ⌖ ${UUID} ⟦also⟧ → 📖 relay/src/b.ts ⌖ a1b2c3d4 ⟦rail⟧`;
+    const corpus = extractCoordinateConservationCorpus([{ role: 'user', content: foldBlock(frozen) }]);
+    expect(isConservedIn(corpus, UUID)).toBe(true);
+    expect(isConservedIn(corpus, 'a1b2c3d4')).toBe(true);
+    expect(isConservedIn(corpus, 'deadbeefdeadbeef')).toBe(false);
+  });
+
+  test('skips the context-note preamble line even though it mentions the ⌖ glyph', () => {
+    const corpus = extractCoordinateConservationCorpus([{ role: 'user', content: FOLD_BLOCK_PREAMBLE }]);
+    expect(isConservedIn(corpus, 'suffixes on the turn skeleton')).toBe(false);
+  });
+
+  test('does not interpret ordinary artifact prose containing the ⌖ glyph as a suffix', () => {
+    const prose = `Artifact prose says ⌖ ${UUID} is an example, not fold syntax.`;
+    const retained = foldBlock(`📖 relay/src/a.ts\n   ${prose}`);
+    const corpus = extractCoordinateConservationCorpus([{ role: 'user', content: `${prose}\n${retained}` }]);
+    expect(isConservedIn(corpus, UUID)).toBe(false);
+  });
+
+  test('still extracts the legacy flat marker line and raw-trace closet bullets', () => {
+    const legacy = `⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖ conserved verbatim ids/paths/values from folded turns — trust before re-reading files: ${UUID} ⟦also⟧`;
+    const seed = `── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──\n- a1b2c3d4 (id)\n\n── Next Section ──`;
+    const corpus = extractCoordinateConservationCorpus([{ role: 'user', content: `${legacy}\n${seed}` }]);
+    expect(isConservedIn(corpus, UUID)).toBe(true);
+    expect(isConservedIn(corpus, 'a1b2c3d4')).toBe(true);
+  });
+});
+
+describe('dedupeCoordinateClosetText — inline suffix filtering', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440000';
+  const foldBlock = (line: string): string => `[Conversation Context — 2 turns folded, 2K → 1K chars]\n\n${FOLD_BLOCK_PREAMBLE}\n\n${line}\n\n[End Folded Context]`;
+
+  test('strips already-carried items from inline suffixes and drops emptied segments', () => {
+    const band = `🔬 Investigated (2 turns): 📖 relay/src/a.ts ⌖ ${UUID} ⟦also⟧ → 📖 relay/src/b.ts ⌖ a1b2c3d4 ⟦rail⟧`;
+    const out = dedupeCoordinateClosetText(foldBlock(band), `prior corpus carrying ${UUID}`);
+    expect(out).toContain(`🔬 Investigated (2 turns): 📖 relay/src/a.ts → 📖 relay/src/b.ts ⌖ a1b2c3d4 ⟦rail⟧`);
+  });
+
+  test('drops every emptied suffix while keeping collapse arrows balanced', () => {
+    const band = `📖 relay/src/a.ts ⌖ ${UUID} → 📖 relay/src/b.ts ⌖ a1b2c3d4`;
+    const out = dedupeCoordinateClosetText(foldBlock(band), `${UUID} a1b2c3d4`);
+    expect(out).toContain('📖 relay/src/a.ts → 📖 relay/src/b.ts');
+  });
+
+  test('legacy marker-line filtering still applies (kill-switch layout)', () => {
+    const line = `⌖⌖⌖ COORDINATE CLOSET ⌖⌖⌖ conserved verbatim ids: ${UUID} ⟦also⟧ · a1b2c3d4 ⟦rail⟧`;
+    const out = dedupeCoordinateClosetText(line, UUID);
+    expect(out).not.toContain(`${UUID} ⟦also⟧`);
+    expect(out).toContain('a1b2c3d4 ⟦rail⟧');
+  });
+
+  test('returns text unchanged when nothing is conserved upstream', () => {
+    const band = `📖 relay/src/a.ts ⌖ ${UUID}`;
+    const block = foldBlock(band);
+    expect(dedupeCoordinateClosetText(block, 'unrelated corpus')).toBe(block);
+  });
+
+  test('leaves ordinary artifact prose and indented retained text byte-identical', () => {
+    const prose = `Artifact prose says ⌖ ${UUID} is an example, not fold syntax.`;
+    const block = `${prose}\n${foldBlock(`📖 relay/src/a.ts\n   ${prose}`)}`;
+    expect(dedupeCoordinateClosetText(block, UUID)).toBe(block);
   });
 });
 
@@ -2426,6 +2630,54 @@ describe('computeEvictableThroughOrdinal (E10 eligibility)', () => {
     expect(computeEvictableThroughOrdinal(turns, 99, [], 5)).toBe(0);
     expect(computeEvictableThroughOrdinal(turns, 99, [{ epoch: 4, turnsFolded: 3 }], 5)).toBe(0);
   });
+
+  test('both eligibility arms gate real eviction while the raw transcript stays immutable', () => {
+    const raw: FoldMessage[] = [];
+    for (let i = 0; i < 5; i++) raw.push(...evictionTurn(i));
+    const rawBytes = JSON.stringify(raw);
+    const rawTurns = detectTurns(raw);
+    const foldWith = (
+      durableCursorIndex: number,
+      frontiers: Array<{ epoch: number; turnsFolded: number }>,
+      upcomingEpoch: number,
+    ) => foldContext(raw, 4, ALWAYS_ON_FOLD_CONFIG, {
+      evictedSpans: [],
+      evictableThroughOrdinal: computeEvictableThroughOrdinal(
+        rawTurns,
+        durableCursorIndex,
+        frontiers,
+        upcomingEpoch,
+      ),
+      targetEvictThroughOrdinal: 2,
+      thresholdChars: 1,
+      nowIso: '2026-06-11T00:00:00.000Z',
+    });
+
+    // Cursor zero is the production representation of no durable episodic
+    // capture coverage. Episode-free captured ranges may be covered vacuously;
+    // individual episode-row existence is intentionally not this predicate.
+    const uncovered = foldWith(0, [{ epoch: 1, turnsFolded: 4 }], 3);
+    expect(uncovered.evictionOutcome).toBe('nothing_eligible');
+    expect(uncovered.newlyEvictedTurns).toBe(0);
+    expect(extractFoldBlock(uncovered.messages)).not.toContain(FOLD_TOMBSTONE_PREFIX);
+
+    const tooYoung = foldWith(raw.length, [{ epoch: 2, turnsFolded: 4 }], 3);
+    expect(tooYoung.evictionOutcome).toBe('nothing_eligible');
+    expect(tooYoung.newlyEvictedTurns).toBe(0);
+    expect(extractFoldBlock(tooYoung.messages)).not.toContain(FOLD_TOMBSTONE_PREFIX);
+
+    const eligible = foldWith(raw.length, [{ epoch: 1, turnsFolded: 4 }], 3);
+    expect(eligible.evictionOutcome).toBe('evicted');
+    expect(eligible.newlyEvictedTurns).toBe(2);
+    const tombstoneLines = extractFoldBlock(eligible.messages)
+      .split('\n')
+      .filter((line) => line.startsWith(FOLD_TOMBSTONE_PREFIX));
+    expect(tombstoneLines).toEqual([
+      formatFoldTombstoneLine(eligible.evictedSpans![0]),
+    ]);
+    expect(tombstoneLines[0].split('\n')).toHaveLength(1);
+    expect(JSON.stringify(raw)).toBe(rawBytes);
+  });
 });
 
 describe('formatFoldTombstoneLine + mergeEvictionSpans (E10)', () => {
@@ -2627,6 +2879,10 @@ describe('extractVerbatimContextLabel — Tier-1 annotated keep (page-out)', () 
 });
 
 describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1 integration)', () => {
+  // Legacy flat-closet layout pinned under the kill-switch; the default
+  // inline placement path renders the same labelled forms as ⌖ suffixes.
+  beforeEach(() => { vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1'); });
+  afterEach(() => { vi.unstubAllEnvs(); });
   const hash = '7fd5835b00ab';
   const closetOf = (msgs: FoldMessage[], cfg: FoldConfig, foldCount: number): string | undefined => {
     const result = foldContext(msgs, foldCount, cfg);
@@ -2747,24 +3003,6 @@ describe('annotated Coordinate Closet — labelled render in foldContext (Tier-1
     const cfg: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 15 };
     const closetLine = closetOf(msgs, cfg, 1);
     expect(closetLine ?? '').not.toContain(ts);
-  });
-});
-
-describe('foldContext explicit timestamp provenance', () => {
-  test('timestamp-less fold metadata stays explicitly unknown and deterministic', () => {
-    const messages: FoldMessage[] = [
-      userMsg('historical question'),
-      assistantMsg('historical answer'),
-      userMsg('active question'),
-      assistantMsg('active answer'),
-    ];
-    const config: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1 };
-    const first = foldContext(messages, 1, config);
-    const second = foldContext(messages, 1, config);
-
-    expect(first.foldSummaries.every((summary) => summary.timestamp === '')).toBe(true);
-    expect(second.foldSummaries).toEqual(first.foldSummaries);
-    expect(second.messages).toEqual(first.messages);
   });
 });
 

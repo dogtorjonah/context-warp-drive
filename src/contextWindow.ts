@@ -164,6 +164,13 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'qwen-3.5-max': 1_000_000,
   'qwen-3.5-plus': 1_000_000,
 
+  // ── Thinking Machines Inkling (OpenRouter, provider-qualified ids) ──
+  // Advertised ~1.05M; pinned to a conservative guaranteed floor (see MiniMax precedent in ENGINE_DEFAULTS).
+  'thinkingmachines/inkling': 512_000,
+  'thinkingmachines/inkling-small': 512_000,
+  'inkling': 512_000,
+  'inkling-small': 512_000,
+
   // ── OpenAI direct models (non-Codex) ──
   'gpt-5.4-mini': 400_000,
   'gpt-5.4-nano': 400_000,
@@ -184,6 +191,7 @@ const ENGINE_DEFAULTS: Record<string, number> = {
   deepseek: 1_000_000,
   kimi: 256_000,
   qwen: 1_000_000,
+  inkling: 512_000, // guaranteed floor, not advertised ~1.05M ceiling (Thinking Machines Inkling via OpenRouter)
   'codex-api': 1_048_576,
   'gemini-api': 1_048_576,
 };

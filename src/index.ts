@@ -41,12 +41,14 @@
  */
 export * from './fold.ts';
 export * from './foldReceipts.ts';
+export * from './foldReconciliation.ts';
 export * from './foldProvenance.ts';
 export * from './contextBudget.ts';
 export * from './boundaryAuction.ts';
 export * from './episodes.ts';
 export * from './foldRecallUsage.ts';
 export * from './foldRailPrefetch.ts';
+export * from './rebirthDialogue.ts';
 export * from './episodes/runtime.ts';
 export * from './glyphs.ts';
 export * from './taskRail.ts';

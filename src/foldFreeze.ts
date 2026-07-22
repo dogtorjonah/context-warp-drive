@@ -45,19 +45,21 @@
  *     extends the frozen coverage (rebirth artifacts, truncation, in-place
  *     rewrites). Self-healing: recompute from current raw truth.
  *
- * ── THE TWO-EPOCH LAW ──────────────────────────────────────────────────
- * A live fold has exactly TWO epoch types — never a third:
- *   1. TAIL EPOCH — append-only band commit (`appendFoldFreezeTailEpoch`):
+ * ── THE TWO-SHAPE WRITE LAW ────────────────────────────────────────────
+ * A fold publication has exactly TWO immutable shapes — never an in-place
+ * rewrite of an already published stratum:
+ *   1. BAND APPEND (`appendFoldFreezeTailEpoch`):
  *      the frozen prefix stays byte-identical; only the freshly folded tail
  *      band is appended behind it.
- *   2. HARD EPOCH — whole-view rebuild (`commitFoldFreeze`), paired by the
- *      session layer with a rebirth-grade continuity seed (portable reset).
- *      `FoldFreezeHardEpochCause` enumerates WHY a hard epoch fired
- *      (first-call bootstrap, cold-gap, boundary healing, pressure, …).
- * The legacy bandless middle tier — a seedless re-fold of
- * the whole history — is retired vocabulary and a banned code path. Do not
- * reintroduce it: any fold that cannot band-append escalates to the seeded
- * hard epoch, full stop.
+ *   2. WHOLE-VIEW BASE PUBLICATION:
+ *      `initializeFoldFreezeBase` installs the first generation;
+ *      `commitFoldFreeze` replaces one under explicit write authority.
+ * Host routing classifies that publication as foundation initialization,
+ * cache-free cold-gap refold, structural repair, or a seeded HARD EPOCH. The
+ * compatibility `FoldFreezeHardEpochCause` name predates that lifecycle split;
+ * membership in it does not turn every replacement into a hard epoch. The
+ * banned third shape is mutation of an existing prefix/band between these
+ * publications.
  *
  * Net effect: the fold's quality machinery (graduated assistant-text budget,
  * sequence collapsing, claimed-path unfolds, atlas-metadata preservation) is
@@ -85,6 +87,7 @@ import {
   normalizeToolPath,
   type FoldMessage,
 } from './rollingFold.ts';
+import { foldProvenanceDigest } from './foldProvenance.ts';
 import {
   buildRawRebirthSeedFromMessages,
   DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS,
@@ -205,15 +208,17 @@ function boundaryFingerprintInput(msg: FoldMessage): string {
 // ══════════════════════════════════════════════════════════════════════
 
 /**
- * Cause attached to a whole-view rebuild (`commitFoldFreeze`). Two-epoch
- * law: a committed whole-view rebuild IS the hard epoch — the only non-tail
- * epoch type; there is no separate bandless re-fold epoch. Note 'tail-epoch'
- * here means "raw tail overflow made a fold due": callers attempt the
- * append-only band first and reach commitFoldFreeze with this cause only by
- * escalating to the seeded hard epoch.
+ * Compatibility cause attached to a whole-view `commitFoldFreeze` publication.
+ * This union predates the host-level distinction between seeded hard epochs
+ * and in-place initialization, cold refolds, or structural repairs, so
+ * membership here does not classify the host lifecycle transition. Note
+ * 'tail-epoch' means "raw tail overflow made a fold due": callers attempt the
+ * append-only band first, then choose the appropriate non-append route if it
+ * cannot be sealed.
  */
 export type FoldFreezeHardEpochCause =
   | 'first-call'
+  | 'restore-integrity-failed'
   | 'cold-gap'
   | 'context-changed'
   | 'history-rewound'
@@ -248,6 +253,20 @@ export type FoldFreezeAppendSkipReason =
   | 'empty-tail'
   | 'not-smaller';
 
+export type FoldFreezeShrinkQuestion =
+  | 'did-folding-help-at-all'
+  | 'did-folding-help-enough-to-matter';
+
+/** Machine-readable answer to one of the append fold's two shrink questions. */
+export interface FoldFreezeShrinkDiagnostic {
+  readonly kind: 'shrink-ratio';
+  readonly code: 'minimum-shrink-not-met' | 'efficiency-alarm';
+  readonly question: FoldFreezeShrinkQuestion;
+  readonly failed: true;
+  readonly shrinkRatio: number;
+  readonly threshold: number;
+}
+
 export interface FoldFreezeAppendCommit {
   committed: true;
   view: FoldMessage[];
@@ -257,6 +276,7 @@ export interface FoldFreezeAppendCommit {
   bandViewChars: number;
   savedChars: number;
   shrinkRatio: number;
+  shrinkDiagnostics: readonly FoldFreezeShrinkDiagnostic[];
   commitReason: FoldFreezeAppendCommitReason;
 }
 
@@ -269,12 +289,101 @@ export interface FoldFreezeAppendSkip {
   bandViewChars: number;
   savedChars: number;
   shrinkRatio: number | null;
+  shrinkDiagnostics: readonly FoldFreezeShrinkDiagnostic[];
   skipReason: FoldFreezeAppendSkipReason;
 }
 
 export type FoldFreezeAppendResult = FoldFreezeAppendCommit | FoldFreezeAppendSkip;
 
-const APPEND_TAIL_MIN_SHRINK_RATIO = 0.9;
+/** Additional immutable artifacts published with a successful tail-band seal. */
+export interface FoldFreezeTailEpochSealOptions {
+  /**
+   * Vault rows rendered into this exact band. They remain pending while the
+   * seal is prepared and join the state's seal-once set only at publication.
+   */
+  readonly sealedVaultFingerprints?: Iterable<string>;
+}
+
+/** @internal Optimistic identity captured while a tail-band seal is prepared. */
+export interface FoldFreezeTailEpochSealBase {
+  readonly frozenView: FoldMessage[];
+  readonly frozenViewDigest: string;
+  readonly frozenViewChars: number;
+  readonly seedBaseDigest?: string;
+  readonly lastAppendBoundaryViewCount?: number;
+  readonly sealedBands: readonly FoldFreezeSealedBandMetadata[];
+  readonly sealedBandsDigest: string;
+  readonly sealedVaultFingerprints: Set<string>;
+  readonly sealedVaultFingerprintsDigest: string;
+  readonly frozenRawCount: number;
+  readonly boundaryRole: string;
+  readonly boundaryChars: number;
+  readonly boundaryHash?: string;
+  readonly thinningMode: string;
+  readonly frozenToolPaths: ReadonlySet<string>;
+  readonly frozenToolPathsDigest: string;
+  readonly frozenRelevantClaims: ReadonlySet<string>;
+  readonly frozenRelevantClaimsDigest: string;
+  readonly epochs: number;
+  readonly lastCallAt: number;
+  readonly hotReuses: number;
+  readonly lastTransitionReason?: FoldFreezeTransitionReason;
+  readonly lastHardEpochReason?: FoldFreezeHardEpochCause;
+  readonly restoreIntegrityFailure?: FoldFreezeRestoreIntegrityFailure;
+  readonly forceAcceptRestoredView?: boolean;
+}
+
+/**
+ * Detached, all-or-nothing tail-band transaction. Preparing one mutates
+ * nothing: the new view, manifest row, coverage sets, and vault fingerprints
+ * live only in this process-local plan. Publishing performs one synchronous,
+ * non-yielding state replacement after a stale-plan guard. If the process is
+ * interrupted before publication, a restart can only observe the prior
+ * serialized state; there is no partial band or fingerprint artifact to read.
+ */
+export interface FoldFreezeTailEpochSealPlan {
+  readonly prepared: true;
+  /**
+   * Detached preview of the successful result. It is deliberately not the
+   * publication object, so inspecting or mutating it cannot rewrite either
+   * the live frozen prefix or the process-local transaction.
+   */
+  readonly result: FoldFreezeAppendCommit;
+}
+
+export interface FoldFreezeTailEpochSealDecline {
+  readonly prepared: false;
+  readonly result: FoldFreezeAppendSkip;
+}
+
+export type FoldFreezeTailEpochSealPreparation =
+  | FoldFreezeTailEpochSealPlan
+  | FoldFreezeTailEpochSealDecline;
+
+interface FoldFreezeTailEpochSealInternals {
+  readonly nextState: FoldFreezeState;
+  readonly base: FoldFreezeTailEpochSealBase;
+  readonly result: FoldFreezeAppendCommit;
+}
+
+/**
+ * Keep publication authority out of the caller-visible plan. Besides making a
+ * plan unforgeable, this prevents preview mutation from becoming a write path
+ * into either the current frozen stratum or the prepared next generation.
+ */
+const foldFreezeTailEpochSealInternals =
+  new WeakMap<FoldFreezeTailEpochSealPlan, FoldFreezeTailEpochSealInternals>();
+
+/** Typed conflict: a prepared seal may never overwrite a newer state. */
+export class FoldFreezeTailEpochSealConflict extends Error {
+  constructor() {
+    super('tail-epoch seal publication rejected: fold-freeze state changed after preparation');
+    this.name = 'FoldFreezeTailEpochSealConflict';
+  }
+}
+
+/** 0.9 answers the append gate's "did folding help at all?" question. */
+export const APPEND_TAIL_MIN_SHRINK_RATIO = 0.9;
 
 /**
  * Tail-epoch efficiency ALARM threshold (rail-c63e326e s4). A tail-epoch
@@ -284,11 +393,10 @@ const APPEND_TAIL_MIN_SHRINK_RATIO = 0.9;
  * code / JSON content that resists turn-based compaction. This SEPARATE,
  * stricter threshold flags that "barely helped" case for operator visibility:
  * 0.9 asks "did folding help AT ALL"; 0.6 asks "did it help ENOUGH to matter"
- * (>=40% saved). A shrink ratio worse than this escalates the emitted
- * epoch/skip log line from console.log to console.warn and appends an
- * ` ⚠ ALARM: …` suffix into the epochCause string — visible through the
- * EXISTING aa-ledger fold_events `epoch_cause` field with no schema change,
- * since EPOCH_RE captures the full cause text lazily up to `) — frozen`.
+ * (>=40% saved). A shrink ratio worse than this emits a typed
+ * `efficiency-alarm` diagnostic on the append result. Hosts can react without
+ * parsing logs; the relay maps the diagnostic into warning level, telemetry,
+ * and its existing epoch-cause ledger text.
  *
  * Live case that validates this threshold (2026-07-01, stealth-dragon/glm,
  * epoch #2, ts 1782921627686): a single append-only tail-epoch attempt folded
@@ -315,11 +423,40 @@ export function isTailEpochEfficiencyAlarm(shrinkRatio: number | null): boolean 
   return shrinkRatio !== null && shrinkRatio > TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO;
 }
 
+function collectFoldFreezeShrinkDiagnostics(
+  shrinkRatio: number | null,
+): FoldFreezeShrinkDiagnostic[] {
+  if (shrinkRatio === null || !Number.isFinite(shrinkRatio)) return [];
+  const diagnostics: FoldFreezeShrinkDiagnostic[] = [];
+  if (shrinkRatio > APPEND_TAIL_MIN_SHRINK_RATIO) {
+    diagnostics.push({
+      kind: 'shrink-ratio',
+      code: 'minimum-shrink-not-met',
+      question: 'did-folding-help-at-all',
+      failed: true,
+      shrinkRatio,
+      threshold: APPEND_TAIL_MIN_SHRINK_RATIO,
+    });
+  }
+  if (shrinkRatio > TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO) {
+    diagnostics.push({
+      kind: 'shrink-ratio',
+      code: 'efficiency-alarm',
+      question: 'did-folding-help-enough-to-matter',
+      failed: true,
+      shrinkRatio,
+      threshold: TAIL_EPOCH_EFFICIENCY_ALARM_SHRINK_RATIO,
+    });
+  }
+  return diagnostics;
+}
+
 /**
  * Tail-epoch YIELD-ESCALATION threshold (rail P180/TRIG150 — the per-fold yield
- * gate). Distinct from the 0.6 efficiency ALARM above: the alarm only SURFACES a
- * weak fold in the epoch/skip log line and changes NO behavior. This stricter-
- * action threshold makes a genuinely useless fold ACTIONABLE. When a would-be
+ * gate). Distinct from the 0.6 efficiency ALARM above: the alarm emits a typed
+ * diagnostic but does not change the append/skip decision; hosts may project
+ * it into telemetry or logs. This stricter-action threshold makes a genuinely
+ * useless fold ACTIONABLE. When a would-be
  * tail-epoch band retains more than 70% of the raw it folds (saved < 30%),
  * appending it buys almost nothing — the frozen floor barely drops and the very
  * next turn tail-epochs again (the "folds barely dropping the tail" livelock,
@@ -379,6 +516,7 @@ export function shouldEscalateTailEpochForLowYield(
 
 export const FOLD_FREEZE_HARD_EPOCH_CAUSES: readonly FoldFreezeHardEpochCause[] = [
   'first-call',
+  'restore-integrity-failed',
   'cold-gap',
   'context-changed',
   'history-rewound',
@@ -389,6 +527,11 @@ export const FOLD_FREEZE_HARD_EPOCH_CAUSES: readonly FoldFreezeHardEpochCause[] 
   'prefix-saturation',
   'hard-epoch',
 ];
+
+/** Hard synchronous-work bounds for restore verification on the relay thread. */
+export const MAX_FOLD_FREEZE_RESTORE_VIEW_CHARS = 1_000_000;
+export const MAX_FOLD_FREEZE_RESTORE_VIEW_MESSAGES = 50_000;
+export const MAX_FOLD_FREEZE_RESTORE_SEALED_BANDS = 2_048;
 
 /** Header that separates the rebirth-package seed body from the merged live turn. */
 export const HARD_EPOCH_LIVE_TURN_HEADER =
@@ -416,10 +559,9 @@ export interface RawHardEpochSeedOptions {
   /** Boundary capture time; omitted remains explicitly unknown in live-state provenance. */
   readonly capturedAt?: string;
   /**
-   * Helper-level API for direct buildRawHardEpochSeed callers that need a complete
-   * raw trace seed without calling buildHardEpochSeedView afterward. FoldSession
-   * leaves this unset because buildHardEpochSeedView appends the live trailing
-   * user turn separately; including it in both places would duplicate the request.
+   * Helper-level API for direct buildRawHardEpochSeed callers that need the live
+   * trailing user turn included in the trace frontier. When false, the helper
+   * still promotes that exact turn into READ FIRST as the active request.
    */
   readonly includeTrailingUserTurn?: boolean;
   /** Trace-derived episodic recall text (portable-mode memory section). */
@@ -432,9 +574,9 @@ export interface RawHardEpochSeedOptions {
  * Compute the default raw same-instance hard-epoch seed directly from the local
  * provider trace. This is the standalone fallback for callers that do not have a
  * richer host rebirth renderer: no Atlas, no episodic memory, no LLM summary.
- * Direct helper callers may set includeTrailingUserTurn when they will not later
- * call buildHardEpochSeedView; FoldSession intentionally keeps it false and uses
- * buildHardEpochSeedView for the provider-safe single-message live-turn merge.
+ * Direct helper callers may set includeTrailingUserTurn when the live request
+ * belongs inside the trace frontier. The default keeps the frontier before the
+ * live request while still promoting its exact text into READ FIRST.
  */
 export function buildRawHardEpochSeed(
   messages: readonly FoldMessage[],
@@ -459,12 +601,19 @@ export function buildRawHardEpochSeed(
     rawTraceCoordinateCloset: Math.min(closetBudget, 4_000),
     thinkingTrail: Math.max(1_000, Math.min(8_000, Math.floor(maxChars * 0.18))),
   };
+  const includeTrailingUserTurn = options.includeTrailingUserTurn === true;
+  const traceEnd = findRawRebirthSeedTraceEnd(messages, includeTrailingUserTurn);
+  const triggeringUserMessage = includeTrailingUserTurn
+    ? undefined
+    : extractTrailingUserTurnText(messages, traceEnd) || undefined;
   return buildRawRebirthSeedFromMessages(messages, {
     predecessorName: options.predecessorName ?? 'predecessor',
     packageBudget: maxChars,
     sectionMaxChars: compactSectionMaxChars,
     rawTraceCoordinateClosetChars: closetBudget,
-    includeTrailingUserTurn: options.includeTrailingUserTurn === true,
+    includeTrailingUserTurn,
+    triggeringUserMessage,
+    userMessageTriggered: Boolean(triggeringUserMessage),
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
     capturedAt: options.capturedAt,
@@ -493,8 +642,16 @@ export function buildHardEpochSeedView(
   const traceEnd = findRawHardEpochTraceEnd(messages);
   const liveTurnText = extractTrailingUserTurnText(messages, traceEnd);
   const seedBody = ensureHardEpochContinuityDirective(seedPrompt);
-  const liveRequestAlreadyBundled = seedBody.includes(LIVE_CONTINUITY_STATE_HEADER)
-    && seedBody.includes('active request (');
+  const readFirstStart = seedBody.indexOf('── Last User + AI Messages (READ FIRST) ──');
+  const readFirstEnd = readFirstStart >= 0
+    ? seedBody.indexOf('\n── ', readFirstStart + 1)
+    : -1;
+  const readFirstBlock = readFirstStart >= 0
+    ? seedBody.slice(readFirstStart, readFirstEnd >= 0 ? readFirstEnd : undefined)
+    : '';
+  const liveRequestAlreadyBundled = Boolean(liveTurnText)
+    && (readFirstBlock.includes(liveTurnText)
+      || (seedBody.includes(LIVE_CONTINUITY_STATE_HEADER) && seedBody.includes('active request (')));
   const content = liveTurnText && !liveRequestAlreadyBundled
     ? `${seedBody}\n\n${HARD_EPOCH_LIVE_TURN_HEADER}\n${liveTurnText}`
     : seedBody;
@@ -547,6 +704,8 @@ export interface FoldFreezeSealedBandMetadata {
   /** Folded message count and char size for the appended band. */
   bandViewCount: number;
   bandViewChars: number;
+  /** Canonical SHA-256 of the exact provider-visible messages in this band. */
+  bandViewDigest?: string;
   /** Raw tail size before folding, and realized append-band reduction. */
   rawTailChars?: number;
   savedChars?: number;
@@ -569,6 +728,8 @@ export interface FoldFreezeState {
   frozenView: FoldMessage[] | null;
   /** Char size of frozenView (telemetry). */
   frozenViewChars: number;
+  /** Canonical SHA-256 sealed with the hard-epoch/base stratum (before appended bands). */
+  seedBaseDigest?: string;
   /** Message count at the last append-only sealed-boundary split, if this epoch appended a tail band. */
   lastAppendBoundaryViewCount?: number;
   /** Deterministic metadata for append-only sealed bands in this freeze epoch. */
@@ -601,6 +762,8 @@ export interface FoldFreezeState {
   lastTransitionReason?: FoldFreezeTransitionReason;
   /** Last hard-epoch (whole-view rebuild) cause; append-only tail epochs do not overwrite it. */
   lastHardEpochReason?: FoldFreezeHardEpochCause;
+  /** Persisted-state rejection retained until the healing hard epoch commits. */
+  restoreIntegrityFailure?: FoldFreezeRestoreIntegrityFailure;
   /**
    * One-shot bypass set by rebirth fold-state restoration: when true, the
    * next evaluateFoldFreeze call skips boundary/hash validation and trusts the
@@ -628,6 +791,7 @@ export function createFoldFreezeState(): FoldFreezeState {
   return {
     frozenView: null,
     frozenViewChars: 0,
+    seedBaseDigest: undefined,
     lastAppendBoundaryViewCount: undefined,
     sealedBands: [],
     frozenRawCount: 0,
@@ -641,14 +805,19 @@ export function createFoldFreezeState(): FoldFreezeState {
     epochs: 0,
     lastTransitionReason: undefined,
     lastHardEpochReason: undefined,
+    restoreIntegrityFailure: undefined,
     sealedVaultFingerprints: new Set(),
   };
 }
 
 export interface SerializedFoldFreezeState {
-  version: 1;
+  /** v2 seals the seed/base stratum and every append band with SHA-256. */
+  version: 1 | 2;
   frozenView: FoldMessage[] | null;
   frozenViewChars: number;
+  seedBaseDigest?: string;
+  /** SHA-256 over routing-critical snapshot metadata and the per-stratum digests. */
+  integrityManifestDigest?: string;
   lastAppendBoundaryViewCount?: number;
   sealedBands: FoldFreezeSealedBandMetadata[];
   frozenRawCount: number;
@@ -688,6 +857,10 @@ export interface FoldFreezeStateMetadata {
   rawFrontierIndex: number;
   sealedBoundaryViewCount: number | null;
   sealedBands: readonly FoldFreezeSealedBandMetadata[];
+  integrity: {
+    seedBaseDigest?: string;
+    restoreFailure?: FoldFreezeRestoreIntegrityFailure;
+  };
   boundary: FoldFreezeBoundaryMetadata;
   cache: {
     lastCallAt: number;
@@ -699,11 +872,34 @@ export interface FoldFreezeStateMetadata {
   hardEpochCauses: readonly FoldFreezeHardEpochCause[];
 }
 
+function foldFreezeIntegrityManifestDigest(
+  snapshot: Omit<SerializedFoldFreezeState, 'integrityManifestDigest'>,
+): string {
+  return foldProvenanceDigest({
+    version: snapshot.version,
+    frozenViewChars: snapshot.frozenViewChars,
+    seedBaseDigest: snapshot.seedBaseDigest,
+    lastAppendBoundaryViewCount: snapshot.lastAppendBoundaryViewCount,
+    sealedBands: snapshot.sealedBands,
+    frozenRawCount: snapshot.frozenRawCount,
+    boundaryRole: snapshot.boundaryRole,
+    boundaryChars: snapshot.boundaryChars,
+    boundaryHash: snapshot.boundaryHash,
+    thinningMode: snapshot.thinningMode,
+    frozenToolPaths: snapshot.frozenToolPaths,
+    frozenRelevantClaims: snapshot.frozenRelevantClaims,
+    sealedVaultFingerprints: snapshot.sealedVaultFingerprints ?? [],
+  });
+}
+
 export function serializeFoldFreezeState(state: FoldFreezeState): SerializedFoldFreezeState {
-  return {
-    version: 1,
-    frozenView: state.frozenView ? state.frozenView.slice() : null,
+  const snapshot: Omit<SerializedFoldFreezeState, 'integrityManifestDigest'> = {
+    version: 2,
+    // A handoff snapshot is an ownership boundary. Detach nested provider
+    // content so a consumer cannot mutate the live sealed state after hashing.
+    frozenView: state.frozenView ? structuredClone(state.frozenView) : null,
     frozenViewChars: state.frozenViewChars,
+    seedBaseDigest: state.seedBaseDigest,
     lastAppendBoundaryViewCount: state.lastAppendBoundaryViewCount,
     sealedBands: state.sealedBands.map((band) => ({ ...band })),
     frozenRawCount: state.frozenRawCount,
@@ -721,12 +917,175 @@ export function serializeFoldFreezeState(state: FoldFreezeState): SerializedFold
     forceAcceptRestoredView: state.forceAcceptRestoredView,
     sealedVaultFingerprints: Array.from(state.sealedVaultFingerprints).sort(),
   };
+  return {
+    ...snapshot,
+    integrityManifestDigest: foldFreezeIntegrityManifestDigest(snapshot),
+  };
+}
+
+export type FoldFreezeRestoreIntegrityFailureReason =
+  | 'snapshot-malformed'
+  | 'snapshot-version-unsupported'
+  | 'verification-budget-exceeded'
+  | 'missing-integrity-metadata'
+  | 'integrity-manifest-digest-mismatch'
+  | 'frozen-view-char-mismatch'
+  | 'seed-base-digest-mismatch'
+  | 'sealed-band-layout-invalid'
+  | 'sealed-band-char-mismatch'
+  | 'sealed-band-digest-mismatch'
+  | 'raw-band-layout-invalid';
+
+export interface FoldFreezeRestoreIntegrityFailure {
+  readonly reason: FoldFreezeRestoreIntegrityFailureReason;
+  readonly detail?: string;
+}
+
+export type FoldFreezeRestoreIntegrityResult =
+  | { readonly valid: true }
+  | { readonly valid: false; readonly failure: FoldFreezeRestoreIntegrityFailure };
+
+function invalidRestore(
+  reason: FoldFreezeRestoreIntegrityFailureReason,
+  detail?: string,
+): FoldFreezeRestoreIntegrityResult {
+  return { valid: false, failure: detail ? { reason, detail } : { reason } };
+}
+
+/**
+ * Verify a persisted frozen generation before any rebirth/fork trust bypass can
+ * expose it to a provider. This is a read-side check only: it never repairs or
+ * rewrites sealed bytes. v1 snapshots with a frozen view are deliberately
+ * unverifiable and fail closed; the caller heals them through a fresh hard
+ * epoch. Empty v1 state remains safe because it contains no frozen stratum.
+ */
+export function verifySerializedFoldFreezeState(
+  snapshot: SerializedFoldFreezeState,
+): FoldFreezeRestoreIntegrityResult {
+  try {
+  if (snapshot.version !== 1 && snapshot.version !== 2) {
+    return invalidRestore('snapshot-version-unsupported', `version=${String(snapshot.version)}`);
+  }
+  if (!Array.isArray(snapshot.sealedBands)
+    || !Array.isArray(snapshot.frozenToolPaths)
+    || !Array.isArray(snapshot.frozenRelevantClaims)
+    || (snapshot.frozenView !== null && !Array.isArray(snapshot.frozenView))
+    || !Number.isSafeInteger(snapshot.frozenViewChars) || snapshot.frozenViewChars < 0
+    || !Number.isSafeInteger(snapshot.frozenRawCount) || snapshot.frozenRawCount < 0
+    || !Number.isSafeInteger(snapshot.boundaryChars) || snapshot.boundaryChars < 0
+    || !Number.isSafeInteger(snapshot.lastCallAt) || snapshot.lastCallAt < 0
+    || !Number.isSafeInteger(snapshot.hotReuses) || snapshot.hotReuses < 0
+    || !Number.isSafeInteger(snapshot.epochs) || snapshot.epochs < 0
+    || typeof snapshot.boundaryRole !== 'string'
+    || typeof snapshot.thinningMode !== 'string') {
+    return invalidRestore('snapshot-malformed', 'required snapshot fields have invalid runtime shapes');
+  }
+  if (snapshot.frozenView === null) {
+    if (snapshot.frozenViewChars !== 0 || snapshot.sealedBands.length !== 0) {
+      return invalidRestore('sealed-band-layout-invalid', 'empty view carries non-empty geometry');
+    }
+    return { valid: true };
+  }
+  const view = snapshot.frozenView;
+  if (snapshot.version !== 2 || !snapshot.seedBaseDigest || !snapshot.integrityManifestDigest) {
+    return invalidRestore('missing-integrity-metadata', 'frozen seed/base or manifest digest absent');
+  }
+  if (view.length > MAX_FOLD_FREEZE_RESTORE_VIEW_MESSAGES
+    || snapshot.sealedBands.length > MAX_FOLD_FREEZE_RESTORE_SEALED_BANDS
+    || snapshot.frozenViewChars > MAX_FOLD_FREEZE_RESTORE_VIEW_CHARS) {
+    return invalidRestore('verification-budget-exceeded');
+  }
+  const verifiedViewChars = countChars(view);
+  if (verifiedViewChars > MAX_FOLD_FREEZE_RESTORE_VIEW_CHARS) {
+    return invalidRestore('verification-budget-exceeded');
+  }
+  if (verifiedViewChars !== snapshot.frozenViewChars) {
+    return invalidRestore('frozen-view-char-mismatch');
+  }
+
+  const bands = snapshot.sealedBands;
+  const seedEnd = bands[0]?.bandStartViewIndex ?? view.length;
+  if (!Number.isSafeInteger(seedEnd) || seedEnd < 0 || seedEnd > view.length) {
+    return invalidRestore('sealed-band-layout-invalid', 'seed/base endpoint is out of range');
+  }
+  if (foldProvenanceDigest(view.slice(0, seedEnd)) !== snapshot.seedBaseDigest) {
+    return invalidRestore('seed-base-digest-mismatch');
+  }
+
+  let viewCursor = seedEnd;
+  let verifiedPrefixChars = countChars(view.slice(0, seedEnd));
+  let rawCursor: number | null = null;
+  for (let index = 0; index < bands.length; index += 1) {
+    const band = bands[index]!;
+    const geometry = [
+      band.sealedPrefixMessageCount,
+      band.sealedPrefixChars,
+      band.bandStartViewIndex,
+      band.bandEndViewIndex,
+      band.bandViewCount,
+      band.bandViewChars,
+      band.rawStartIndex,
+      band.rawEndIndex,
+      band.rawCount,
+    ];
+    if (geometry.some((value) => !Number.isSafeInteger(value) || value < 0)
+      || band.sealedPrefixMessageCount !== viewCursor
+      || band.bandStartViewIndex !== viewCursor
+      || band.bandEndViewIndex !== band.bandStartViewIndex + band.bandViewCount
+      || band.bandEndViewIndex > view.length) {
+      return invalidRestore('sealed-band-layout-invalid', `band=${index}`);
+    }
+    if (band.sealedPrefixChars !== verifiedPrefixChars) {
+      return invalidRestore('sealed-band-char-mismatch', `band=${index}:prefix`);
+    }
+    const bandView = view.slice(band.bandStartViewIndex, band.bandEndViewIndex);
+    const verifiedBandChars = countChars(bandView);
+    if (band.bandViewChars !== verifiedBandChars) {
+      return invalidRestore('sealed-band-char-mismatch', `band=${index}:content`);
+    }
+    if (!band.bandViewDigest) {
+      return invalidRestore('missing-integrity-metadata', `band=${index}`);
+    }
+    if (foldProvenanceDigest(bandView) !== band.bandViewDigest) {
+      return invalidRestore('sealed-band-digest-mismatch', `band=${index}`);
+    }
+    if (band.rawEndIndex - band.rawStartIndex !== band.rawCount
+      || (rawCursor !== null && band.rawStartIndex !== rawCursor)) {
+      return invalidRestore('raw-band-layout-invalid', `band=${index}`);
+    }
+    viewCursor = band.bandEndViewIndex;
+    verifiedPrefixChars += verifiedBandChars;
+    rawCursor = band.rawEndIndex;
+  }
+  if (viewCursor !== view.length
+    || (rawCursor !== null && rawCursor !== snapshot.frozenRawCount)
+    || (bands.length > 0
+      && snapshot.lastAppendBoundaryViewCount !== bands.at(-1)!.sealedPrefixMessageCount)) {
+    return invalidRestore('sealed-band-layout-invalid', 'sealed generation frontier mismatch');
+  }
+  const { integrityManifestDigest: _storedManifest, ...manifestInput } = snapshot;
+  if (foldFreezeIntegrityManifestDigest(manifestInput) !== snapshot.integrityManifestDigest) {
+    return invalidRestore('integrity-manifest-digest-mismatch');
+  }
+  return { valid: true };
+  } catch {
+    return invalidRestore('snapshot-malformed', 'snapshot verification raised on invalid runtime shape');
+  }
 }
 
 export function restoreFoldFreezeState(snapshot: SerializedFoldFreezeState): FoldFreezeState {
+  const integrity = verifySerializedFoldFreezeState(snapshot);
+  if (!integrity.valid) {
+    const rejected = createFoldFreezeState();
+    rejected.restoreIntegrityFailure = integrity.failure;
+    return rejected;
+  }
   return {
-    frozenView: snapshot.frozenView ? snapshot.frozenView.slice() : null,
+    // Detach from the caller-owned transport object after verification. This
+    // closes the verify/use alias window for nested provider content.
+    frozenView: snapshot.frozenView ? structuredClone(snapshot.frozenView) : null,
     frozenViewChars: snapshot.frozenViewChars,
+    seedBaseDigest: snapshot.seedBaseDigest,
     lastAppendBoundaryViewCount: snapshot.lastAppendBoundaryViewCount,
     sealedBands: snapshot.sealedBands.map((band) => ({ ...band })),
     frozenRawCount: snapshot.frozenRawCount,
@@ -742,6 +1101,7 @@ export function restoreFoldFreezeState(snapshot: SerializedFoldFreezeState): Fol
     lastTransitionReason: snapshot.lastTransitionReason,
     // Legacy read compat: pre-rename snapshots carry lastFullRecomputeReason.
     lastHardEpochReason: snapshot.lastHardEpochReason ?? snapshot.lastFullRecomputeReason,
+    restoreIntegrityFailure: undefined,
     forceAcceptRestoredView: snapshot.forceAcceptRestoredView,
     sealedVaultFingerprints: new Set(snapshot.sealedVaultFingerprints ?? []),
   };
@@ -755,6 +1115,10 @@ export function getFoldFreezeMetadata(state: FoldFreezeState): FoldFreezeStateMe
     rawFrontierIndex: state.frozenRawCount,
     sealedBoundaryViewCount: state.lastAppendBoundaryViewCount ?? null,
     sealedBands: state.sealedBands.map((band) => ({ ...band })),
+    integrity: {
+      seedBaseDigest: state.seedBaseDigest,
+      restoreFailure: state.restoreIntegrityFailure,
+    },
     boundary: {
       rawIndex: state.frozenRawCount > 0 ? state.frozenRawCount - 1 : null,
       role: state.boundaryRole,
@@ -770,6 +1134,100 @@ export function getFoldFreezeMetadata(state: FoldFreezeState): FoldFreezeStateMe
     },
     hardEpochCauses: FOLD_FREEZE_HARD_EPOCH_CAUSES,
   };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Frozen-stratum write law (executable predicate)
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * The governing law of the freeze layer as an executable classification:
+ * every improvement lands as a view, a band, recall logic, or a new overlay
+ * artifact — never as a mutation to a frozen stratum between hard epochs.
+ * The provider prompt cache matches byte-identical prefixes, boundary
+ * fingerprints detect covered-history rewrites, and forks/siblings read the
+ * same history concurrently — so a write that would rewrite sealed bytes is
+ * legal ONLY while a hard-epoch materialization is committing a new frozen
+ * generation. Restore-time per-stratum verification above enforces the same
+ * law on persisted reads. Everything else is an overlay: appends, recall
+ * injections, and transient renders that never touch sealed bytes.
+ */
+export type FoldWriteTarget =
+  /** Mutating the sealed frozen view head. */
+  | 'frozen-prefix'
+  /** Mutating an already-sealed band's bytes or metadata. */
+  | 'sealed-band'
+  /** Sealing a NEW band above the frozen view (tail epoch). */
+  | 'band-append'
+  /** Appending new raw history. */
+  | 'raw-tail-append'
+  /** Injecting recall cards onto the transient tail. */
+  | 'recall-card-injection'
+  /** Re-rendering derived transient views (vault overlays, digests). */
+  | 'transient-render';
+
+export type FoldWriteClass = 'frozen-stratum' | 'overlay';
+
+/**
+ * Classify a write target: frozen stratum (sealed bytes) vs overlay
+ * (append/render). The default is deliberately frozen-stratum so an unknown
+ * runtime value from an untyped or version-skewed caller fails closed.
+ */
+export function classifyFoldWriteTarget(target: FoldWriteTarget): FoldWriteClass {
+  switch (target) {
+    case 'band-append':
+    case 'raw-tail-append':
+    case 'recall-card-injection':
+    case 'transient-render':
+      return 'overlay';
+    case 'frozen-prefix':
+    case 'sealed-band':
+    default:
+      return 'frozen-stratum';
+  }
+}
+
+/** Authority under which a fold write is attempted. */
+export interface FoldWriteAuthority {
+  /** True only while a hard-epoch materialization is committing. */
+  readonly hardEpochMaterialization: boolean;
+}
+
+/** Default authority: no hard epoch in flight — frozen strata are read-only. */
+export const NO_FOLD_WRITE_AUTHORITY: FoldWriteAuthority = Object.freeze({
+  hardEpochMaterialization: false,
+});
+
+/** Authority held only by the hard-epoch commit path. */
+export const HARD_EPOCH_MATERIALIZATION: FoldWriteAuthority = Object.freeze({
+  hardEpochMaterialization: true,
+});
+
+/**
+ * Fail-closed write gate: overlay writes are always legal; frozen-stratum
+ * writes are legal only under hard-epoch materialization authority.
+ */
+export function isFoldWriteAllowed(target: FoldWriteTarget, authority: FoldWriteAuthority): boolean {
+  if (classifyFoldWriteTarget(target) === 'overlay') return true;
+  return authority.hardEpochMaterialization === true;
+}
+
+/** Typed rejection for a frozen-stratum write without hard-epoch authority. */
+export class FoldFrozenStratumViolation extends Error {
+  readonly target: FoldWriteTarget;
+
+  constructor(target: FoldWriteTarget) {
+    super(
+      `frozen-stratum write rejected: '${target}' may only be replaced during a hard-epoch materialization`,
+    );
+    this.name = 'FoldFrozenStratumViolation';
+    this.target = target;
+  }
+}
+
+/** Throwing form of isFoldWriteAllowed for write paths that must fail closed. */
+export function assertFoldWriteAllowed(target: FoldWriteTarget, authority: FoldWriteAuthority): void {
+  if (!isFoldWriteAllowed(target, authority)) throw new FoldFrozenStratumViolation(target);
 }
 
 /** Per-band char summary for one sealed append-only tail-epoch band. */
@@ -833,10 +1291,11 @@ export interface FoldFreezeContext {
 // ══════════════════════════════════════════════════════════════════════
 
 /**
- * Reason attached to an `action: 'recompute'` decision — the freeze cache
- * saying "the whole view must be rebuilt". Under the two-epoch law every
- * committed whole-view rebuild is a (seeded) HARD epoch, hence the alias.
- * Callers that can still band-append do so instead of committing this.
+ * Broad reason attached to an `action: 'recompute'` decision — the freeze
+ * cache asks the host to replace the whole view, but does not choose the host's
+ * lifecycle transition. The alias preserves the public compatibility name;
+ * callers may initialize, refold in place, repair, or materialize a seeded
+ * hard epoch according to their routing rules.
  */
 export type FoldFreezeRecomputeReason = FoldFreezeHardEpochCause;
 
@@ -870,6 +1329,14 @@ export function evaluateFoldFreeze(
 ): FoldFreezeDecision {
   const gapMs = state.lastCallAt > 0 ? Math.max(0, now - state.lastCallAt) : 0;
 
+  if (state.restoreIntegrityFailure) {
+    return {
+      action: 'recompute',
+      reason: 'restore-integrity-failed',
+      gapMs,
+      detail: state.restoreIntegrityFailure.reason,
+    };
+  }
   if (!state.frozenView) {
     return { action: 'recompute', reason: 'first-call', gapMs };
   }
@@ -996,10 +1463,15 @@ export function initializeFoldFreezeBase(
   view: FoldMessage[],
   context: FoldFreezeContext,
   now: number,
+  authority: FoldWriteAuthority = NO_FOLD_WRITE_AUTHORITY,
 ): void {
+  // Installing the first provider-visible base creates a stratum; replacing an
+  // existing sealed base mutates one and therefore requires hard-epoch authority.
+  if (state.frozenView !== null) assertFoldWriteAllowed('frozen-prefix', authority);
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
   state.frozenView = view.slice();
   state.frozenViewChars = countChars(view);
+  state.seedBaseDigest = foldProvenanceDigest(view);
   state.lastAppendBoundaryViewCount = undefined;
   state.sealedBands = [];
   state.frozenRawCount = history.length;
@@ -1017,6 +1489,7 @@ export function initializeFoldFreezeBase(
   state.frozenRelevantClaims = relevant;
   state.lastCallAt = now;
   state.hotReuses = 0;
+  state.restoreIntegrityFailure = undefined;
 }
 
 /**
@@ -1035,7 +1508,7 @@ export function commitFoldFreeze(
   now: number,
   hardEpochCause: FoldFreezeHardEpochCause = 'first-call',
 ): void {
-  initializeFoldFreezeBase(state, history, view, context, now);
+  initializeFoldFreezeBase(state, history, view, context, now, HARD_EPOCH_MATERIALIZATION);
   state.epochs += 1;
   state.lastTransitionReason = hardEpochCause;
   state.lastHardEpochReason = hardEpochCause;
@@ -1047,37 +1520,46 @@ export function commitFoldFreeze(
  * message objects remain the byte-identical prefix, and only the newly folded
  * tail band is concatenated behind them.
  */
-export function appendFoldFreezeTailEpoch(
+export function prepareFoldFreezeTailEpochSeal(
   state: FoldFreezeState,
   history: FoldMessage[],
   tailView: FoldMessage[],
   context: FoldFreezeContext,
   now: number,
-): FoldFreezeAppendResult {
+  options: FoldFreezeTailEpochSealOptions = {},
+): FoldFreezeTailEpochSealPreparation {
   if (!state.frozenView) {
     return {
-      committed: false,
-      view: null,
-      sealedPrefixMessageCount: null,
-      rawTailChars: 0,
-      rawTailMessages: 0,
-      bandViewChars: countChars(tailView),
-      savedChars: 0,
-      shrinkRatio: null,
-      skipReason: 'missing-frozen-view',
+      prepared: false,
+      result: {
+        committed: false,
+        view: null,
+        sealedPrefixMessageCount: null,
+        rawTailChars: 0,
+        rawTailMessages: 0,
+        bandViewChars: countChars(tailView),
+        savedChars: 0,
+        shrinkRatio: null,
+        shrinkDiagnostics: [],
+        skipReason: 'missing-frozen-view',
+      },
     };
   }
   if (history.length < state.frozenRawCount) {
     return {
-      committed: false,
-      view: null,
-      sealedPrefixMessageCount: state.frozenView.length,
-      rawTailChars: 0,
-      rawTailMessages: 0,
-      bandViewChars: countChars(tailView),
-      savedChars: 0,
-      shrinkRatio: null,
-      skipReason: 'history-rewound',
+      prepared: false,
+      result: {
+        committed: false,
+        view: null,
+        sealedPrefixMessageCount: state.frozenView.length,
+        rawTailChars: 0,
+        rawTailMessages: 0,
+        bandViewChars: countChars(tailView),
+        savedChars: 0,
+        shrinkRatio: null,
+        shrinkDiagnostics: [],
+        skipReason: 'history-rewound',
+      },
     };
   }
 
@@ -1087,37 +1569,52 @@ export function appendFoldFreezeTailEpoch(
   const rawTail = history.slice(rawStartIndex);
   const rawTailChars = rawTail.length > 0 ? countChars(rawTail) : 0;
   const rawTailMessages = rawTail.length;
-  const bandViewChars = countChars(tailView);
-  const savedChars = rawTailChars - bandViewChars;
-  const shrinkRatio = rawTailChars > 0 ? bandViewChars / rawTailChars : null;
   if (rawTailChars <= 0) {
+    const bandViewChars = countChars(tailView);
     return {
-      committed: false,
-      view: state.frozenView.concat(rawTail),
-      sealedPrefixMessageCount,
-      rawTailChars,
-      rawTailMessages,
-      bandViewChars,
-      savedChars,
-      shrinkRatio,
-      skipReason: 'empty-tail',
-    };
-  }
-  if (savedChars <= 0 || shrinkRatio === null || shrinkRatio > APPEND_TAIL_MIN_SHRINK_RATIO) {
-    return {
-      committed: false,
-      view: state.frozenView.concat(rawTail),
-      sealedPrefixMessageCount,
-      rawTailChars,
-      rawTailMessages,
-      bandViewChars,
-      savedChars,
-      shrinkRatio,
-      skipReason: 'not-smaller',
+      prepared: false,
+      result: {
+        committed: false,
+        view: state.frozenView.concat(rawTail),
+        sealedPrefixMessageCount,
+        rawTailChars,
+        rawTailMessages,
+        bandViewChars,
+        savedChars: -bandViewChars,
+        shrinkRatio: null,
+        shrinkDiagnostics: [],
+        skipReason: 'empty-tail',
+      },
     };
   }
 
-  const view = state.frozenView.concat(tailView);
+  // The caller still owns tailView after this function returns. Detach it
+  // before measuring or gating so every decision and manifest field describes
+  // the exact immutable bytes that a successful publication will install.
+  const preparedTailView = structuredClone(tailView);
+  const bandViewChars = countChars(preparedTailView);
+  const savedChars = rawTailChars - bandViewChars;
+  const shrinkRatio = bandViewChars / rawTailChars;
+  const shrinkDiagnostics = collectFoldFreezeShrinkDiagnostics(shrinkRatio);
+  if (savedChars <= 0 || shrinkRatio > APPEND_TAIL_MIN_SHRINK_RATIO) {
+    return {
+      prepared: false,
+      result: {
+        committed: false,
+        view: state.frozenView.concat(rawTail),
+        sealedPrefixMessageCount,
+        rawTailChars,
+        rawTailMessages,
+        bandViewChars,
+        savedChars,
+        shrinkRatio,
+        shrinkDiagnostics,
+        skipReason: 'not-smaller',
+      },
+    };
+  }
+
+  const view = state.frozenView.concat(preparedTailView);
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
   const boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
   const band: FoldFreezeSealedBandMetadata = {
@@ -1125,8 +1622,9 @@ export function appendFoldFreezeTailEpoch(
     sealedPrefixChars,
     bandStartViewIndex: sealedPrefixMessageCount,
     bandEndViewIndex: view.length,
-    bandViewCount: tailView.length,
+    bandViewCount: preparedTailView.length,
     bandViewChars,
+    bandViewDigest: foldProvenanceDigest(preparedTailView),
     rawTailChars,
     savedChars,
     shrinkRatio,
@@ -1140,30 +1638,19 @@ export function appendFoldFreezeTailEpoch(
     createdAt: now,
   };
 
-  state.frozenView = view.slice();
-  state.frozenViewChars = countChars(view);
-  state.lastAppendBoundaryViewCount = sealedPrefixMessageCount;
-  state.sealedBands = state.sealedBands.concat(band);
-  state.frozenRawCount = history.length;
-  state.boundaryRole = boundary?.role ?? '';
-  state.boundaryChars = boundary ? countChars([boundary]) : 0;
-  state.boundaryHash = boundaryHash;
-  state.thinningMode = context.thinningMode;
-
   const toolPaths = extractToolPathSet(history);
   const relevant = new Set<string>();
   for (const claimed of context.claimedPaths) {
     const normalized = normalizeToolPath(claimed);
     if (toolPaths.has(normalized)) relevant.add(normalized);
   }
-  state.frozenToolPaths = toolPaths;
-  state.frozenRelevantClaims = relevant;
-  state.lastCallAt = now;
-  state.hotReuses = 0;
-  state.epochs += 1;
-  state.lastTransitionReason = 'append-tail-epoch';
-
-  return {
+  const sealedVaultFingerprints = new Set(state.sealedVaultFingerprints);
+  for (const fingerprint of options.sealedVaultFingerprints ?? []) {
+    if (typeof fingerprint === 'string' && fingerprint.length > 0) {
+      sealedVaultFingerprints.add(fingerprint);
+    }
+  }
+  const result: FoldFreezeAppendCommit = {
     committed: true,
     view,
     sealedPrefixMessageCount,
@@ -1172,6 +1659,149 @@ export function appendFoldFreezeTailEpoch(
     bandViewChars,
     savedChars,
     shrinkRatio,
+    shrinkDiagnostics,
     commitReason: 'material-shrink',
+  };
+  const nextState: FoldFreezeState = {
+    ...state,
+    frozenView: view.slice(),
+    frozenViewChars: countChars(view),
+    lastAppendBoundaryViewCount: sealedPrefixMessageCount,
+    sealedBands: state.sealedBands.concat(band),
+    frozenRawCount: history.length,
+    boundaryRole: boundary?.role ?? '',
+    boundaryChars: boundary ? countChars([boundary]) : 0,
+    boundaryHash,
+    thinningMode: context.thinningMode,
+    frozenToolPaths: toolPaths,
+    frozenRelevantClaims: relevant,
+    lastCallAt: now,
+    hotReuses: 0,
+    epochs: state.epochs + 1,
+    lastTransitionReason: 'append-tail-epoch',
+    sealedVaultFingerprints,
+  };
+  const plan: FoldFreezeTailEpochSealPlan = {
+    prepared: true,
+    result: {
+      ...result,
+      view: structuredClone(result.view),
+      shrinkDiagnostics: structuredClone(result.shrinkDiagnostics),
+    },
+  };
+  foldFreezeTailEpochSealInternals.set(plan, {
+    result,
+    nextState,
+    base: {
+      frozenView: state.frozenView,
+      frozenViewDigest: foldProvenanceDigest(state.frozenView),
+      frozenViewChars: state.frozenViewChars,
+      seedBaseDigest: state.seedBaseDigest,
+      lastAppendBoundaryViewCount: state.lastAppendBoundaryViewCount,
+      sealedBands: state.sealedBands,
+      sealedBandsDigest: foldProvenanceDigest(state.sealedBands),
+      sealedVaultFingerprints: state.sealedVaultFingerprints,
+      sealedVaultFingerprintsDigest: foldProvenanceDigest(
+        Array.from(state.sealedVaultFingerprints).sort(),
+      ),
+      frozenRawCount: state.frozenRawCount,
+      boundaryRole: state.boundaryRole,
+      boundaryChars: state.boundaryChars,
+      boundaryHash: state.boundaryHash,
+      thinningMode: state.thinningMode,
+      frozenToolPaths: state.frozenToolPaths,
+      frozenToolPathsDigest: foldProvenanceDigest(Array.from(state.frozenToolPaths).sort()),
+      frozenRelevantClaims: state.frozenRelevantClaims,
+      frozenRelevantClaimsDigest: foldProvenanceDigest(
+        Array.from(state.frozenRelevantClaims).sort(),
+      ),
+      epochs: state.epochs,
+      lastCallAt: state.lastCallAt,
+      hotReuses: state.hotReuses,
+      lastTransitionReason: state.lastTransitionReason,
+      lastHardEpochReason: state.lastHardEpochReason,
+      restoreIntegrityFailure: state.restoreIntegrityFailure,
+      forceAcceptRestoredView: state.forceAcceptRestoredView,
+    },
+  });
+  return plan;
+}
+
+/** Publish a prepared tail-band plan, or reject it if the base state moved. */
+export function commitFoldFreezeTailEpochSeal(
+  state: FoldFreezeState,
+  plan: FoldFreezeTailEpochSealPlan,
+): FoldFreezeAppendCommit {
+  const internals = foldFreezeTailEpochSealInternals.get(plan);
+  if (!internals) throw new FoldFreezeTailEpochSealConflict();
+  const base = internals.base;
+  if (state.frozenView !== base.frozenView
+    || foldProvenanceDigest(state.frozenView) !== base.frozenViewDigest
+    || state.frozenViewChars !== base.frozenViewChars
+    || state.seedBaseDigest !== base.seedBaseDigest
+    || state.lastAppendBoundaryViewCount !== base.lastAppendBoundaryViewCount
+    || state.sealedBands !== base.sealedBands
+    || foldProvenanceDigest(state.sealedBands) !== base.sealedBandsDigest
+    || state.sealedVaultFingerprints !== base.sealedVaultFingerprints
+    || state.frozenRawCount !== base.frozenRawCount
+    || state.boundaryRole !== base.boundaryRole
+    || state.boundaryChars !== base.boundaryChars
+    || state.boundaryHash !== base.boundaryHash
+    || state.thinningMode !== base.thinningMode
+    || state.frozenToolPaths !== base.frozenToolPaths
+    || foldProvenanceDigest(Array.from(state.frozenToolPaths).sort())
+      !== base.frozenToolPathsDigest
+    || state.frozenRelevantClaims !== base.frozenRelevantClaims
+    || foldProvenanceDigest(Array.from(state.frozenRelevantClaims).sort())
+      !== base.frozenRelevantClaimsDigest
+    || state.epochs !== base.epochs
+    || state.lastCallAt !== base.lastCallAt
+    || state.hotReuses !== base.hotReuses
+    || state.lastTransitionReason !== base.lastTransitionReason
+    || state.lastHardEpochReason !== base.lastHardEpochReason
+    || state.restoreIntegrityFailure !== base.restoreIntegrityFailure
+    || state.forceAcceptRestoredView !== base.forceAcceptRestoredView
+    || foldProvenanceDigest(Array.from(state.sealedVaultFingerprints).sort())
+      !== base.sealedVaultFingerprintsDigest) {
+    throw new FoldFreezeTailEpochSealConflict();
+  }
+  // Complete the fallible caller-result detachment before publication. A
+  // provider-shaped message may expose getters to structuredClone; if one
+  // throws, the live state must still be the untouched pre-seal generation.
+  const publishedResult: FoldFreezeAppendCommit = {
+    ...internals.result,
+    view: structuredClone(internals.result.view),
+    shrinkDiagnostics: structuredClone(internals.result.shrinkDiagnostics),
+  };
+  // Every value above was prepared off-state. Object.assign is synchronous and
+  // contains no user callbacks or I/O, so nothing can observe an intermediate
+  // manifest/fingerprint state on the JavaScript event loop.
+  Object.assign(state, internals.nextState);
+  foldFreezeTailEpochSealInternals.delete(plan);
+  return publishedResult;
+}
+
+/**
+ * Compatibility wrapper retaining the original one-call append API and exact
+ * successful view bytes while routing publication through the atomic seal.
+ */
+export function appendFoldFreezeTailEpoch(
+  state: FoldFreezeState,
+  history: FoldMessage[],
+  tailView: FoldMessage[],
+  context: FoldFreezeContext,
+  now: number,
+  options: FoldFreezeTailEpochSealOptions = {},
+): FoldFreezeAppendResult {
+  const frozenPrefix = state.frozenView;
+  const prepared = prepareFoldFreezeTailEpochSeal(state, history, tailView, context, now, options);
+  if (!prepared.prepared) return prepared.result;
+  const committed = commitFoldFreezeTailEpochSeal(state, prepared);
+  // Preserve the original one-call API's reference identity for the caller's
+  // tail messages. The state itself holds the detached prepared band, so later
+  // mutation of this compatibility view cannot rewrite the sealed generation.
+  return {
+    ...committed,
+    view: (frozenPrefix ?? []).concat(tailView),
   };
 }

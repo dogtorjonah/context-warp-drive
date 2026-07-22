@@ -6,6 +6,82 @@ export const REGISTER_GLYPHS = {
   blocked: '❓',
 } as const;
 
+/**
+ * Immutable cognitive history keeps superseded rows visible with this glyph.
+ * The replacement relationship itself lives on the structured provenance
+ * line (source-id=… · current=superseded · superseded-by=…); consumers must
+ * join on those identities rather than guessing from similar prose or age.
+ */
+export const COGNITIVE_SUPERSEDED_GLYPH = '⊘';
+
+export interface CognitiveSupersessionPointer {
+  readonly sourceIdentity: string;
+  readonly supersededByIdentity: string;
+}
+
+const COGNITIVE_SOURCE_ID_RE = /(?:^|\s·\s)source-id=([^\s·()]+)/u;
+const COGNITIVE_SUPERSEDED_BY_RE = /(?:^|\s·\s)superseded-by=([^\s·()]+)/u;
+const COGNITIVE_EXACT_SOURCE_ID_RE = /(?:^|\s·\s)source-identity=exact(?:\s·\s|$)/u;
+
+/**
+ * Parse the canonical cognitive supersession overlay. Only a provenance row
+ * that explicitly declares current=superseded can create an edge; bare words,
+ * quoted examples, episode glyphs, and merely old rows are ignored.
+ * Duplicate source identities are last-write-wins in rendered stratum order,
+ * matching the append-only newer-band authority rule. Self edges are invalid.
+ */
+export function extractCognitiveSupersessionPointers(
+  input: string,
+): CognitiveSupersessionPointer[] {
+  const bySource = new Map<string, string>();
+  let inCognitiveBlock = false;
+  let provenanceSeen = false;
+  let fencedBy: { readonly marker: '`' | '~'; readonly length: number } | null = null;
+  for (const line of input.split('\n')) {
+    if (line === '[cognitive]' || line.startsWith('[cognitive — historical waypoints')) {
+      inCognitiveBlock = true;
+      provenanceSeen = false;
+      continue;
+    }
+    if (!inCognitiveBlock) continue;
+    if (line.includes('artifact=cognitive-waypoints class=synthesized-history')) {
+      provenanceSeen = true;
+      continue;
+    }
+    if (provenanceSeen && line.startsWith('[')) {
+      inCognitiveBlock = false;
+      provenanceSeen = false;
+      fencedBy = null;
+      continue;
+    }
+    if (!provenanceSeen) continue;
+    const fenceRun = /^(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (fencedBy) {
+      if (
+        fenceRun?.[0] === fencedBy.marker
+        && fenceRun.length >= fencedBy.length
+        && line.slice(fenceRun.length).trim() === ''
+      ) fencedBy = null;
+      continue;
+    }
+    if (fenceRun) {
+      fencedBy = { marker: fenceRun[0] as '`' | '~', length: fenceRun.length };
+      continue;
+    }
+    if (!line.startsWith('↞ ')) continue;
+    if (!/(?:^|\s·\s)current=superseded(?:\s·\s|$)/u.test(line)) continue;
+    if (!COGNITIVE_EXACT_SOURCE_ID_RE.test(line)) continue;
+    const sourceIdentity = COGNITIVE_SOURCE_ID_RE.exec(line)?.[1];
+    const supersededByIdentity = COGNITIVE_SUPERSEDED_BY_RE.exec(line)?.[1];
+    if (!sourceIdentity || !supersededByIdentity || sourceIdentity === supersededByIdentity) continue;
+    if (sourceIdentity.length > 256 || supersededByIdentity.length > 256) continue;
+    bySource.set(sourceIdentity, supersededByIdentity);
+  }
+  return [...bySource.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([sourceIdentity, supersededByIdentity]) => ({ sourceIdentity, supersededByIdentity }));
+}
+
 export const ASCII_REGISTER_ALIASES = {
   '[progress]': 'in_progress',
   '[in_progress]': 'in_progress',
