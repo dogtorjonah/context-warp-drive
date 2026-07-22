@@ -48,12 +48,6 @@ export function extractCognitiveSupersessionPointers(
       provenanceSeen = true;
       continue;
     }
-    if (provenanceSeen && line.startsWith('[')) {
-      inCognitiveBlock = false;
-      provenanceSeen = false;
-      fencedBy = null;
-      continue;
-    }
     if (!provenanceSeen) continue;
     const fenceRun = /^(`{3,}|~{3,})/u.exec(line)?.[1];
     if (fencedBy) {
@@ -66,6 +60,11 @@ export function extractCognitiveSupersessionPointers(
     }
     if (fenceRun) {
       fencedBy = { marker: fenceRun[0] as '`' | '~', length: fenceRun.length };
+      continue;
+    }
+    if (line.startsWith('[')) {
+      inCognitiveBlock = false;
+      provenanceSeen = false;
       continue;
     }
     if (!line.startsWith('↞ ')) continue;

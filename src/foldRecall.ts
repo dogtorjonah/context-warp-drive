@@ -894,15 +894,13 @@ export function normalizeFoldRecallPovText(text: string): string {
 
 function collectCognitiveSupersessions(
   messages: readonly FoldMessage[],
-  syntheticContext: SyntheticContextOptions,
 ): CognitiveSupersessionPointer[] {
   const bySource = new Map<string, string>();
   for (const message of messages) {
     const trustedSynthetic = message.contextWarpSynthetic === 'folded-context'
       || message.contextWarpSynthetic === 'cognitive-overlay';
-    if (message.role !== 'assistant' && message.role !== 'model' && !trustedSynthetic) continue;
+    if (!trustedSynthetic) continue;
     for (const text of collectMessageTextFragments(message)) {
-      if (!trustedSynthetic && !isSyntheticContextText(text, syntheticContext)) continue;
       for (const pointer of extractCognitiveSupersessionPointers(text)) {
         bySource.set(pointer.sourceIdentity, pointer.supersededByIdentity);
       }
@@ -1419,7 +1417,7 @@ export function buildFoldIndex(
 ): FoldRecallIndex {
   const entries: FoldIndexEntry[] = [];
   const visibleRecallCards = collectVisibleRecallCards(foldedView);
-  const supersessions = collectCognitiveSupersessions(foldedView, syntheticContext);
+  const supersessions = collectCognitiveSupersessions(foldedView);
 
   // ── Inter-turn entries: replay turn detection over raw, count from the view's fold blocks ──
   // FC append-only tail epochs seal one fold block PER BAND, so a folded view

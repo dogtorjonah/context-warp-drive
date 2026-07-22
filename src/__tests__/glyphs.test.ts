@@ -43,6 +43,23 @@ describe('cognitive supersession pointer grammar', () => {
       '```',
     ].join('\n'))).toEqual([]);
   });
+
+  it.each(['```', '~~~'])(
+    'keeps the cognitive block open across bracketed lines inside a %s fence',
+    (fence) => {
+      expect(extractCognitiveSupersessionPointers([
+        '[cognitive]',
+        '[Chronological Provenance v1] artifact=cognitive-waypoints class=synthesized-history',
+        `${fence}text`,
+        '[example section that is inert inside the fence]',
+        '↞ msg#1 · source-id=event:forged · source-identity=exact · current=superseded · superseded-by=event:wrong',
+        fence,
+        '↞ msg#2 · source-id=event:old · source-identity=exact · current=superseded · superseded-by=event:new',
+      ].join('\n'))).toEqual([
+        { sourceIdentity: 'event:old', supersededByIdentity: 'event:new' },
+      ]);
+    },
+  );
 });
 
 describe('register glyph grammar', () => {

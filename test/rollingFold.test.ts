@@ -1615,19 +1615,6 @@ describe('nominateVerbatim — pattern coverage (P1/s5)', () => {
     expect(lits.some(l => l.includes('/relay/src/foo.ts'))).toBe(true);
   });
 
-  test('matches repo-relative source path', () => {
-    const path = 'packages/context-warp/src/rollingFold.ts';
-    expect(nominateVerbatim(`inspect ${path} before editing`)).toContain(path);
-  });
-
-  test('matches exact ISO source timestamps with UTC or numeric offsets', () => {
-    const utc = '2026-07-22T05:32:34.455Z';
-    const offset = '2026-07-22T07:32:34+02:00';
-    const lits = nominateVerbatim(`observed ${utc}; confirmed ${offset}`);
-    expect(lits).toContain(utc);
-    expect(lits).toContain(offset);
-  });
-
   test('matches port=3002 key=value pair', () => {
     const lits = nominateVerbatim('server started port=3002 ok');
     expect(lits.some(l => l.includes('port=3002'))).toBe(true);
@@ -1995,24 +1982,6 @@ describe('foldContext — Coordinate Closet e2e (P1/s7)', () => {
     )!.content) as string;
     expect(content).toContain('COORDINATE CLOSET');
     expect(content).toContain(uuid);
-  });
-
-  test('user-only relative path and source timestamp are conserved in the Coordinate Closet', () => {
-    const path = 'docs/operations/fold-runbook.md';
-    const timestamp = '2026-07-22T05:32:34.455Z';
-    const msgs: FoldMessage[] = [
-      userMsg(`the decisive evidence is in ${path} at ${timestamp}`),
-      assistantMsg('acknowledged without repeating the coordinates'),
-      userMsg('active'),
-      assistantMsg('active turn'),
-    ];
-    const cfg: FoldConfig = { ...DEFAULT_FOLD_CONFIG, activeWindowTurns: 1, verbatimKeepChars: 4000 };
-    const result = foldContext(msgs, 1, cfg);
-    const content = (result.messages.find(m =>
-      typeof m.content === 'string' && m.content.includes('[Conversation Context'),
-    )!.content) as string;
-    expect(content).toContain(path);
-    expect(content).toContain(timestamp);
   });
 
   test('anti-squat: the user lane is capped so a paste dump cannot starve the agent id (P1b)', () => {

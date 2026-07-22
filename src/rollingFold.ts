@@ -1715,24 +1715,18 @@ const VERBATIM_HEX_RE = /\b[0-9a-f]{12,64}\b/gi;
  *  digit runs (20260610) and hex-only English words (deadbeef). */
 const VERBATIM_HEX_SHORT_RE = /\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{8,11}\b/gi;
 const VERBATIM_ABS_PATH_RE = /(?:^|[\s"'`(=])(\/(?:[\w.@-]+\/)+[\w.@-]+)/g;
-/** Repo-relative source path with an extension. The extension requirement keeps
- * slash-separated prose out while admitting operator-named files such as
- * `packages/context-warp/src/rollingFold.ts`. */
-const VERBATIM_REL_PATH_RE = new RegExp(USER_NAMED_REL_PATH_RE.source, USER_NAMED_REL_PATH_RE.flags);
 /** Value must contain a digit, '/', or '@' — keeps ports/ids/urls/emails
  *  (port=3002, ref: abc1234), drops prose KVs ("result: this", "mode=continuous"). */
 const VERBATIM_KV_RE = /\b([A-Za-z_][\w.-]{0,40}[=:][ ]?(?=[\w./:@-]*[\d/@])[\w./:@-]{4,80})/g;
 const VERBATIM_REF_RE = /(?:^|\s)(#\d{2,8})\b/g;
-/** Exact source-time coordinate, with UTC or an explicit numeric offset. */
-const VERBATIM_ISO_TIMESTAMP_RE = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\b/g;
 
 /**
  * Nominate carry-worthy verbatim values from text (UUIDs, hex ids ≥12, short
- * mixed hex 8-11, absolute and repo-relative paths, key=value pairs with
- * digit-bearing values, issue refs #1234, and ISO source timestamps). Collects
- * in PATTERN-PRIORITY order — source order within each pattern. Under a budget
- * this priority order is the carry policy: id/path-shaped values win over KVs
- * and timestamps. Dedupes exactly, stops at cap.
+ * mixed hex 8-11, absolute paths, key=value pairs with digit-bearing values,
+ * issue refs #1234). Collects in PATTERN-PRIORITY order — all UUIDs, then hex,
+ * then short hex, paths, KVs, refs — source order within each pattern. Under a
+ * budget this priority order is the carry policy: id-shaped values win over
+ * KV pairs. Dedupes exactly, stops at cap.
  *
  * A literal is either carried WHOLE or not at all — a mid-literal cut mints a
  * phantom coordinate ('/home/jonah/voxxo-swarm/ap') that never existed, worse
@@ -1764,10 +1758,8 @@ export function nominateVerbatim(text: string, cap = 40): string[] {
     [new RegExp(VERBATIM_HEX_RE.source, VERBATIM_HEX_RE.flags), 0],
     [new RegExp(VERBATIM_HEX_SHORT_RE.source, VERBATIM_HEX_SHORT_RE.flags), 0],
     [new RegExp(VERBATIM_ABS_PATH_RE.source, VERBATIM_ABS_PATH_RE.flags), 1],
-    [new RegExp(VERBATIM_REL_PATH_RE.source, VERBATIM_REL_PATH_RE.flags), 1],
     [new RegExp(VERBATIM_KV_RE.source, VERBATIM_KV_RE.flags), 1],
     [new RegExp(VERBATIM_REF_RE.source, VERBATIM_REF_RE.flags), 1],
-    [new RegExp(VERBATIM_ISO_TIMESTAMP_RE.source, VERBATIM_ISO_TIMESTAMP_RE.flags), 0],
   ];
 
   for (const [re, group] of patterns) {
