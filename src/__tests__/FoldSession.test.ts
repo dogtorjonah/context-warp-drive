@@ -653,7 +653,7 @@ Conserved high-value literals newest-first.
       ...first,
       { role: 'user', content: 'keep this live request authoritative while the call is pending' },
       anthropicToolUse(openId, '/tmp/live-anchor.ts'),
-      { role: 'assistant', content: `later bulky narration ${'x'.repeat(45_000)}` },
+      { role: 'assistant', content: `later bulky narration ${'x'.repeat(165_000)}` },
     ], { measuredInputTokens: 70_000 });
 
     expect(deferred.cacheHot).toBe(true);
@@ -702,7 +702,7 @@ Conserved high-value literals newest-first.
       { role: 'assistant', content: profitableTail('older foldable answer') },
       { role: 'user', content: null, parts: [{ text: directive }] } as FoldMessage,
       anthropicToolUse('toolu_parts_anchor', '/tmp/parts-anchor.ts'),
-      anthropicToolResult('toolu_parts_anchor', `GIANT_PARTS_RESULT\n${'x'.repeat(45_000)}`),
+      anthropicToolResult('toolu_parts_anchor', `GIANT_PARTS_RESULT\n${'x'.repeat(165_000)}`),
     ], { measuredInputTokens: 70_000 });
 
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
@@ -741,7 +741,7 @@ Conserved high-value literals newest-first.
           { type: 'tool_use', id: 'toolu_plan_anchor', name: 'Read', input: { file_path: '/tmp/plan-anchor.ts' } },
         ],
       },
-      anthropicToolResult('toolu_plan_anchor', `GIANT_PLAN_RESULT\n${'y'.repeat(45_000)}`),
+      anthropicToolResult('toolu_plan_anchor', `GIANT_PLAN_RESULT\n${'y'.repeat(165_000)}`),
     ], { measuredInputTokens: 70_000 });
 
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
@@ -1260,7 +1260,7 @@ describe('FoldSession per-band vault sealing', () => {
       { role: 'assistant', content: profitableTail('older foldable answer') },
       { role: 'user', content: directive },
       anthropicToolUse('toolu_raw_vault', '/tmp/raw-vault.ts'),
-      anthropicToolResult('toolu_raw_vault', `RAW VAULT RESULT\n${'v'.repeat(45_000)}`),
+      anthropicToolResult('toolu_raw_vault', `RAW VAULT RESULT\n${'v'.repeat(165_000)}`),
     ], { measuredInputTokens: 70_000 });
 
     expect(appended.stats.appendDecision).toBe('committed');

@@ -3,6 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   BlockedSprintError,
   DraftRailError,
+  TASK_RAIL_ROLES,
+  TASK_RAIL_ROLE_STATUSES,
+  TASK_RAIL_TEMPLATE_VERSION,
   abandonDraft,
   ackStep,
   appendSteps,
@@ -12,12 +15,20 @@ import {
   createTaskRailStep,
   isDraftEditable,
   lockRail,
+  parseStepsFileText,
+  railToTemplate,
   restoreTaskRail,
   serializeTaskRail,
   shoot,
   sprint,
   startTaskRail,
+  templateIndexEntry,
+  templateToStepSeeds,
   updateDraftStep,
+} from '../src/taskRail.ts';
+import type {
+  TaskRailMode,
+  TaskRailRoleRegistration,
 } from '../src/taskRail.ts';
 
 describe('portable task rail', () => {
@@ -213,5 +224,128 @@ describe('portable task rail', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('abandoned and cannot be merged');
+  });
+
+  it('matches the full portable mode and collaboration-role contracts', () => {
+    const modes: TaskRailMode[] = ['load', 'shoot', 'sprint', 'draft', 'template', 'audit', 'role'];
+    const registration: TaskRailRoleRegistration = {
+      role: 'reviewer',
+      instanceId: 'reviewer-1',
+      status: 'approved',
+      requestedAt: '2026-07-22T05:00:00.000Z',
+      decidedAt: '2026-07-22T05:01:00.000Z',
+    };
+
+    const rail = startTaskRail({
+      id: 'rail-roles',
+      locked: true,
+      steps: [{ instruction: 'Review the implementation.' }],
+    });
+    rail.crewRoomId = 'room-1';
+    rail.reviewerNotifiedAt = '2026-07-22T05:02:00.000Z';
+    rail.roleRegistrations = [registration];
+
+    const restored = restoreTaskRail(JSON.parse(JSON.stringify(serializeTaskRail(rail))));
+    expect(modes).toHaveLength(7);
+    expect(TASK_RAIL_ROLES).toEqual(['co_executor', 'reviewer']);
+    expect(TASK_RAIL_ROLE_STATUSES).toEqual(['requested', 'approved', 'denied', 'revoked']);
+    expect(restored).toMatchObject({
+      crewRoomId: 'room-1',
+      reviewerNotifiedAt: '2026-07-22T05:02:00.000Z',
+      roleRegistrations: [registration],
+    });
+  });
+
+  it('ACKs a sprint batch and stops at the first blocking result', () => {
+    const rail = startTaskRail({
+      id: 'rail-batch-ack',
+      locked: true,
+      now: '2026-07-22T05:10:00.000Z',
+      steps: [
+        { id: 's1', instruction: 'First.' },
+        { id: 's2', instruction: 'Second.' },
+        { id: 's3', instruction: 'Third.' },
+        { id: 's4', instruction: 'Fourth.' },
+      ],
+    });
+    sprint(rail, { sprintCount: 4 }, { now: '2026-07-22T05:11:00.000Z' });
+
+    const result = shoot(rail, {
+      acks: [
+        { ackStepId: 's1', ackStatus: 'done', evidence: 'one' },
+        { ackStepId: 's2', ackStatus: 'done', evidence: 'two' },
+        { ackStepId: 's3', ackStatus: 'blocked', note: 'waiting' },
+        { ackStepId: 's4', ackStatus: 'done' },
+      ],
+    }, { now: '2026-07-22T05:12:00.000Z' });
+
+    expect(result.ackedSteps?.map((step) => step.id)).toEqual(['s1', 's2', 's3']);
+    expect(result).toMatchObject({ paused: true, step: { id: 's3', status: 'blocked' } });
+    expect(rail.steps.map((step) => step.status)).toEqual(['done', 'done', 'blocked', 'in_progress']);
+  });
+
+  it('captures reusable plan-only templates without leaking execution state', () => {
+    const rail = startTaskRail({
+      id: 'rail-template',
+      title: 'Source rail',
+      objective: 'Reuse the authored plan.',
+      locked: true,
+      steps: [{
+        id: 'executed-step',
+        title: 'Portable step',
+        instruction: 'Do the portable work.',
+        acceptanceCriteria: ['It passes'],
+        notes: 'Keep this note',
+        scope: 'src/taskRail.ts',
+        status: 'done',
+      }],
+    });
+    rail.steps[0].attempts = 3;
+    rail.steps[0].evidence = 'tests passed';
+
+    const template = railToTemplate(rail, {
+      id: 'tpl-1',
+      name: 'Portable template',
+      description: 'Reusable plan',
+      createdBy: 'standalone-agent',
+      now: '2026-07-22T05:20:00.000Z',
+    });
+
+    expect(template.version).toBe(TASK_RAIL_TEMPLATE_VERSION);
+    expect(template.steps[0]).toEqual({
+      title: 'Portable step',
+      instruction: 'Do the portable work.',
+      acceptanceCriteria: ['It passes'],
+      notes: 'Keep this note',
+      scope: 'src/taskRail.ts',
+    });
+    expect(templateIndexEntry(template)).toMatchObject({ id: 'tpl-1', stepCount: 1 });
+    expect(templateToStepSeeds(template)).toEqual([{
+      title: 'Portable step',
+      instruction: 'Do the portable work.',
+      acceptance_criteria: ['It passes'],
+      notes: 'Keep this note',
+      scope: 'src/taskRail.ts',
+    }]);
+
+    template.steps[0].acceptanceCriteria.push('template-only mutation');
+    expect(rail.steps[0].acceptanceCriteria).toEqual(['It passes']);
+  });
+
+  it('parses JSON arrays, JSONL, and plain-line bulk step sources', () => {
+    expect(parseStepsFileText('["one", {"title":"Two"}, 3]')).toEqual([
+      'one',
+      { title: 'Two' },
+      '3',
+    ]);
+    expect(parseStepsFileText('{"title":"One"}\n"two"\nplain')).toEqual([
+      { title: 'One' },
+      'two',
+      'plain',
+    ]);
+    expect(parseStepsFileText('first\n\n second ')).toEqual(['first', 'second']);
+    expect(() => parseStepsFileText('[{"title":"unterminated"}')).toThrow(
+      /steps_file starts with "\[" but is not valid JSON/,
+    );
   });
 });

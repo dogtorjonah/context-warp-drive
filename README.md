@@ -272,7 +272,14 @@ Budget outputs are mechanical ceilings and knobs: `contextWindowTokens`, `messag
 
 ## Portable Task Rail — `context-warp-drive/task-rail`
 
-Long-horizon agents need more than memory compression: they need an execution spine that survives folding, rebirth, process restarts, or a custom UI. The Task Rail export is a pure state machine for plan steps, sprint/shoot execution, ACKs, progress, and JSON serialization.
+Long-horizon agents need more than memory compression: they need an execution spine that survives folding, rebirth, process restarts, or a custom UI. The Task Rail export now carries the complete portable `@voxxo/task-rail` contract:
+
+- plan lifecycle and conflict-safe draft editing/merge helpers;
+- single or batched shoot ACKs and bounded sprint reservations;
+- reusable plan-only templates that strip execution state;
+- JSON-array, JSONL, and plain-line bulk step parsing;
+- co-executor/reviewer registration data contracts; and
+- progress, query, serialization, and restore helpers.
 
 It is deliberately **not** a tool server. No MCP wrapper, no relay persistence, no squad permissions, no chat/Atlas coupling. You own the wrapper: CLI, MCP, browser UI, local JSON, SQLite, or your own agent runtime.
 
@@ -307,7 +314,9 @@ const restored = restoreTaskRail(JSON.parse(saved));
 
 Pair it with FoldSession like this: raw transcript stays in your storage, folded prompt view stays lean, and task rail tracks what the agent is supposed to do next.
 
-> **Draft operations** (`TASK_RAIL_DRAFT_OPERATIONS`, `TaskRailDraft`, conflict/merge types) are exported for parity with the full-featured relay wrapper. The draft *types* are here; the merge *engine* lives in the relay-side wrapper. If you need collaborative draft merging, build it on the exported types — the pure state machine only handles locked-rail execution.
+The portable module deliberately stops at the pure boundary. Draft merge logic, template conversion, bulk-text parsing, and batch ACK behavior run locally with no I/O. Storage/hydration, persisted template indexes, audit replay logs, role authorization decisions, cross-instance switching/transfer, MCP formatting, and reading a `steps_file` from disk remain responsibilities of the caller's adapter.
+
+The source is bundled as one standalone file, while Voxxo keeps the canonical implementation split across `packages/task-rail`. The automated mirror-parity suite compares their public exports and behavior-bearing contracts so a new portable package feature cannot silently miss this surface.
 
 See [`examples/task-rail.ts`](./examples/task-rail.ts) for a full runnable walkthrough (start → sprint → ack → shoot → serialize → restore, zero dependencies).
 

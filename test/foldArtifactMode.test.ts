@@ -5,6 +5,7 @@ import {
   foldArtifactOnlyEnabled,
   foldContext,
   extractCoordinateConservationCorpus,
+  parseHistoricalPayloadRecord,
   FoldSession,
   COORDINATE_CONSERVATION_OVERLAY_END,
   COORDINATE_CONSERVATION_OVERLAY_HEADER,
@@ -134,28 +135,33 @@ describe('artifact-mode band body — flag on', () => {
   it('replaces skeleton rows with receipts, provenance header, artifacts, and literals', () => {
     const skeletonBlock = foldBlockText(representativeFixture(), TEST_FOLD_CONFIG);
     const artifactBlock = foldBlockText(representativeFixture(), artifactConfig);
+    const artifactPayload = artifactBlock
+      .split('\n')
+      .map(line => parseHistoricalPayloadRecord(line))
+      .find(record => record?.kind === 'fold-artifact')?.text;
+    expect(artifactPayload).toBeDefined();
 
     // Receipts + totality header.
-    expect(artifactBlock).toContain('[Fold receipts — 3 tool call(s): 1 edit(s) · 1 test run(s)');
-    expect(artifactBlock).toContain('aggregated: 1 read');
+    expect(artifactPayload).toContain('[Fold receipts — 3 tool call(s): 1 edit(s) · 1 test run(s)');
+    expect(artifactPayload).toContain('aggregated: 1 read');
     // Chronological Provenance header.
-    expect(artifactBlock).toContain('fold-artifact-band');
-    expect(artifactBlock).toContain('synthesized-history');
+    expect(artifactPayload).toContain('fold-artifact-band');
+    expect(artifactPayload).toContain('synthesized-history');
     // Receipt lines carry source-time prefixes.
-    expect(artifactBlock).toContain(
+    expect(artifactPayload).toContain(
       '[8:05 AM] ACTION kind=edit outcome=applied reconciliation-required=false '
       + 'target="src/a.ts" action-id="tool-call:e1" — ✏️ src/a.ts',
     );
-    expect(artifactBlock).toContain(
+    expect(artifactPayload).toContain(
       '[8:10 AM] ❔ VALIDATION freshness=unknown reason=validated-artifact-path-missing '
       + 'scope="test-run:unknown" artifacts=none — 🧪 npx vitest run src/a.test.ts '
       + '→ Test Files  1 passed (1) · Tests  9 passed (9) ↞ source=tool-call:t1',
     );
     // Cognitive artifact from the 🏁 decision prose.
-    expect(artifactBlock).toContain('cognitive-waypoints');
+    expect(artifactPayload).toContain('cognitive-waypoints');
     // Conserved literal pool line.
-    expect(artifactBlock).toContain('⌖ literals:');
-    expect(artifactBlock).toContain('a1b2c3d4e5f6');
+    expect(artifactPayload).toContain('⌖ literals:');
+    expect(artifactPayload).toContain('a1b2c3d4e5f6');
     // The skeleton-mode rows are gone.
     const skeletonOnlyLine = '📖 src/a.ts';
     expect(skeletonBlock).toContain(skeletonOnlyLine);

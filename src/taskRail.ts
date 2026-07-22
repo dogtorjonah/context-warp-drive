@@ -32,7 +32,7 @@
 // ══════════════════════════════════════════════════════════════════════
 
 /** Top-level task_rail tool mode. */
-export type TaskRailMode = 'load' | 'shoot' | 'sprint' | 'draft';
+export type TaskRailMode = 'load' | 'shoot' | 'sprint' | 'draft' | 'template' | 'audit' | 'role';
 
 /** Valid operations for mode=load. */
 export const TASK_RAIL_LOAD_OPERATIONS = [
@@ -114,6 +114,24 @@ export type TaskRailDraftState =
   | 'conflicted'
   | 'abandoned';
 
+/** Explicit collaboration roles on a rail. */
+export const TASK_RAIL_ROLES = [
+  'co_executor',
+  'reviewer',
+] as const;
+
+export type TaskRailRole = (typeof TASK_RAIL_ROLES)[number];
+
+/** Lifecycle status for a role request/assignment. */
+export const TASK_RAIL_ROLE_STATUSES = [
+  'requested',
+  'approved',
+  'denied',
+  'revoked',
+] as const;
+
+export type TaskRailRoleStatus = (typeof TASK_RAIL_ROLE_STATUSES)[number];
+
 // ══════════════════════════════════════════════════════════════════════
 //  Core domain entities
 // ══════════════════════════════════════════════════════════════════════
@@ -146,6 +164,22 @@ export interface TaskRailHistoryEntry {
   actorName?: string;
 }
 
+/** One requested or approved rail role assignment. */
+export interface TaskRailRoleRegistration {
+  role: TaskRailRole;
+  instanceId: string;
+  instanceName?: string;
+  status: TaskRailRoleStatus;
+  requestedAt: string;
+  requestedById?: string;
+  requestedByName?: string;
+  decidedAt?: string;
+  decidedById?: string;
+  decidedByName?: string;
+  note?: string;
+  decisionNote?: string;
+}
+
 /** A complete task rail owned by a single instance. */
 export interface TaskRailLifecycle {
   id: string;
@@ -160,6 +194,12 @@ export interface TaskRailLifecycle {
   completedAt?: string;
   /** ID of the parent rail this one is linked to (e.g., review rail → implementation rail). */
   parentRailId?: string;
+  /** Rail-scoped crew chatroom id for approved co-executors and reviewers. */
+  crewRoomId?: string;
+  /** Timestamp when approved reviewers were notified that the rail entered review. */
+  reviewerNotifiedAt?: string;
+  /** Requested/approved co-executor and reviewer registrations for this rail. */
+  roleRegistrations?: TaskRailRoleRegistration[];
   steps: TaskRailStep[];
   history: TaskRailHistoryEntry[];
 }
@@ -1240,6 +1280,12 @@ export function moveDraftStep(
   return step;
 }
 
+/** Alias matching the split package's draft-module context export. */
+export type DraftLifecycleContext = LifecycleContext;
+
+/** Alias matching the split package's draft-module step-update export. */
+export type DraftStepUpdateFields = StepUpdateFields;
+
 // ══════════════════════════════════════════════════════════════════════
 //  Source: @voxxo/task-rail/src/execution.ts
 // ══════════════════════════════════════════════════════════════════════
@@ -1275,6 +1321,17 @@ export interface ShootArgs {
   ackStatus?: TaskRailAckStatus;
   /** Explicit step id to ACK (defaults to active/blocking step). */
   ackStepId?: string;
+  /** ACK multiple completed/resolved steps in one shoot call. */
+  acks?: ShootAckInput[];
+  note?: string;
+  evidence?: string;
+}
+
+export interface ShootAckInput {
+  /** ACK status for this step. */
+  ackStatus: TaskRailAckStatus;
+  /** Explicit step id to ACK. Defaults to the current active/blocking step. */
+  ackStepId?: string;
   note?: string;
   evidence?: string;
 }
@@ -1282,6 +1339,8 @@ export interface ShootArgs {
 export interface ShootResult {
   /** The current step, if one exists. */
   step?: TaskRailStep;
+  /** Steps acknowledged during this shoot call. */
+  ackedSteps?: TaskRailStep[];
   /** True when the step is blocking progress (blocked/needs_review). */
   paused?: boolean;
   /** True when the rail is complete (all steps resolved). */
@@ -1348,6 +1407,28 @@ export class BlockedSprintError extends Error {
   }
 }
 
+function assertAckStatus(value: TaskRailAckStatus): TaskRailAckStatus {
+  if (!isAckStatus(value)) {
+    throw new InvalidAckStatusError(String(value));
+  }
+  return value;
+}
+
+function resolveAckInputs(args: ShootArgs): ShootAckInput[] {
+  if (Array.isArray(args.acks) && args.acks.length > 0) {
+    return args.acks;
+  }
+  if (args.ackStatus === undefined) {
+    return [];
+  }
+  return [{
+    ackStatus: args.ackStatus,
+    ackStepId: args.ackStepId,
+    note: args.note,
+    evidence: args.evidence,
+  }];
+}
+
 // ══════════════════════════════════════════════════════════════════════
 //  Validation
 // ══════════════════════════════════════════════════════════════════════
@@ -1388,14 +1469,13 @@ export function shoot(
 
   const wasTerminalOnLoad = rail.state === 'complete' || rail.state === 'review';
 
-  // ── ACK phase ──
-  if (args.ackStatus !== undefined) {
-    if (!isAckStatus(args.ackStatus)) {
-      throw new InvalidAckStatusError(args.ackStatus);
-    }
+  const ackedSteps: TaskRailStep[] = [];
+  const ackInputs = resolveAckInputs(args);
 
-    // Resolve the step to ACK: explicit id or active/blocking
-    let ackStepId = args.ackStepId;
+  // ── ACK phase ──
+  for (const ack of ackInputs) {
+    const ackStatus = assertAckStatus(ack.ackStatus);
+    let ackStepId = ack.ackStepId;
     if (!ackStepId) {
       const active = findActiveOrBlockingStep(rail.steps);
       if (!active) {
@@ -1404,11 +1484,16 @@ export function shoot(
       ackStepId = active.id;
     }
 
-    ackStep(rail, ackStepId, args.ackStatus, {
+    const acked = ackStep(rail, ackStepId, ackStatus, {
       ...ctx,
-      note: args.note ?? ctx?.note,
-      evidence: args.evidence,
+      note: ack.note ?? args.note ?? ctx?.note,
+      evidence: ack.evidence ?? args.evidence,
     });
+    ackedSteps.push(acked);
+
+    if (ackStatus === 'blocked' || ackStatus === 'needs_review') {
+      break;
+    }
   }
 
   // ── Step resolution phase ──
@@ -1417,15 +1502,15 @@ export function shoot(
   const active = findActiveOrBlockingStep(rail.steps);
   if (active) {
     if (active.status === 'blocked' || active.status === 'needs_review') {
-      return { step: active, paused: true };
+      return { step: active, paused: true, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
     }
-    return { step: active };
+    return { step: active, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
   }
 
   // No active/blocking step — try to activate the next pending
   const next = activateNextStep(rail, ctx);
   if (next) {
-    return { step: next };
+    return { step: next, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
   }
 
   // Nothing left — refresh state (review → complete or stays terminal)
@@ -1435,7 +1520,7 @@ export function shoot(
     rail.state = 'complete';
     rail.completedAt ??= ctx?.now ?? new Date().toISOString();
   }
-  return { complete: true };
+  return { complete: true, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1620,4 +1705,177 @@ export function restoreTaskRail(serialized: SerializedTaskRail): TaskRailLifecyc
     throw new Error(`Unsupported task rail schema: ${String((serialized as { schema?: unknown }).schema)}`);
   }
   return serialized.rail;
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  Source: @voxxo/task-rail/src/template.ts
+// ══════════════════════════════════════════════════════════════════════
+
+/** Current persisted template schema version. Bump on shape changes. */
+export const TASK_RAIL_TEMPLATE_VERSION = 1;
+
+/** A plan-only template step with all execution state removed. */
+export interface TaskRailTemplateStep {
+  title: string;
+  instruction: string;
+  acceptanceCriteria: string[];
+  notes?: string;
+  scope?: string;
+}
+
+/** A reusable task rail template. Persistence remains caller-owned. */
+export interface TaskRailTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  objective?: string;
+  title?: string;
+  version: number;
+  sourceRailId?: string;
+  createdBy?: string;
+  createdAt: string;
+  steps: TaskRailTemplateStep[];
+}
+
+/** Lightweight index row for listing caller-persisted templates. */
+export interface TaskRailTemplateIndexEntry {
+  id: string;
+  name: string;
+  description?: string;
+  stepCount: number;
+  sourceRailId?: string;
+  createdBy?: string;
+  createdAt: string;
+}
+
+/** Metadata supplied when capturing a live rail as a template. */
+export interface SnapshotTemplateMeta {
+  id: string;
+  name: string;
+  description?: string;
+  objective?: string;
+  title?: string;
+  createdBy?: string;
+  now?: string;
+}
+
+/** Plan-only seed shape accepted by task-rail adapters. */
+export interface TaskRailTemplateStepSeed {
+  title: string;
+  instruction: string;
+  acceptance_criteria: string[];
+  notes?: string;
+  scope?: string;
+}
+
+function toTemplateStep(step: TaskRailStep): TaskRailTemplateStep {
+  return {
+    title: step.title,
+    instruction: step.instruction,
+    acceptanceCriteria: [...step.acceptanceCriteria],
+    ...(step.notes ? { notes: step.notes } : {}),
+    ...(step.scope ? { scope: step.scope } : {}),
+  };
+}
+
+/** Capture a live rail as a plan-only template with fresh-array isolation. */
+export function railToTemplate(
+  rail: TaskRailLifecycle,
+  meta: SnapshotTemplateMeta,
+): TaskRailTemplate {
+  return {
+    id: meta.id,
+    name: meta.name,
+    ...(meta.description ? { description: meta.description } : {}),
+    objective: meta.objective ?? rail.objective ?? '',
+    title: meta.title ?? rail.title,
+    version: TASK_RAIL_TEMPLATE_VERSION,
+    sourceRailId: rail.id,
+    ...(meta.createdBy ? { createdBy: meta.createdBy } : {}),
+    createdAt: meta.now ?? new Date().toISOString(),
+    steps: rail.steps.map(toTemplateStep),
+  };
+}
+
+/** Build a lightweight list entry for a caller-owned template index. */
+export function templateIndexEntry(template: TaskRailTemplate): TaskRailTemplateIndexEntry {
+  return {
+    id: template.id,
+    name: template.name,
+    ...(template.description ? { description: template.description } : {}),
+    stepCount: template.steps.length,
+    ...(template.sourceRailId ? { sourceRailId: template.sourceRailId } : {}),
+    ...(template.createdBy ? { createdBy: template.createdBy } : {}),
+    createdAt: template.createdAt,
+  };
+}
+
+/** Expand a template into fresh plan-only step seeds. */
+export function templateToStepSeeds(template: TaskRailTemplate): TaskRailTemplateStepSeed[] {
+  return template.steps.map((step) => ({
+    title: step.title,
+    instruction: step.instruction,
+    acceptance_criteria: [...step.acceptanceCriteria],
+    ...(step.notes ? { notes: step.notes } : {}),
+    ...(step.scope ? { scope: step.scope } : {}),
+  }));
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  Source: @voxxo/task-rail/src/stepsFile.ts
+// ══════════════════════════════════════════════════════════════════════
+
+/** A loose bulk step seed matching the inline task-rail adapter input. */
+export type StepSeedInput = Record<string, unknown> | string;
+
+function normalizeSeed(value: unknown): StepSeedInput {
+  if (typeof value === 'string') return value;
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return String(value);
+}
+
+function looksLikeJson(cell: string): boolean {
+  const first = cell[0];
+  return first === '{' || first === '[' || first === '"';
+}
+
+/** Parse JSON-array, JSONL, or one-instruction-per-line bulk step text. */
+export function parseStepsFileText(raw: string): StepSeedInput[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+
+  if (trimmed[0] === '[') {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(
+        `steps_file starts with "[" but is not valid JSON: ${(err as Error).message}`,
+      );
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error('steps_file JSON must be an array of step seeds.');
+    }
+    return parsed.map(normalizeSeed);
+  }
+
+  const seeds: StepSeedInput[] = [];
+  for (const line of trimmed.split('\n')) {
+    const cell = line.trim();
+    if (!cell) continue;
+    if (looksLikeJson(cell)) {
+      try {
+        seeds.push(normalizeSeed(JSON.parse(cell)));
+        continue;
+      } catch {
+        // JSON-looking plain text remains a valid instruction.
+      }
+    }
+    seeds.push(cell);
+  }
+  return seeds;
 }

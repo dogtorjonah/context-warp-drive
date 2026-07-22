@@ -1235,11 +1235,11 @@ export class FoldSession {
     if (appendOnlyTailEpoch) {
       // ── Kept-raw working set ──
       // Keep a live working set of recent messages untouched by the fold
-      // (~10K tokens ≈ 40K chars). Without this the entire raw tail folds
+      // (~40K tokens ≈ 160K chars). Without this the entire raw tail folds
       // into the frozen prefix and the agent loses active investigation
       // context, user questions, and recent tool results. Mirrors the relay
       // FC path and Claude CLI's DEFAULT_CLAUDE_CLI_BAND_MAX_TAIL_CHARS.
-      const KEPT_RAW_CHARS = 40_000;
+      const KEPT_RAW_CHARS = 160_000;
       const frozenCount = this.freezeState.frozenRawCount;
       const fullTail = messages.slice(frozenCount);
       let keptRawSplitIndex = fullTail.length;
@@ -1258,7 +1258,7 @@ export class FoldSession {
       // Anchor the kept-raw window on live intent, shape-aware. A string-only
       // role check silently skips Anthropic content[] and Gemini parts[] user
       // turns, leaving those sessions with NO anchor: the window degrades to
-      // the newest ~40K chars — often a single large tool result — and the
+      // the newest ~160K chars — often a single large tool result — and the
       // live directive plus the agent's plan narration fold into a cold band
       // that retains zero assistant prose ("lost the plot"). extractUserText
       // reads genuine user text across all three shapes and ignores
