@@ -50,7 +50,13 @@ import {
   type SyntheticContextOptions,
 } from '../rollingFold.ts';
 import { withArtifactModeConfig } from '../foldReceipts.ts';
-import { extractCognitiveArtifacts, renderCognitiveBlock, mergeBlockIntoViewTail } from '../cognitiveArtifacts.ts';
+import {
+  containsCognitiveBlock,
+  extractCognitiveArtifacts,
+  flattenFoldMessageText,
+  renderCognitiveBlock,
+  mergeBlockIntoViewTail,
+} from '../cognitiveArtifacts.ts';
 import {
   appendDedicatedChronologicalMessage,
   foldMessageTimestampBounds,
@@ -209,7 +215,7 @@ export interface FoldSessionOptions {
   readonly eviction?: boolean | { readonly thresholdChars?: number };
   /**
    * Absolute pressure guard for large-window models. Enabled by default at
-   * 150k measured input tokens (the shared
+   * 200k measured input tokens (the shared
    * DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS); pass false to disable or
    * a number/config to tune. The host must pass measuredInputTokens to
    * prepare() for it to fire.
@@ -1112,10 +1118,13 @@ export class FoldSession {
       );
       const stepResult = this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig);
       const bookkeepingResult = result.turnsFolded > 0 ? result : stepResult ?? result;
+      const preparedMessages = stepResult?.messages ?? result.messages;
+      // Artifact mode renders the [cognitive] block into the fold body itself,
+      // so merging a second one repeats the same waypoints for one fold window.
       const cognitiveBlock = bookkeepingResult.turnsFolded > 0
+        && !preparedMessages.some((message) => containsCognitiveBlock(flattenFoldMessageText(message.content)))
         ? renderCognitiveBlock(extractCognitiveArtifacts(messages))
         : '';
-      const preparedMessages = stepResult?.messages ?? result.messages;
       // Merge (never append): a trailing assistant enrichment message breaks
       // providers that require the request to end with a user message when the
       // fold consumes the whole tail (Anthropic 400 assistant-prefill).
@@ -1402,7 +1411,12 @@ export class FoldSession {
       // Pre-commit enrichment: merge cognitive block into the sealed tail's
       // final message so the gate measures the actual committed size.
       // Merging (not appending) preserves the terminal role and message count.
+      // Header-keyed, not block-keyed: artifact mode already rendered a block
+      // into the fold body, and its bytes differ from this one (different
+      // artifact filter and render options), so an exact-text check would miss
+      // it and seal the same waypoints twice.
       const enrichedTail = cognitiveBlock
+        && !sealedTail.some((message) => containsCognitiveBlock(flattenFoldMessageText(message.content)))
         ? mergeBlockIntoViewTail(sealedTail, cognitiveBlock)
         : sealedTail;
       const sourceTime = foldMessageTimestampBounds(tail);
@@ -1551,8 +1565,11 @@ export class FoldSession {
       : '';
     const sealedBaseView = this.bakeVault(stepResult?.messages ?? result.messages, 'full');
     // Merge (never append) — same terminal-role invariant as the tail-epoch
-    // path: the sealed view may be the entire request body.
+    // path: the sealed view may be the entire request body. Header-keyed skip:
+    // artifact mode already rendered a block into the fold body, and its bytes
+    // differ from this one, so an exact-text check would seal it twice.
     const sealedView = recomputeCognitiveBlock
+      && !sealedBaseView.some((message) => containsCognitiveBlock(flattenFoldMessageText(message.content)))
       ? mergeBlockIntoViewTail(sealedBaseView, recomputeCognitiveBlock)
       : sealedBaseView;
     commitFoldFreeze(

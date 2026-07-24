@@ -303,8 +303,64 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     expect(state.frozenRawCount).toBe(grown.length);
     expect(state.frozenView?.slice(0, view.length)).toEqual(view);
     expect(JSON.stringify(state.frozenView?.slice(0, view.length))).toBe(sealedPrefixBytes);
-    expect(state.lastAppendBoundaryViewCount).toBe(view.length);
+    expect(state.lastAppendBoundaryViewCount).toBe(view.length + tailFolded.length);
     expect(state.epochs).toBe(2);
+  });
+
+  it('folds an unbanded baseline into band one, then preserves band one on later appends', () => {
+    const { state, history, view: baselineView } = frozenFixture();
+    const firstRawTail = [
+      msg('user', 'first generation tail '.repeat(80)),
+      msg('assistant', 'first generation answer '.repeat(20)),
+    ];
+    const firstHistory = [...history, ...firstRawTail];
+    const firstBand = [msg('user', '[band one contains rebirth seed plus first tail]')];
+
+    const first = appendFoldFreezeTailEpoch(
+      state,
+      firstHistory,
+      firstBand,
+      ctx(),
+      T0 + 4_000,
+      { foldBaseIntoFirstBand: true },
+    );
+
+    expect(first.committed).toBe(true);
+    if (!first.committed) return;
+    expect(first.sealedPrefixMessageCount).toBe(0);
+    expect(first.view).toEqual(firstBand);
+    expect(JSON.stringify(first.view)).not.toContain(JSON.stringify(baselineView));
+    expect(state.lastTransitionReason).toBe('first-tail-epoch');
+    expect(state.lastAppendBoundaryViewCount).toBe(firstBand.length);
+    expect(state.sealedBands).toHaveLength(1);
+    expect(state.sealedBands[0]).toMatchObject({
+      sealedPrefixMessageCount: 0,
+      sealedPrefixChars: 0,
+      bandStartViewIndex: 0,
+      rawStartIndex: 0,
+      rawEndIndex: firstHistory.length,
+      rawCount: firstHistory.length,
+    });
+    expect(verifySerializedFoldFreezeState(serializeFoldFreezeState(state))).toEqual({ valid: true });
+
+    const bandOneBytes = JSON.stringify(state.frozenView);
+    const secondRawTail = [msg('user', 'second generation tail '.repeat(80))];
+    const secondBand = [msg('assistant', '[band two]')];
+    const second = appendFoldFreezeTailEpoch(
+      state,
+      [...firstHistory, ...secondRawTail],
+      secondBand,
+      ctx(),
+      T0 + 8_000,
+    );
+    expect(second.committed).toBe(true);
+    if (!second.committed) return;
+    expect(second.sealedPrefixMessageCount).toBe(firstBand.length);
+    expect(JSON.stringify(second.view.slice(0, firstBand.length))).toBe(bandOneBytes);
+    expect(state.sealedBands).toHaveLength(2);
+    expect(state.sealedBands[1]?.rawStartIndex).toBe(firstHistory.length);
+    expect(state.lastAppendBoundaryViewCount).toBe(firstBand.length + secondBand.length);
+    expect(verifySerializedFoldFreezeState(serializeFoldFreezeState(state))).toEqual({ valid: true });
   });
 
   it('keeps a prepared band, manifest row, and vault fingerprints invisible until publication', () => {
@@ -710,7 +766,7 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
     appendFoldFreezeTailEpoch(state, grown, tailFolded, ctx(), T0 + 4_000);
 
     const metadata = getFoldFreezeMetadata(state);
-    expect(metadata.sealedBoundaryViewCount).toBe(view.length);
+    expect(metadata.sealedBoundaryViewCount).toBe(view.length + tailFolded.length);
     expect(metadata.rawFrontierIndex).toBe(grown.length);
     expect(metadata.cache.lastTransitionReason).toBe('append-tail-epoch');
     expect(metadata.cache.lastHardEpochReason).toBe('first-call');
@@ -749,7 +805,7 @@ describe('commitFoldFreeze / touchFoldFreeze — state transitions', () => {
 
     const restored = restoreFoldFreezeState(JSON.parse(JSON.stringify(snapshot)) as typeof snapshot);
     expect(restored.sealedBands).toEqual(snapshot.sealedBands);
-    expect(restored.lastAppendBoundaryViewCount).toBe(view.length);
+    expect(restored.lastAppendBoundaryViewCount).toBe(view.length + tailFolded.length);
 
     const hot = evaluateFoldFreeze(restored, grown, ctx(), T0 + 5_000, CFG);
     expect(hot.action).toBe('reuse');

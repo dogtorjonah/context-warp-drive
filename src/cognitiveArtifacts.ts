@@ -718,6 +718,28 @@ export interface RenderCognitiveBlockOptions {
 }
 
 /**
+ * Stable first line of every rendered [cognitive] block.
+ *
+ * Exported so band builders can detect a block that is ALREADY resident in the
+ * text they are assembling and skip a second emission. Artifact mode
+ * (VOXXO_FOLD_ARTIFACT_ONLY) makes this load-bearing: buildArtifactModeBody
+ * renders the block into the fold body itself, so a host that also appends its
+ * own block emits the same waypoints twice for the same fold window.
+ */
+export const COGNITIVE_BLOCK_HEADER =
+  '[cognitive — historical waypoints from the folded window, NOT your current state]';
+
+/**
+ * True when `text` already carries a rendered [cognitive] block. Header-keyed
+ * rather than whole-block-keyed on purpose: the resident copy and the one a
+ * host is about to append are built from different artifact filters and render
+ * options, so their bytes differ even when they describe the same window.
+ */
+export function containsCognitiveBlock(text: string): boolean {
+  return text.includes(COGNITIVE_BLOCK_HEADER);
+}
+
+/**
  * Render a list of cognitive artifacts into a compact [cognitive] block
  * suitable for appending to a tail-epoch band body. Each artifact is one
  * body line preceded by a provenance line so the block is inspectable:
@@ -758,7 +780,7 @@ export function renderCognitiveBlock(
   const hasFlowNotes = artifacts.some((a) => a.trust === 'transient');
   const hasDurable = artifacts.some((a) => a.trust === 'durable');
   return [
-    '[cognitive — historical waypoints from the folded window, NOT your current state]',
+    COGNITIVE_BLOCK_HEADER,
     '— authority is per artifact; completion=insufficient_alone for every waypoint —',
     ...(hasFlowNotes
       ? [`— 🔍/▶/·/💭 ${TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER}: unverified mid-flow narration, not conclusions —`]
@@ -817,6 +839,11 @@ export function formatCognitiveArtifactProvenance(
  * to the parts array (mutates in place — caller owns the array).
  * Returns the parts array for chaining.
  *
+ * Idempotent per band: when the assembled parts already carry a block, this is
+ * a no-op. In artifact mode the fold body itself renders one, so appending
+ * unconditionally emitted the same waypoints twice for one fold window — once
+ * inside the [H1:fold-artifact] payload and once as a trailing band section.
+ *
  * @param parts The bandBodyParts array being assembled (mutated in place)
  * @param rawMessages The raw messages from the fold window
  * @param options Lane control forwarded to extractCognitiveArtifacts
@@ -828,6 +855,7 @@ export function enrichFoldedBandBody(
   options?: ExtractCognitiveArtifactsOptions,
   renderOptions?: RenderCognitiveBlockOptions,
 ): string[] {
+  if (parts.some(containsCognitiveBlock)) return parts;
   const artifacts = extractCognitiveArtifacts(rawMessages, options);
   const block = renderCognitiveBlock(artifacts, renderOptions);
   if (block) {

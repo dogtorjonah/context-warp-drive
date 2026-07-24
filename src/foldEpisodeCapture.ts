@@ -59,6 +59,7 @@ import {
   type TraceStep,
 } from './foldEpisodes.ts';
 import { canonicalizeExtractedPaths, type CanonContext } from './foldPathCanon.ts';
+import { createCognitiveArtifactEnvelope } from './cognitiveArtifactEnvelope.ts';
 import { extractPathsFromBashCommand, extractRecallSignals } from './foldRecall.ts';
 import { extractUserText, isSyntheticContextText, normalizeToolPath, type FoldMessage, type SyntheticContextOptions } from './rollingFold.ts';
 
@@ -538,19 +539,22 @@ function mineVoice(call: ToolCallView): EpisodeAnnotation | null {
     // single-step ack form carries a top-level `note` instead. task_rail emits
     // no file touches (extractRecallSignals only reads file_path/path keys), so
     // this voice attaches to the work burst it concludes by event proximity.
-    const pickAckNote = (): string | null => {
+    const pickAck = (): { note: string; stepId: string | null } | null => {
       const acks = Array.isArray(call.input.acks) ? call.input.acks : null;
       if (acks) {
-        let firstNonEmpty: string | null = null;
+        let firstNonEmpty: { note: string; stepId: string | null } | null = null;
         for (const raw of acks) {
           const a = asRecord(raw);
           if (!a) continue;
           const note = typeof a.note === 'string' ? a.note.trim() : '';
           if (note.length === 0) continue;
+          const stepId = typeof a.step_id === 'string' ? a.step_id
+            : typeof a.stepId === 'string' ? a.stepId : null;
           const status = typeof a.ack_status === 'string' ? a.ack_status
             : typeof a.ackStatus === 'string' ? a.ackStatus : '';
-          if (status === 'blocked' || status === 'needs_review') return note;
-          if (firstNonEmpty === null) firstNonEmpty = note;
+          const selected = { note, stepId };
+          if (status === 'blocked' || status === 'needs_review') return selected;
+          if (firstNonEmpty === null) firstNonEmpty = selected;
         }
         if (firstNonEmpty !== null) return firstNonEmpty;
       }
@@ -560,10 +564,21 @@ function mineVoice(call: ToolCallView): EpisodeAnnotation | null {
         || typeof call.input.ackStatus === 'string'
         || typeof call.input.ack_step_id === 'string'
         || typeof call.input.ackStepId === 'string';
-      return single.length > 0 && isAck ? single : null;
+      if (single.length === 0 || !isAck) return null;
+      const stepId = typeof call.input.ack_step_id === 'string' ? call.input.ack_step_id
+        : typeof call.input.ackStepId === 'string' ? call.input.ackStepId
+          : typeof call.input.step_id === 'string' ? call.input.step_id
+            : typeof call.input.stepId === 'string' ? call.input.stepId : null;
+      return { note: single, stepId };
     };
-    const ackNote = pickAckNote();
-    if (ackNote) return { ts: '', kind: 'rail', text: truncateVerbatim(ackNote, VOICE_TEXT_CAP_CHARS) };
+    const ack = pickAck();
+    if (ack) {
+      return {
+        ts: '',
+        kind: 'rail',
+        text: truncateVerbatim(ack.note, VOICE_TEXT_CAP_CHARS),
+      };
+    }
     return null;
   }
   return null;
@@ -594,6 +609,24 @@ function assistantTextOf(message: FoldMessage): string {
     if (block && block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
   }
   return parts.join('\n').trim();
+}
+
+/**
+ * Link register voice only when its message already carries the exact durable
+ * transcript-row identity and authoritative source time. Tool-call timestamps
+ * are deliberately ineligible: star and rail persistence assign their own
+ * clocks, so reconstructing those envelopes here would mint false identities.
+ */
+function glyphArtifactForMessage(
+  message: FoldMessage,
+  sourceTime: string | undefined,
+): EpisodeAnnotation['artifact'] | undefined {
+  const messageId = message.sourceIdentity?.trim();
+  if (!messageId || !sourceTime || !classifyMessageGlyph(assistantTextOf(message))) return undefined;
+  return createCognitiveArtifactEnvelope({
+    source: { family: 'glyph', messageId, sourceTime },
+    authorityClass: 'historical_observation',
+  }) ?? undefined;
 }
 
 /**
@@ -662,13 +695,19 @@ function mineNarrationForGap(
       { requireVerdictShape: false },
     );
     const ts = timestampAt(i);
+    const artifact = glyphArtifactForMessage(messages[i], ts);
     for (const line of lines) {
       const key = line.trim().toLowerCase();
       if (seen.has(key)) continue; // within-burst exact-text dedup (hygiene, not a cap)
       seen.add(key);
       deliberate.push({
         eventIndex: i,
-        annotation: { ...(ts !== undefined ? { ts } : {}), kind, text: line },
+        annotation: {
+          ...(ts !== undefined ? { ts } : {}),
+          kind,
+          text: line,
+          ...(artifact ? { artifact } : {}),
+        },
       });
     }
   }
@@ -714,9 +753,15 @@ function mineNarrationForGap(
         const lines = extractNarrationLines(text, isSynthetic, cap);
         if (lines.length > 0) {
           const ts = timestampAt(i);
+          const artifact = glyphArtifactForMessage(messages[i], ts);
           verdictResult = lines.map((line) => ({
             eventIndex: i,
-            annotation: { ...(ts !== undefined ? { ts } : {}), kind, text: line },
+            annotation: {
+              ...(ts !== undefined ? { ts } : {}),
+              kind,
+              text: line,
+              ...(artifact ? { artifact } : {}),
+            },
           }));
         }
       }
@@ -728,9 +773,15 @@ function mineNarrationForGap(
         const pick = rationaleLines.find((line) => !seen.has(line.trim().toLowerCase()));
         if (pick) {
           const ts = timestampAt(i);
+          const artifact = glyphArtifactForMessage(messages[i], ts);
           rationale = {
             eventIndex: i,
-            annotation: { ...(ts !== undefined ? { ts } : {}), kind: 'narration', text: pick },
+            annotation: {
+              ...(ts !== undefined ? { ts } : {}),
+              kind: 'narration',
+              text: pick,
+              ...(artifact ? { artifact } : {}),
+            },
           };
         }
       }
@@ -796,12 +847,14 @@ function mineProcessNarrationForBurst(
       if (seen.has(key)) continue;
       seen.add(key);
       const ts = timestampAt(i);
+      const artifact = glyphArtifactForMessage(messages[i], ts);
       out.push({
         eventIndex: i,
         annotation: {
           ...(ts !== undefined ? { ts } : {}),
           kind: candidate.kind,
           text: candidate.text,
+          ...(artifact ? { artifact } : {}),
         },
       });
       if (out.length >= PROCESS_MAX_LINES) break;

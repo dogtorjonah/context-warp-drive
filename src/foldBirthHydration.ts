@@ -43,7 +43,10 @@ export interface BirthFoldSourceRow {
   /** Stable transcript row identity when available. Tool-use rows normally use the provider call id. */
   id?: string;
   /** Original row identity when this transcript row was inherited through a copy. */
-  prov?: { sourceRowId?: string | null };
+  prov?: {
+    sourceRowId?: string | null;
+    sourceTimestamp?: string | null;
+  };
   /** Row type: user, assistant_text, tool_use, tool_result, system_reminder, reasoning. */
   ty: string;
   /** Text content. */
@@ -223,10 +226,25 @@ function shortTs(ts: string | undefined): string {
  * row carries no usable timestamp — never falls back to the conversion clock,
  * so unknown source time stays unknown all the way into episodic capture.
  */
+const SOURCE_ROW_UTC_ISO_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?Z$/;
+
 function sourceRowTsMs(row: BirthFoldSourceRow): number | undefined {
-  if (typeof row.ts !== 'string' || row.ts.length === 0) return undefined;
-  const ms = Date.parse(row.ts);
-  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+  const sourceTime = row.prov?.sourceTimestamp?.trim() || row.ts;
+  if (typeof sourceTime !== 'string' || sourceTime.length === 0) return undefined;
+  const match = SOURCE_ROW_UTC_ISO_RE.exec(sourceTime);
+  if (!match) return undefined;
+  const ms = Date.parse(sourceTime);
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  const date = new Date(ms);
+  const [, year, month, day, hour, minute, second] = match;
+  return date.getUTCFullYear() === Number(year)
+    && date.getUTCMonth() + 1 === Number(month)
+    && date.getUTCDate() === Number(day)
+    && date.getUTCHours() === Number(hour)
+    && date.getUTCMinutes() === Number(minute)
+    && date.getUTCSeconds() === Number(second)
+    ? ms
+    : undefined;
 }
 
 function mergeConsecutiveRoles(messages: BirthFoldSeedMessage[]): BirthFoldSeedMessage[] {
@@ -257,6 +275,110 @@ function sourceRowIdentity(row: BirthFoldSourceRow): string | undefined {
   if (inherited) return inherited;
   const native = row.id?.trim();
   return native || undefined;
+}
+
+export interface PersistedEpisodeProjectionMessage {
+  role: unknown;
+  content?: unknown;
+  parts?: unknown;
+  tsMs?: number;
+  sourceIdentity?: string;
+  sourceIdentities?: readonly string[];
+}
+
+interface PersistedAssistantSource {
+  sourceIdentity: string;
+  tsMs: number;
+  text: string;
+}
+
+function projectedAssistantText(message: PersistedEpisodeProjectionMessage): string {
+  if (message.role !== 'assistant' && message.role !== 'model') return '';
+  if (typeof message.content === 'string') return message.content.trim();
+
+  const text: string[] = [];
+  if (Array.isArray(message.content)) {
+    for (const value of message.content) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const block = value as { type?: unknown; text?: unknown };
+      if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        text.push(block.text);
+      }
+    }
+  }
+  if (Array.isArray(message.parts)) {
+    for (const value of message.parts) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const part = value as { text?: unknown };
+      if (typeof part.text === 'string' && part.text.trim()) text.push(part.text);
+    }
+  }
+  return text.join('\n').trim();
+}
+
+function uniquePersistedAssistantSources(
+  candidates: readonly PersistedAssistantSource[],
+): PersistedAssistantSource[] {
+  const byCoordinate = new Map<string, PersistedAssistantSource>();
+  for (const candidate of candidates) {
+    byCoordinate.set(`${candidate.sourceIdentity}\u0000${candidate.tsMs}`, candidate);
+  }
+  return [...byCoordinate.values()];
+}
+
+/**
+ * Overlay a provider-shaped capture view with exact transcript-row provenance.
+ * The message array, roles, and content remain length/reference preserving. A
+ * provider or positional identity is displaced only when one durable assistant
+ * row uniquely owns the same speech; repeated/ambiguous speech stays unlinked.
+ */
+export function annotateEpisodeMessagesWithPersistedRows<
+  T extends PersistedEpisodeProjectionMessage,
+>(messages: readonly T[], rows: readonly BirthFoldSourceRow[]): T[] {
+  const exactByText = new Map<string, PersistedAssistantSource[]>();
+  for (const row of rows) {
+    if (row.ty !== 'assistant_text' || row.sg === true) continue;
+    const text = typeof row.tx === 'string' ? row.tx.trim() : '';
+    const sourceIdentity = sourceRowIdentity(row);
+    const tsMs = sourceRowTsMs(row);
+    if (!text || !sourceIdentity || tsMs === undefined) continue;
+    const source = { sourceIdentity, tsMs, text };
+    const exact = exactByText.get(text);
+    if (exact) exact.push(source);
+    else exactByText.set(text, [source]);
+  }
+
+  return messages.map((message) => {
+    const speech = projectedAssistantText(message);
+    if (!speech) return message;
+
+    const existingIdentity = message.sourceIdentity?.trim();
+    let candidates = uniquePersistedAssistantSources(exactByText.get(speech) ?? []);
+    if (existingIdentity) {
+      const exactExisting = candidates.filter((candidate) => candidate.sourceIdentity === existingIdentity);
+      if (exactExisting.length === 1) candidates = exactExisting;
+    }
+    if (candidates.length !== 1) {
+      if (!existingIdentity) return message;
+      const unlinked = { ...message };
+      delete unlinked.sourceIdentity;
+      return unlinked;
+    }
+
+    const [source] = candidates;
+    const sourceIdentities = [...new Set([
+      ...(message.sourceIdentities ?? []).filter((identity): identity is string => (
+        typeof identity === 'string' && identity.trim().length > 0
+      )),
+      source.sourceIdentity,
+    ])];
+    return {
+      ...message,
+      sourceIdentity: source.sourceIdentity,
+      sourceIdentities,
+      tsMs: source.tsMs,
+    };
+  });
 }
 
 function sourceRowToolUseId(row: BirthFoldSourceRow): string | undefined {

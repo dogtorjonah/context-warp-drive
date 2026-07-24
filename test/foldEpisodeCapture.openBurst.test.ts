@@ -5,6 +5,7 @@ import {
   deriveEpisodesFromMessages,
   type EpisodeCaptureIdentity,
 } from '../src/foldEpisodeCapture.ts';
+import { createCognitiveArtifactEnvelope } from '../src/cognitiveArtifactEnvelope.ts';
 import type { FoldMessage } from '../src/fold.ts';
 
 function userMsg(text: string): FoldMessage {
@@ -173,6 +174,53 @@ describe('computeOpenBurst — read-burst fold-guard boundary', () => {
     expect(result.episodes[0].railId).toBe('rail-fixture');
     expect(result.episodes[0].intent).toBe('Populate dormant metadata');
     expect(result.episodes[0].summary).toBe('Episodic richness hardening');
+  });
+
+  test('links exact glyph rows while star and rail tool clocks remain unlinked', () => {
+    const sourceTime = '2026-06-18T20:00:00.000Z';
+    const messages: FoldMessage[] = [
+      toolUse('Read', { file_path: '/repo/src/card.ts' }, 't1'),
+      toolResult('t1', 'ok'),
+      {
+        role: 'assistant',
+        content: '🔍 I chose the exact persisted identity for lifecycle joins.',
+        sourceIdentity: 'message-working-1',
+        tsMs: Date.parse(sourceTime),
+      },
+      toolUse('Read', { file_path: '/repo/src/identity.ts' }, 't1b'),
+      toolResult('t1b', 'ok'),
+      toolUse('tap_star', { category: 'decision', note: 'Keep the canonical join pure.' }, 't2'),
+      toolResult('t2', 'pinned'),
+      toolUse('tap_star', { category: 'decision', note: 'Keep the canonical join pure.' }, 't2b'),
+      toolResult('t2b', 'deduplicated to the prior durable row'),
+      toolUse('task_rail', {
+        mode: 'shoot',
+        rail_id: 'rail-fixture',
+        acks: [{ step_id: 'join-step', ack_status: 'done', note: 'The join is exact.' }],
+      }, 't3'),
+      toolResult('t3', 'ack'),
+    ];
+    const result = deriveEpisodesFromMessages(messages, 0, {
+      ...ID,
+      railId: 'rail-fixture',
+    }, {
+      sealTrailing: true,
+      timestamps: messages.map(() => sourceTime),
+    });
+
+    const star = result.episodes[0].annotations.find((annotation) => annotation.kind === 'star:decision');
+    const rail = result.episodes[0].annotations.find((annotation) => annotation.kind === 'rail');
+    const process = result.episodes[0].annotations.find((annotation) => annotation.kind === 'process:decision');
+    expect(process?.artifact).toEqual(createCognitiveArtifactEnvelope({
+      source: { family: 'glyph', messageId: 'message-working-1', sourceTime },
+      authorityClass: 'historical_observation',
+    }));
+    expect(result.episodes[0].annotations.filter((annotation) => annotation.kind === 'star:decision')).toHaveLength(2);
+    expect(result.episodes[0].annotations
+      .filter((annotation) => annotation.kind === 'star:decision')
+      .every((annotation) => annotation.artifact === undefined)).toBe(true);
+    expect(star?.artifact).toBeUndefined();
+    expect(rail?.artifact).toBeUndefined();
   });
 
   test('capture links verdict narration to decisive result evidence or explicit none', () => {

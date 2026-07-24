@@ -591,6 +591,72 @@ describe('compileFoldReceipts — typed durable action records', () => {
     expect(totalitySum(compiled.counts)).toBe(compiled.counts.totalToolCalls);
   });
 
+  it('keeps successful mutations applied when output merely mentions interruption words', () => {
+    // Each result below is ordinary command OUTPUT that happens to contain a
+    // word the harness also uses for verdicts. Treating those as verdicts
+    // downgraded plainly-successful mutations to `unknown`, which forces
+    // reconciliation a successor cannot satisfy.
+    const window: FoldMessage[] = [
+      toolUse('log-mv', 'Bash', { command: 'mv src/a.ts src/b.ts' }, T1),
+      toolResult('log-mv', 'abc1234 fix: handle aborted uploads on retry', { tsMs: T2 }),
+      toolUse('test-cp', 'Bash', { command: 'cp fixtures/x.json build/x.json' }, T1),
+      toolResult('test-cp', 'PASS suite (timeout: 5000ms)\n12 passed', { tsMs: T2 }),
+      toolUse('grep-mkdir', 'Bash', { command: 'mkdir -p out/dist' }, T1),
+      toolResult('grep-mkdir', 'matched: the request was cancelled by the peer', { tsMs: T2 }),
+    ];
+
+    const actions = compileFoldReceipts(window).receipts.filter(
+      (receipt): receipt is FoldActionRecord => receipt.recordType === 'action',
+    );
+    expect(actions.map(({ outcome }) => outcome)).toEqual(['applied', 'applied', 'applied']);
+    expect(actions.every(({ reconciliationRequired }) => !reconciliationRequired)).toBe(true);
+  });
+
+  it('still classifies genuine harness interruption verdicts as unknown', () => {
+    const window: FoldMessage[] = [
+      toolUse('timed-out', 'Bash', { command: 'rm -rf build/stale' }, T1),
+      toolResult('timed-out', 'partial output\nCommand timed out after 2m 0.0s', { tsMs: T2 }),
+      toolUse('warp-interrupt', 'Bash', { command: 'mv a/x.ts a/y.ts' }, T1),
+      toolResult('warp-interrupt', 'Context Warp automatically interrupted this call', { tsMs: T2 }),
+      toolUse('aborted-line', 'Bash', { command: 'cp a/x.ts a/z.ts' }, T1),
+      toolResult('aborted-line', 'Aborted.', { tsMs: T2 }),
+      toolUse('infra', 'Bash', { command: 'mkdir -p a/b' }, T1),
+      toolResult('infra', '{"ok":false,"status":"launch_error"}', { tsMs: T2 }),
+    ];
+
+    const actions = compileFoldReceipts(window).receipts.filter(
+      (receipt): receipt is FoldActionRecord => receipt.recordType === 'action',
+    );
+    expect(actions.map(({ outcome }) => outcome)).toEqual(
+      ['unknown', 'unknown', 'unknown', 'unknown'],
+    );
+    expect(actions.every(({ reconciliationRequired }) => reconciliationRequired)).toBe(true);
+  });
+
+  it('gives bash mutations a real target instead of an empty one', () => {
+    const window: FoldMessage[] = [
+      toolUse('with-paths', 'Bash', { command: 'mv src/old.ts src/new.ts' }, T1),
+      toolResult('with-paths', 'ok', { tsMs: T2 }),
+      toolUse('no-paths', 'Bash', { command: 'npm ci' }, T1),
+      toolResult('no-paths', 'added 1 package', { tsMs: T2 }),
+    ];
+
+    const actions = compileFoldReceipts(window).receipts.filter(
+      (receipt): receipt is FoldActionRecord => receipt.recordType === 'action',
+    );
+    // Previously every bash mutation rendered target="unknown", asserting the
+    // target was undeterminable when the command names it outright.
+    expect(actions[0]?.targetIdentity).toContain('src/old.ts');
+    expect(actions[0]?.targetIdentity).toContain('src/new.ts');
+    const rendered = renderFoldReceipts(compileFoldReceipts(window)).join('\n');
+    expect(rendered).toContain('kind=bash-mutation outcome=applied'
+      + ' reconciliation-required=false target="src/old.ts|src/new.ts"');
+    // A pathless mutation has no target identity to invent: it stays empty and
+    // opts out of supersession rather than keying on a truncatable command
+    // string, which would collide with any command sharing its prefix.
+    expect(actions[1]?.targetIdentity).toBe('');
+  });
+
   it('promotes acquire/release attempts into typed action outcomes', () => {
     const compiled = compileFoldReceipts([
       toolUse('claim-applied', 'partner_claim_file', {

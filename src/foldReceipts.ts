@@ -41,6 +41,12 @@ import {
 import {
   renderEmbeddedContinuityArtifactProvenance,
 } from './chronologicalProvenance.ts';
+// Path extraction for bash mutations. `extractPathsFromBashCommand` applies the
+// same `normalizeToolPath` as structured-tool path extraction, so a bash
+// mutation's target collapses onto the SAME forward-index key as an Edit on the
+// same file; the raw-spelling variant would not unify. foldRecall imports only
+// rollingFold/chronologicalProvenance/glyphs, so this edge adds no cycle.
+import { extractPathsFromBashCommand } from './foldRecall.ts';
 
 // ══════════════════════════════════════════════════════════════════════
 // Relay-wide artifact-mode flag (VOXXO_FOLD_ARTIFACT_ONLY)
@@ -663,13 +669,40 @@ function resultOpensWithError(resultText: string): boolean {
     || /\bCommand failed\b|\bexit code [1-9]/.test(head);
 }
 
-const ACTION_OUTCOME_UNKNOWN_RE =
-  /\[Request interrupted by user|Context Warp automatically interrupted|\b(?:interrupted|cancelled|canceled|aborted)\b|\b(?:timed out|timeout)\b|Script running with cell ID|"status"\s*:\s*"(?:busy|infra_timeout|launch_error|max_buffer|run_error|crash)"/i;
+/**
+ * Harness-shaped interruption markers. The runtime emits these verbatim, so
+ * they are unambiguous wherever they land in a result body — including after
+ * partial command output.
+ */
+const ACTION_OUTCOME_UNKNOWN_MARKER_RE =
+  /\[Request interrupted by user|Context Warp automatically interrupted|Script running with cell ID|\b(?:command|tool|request|operation|execution)\s+timeout\b|"status"\s*:\s*"(?:busy|infra_timeout|launch_error|max_buffer|run_error|crash)"/i;
+
+/**
+ * Bare interruption verdicts ("Command timed out after 2m 0.0s", "Aborted.").
+ * Anchored to the start of a line because that is where the harness states a
+ * verdict, whereas arbitrary command OUTPUT merely mentions the same words as
+ * data.
+ *
+ * Matching these anywhere in the body silently downgraded successful mutations
+ * to `unknown` whenever their output happened to contain the word: a `git log`
+ * carrying "fix: handle aborted uploads", a passing suite printing
+ * "timeout: 5000ms", or a grep over this very file. `unknown` is not a free
+ * hedge — it sets `reconciliationRequired`, so each false positive spends
+ * successor attention reconciling a mutation that plainly succeeded, and
+ * dilutes the genuine unknowns that rule exists to protect.
+ */
+const ACTION_OUTCOME_UNKNOWN_VERDICT_RE =
+  /^[ \t>*_#-]*(?:[✗✖×⚠]\s*)?(?:(?:the\s+)?(?:command|tool|request|operation|execution|call|run|process)\s+)?(?:(?:was|were|has\s+been|had\s+been)\s+)?(?:interrupted|cancell?ed|aborted|timed\s+out)\b/im;
+
+function isUnknownActionOutcome(result: string): boolean {
+  return ACTION_OUTCOME_UNKNOWN_MARKER_RE.test(result)
+    || ACTION_OUTCOME_UNKNOWN_VERDICT_RE.test(result);
+}
 
 function resolveActionOutcome(call: ReceiptToolCall, errorIds: Set<string>): FoldActionOutcome {
   if (call.completion === 'pending') return 'unknown';
   const result = call.resultText.trim();
-  if (!result || ACTION_OUTCOME_UNKNOWN_RE.test(result)) return 'unknown';
+  if (!result || isUnknownActionOutcome(result)) return 'unknown';
   if (errorIds.has(call.toolId) || resultOpensWithError(result) || /"ok"\s*:\s*false\b/.test(result)) {
     return 'failed';
   }
@@ -1243,8 +1276,28 @@ function targetIdentity(kind: FoldReceiptKind, call: ReceiptToolCall): string {
     case 'rail-op': return String(call.input.step_id ?? call.input.ack_step_id ?? '');
     case 'claim-op': return claimTargets(call.input).map((target) => target.targetIdentity).join('|');
     case 'decision': return parseDecision(call).subject;
+    case 'bash-mutation': return bashMutationTarget(call.input);
     default: return '';
   }
+}
+
+/**
+ * Target identity for a bash mutation. `isMutatingBash` already decided the
+ * command mutates something, but without this case every bash mutation rendered
+ * `target="unknown"` — asserting the target could not be determined when it is
+ * derivable from the command itself.
+ *
+ * Paths only, via the same `normalizeToolPath` used for structured-tool targets,
+ * so `bash-mutation:<path>` keys are exact. A pathless mutation (`npm ci`)
+ * returns empty and opts out of supersession per the `targetIdentity` contract;
+ * its command still rides the receipt text. Deliberately NOT a truncated command
+ * string: two commands sharing a truncated prefix would collide into one
+ * identity and falsely supersede each other.
+ */
+function bashMutationTarget(input: Record<string, unknown>): string {
+  const command = String(input.command ?? '');
+  if (!command) return '';
+  return extractPathsFromBashCommand(command).join('|');
 }
 
 // ══════════════════════════════════════════════════════════════════════

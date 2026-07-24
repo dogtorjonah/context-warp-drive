@@ -6,9 +6,7 @@ import {
 } from '../src/contextBudget.ts';
 
 describe('resolveContextBudget', () => {
-  it('keeps opus-4.8-max Claude API sessions on the single-ceiling S37/M40/A5/T10/F30/P180 geometry', () => {
-    // FC surfaces retain the P=180K base; tuned CLI/interactive engine aliases
-    // use their own table entries without changing this API geometry.
+  it('keeps opus-4.8-max Claude API sessions on the single-ceiling S37/M40/A5/T10/F30/P200 geometry', () => {
     const budget = resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' });
 
     expect(budget.contextWindowTokens).toBe(1_000_000);
@@ -19,35 +17,49 @@ describe('resolveContextBudget', () => {
     expect(budget.appendBandTargetTokens).toBe(5_000);
     expect(budget.tailEpochRunwayTokens).toBe(10_000);
     expect(budget.tailEpochMinRunwayTokens).toBe(30_000);
-    expect(budget.foldTriggerTokens).toBe(180_000);
-    expect(budget.pressureCeilingTokens).toBe(180_000);
+    expect(budget.foldTriggerTokens).toBe(200_000);
+    expect(budget.pressureCeilingTokens).toBe(200_000);
     expect(budget.prefixSaturationTokens).toBe(900_000);
-    expect(budget.tailEpochCapTokens).toBe(180_000);
-    expect(budget.tailEpochPressureMarginTokens).toBe(93_000);
+    expect(budget.tailEpochCapTokens).toBe(200_000);
+    expect(budget.tailEpochPressureMarginTokens).toBe(113_000);
     expect(budget.evictionPolicy).toBe('hard-epoch-on-prefix-saturation');
   });
 
-  it('keeps FC surfaces at 180K while the tuned Claude interactive surface uses 220K', () => {
-    expect(resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(180_000);
-    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(180_000);
-    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(220_000);
-    expect(resolveContextBudget({ engine: 'codex-api', model: 'gpt-5.5' }).pressureCeilingTokens).toBe(180_000);
+  it('uses the uniform 200K target across API and interactive surfaces', () => {
+    expect(resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'codex-api', model: 'gpt-5.5' }).pressureCeilingTokens).toBe(200_000);
   });
 
-  it('gives only the Fable API surface a 250K single ceiling', () => {
-    expect(resolveContextBudget({ engine: 'claude', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(180_000);
-    expect(resolveContextBudget({ engine: 'claude', model: 'claude-fable-5' }).foldTriggerTokens).toBe(180_000);
-    expect(resolveContextBudget({ engine: 'claude-cli', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(220_000);
-    expect(resolveContextBudget({ engine: 'claude-cli', model: 'claude-fable-5' }).foldTriggerTokens).toBe(220_000);
-    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(250_000);
-    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5' }).foldTriggerTokens).toBe(250_000);
-    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5-versioned' }).pressureCeilingTokens).toBe(250_000);
-    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(220_000);
-    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-fable-5' }).foldTriggerTokens).toBe(220_000);
-    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(180_000);
+  it('requests 200K for every spawnable engine when the physical window admits it', () => {
+    const engines = [
+      'claude', 'claude-api', 'claude-cli', 'claude-interactive',
+      'codex', 'codex-api', 'openai',
+      'gemini', 'gemini-api',
+      'minimax', 'mistral', 'grok', 'glm', 'deepseek', 'kimi', 'qwen', 'inkling', 'local',
+    ];
+    for (const engine of engines) {
+      const budget = resolveContextBudget({ engine, contextWindowTokens: 1_000_000, env: {} });
+      expect(budget.pressureCeilingTokens, engine).toBe(200_000);
+      expect(budget.foldTriggerTokens, engine).toBe(200_000);
+    }
   });
 
-  it('puts 200k Claude models in survival mode with the uniform 180K default pressure ceiling', () => {
+  it('removes the old Fable and CLI carve-outs in favor of 200K everywhere', () => {
+    expect(resolveContextBudget({ engine: 'claude', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude', model: 'claude-fable-5' }).foldTriggerTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-cli', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-cli', model: 'claude-fable-5' }).foldTriggerTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5' }).foldTriggerTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-fable-5-versioned' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-fable-5' }).pressureCeilingTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-interactive', model: 'claude-fable-5' }).foldTriggerTokens).toBe(200_000);
+    expect(resolveContextBudget({ engine: 'claude-api', model: 'claude-opus-4-8' }).pressureCeilingTokens).toBe(200_000);
+  });
+
+  it('safely clamps the uniform 200K target on physical 200K Claude windows', () => {
     const budget = resolveContextBudget({ engine: 'claude', model: 'claude-sonnet-4' });
 
     expect(budget.contextWindowTokens).toBe(200_000);
@@ -65,25 +77,25 @@ describe('resolveContextBudget', () => {
   it('sizes the single-ceiling tail-epoch cap to the whole measured P batch', () => {
     const oneM = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8' });
     expect(oneM.systemToolsReserveTokens).toBe(37_000);
-    expect(oneM.pressureCeilingTokens).toBe(180_000);
-    expect(oneM.tailEpochPressureMarginTokens).toBe(93_000);
+    expect(oneM.pressureCeilingTokens).toBe(200_000);
+    expect(oneM.tailEpochPressureMarginTokens).toBe(113_000);
     expect(oneM.tailEpochRunwayTokens).toBe(10_000);
     expect(oneM.tailEpochMinRunwayTokens).toBe(30_000);
-    expect(oneM.tailEpochCapTokens).toBe(180_000);
-    expect(oneM.tailEpochCapChars).toBe(180_000 * oneM.charsPerToken);
+    expect(oneM.tailEpochCapTokens).toBe(200_000);
+    expect(oneM.tailEpochCapChars).toBe(200_000 * oneM.charsPerToken);
   });
 
   it('keeps the whole-tail cap at P under heavier tool load', () => {
     const base = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', systemToolsReserveTokens: 37_000 });
     const heavyTools = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', systemToolsReserveTokens: 52_000 });
-    expect(base.tailEpochCapTokens).toBe(180_000);
-    expect(heavyTools.tailEpochCapTokens).toBe(180_000);
-    expect(heavyTools.tailEpochPressureMarginTokens).toBe(78_000);
+    expect(base.tailEpochCapTokens).toBe(200_000);
+    expect(heavyTools.tailEpochCapTokens).toBe(200_000);
+    expect(heavyTools.tailEpochPressureMarginTokens).toBe(98_000);
   });
 
   it('ignores tail pressure-margin overrides for the single-ceiling whole-tail cap', () => {
     const widerMargin = resolveContextBudget({ engine: 'claude', model: 'claude-opus-4-8', tailEpochPressureMarginTokens: 80_000 });
-    expect(widerMargin.tailEpochCapTokens).toBe(180_000);
+    expect(widerMargin.tailEpochCapTokens).toBe(200_000);
     // glm-5 80k with oversized S: geometry collapses, so the raw-tail cap floors at MIN (4k).
     // The runtime runway gate must hard-epoch instead of appending in this impossible geometry.
     const tiny = resolveContextBudget({
@@ -166,13 +178,13 @@ describe('resolveContextBudget', () => {
     expect(cli.compressionProfile).toBe('survival');
     expect(cli.bandTokens).toBe(40_000);
     expect(cli.messageCeilingTokens).toBe(236_840);
-    expect(cli.pressureCeilingTokens).toBe(220_000);
-    expect(cli.foldTriggerTokens).toBe(220_000);
+    expect(cli.pressureCeilingTokens).toBe(200_000);
+    expect(cli.foldTriggerTokens).toBe(200_000);
     expect(api.contextWindowTokens).toBe(1_048_576);
     expect(api.compressionProfile).toBe('cache-economic');
     expect(api.bandTokens).toBe(40_000);
-    expect(api.pressureCeilingTokens).toBe(180_000);
-    expect(api.foldTriggerTokens).toBe(180_000);
+    expect(api.pressureCeilingTokens).toBe(200_000);
+    expect(api.foldTriggerTokens).toBe(200_000);
   });
 
   it('treats GLM 5.2 as a 1M flagship window instead of the older GLM fallback', () => {
@@ -182,7 +194,7 @@ describe('resolveContextBudget', () => {
     expect(budget.budgetTier).toBe('large-1m');
     expect(budget.compressionProfile).toBe('cache-economic');
     expect(budget.bandTokens).toBe(40_000);
-    expect(budget.pressureCeilingTokens).toBe(180_000);
+    expect(budget.pressureCeilingTokens).toBe(200_000);
   });
 
   it('supports arbitrary new models through an explicit context window override', () => {
@@ -199,14 +211,14 @@ describe('resolveContextBudget', () => {
     expect(budget.contextWindowTokens).toBe(1_000_000);
     expect(budget.budgetTier).toBe('large-1m');
     expect(budget.bandTokens).toBe(150_000);
-    expect(budget.pressureCeilingTokens).toBe(180_000);
+    expect(budget.pressureCeilingTokens).toBe(200_000);
   });
 
   it('resolves Codex and Gemini CLI triggers exactly at their resolved P in single-ceiling mode', () => {
     const codex = resolveContextBudget({ engine: 'codex', model: 'gpt-5.5' });
     expect(codex.bandTokens).toBe(40_000);
-    expect(codex.pressureCeilingTokens).toBe(220_000);
-    expect(codex.foldTriggerTokens).toBe(220_000);
+    expect(codex.pressureCeilingTokens).toBe(200_000);
+    expect(codex.foldTriggerTokens).toBe(200_000);
     expect(codex.foldTriggerTokens).toBeLessThan(codex.messageCeilingTokens);
     expect(codex.foldTriggerTokens).toBeGreaterThan(codex.bandTokens);
     expect(codex.foldTriggerTokens).toBeLessThanOrEqual(codex.pressureCeilingTokens ?? Number.POSITIVE_INFINITY);
@@ -226,14 +238,14 @@ describe('resolveContextBudget', () => {
       env: { VOXXO_FOLD_TARGET_BAND_TOKENS: '30000' },
     });
     expect(lowBand.bandTokens).toBe(30_000);
-    expect(lowBand.foldTriggerTokens).toBe(220_000);
+    expect(lowBand.foldTriggerTokens).toBe(200_000);
 
     const overridden = resolveContextBudget({
       engine: 'codex',
       model: 'gpt-5.5',
       env: { VOXXO_FOLD_TRIGGER_TOKENS: '120000' },
     });
-    expect(overridden.foldTriggerTokens).toBe(220_000);
+    expect(overridden.foldTriggerTokens).toBe(200_000);
 
     const liveEnvRegression = resolveContextBudget({
       engine: 'codex',
@@ -290,9 +302,10 @@ describe('resolveContextBudget', () => {
       postFoldFloorTokens: 160_000,
       appendEpochsSinceHardReset: 1,
     })).toMatchObject({
-      decision: 'hard-epoch',
-      reason: 'runway-exhausted',
-      runwayBasis: 'floor',
+      decision: 'append',
+      reason: 'runway-holds',
+      runwayBasis: 'disabled',
+      postAppendRunwayTokens: null,
     });
   });
 
@@ -319,12 +332,12 @@ describe('resolveContextBudget', () => {
     expect(decide(normal.foldTriggerTokens)).toEqual(decide(1));
     expect(decide(1)).toMatchObject({
       decision: 'append',
-      runwayBasis: 'floor',
-      postAppendRunwayTokens: 57_400,
+      runwayBasis: 'disabled',
+      postAppendRunwayTokens: null,
     });
   });
 
-  it('rejects back-to-back hard epochs until a real append arms the floor gate', () => {
+  it('keeps a remembered high floor inert before and after an append', () => {
     const highFloor = {
       measuredInputTokens: 180_000,
       pressureCeilingTokens: 180_000,
@@ -336,18 +349,18 @@ describe('resolveContextBudget', () => {
       tailEpochMinRunwayTokens: 30_000,
     } as const;
 
-    // A fresh hard-epoch generation cannot immediately hard-epoch again.
     expect(resolveMeasuredEpochEligibility({
       ...highFloor,
       appendEpochsSinceHardReset: 0,
     }).decision).toBe('append');
-    // A committed append arms the measured projected-floor rule.
     expect(resolveMeasuredEpochEligibility({
       ...highFloor,
       appendEpochsSinceHardReset: 1,
     })).toMatchObject({
-      decision: 'hard-epoch',
-      reason: 'runway-exhausted',
+      decision: 'append',
+      reason: 'runway-holds',
+      runwayBasis: 'disabled',
+      postAppendRunwayTokens: null,
     });
   });
 

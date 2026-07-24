@@ -111,6 +111,7 @@ const TYPED_RAIL: ContinuityReceiptRail = {
     id: 'continuity-receipt',
     title: 'Make boundary state typed and singular',
     status: 'active',
+    updatedAt: '2026-07-17T20:55:10.123Z',
     position: 15,
     totalSteps: 23,
     instruction: 'Introduce a versioned typed continuity receipt as the authoritative boundary snapshot.',
@@ -390,7 +391,8 @@ describe('renderContinuityReceiptControl (canonical renderer)', () => {
     expect(block).toContain('runtime=working');
     expect(block).toContain('frontier=rebirth-rail-snapshot@event#336');
     expect(block).toContain('current task-rail step · 15/23 · continuity-receipt [active] · Make boundary state typed and singular');
-    expect(block).toContain('updated=2026-07-17T20:56:55.631Z');
+    expect(block).toContain('updated=2026-07-17T20:55:10.123Z');
+    expect(block).not.toContain('updated=2026-07-17T20:56:55.631Z');
     expect(block).toContain('step instruction=Introduce a versioned typed continuity receipt as the authoritative boundary snapshot.');
     expect(block).toContain('active files · claims=none · recent edits=packages/context-warp/src/continuityReceipt.ts');
     expect(block).toContain('validation=192/192 tests in both canonical trees');
@@ -413,6 +415,26 @@ describe('renderContinuityReceiptControl (canonical renderer)', () => {
     expect(block).not.toContain('rail:');
     expect(block).not.toContain('active request');
     expect(block).not.toContain('validation=');
+  });
+
+  test('keeps rail and active-step source timestamps distinct in typed live state', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      sourceStatus: 'working',
+      rail: TYPED_RAIL,
+    });
+
+    expect(receipt.liveState?.rail.source.sourceTimestamp).toBe('2026-07-17T20:56:55.631Z');
+    expect(receipt.liveState?.step.source).toMatchObject({
+      kind: 'task-rail-step',
+      id: 'rail-9e2b1075:continuity-receipt',
+      coordinate: 'step:continuity-receipt',
+      sourceTimestamp: '2026-07-17T20:55:10.123Z',
+    });
+    const block = renderContinuityReceiptControl(receipt);
+    expect(block).toContain('updated=2026-07-17T20:55:10.123Z');
+    expect(block).not.toContain('updated=2026-07-17T20:56:55.631Z');
   });
 
   test('renders hazards while keeping reconciliation disagreements internal', () => {

@@ -14,6 +14,7 @@ import {
   DEFAULT_FOLD_RECALL_CONFIG,
   extractRecallSignals,
   resolveFoldRecallConfig,
+  type CognitiveLead,
   type EpisodeVoice,
   type AtlasFileMeta,
 } from '../src/foldRecall.ts';
@@ -75,6 +76,41 @@ const UNIFIED_SEED: FoldMessage[] = [
 ];
 
 describe('foldRecall unified card — voice + Atlas meta blocks', () => {
+  test('renders bounded query-time Cognitive Leads in a lane separate from episode history', () => {
+    const state = createFoldRecallState();
+    state.index = indexFor(UNIFIED_SEED);
+    const lead: CognitiveLead = {
+      path: FILE,
+      artifactId: 'glyph:verdict:42',
+      sourceTime: '2026-07-22T18:00:00.000Z',
+      renderedLine: '🏁 verdict | renderer fixed · source-time=2026-07-22T18:00:00.000Z · authority=historical_observation',
+      authorityClass: 'historical_observation',
+    };
+    state.pathCognitiveLeads.set(FILE, [lead]);
+    state.pathEpisodes.set(FILE, [{
+      path: FILE,
+      voiceLines: ['Earlier historical work on the renderer'],
+      intent: null,
+      chapterIds: [41],
+      endedAt: '2026-07-21T18:00:00.000Z',
+    }]);
+    state.pathAtlasMeta!.set(FILE, { path: FILE, purpose: null, blurb: null, tags: [], drilldown: null });
+
+    const out = buildFoldRecallContext(
+      state,
+      UNIFIED_SEED,
+      editRelevantSignals(),
+      'healthy',
+      DEFAULT_FOLD_RECALL_CONFIG,
+    );
+
+    expect(out.text).toContain('🧭 Current cognitive leads:');
+    expect(out.text).toContain(lead.renderedLine);
+    expect(out.text).toContain('🗣 Your lineage:');
+    expect(out.composition?.cognitiveLeadChars).toBeGreaterThan(0);
+    expect(out.chars).toBeLessThanOrEqual(DEFAULT_FOLD_RECALL_CONFIG.maxTotalChars);
+  });
+
   test('11a: populated carriers show 🗣 voice and 📌/🏷 Atlas-meta in card', () => {
     const state = createFoldRecallState();
     state.index = indexFor(UNIFIED_SEED);

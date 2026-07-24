@@ -42,6 +42,7 @@ import {
   synthesizedHistoricalClaim,
   witnessedHistoricalClaim,
 } from './historicalClaimOrigin.ts';
+import type { CognitiveArtifactEnvelope } from './cognitiveArtifactEnvelope.ts';
 
 /**
  * Persisted membership strength within a burst. Live capture emits only
@@ -111,7 +112,20 @@ export interface EpisodeAnnotation {
   evidence?: EpisodeEvidenceRef;
   /** Optional file path this annotation was about (e.g. atlas_commit target). */
   path?: string;
+  /**
+   * Canonical Cognitive Artifact identity when capture had every durable source
+   * coordinate needed to derive it. Absence means unlinked, never guessed.
+   * Query-time enrichment may update lifecycle fields while preserving the
+   * immutable artifactId/sourceIdentity pair.
+   */
+  artifact?: CognitiveArtifactEnvelope;
 }
+
+/** Bounded query-time lifecycle row supplied by a host-owned artifact index. */
+export type EpisodeArtifactLifecycleState = Pick<
+  CognitiveArtifactEnvelope,
+  'artifactId' | 'sourceIdentity' | 'sourceTime' | 'authorityClass' | 'currentStatus' | 'supersededBy' | 'driftStatus'
+>;
 
 export type EpisodeEvidenceRef =
   | {
@@ -1138,13 +1152,73 @@ function renderStructuralStep(step: TraceStep): string {
   return token;
 }
 
+const EPISODE_ARTIFACT_LIFECYCLE_LIMIT = 1_000;
+
+/**
+ * Resolve denormalized annotation pointers against current host lifecycle rows.
+ * Identity and source time remain capture-owned and immutable; only mutable
+ * lifecycle fields are refreshed. A missing row or identity mismatch returns
+ * the legacy episode unchanged.
+ */
+export function resolveEpisodeArtifactLifecycles(
+  episode: Episode,
+  lifecycleRows: readonly EpisodeArtifactLifecycleState[],
+): Episode {
+  if (episode.annotations.length === 0 || lifecycleRows.length === 0) return episode;
+  const byArtifactId = new Map<string, EpisodeArtifactLifecycleState>();
+  const start = Math.max(0, lifecycleRows.length - EPISODE_ARTIFACT_LIFECYCLE_LIMIT);
+  for (let index = start; index < lifecycleRows.length; index++) {
+    const row = lifecycleRows[index];
+    if (row?.artifactId && row.sourceIdentity) byArtifactId.set(row.artifactId, row);
+  }
+  let changed = false;
+  const annotations = episode.annotations.map((annotation) => {
+    const artifact = annotation.artifact;
+    if (!artifact) return annotation;
+    const current = byArtifactId.get(artifact.artifactId);
+    if (
+      !current
+      || current.sourceIdentity !== artifact.sourceIdentity
+      || current.sourceTime !== artifact.sourceTime
+    ) return annotation;
+    if (
+      artifact.authorityClass === current.authorityClass
+      && artifact.currentStatus === current.currentStatus
+      && artifact.supersededBy === current.supersededBy
+      && artifact.driftStatus === current.driftStatus
+    ) return annotation;
+    changed = true;
+    return {
+      ...annotation,
+      artifact: {
+        ...artifact,
+        authorityClass: current.authorityClass,
+        currentStatus: current.currentStatus,
+        supersededBy: current.supersededBy,
+        driftStatus: current.driftStatus,
+      },
+    };
+  });
+  return changed ? { ...episode, annotations } : episode;
+}
+
+function artifactLifecycleSuffix(annotation: EpisodeAnnotation): string {
+  const artifact = annotation.artifact;
+  if (!artifact || artifact.currentStatus !== 'superseded') return '';
+  const replacement = artifact.supersededBy
+    ? ` by ${truncateVerbatim(artifact.supersededBy, 40)}`
+    : '';
+  return ` [artifact superseded${replacement}]`;
+}
+
 function renderVoiceInline(annotation: EpisodeAnnotation): string {
   const text = truncateVerbatim(annotation.text, TRACE_VOICE_TEXT_CAP_CHARS);
-  if (annotation.kind.startsWith('star:')) return `⭐${annotation.kind.slice(5)}:"${text}"`;
-  if (annotation.kind === 'changelog') return `✎:"${text}"`;
-  if (annotation.kind.startsWith('narration')) return `🗣:"${text}"`;
-  if (annotation.kind === 'rail') return `🛤:"${text}"`;
-  return `💬:"${text}"`;
+  const lifecycle = artifactLifecycleSuffix(annotation);
+  if (annotation.kind.startsWith('star:')) return `⭐${annotation.kind.slice(5)}:"${text}"${lifecycle}`;
+  if (annotation.kind === 'changelog') return `✎:"${text}"${lifecycle}`;
+  if (annotation.kind.startsWith('narration')) return `🗣:"${text}"${lifecycle}`;
+  if (annotation.kind === 'rail') return `🛤:"${text}"${lifecycle}`;
+  return `💬:"${text}"${lifecycle}`;
 }
 
 function structuralKey(step: TraceStep): string {
@@ -1479,18 +1553,19 @@ function filterSelfLineageChapters(
 function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   const text = truncateVerbatim(annotation.text, VOICE_TEXT_CAP_CHARS);
   const at = voiceTimeSuffix(annotation);
+  const lifecycle = artifactLifecycleSuffix(annotation);
   const who = label ? ` ${label}` : '';
   const evidence = evidenceRefSuffix(annotation);
   const withOrigin = (line: string): string => renderHistoricalClaim(synthesizedHistoricalClaim(line));
-  if (annotation.kind.startsWith('star:')) return `${withOrigin(`  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}`)}${evidence}`;
-  if (annotation.kind === 'changelog') return `${withOrigin(`  ✎${who}:"${text}"${at}`)}${evidence}`;
-  if (annotation.kind.startsWith('narration')) return `${withOrigin(`  🗣${who}:"${text}"${at}`)}${evidence}`;
+  if (annotation.kind.startsWith('star:')) return `${withOrigin(`  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}${lifecycle}`)}${evidence}`;
+  if (annotation.kind === 'changelog') return `${withOrigin(`  ✎${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
+  if (annotation.kind.startsWith('narration')) return `${withOrigin(`  🗣${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
   if (annotation.kind.startsWith('process:')) {
     const category = annotation.kind.slice('process:'.length);
-    return `${withOrigin(`  🗣${who} [${category}]:"${text}"${at}`)}${evidence}`;
+    return `${withOrigin(`  🗣${who} [${category}]:"${text}"${at}${lifecycle}`)}${evidence}`;
   }
-  if (annotation.kind === 'rail') return `${withOrigin(`  🛤${who}:"${text}"${at}`)}${evidence}`;
-  return `${withOrigin(`  💬${who}:"${text}"${at}`)}${evidence}`;
+  if (annotation.kind === 'rail') return `${withOrigin(`  🛤${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
+  return `${withOrigin(`  💬${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
 }
 
 function evidenceRefSuffix(annotation: EpisodeAnnotation): string {

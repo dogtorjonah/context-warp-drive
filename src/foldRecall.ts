@@ -1348,6 +1348,37 @@ function buildEpisodeVoiceBlock(
   return parts.join('\n');
 }
 
+/**
+ * Build the query-time Cognitive Rolodex lead block for a recalled path.
+ * The relay performs the exact-path query and supplies already-rendered,
+ * authority-stamped lines; the portable engine only applies the card budget.
+ */
+function buildCognitiveLeadBlock(
+  item: RecallPlanItem,
+  state: FoldRecallState,
+  charBudget: number,
+  suppressPaths: ReadonlySet<string>,
+): string {
+  if (charBudget <= 0) return '';
+  const path = item.matchedPath;
+  const alias = normalizeToolPath(path);
+  if (suppressPaths.has(path) || suppressPaths.has(alias)) return '';
+  const leads = state.pathCognitiveLeads?.get(path) ?? state.pathCognitiveLeads?.get(alias);
+  if (!leads || leads.length === 0) return '';
+
+  const parts: string[] = ['🧭 Current cognitive leads:'];
+  let used = parts[0].length + 1;
+  for (const lead of leads) {
+    const renderedLine = lead.renderedLine.trim();
+    if (!renderedLine) continue;
+    const line = `  ${renderedLine}`;
+    if (used + line.length > charBudget) break;
+    parts.push(line);
+    used += line.length + 1;
+  }
+  return parts.length > 1 ? parts.join('\n') : '';
+}
+
 /** Map of toolId → raw message index for every tool result present in raw history. */
 function buildToolResultPositions(rawHistory: readonly FoldMessage[]): Map<string, number> {
   const positions = new Map<string, number>();
@@ -1655,6 +1686,19 @@ export interface EpisodeVoice {
 }
 
 /**
+ * Query-time Cognitive Rolodex lead for a recalled path. The host filters
+ * superseded artifacts and renders the line with its authority lane before
+ * handing it to this I/O-free package.
+ */
+export interface CognitiveLead {
+  path: string;
+  artifactId: string;
+  sourceTime: string;
+  renderedLine: string;
+  authorityClass: 'pointer' | 'historical_observation' | 'evidence' | 'review_verdict' | 'authoritative_source';
+}
+
+/**
  * Atlas file identity metadata for a recalled path. Carries the timeless
  * identity fields (purpose, blurb, tags) from the Atlas record — the same
  * fields that appear in Ambient Atlas blocks. Does NOT duplicate
@@ -1789,6 +1833,12 @@ export interface FoldRecallState {
    */
   pathEpisodes: Map<string, EpisodeVoice[]>;
   /**
+   * Exact-path, query-time Cognitive Rolodex leads supplied off-thread by the
+   * host. Kept separate from historical EpisodeVoice so current authority and
+   * lineage narration cannot blur into one evidence lane.
+   */
+  pathCognitiveLeads: Map<string, CognitiveLead[]>;
+  /**
    * Optional Atlas file identity metadata carriers: normalized path →
    * AtlasFileMeta (purpose, blurb, tags). Populated OFF-THREAD by the relay
    * alongside the atlas:recallEnrichment batch. Optional for package API
@@ -1833,6 +1883,7 @@ export function createFoldRecallState(): FoldRecallState {
     pathSourceDeltas: new Map(),
     pathAffinity: new Map(),
     pathEpisodes: new Map(),
+    pathCognitiveLeads: new Map(),
     pathAtlasMeta: new Map(),
     passSeq: 0,
     lastIndexSignature: null,
@@ -3824,7 +3875,7 @@ function renderRecallProvenance(
   return `${rendered}\n${episode.length > 260 ? `${charSafeSlice(episode, 0, 259)}…` : episode}`;
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, cardEnvelopeChars: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', atlasMeta = ''): RenderedCard {
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, cardEnvelopeChars: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', cognitiveLeads = '', atlasMeta = ''): RenderedCard {
   // Radar (hazard + highlight guideposts), episodic voice, and the source-delta
   // notifier all prepend the body excerpt and share the card budget. For a
   // claim-tier recall the body is already swapped to CURRENT box source for
@@ -3832,6 +3883,7 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, card
   // body and the notifier carries the drift warning. Empty carriers ⇒ byte-identical.
   const radarBlock = radar ? `${radar}\n` : '';
   const voiceBlock = episodeVoice ? `${episodeVoice}\n` : '';
+  const cognitiveBlock = cognitiveLeads ? `${cognitiveLeads}\n` : '';
   const metaBlock = atlasMeta ? `${atlasMeta}\n` : '';
   const provenance = renderRecallProvenance(item, rawHistory, rawTailStart);
   const provenanceBlock = provenance ? `${provenance}\n` : '';
@@ -3848,10 +3900,10 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, card
     ? Math.min((atlasLines[0]?.length ?? 0) + 1, availableRouteReserve)
     : 0;
   const chargedMetaChars = Math.max(0, metaBlock.length - routeReserve);
-  const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - chargedMetaChars - provenanceBlock.length) / 2);
+  const notifierBudget = Math.floor(Math.max(0, bodyBudget - radarBlock.length - voiceBlock.length - cognitiveBlock.length - chargedMetaChars - provenanceBlock.length) / 2);
   const notifier = formatDeltaNotifier(applied, notifierBudget);
   const notifierBlock = notifier ? `${notifier}\n` : '';
-  const prefixBlock = `${provenanceBlock}${metaBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
+  const prefixBlock = `${provenanceBlock}${metaBlock}${cognitiveBlock}${voiceBlock}${radarBlock}${notifierBlock}`;
   const preferredExcerptChars = Math.max(0, bodyBudget - prefixBlock.length + routeReserve);
   const excerptRenderedLimit = Math.max(
     0,
@@ -3874,6 +3926,7 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, card
       notifierChars: notifier.length,
       radarChars: radar.length,
       episodeVoiceChars: episodeVoice.length,
+      cognitiveLeadChars: cognitiveLeads.length,
       atlasMetaChars: atlasMeta.length,
       swappedPaths: applied.reduce((n, a) => n + (a.swapped ? 1 : 0), 0),
     },
@@ -3894,6 +3947,8 @@ export interface RecallCompositionStats {
   radarChars: number;
   /** Chars of episodic voice blocks. */
   episodeVoiceChars: number;
+  /** Chars of query-time Cognitive Rolodex lead blocks. */
+  cognitiveLeadChars: number;
   /** Chars of Atlas identity metadata blocks. */
   atlasMetaChars: number;
   /** Paths whose card body was swapped to CURRENT box source (claim-tier). */
@@ -4397,6 +4452,7 @@ export function buildFoldRecallContext(
         // notifier + excerpt share the rest. '' (empty carriers / flags off) ⇒ byte-identical.
         const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
         const episodeVoice = buildEpisodeVoiceBlock(item, state, config, Math.floor(bodyBudget / 4), radarSuppressPaths);
+        const cognitiveLeads = buildCognitiveLeadBlock(item, state, Math.floor(bodyBudget / 4), radarSuppressPaths);
         // Atlas routes are mandatory coordinates, so let them consume the full
         // body budget. buildAtlasMetaBlock keeps optional identity prose on the
         // former one-third sub-ceiling; renderCard charges every non-reserved
@@ -4421,7 +4477,7 @@ export function buildFoldRecallContext(
             recordSuppressed(item.entry, item.matchedPath);
             continue;
           }
-          const povComponents = [residentPrunedBody, radar, episodeVoice, atlasMeta].filter((part) => part.length > 0);
+          const povComponents = [residentPrunedBody, radar, episodeVoice, cognitiveLeads, atlasMeta].filter((part) => part.length > 0);
           cardContentKey = povComponents.map(normalizeFoldRecallPovText).join('\u0000');
           const allComponentsResident = rb.applied.length === 0
             && povComponents.length > 0
@@ -4450,6 +4506,7 @@ export function buildFoldRecallContext(
             rawHistory,
             state.index?.rawCount ?? rawHistory.length,
             episodeVoice,
+            cognitiveLeads,
             atlasMeta,
           );
           rendered = rc.text;
@@ -4527,6 +4584,7 @@ export function buildFoldRecallContext(
             notifierChars: composition.notifierChars + cardStats.notifierChars,
             radarChars: composition.radarChars + cardStats.radarChars,
             episodeVoiceChars: composition.episodeVoiceChars + cardStats.episodeVoiceChars,
+            cognitiveLeadChars: composition.cognitiveLeadChars + cardStats.cognitiveLeadChars,
             atlasMetaChars: composition.atlasMetaChars + cardStats.atlasMetaChars,
             swappedPaths: composition.swappedPaths + cardStats.swappedPaths,
           };

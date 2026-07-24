@@ -243,6 +243,7 @@ export type FoldFreezeHardEpochCause =
 export type FoldFreezeTransitionReason =
   | FoldFreezeHardEpochCause
   | 'hot-reuse'
+  | 'first-tail-epoch'
   | 'append-tail-epoch';
 
 /** Cache consequence of the transition that produced one provider request. */
@@ -315,6 +316,12 @@ export type FoldFreezeAppendResult = FoldFreezeAppendCommit | FoldFreezeAppendSk
 
 /** Additional immutable artifacts published with a successful tail-band seal. */
 export interface FoldFreezeTailEpochSealOptions {
+  /**
+   * Replace an unbanded provider baseline with band #1 instead of pinning that
+   * baseline in front of every later append. Valid only before any band exists;
+   * subsequent seals remain strictly append-only.
+   */
+  readonly foldBaseIntoFirstBand?: boolean;
   /**
    * Vault rows rendered into this exact band. They remain pending while the
    * seal is prepared and join the state's seal-once set only at publication.
@@ -748,7 +755,7 @@ export interface FoldFreezeState {
   frozenViewChars: number;
   /** Canonical SHA-256 sealed with the hard-epoch/base stratum (before appended bands). */
   seedBaseDigest?: string;
-  /** Message count at the last append-only sealed-boundary split, if this epoch appended a tail band. */
+  /** Message count through the end of the sealed band stack (provider cache boundary). */
   lastAppendBoundaryViewCount?: number;
   /** Deterministic metadata for append-only sealed bands in this freeze epoch. */
   sealedBands: readonly FoldFreezeSealedBandMetadata[];
@@ -1075,10 +1082,15 @@ export function verifySerializedFoldFreezeState(
     verifiedPrefixChars += verifiedBandChars;
     rawCursor = band.rawEndIndex;
   }
+  const lastBand = bands.at(-1);
+  const storedBoundaryMatchesBandStack = !lastBand
+    || snapshot.lastAppendBoundaryViewCount === lastBand.bandEndViewIndex
+    // v2 compatibility: older snapshots stored the START of the newest band.
+    // Admit the integrity-valid snapshot, then normalize it on restore below.
+    || snapshot.lastAppendBoundaryViewCount === lastBand.sealedPrefixMessageCount;
   if (viewCursor !== view.length
     || (rawCursor !== null && rawCursor !== snapshot.frozenRawCount)
-    || (bands.length > 0
-      && snapshot.lastAppendBoundaryViewCount !== bands.at(-1)!.sealedPrefixMessageCount)) {
+    || !storedBoundaryMatchesBandStack) {
     return invalidRestore('sealed-band-layout-invalid', 'sealed generation frontier mismatch');
   }
   const { integrityManifestDigest: _storedManifest, ...manifestInput } = snapshot;
@@ -1104,7 +1116,8 @@ export function restoreFoldFreezeState(snapshot: SerializedFoldFreezeState): Fol
     frozenView: snapshot.frozenView ? structuredClone(snapshot.frozenView) : null,
     frozenViewChars: snapshot.frozenViewChars,
     seedBaseDigest: snapshot.seedBaseDigest,
-    lastAppendBoundaryViewCount: snapshot.lastAppendBoundaryViewCount,
+    lastAppendBoundaryViewCount: snapshot.sealedBands.at(-1)?.bandEndViewIndex
+      ?? snapshot.lastAppendBoundaryViewCount,
     sealedBands: snapshot.sealedBands.map((band) => ({ ...band })),
     frozenRawCount: snapshot.frozenRawCount,
     boundaryRole: snapshot.boundaryRole,
@@ -1581,9 +1594,11 @@ export function prepareFoldFreezeTailEpochSeal(
     };
   }
 
-  const sealedPrefixMessageCount = state.frozenView.length;
-  const sealedPrefixChars = state.frozenViewChars;
-  const rawStartIndex = state.frozenRawCount;
+  const foldBaseIntoFirstBand = options.foldBaseIntoFirstBand === true
+    && state.sealedBands.length === 0;
+  const sealedPrefixMessageCount = foldBaseIntoFirstBand ? 0 : state.frozenView.length;
+  const sealedPrefixChars = foldBaseIntoFirstBand ? 0 : state.frozenViewChars;
+  const rawStartIndex = foldBaseIntoFirstBand ? 0 : state.frozenRawCount;
   const rawTail = history.slice(rawStartIndex);
   const rawTailChars = rawTail.length > 0 ? countChars(rawTail) : 0;
   const rawTailMessages = rawTail.length;
@@ -1632,7 +1647,9 @@ export function prepareFoldFreezeTailEpochSeal(
     };
   }
 
-  const view = state.frozenView.concat(preparedTailView);
+  const view = foldBaseIntoFirstBand
+    ? preparedTailView.slice()
+    : state.frozenView.concat(preparedTailView);
   const boundary = history.length > 0 ? history[history.length - 1] : undefined;
   const boundaryHash = boundary ? fnv1a32(boundaryFingerprintInput(boundary)) : undefined;
   const band: FoldFreezeSealedBandMetadata = {
@@ -1684,7 +1701,11 @@ export function prepareFoldFreezeTailEpochSeal(
     ...state,
     frozenView: view.slice(),
     frozenViewChars: countChars(view),
-    lastAppendBoundaryViewCount: sealedPrefixMessageCount,
+    seedBaseDigest: foldBaseIntoFirstBand ? foldProvenanceDigest([]) : state.seedBaseDigest,
+    // Provider caching belongs at the END of the complete immutable band stack,
+    // not at the start of the newest band. A live raw tail, when present, gets
+    // its own rolling breakpoint after this boundary.
+    lastAppendBoundaryViewCount: view.length,
     sealedBands: state.sealedBands.concat(band),
     frozenRawCount: history.length,
     boundaryRole: boundary?.role ?? '',
@@ -1696,7 +1717,7 @@ export function prepareFoldFreezeTailEpochSeal(
     lastCallAt: now,
     hotReuses: 0,
     epochs: state.epochs + 1,
-    lastTransitionReason: 'append-tail-epoch',
+    lastTransitionReason: foldBaseIntoFirstBand ? 'first-tail-epoch' : 'append-tail-epoch',
     sealedVaultFingerprints,
   };
   const plan: FoldFreezeTailEpochSealPlan = {
@@ -1812,6 +1833,8 @@ export function appendFoldFreezeTailEpoch(
   options: FoldFreezeTailEpochSealOptions = {},
 ): FoldFreezeAppendResult {
   const frozenPrefix = state.frozenView;
+  const foldBaseIntoFirstBand = options.foldBaseIntoFirstBand === true
+    && state.sealedBands.length === 0;
   const prepared = prepareFoldFreezeTailEpochSeal(state, history, tailView, context, now, options);
   if (!prepared.prepared) return prepared.result;
   const committed = commitFoldFreezeTailEpochSeal(state, prepared);
@@ -1820,6 +1843,6 @@ export function appendFoldFreezeTailEpoch(
   // mutation of this compatibility view cannot rewrite the sealed generation.
   return {
     ...committed,
-    view: (frozenPrefix ?? []).concat(tailView),
+    view: foldBaseIntoFirstBand ? tailView.slice() : (frozenPrefix ?? []).concat(tailView),
   };
 }

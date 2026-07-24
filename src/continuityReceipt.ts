@@ -51,6 +51,8 @@ export interface ContinuityReceiptRailStep {
   readonly id: string;
   readonly title: string;
   readonly status: string;
+  /** Authoritative source time of this step's latest mutation, when known. */
+  readonly updatedAt?: string;
   /** 1-based position within the rail's step list when known. */
   readonly position?: number;
   readonly totalSteps?: number;
@@ -453,6 +455,12 @@ function buildReceiptLiveState(args: {
         ...(rail.updatedAt ? { sourceTimestamp: rail.updatedAt } : {}),
       })
     : captureSource('task-rail', 'none');
+  const stepSource = rail?.activeStep
+    ? captureSource('task-rail-step', `${rail.railId || 'legacy-rail'}:${rail.activeStep.id}`, {
+        coordinate: `step:${rail.activeStep.id}`,
+        ...(rail.activeStep.updatedAt ? { sourceTimestamp: rail.activeStep.updatedAt } : {}),
+      })
+    : captureSource('task-rail-step', 'none');
   const canonicalSource = parts.canonicalRange
     ? captureSource('canonical-events', parts.canonicalRange.traceId, {
         coordinate: `event#${parts.canonicalRange.eventCount}`,
@@ -514,7 +522,7 @@ function buildReceiptLiveState(args: {
     },
     step: {
       status: rail?.activeStep ? 'current' : 'unknown',
-      source: railSource,
+      source: stepSource,
       ...(rail?.activeStep ? { value: rail.activeStep } : {}),
       ...(!rail?.activeStep ? { note: 'no active/blocking rail step resolved' } : {}),
     },
@@ -935,6 +943,7 @@ export function normalizeContinuityReceiptRail(value: unknown): ContinuityReceip
         id: activeStepValue.id,
         title: activeStepValue.title,
         status: activeStepValue.status,
+        ...(typeof activeStepValue.updatedAt === 'string' ? { updatedAt: activeStepValue.updatedAt } : {}),
         ...(typeof activeStepValue.position === 'number' ? { position: activeStepValue.position } : {}),
         ...(typeof activeStepValue.totalSteps === 'number' ? { totalSteps: activeStepValue.totalSteps } : {}),
         ...(typeof activeStepValue.instruction === 'string' ? { instruction: activeStepValue.instruction } : {}),
@@ -1064,7 +1073,7 @@ export function renderContinuityReceiptControl(
     : 'unknown';
   const activeStepLines = renderCurrentTaskRailStep(
     receipt.rail?.activeStep,
-    receipt.rail?.updatedAt,
+    receipt.rail?.activeStep?.updatedAt,
     receipt.rail?.activeStepRawLine,
   );
   return [
