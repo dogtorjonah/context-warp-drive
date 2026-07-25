@@ -3281,13 +3281,26 @@ function renderHint(item: RecallPlanItem): string {
   }
   // Spool artifacts are NOT self-tap recoverable: the bytes never entered raw
   // history, so there is nothing for the fold to page back in. The only handle
-  // that works is the opaque artifact id via read_spooled_artifact — and the
-  // envelope's `path:` is deliberately NOT offered here, because it looks more
-  // actionable than the id while being the wrong argument to reach for.
+  // that works is read_spooled_artifact. In a fork/rebirth, the id is not itself
+  // enough: the exact digest SHA is the inherited-read capability. The envelope's
+  // `path:` is deliberately NOT offered here, because it looks more actionable
+  // than the opaque id while being the wrong argument to reach for.
   if (item.entry.kind === 'spool') {
-    return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} spooled out of context (${formatChars(item.entry.chars)} chars, never in transcript) | trigger: ${item.trigger} | read_spooled_artifact artifact_id: ${item.entry.artifactId}]`;
+    return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} spooled out of context (${formatChars(item.entry.chars)} chars, never in transcript) | trigger: ${item.trigger} | ${formatSpoolReadHandle(item.entry)}]`;
   }
   return `${RECALL_HINT_PREFIX} ${describeEntry(item.entry)} folded earlier (${formatChars(item.entry.chars)} chars) | trigger: ${item.trigger} | self-tap to recover]`;
+}
+
+function formatSpoolReadHandle(entry: SpoolIndexEntry): string {
+  const args = [
+    `artifact_id=${JSON.stringify(entry.artifactId)}`,
+    ...(entry.category ? [`category=${JSON.stringify(entry.category)}`] : []),
+  ];
+  if (/^[a-f0-9]{64}$/u.test(entry.sha256)) {
+    args.push(`sha256=${JSON.stringify(entry.sha256)}`);
+    return `read_spooled_artifact ${args.join(' ')}`;
+  }
+  return `read_spooled_artifact ${args.join(' ')} (caller-owned read only; inherited reads require a valid digest sha256)`;
 }
 
 /** Per-path live-source substitution applied to a recall body; drives the notifier. */
@@ -4897,7 +4910,7 @@ function explicitEntryBody(
     return [
       `Spool artifact ${entry.artifactId} is not resident in raw history.`,
       `tool=${entry.tool || 'unknown'} path=${entry.path || 'unknown'} chars=${entry.chars}`,
-      `recovery=read_spooled_artifact artifact_id=${entry.artifactId} sha256=${entry.sha256}`,
+      `recovery=${formatSpoolReadHandle(entry)}`,
     ].join('\n');
   }
   const paths = entry.kind === 'turn'

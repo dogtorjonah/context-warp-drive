@@ -978,7 +978,46 @@ export interface RenderContinuityReceiptControlOptions {
 }
 
 export const LIVE_CONTINUITY_STATE_HEADER = '── Continuity Boundary (RECOVERY COORDINATES) ──';
-export const LEGACY_REBIRTH_CONTROL_HEADER = LIVE_CONTINUITY_STATE_HEADER;
+
+/**
+ * The spelling this capsule carried before it became the continuity boundary.
+ * Packages written under it are still on disk and still resumable, so readers
+ * must keep recognising it; only the renderer above is current.
+ */
+export const HISTORICAL_CONTINUITY_CONTROL_HEADER = '── Rebirth Control (AUTHORITATIVE) ──';
+
+/**
+ * Every spelling of the control-capsule header, newest first.
+ *
+ * Readers that scan a persisted package for the capsule MUST match this set
+ * rather than one literal. Seed pinning, active-request recovery, and the
+ * post-rebirth bundle split all key off finding the capsule, and each one
+ * fails OPEN when it misses: no error, no assertion — the caller simply
+ * behaves as if the package had no capsule at all. That is how a header
+ * rename silently disables consumers one at a time. Append new spellings
+ * here; never inline the literal at a call site.
+ */
+export const CONTINUITY_CONTROL_HEADERS: readonly string[] = [
+  LIVE_CONTINUITY_STATE_HEADER,
+  HISTORICAL_CONTINUITY_CONTROL_HEADER,
+];
+
+/** Earliest control-capsule header present in `text`, with its offset, or null. */
+export function findContinuityControlHeader(
+  text: string,
+): { readonly index: number; readonly header: string } | null {
+  let found: { index: number; header: string } | null = null;
+  for (const header of CONTINUITY_CONTROL_HEADERS) {
+    const index = text.indexOf(header);
+    if (index >= 0 && (found === null || index < found.index)) found = { index, header };
+  }
+  return found;
+}
+
+/** True when `text` carries a control capsule in any known spelling. */
+export function hasContinuityControlHeader(text: string): boolean {
+  return CONTINUITY_CONTROL_HEADERS.some((header) => text.includes(header));
+}
 
 function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
@@ -1077,7 +1116,7 @@ export function renderContinuityReceiptControl(
     receipt.rail?.activeStepRawLine,
   );
   return [
-    LEGACY_REBIRTH_CONTROL_HEADER,
+    LIVE_CONTINUITY_STATE_HEADER,
     `boundary=${receipt.boundary} · identity=${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)} · runtime=${receipt.sourceStatus ?? 'unknown'}`,
     `frontier=${canonical}`,
     ...activeStepLines,

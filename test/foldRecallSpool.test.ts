@@ -223,7 +223,10 @@ describe('fold recall — spool rendering', () => {
     expect(out.text).not.toBeNull();
     expect(out.hints).toBe(1);
     expect(out.text!).toContain(RECALL_HINT_PREFIX);
-    expect(out.text!).toContain('read_spooled_artifact artifact_id: art_7bdadc7d91');
+    expect(out.text!).toContain(
+      'read_spooled_artifact artifact_id="art_7bdadc7d91" category="codex-tool-result-spool" '
+      + 'sha256="7bdadc7d91f4c2e8a1b0d3f5e6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5"',
+    );
     expect(out.text!).toContain('Codex spool Read');
     expect(out.text!).toContain('never in transcript');
     expect(out.recallIntents).toHaveLength(1);
@@ -232,6 +235,7 @@ describe('fold recall — spool rendering', () => {
       version: 1,
       artifactId: 'art_7bdadc7d91',
       category: 'codex-tool-result-spool',
+      expectedSha256: '7bdadc7d91f4c2e8a1b0d3f5e6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5',
       reason: 'path-touch',
       resolution: 'excerpt',
       characterBudget: 6_000,
@@ -249,7 +253,21 @@ describe('fold recall — spool rendering', () => {
 
     expect(critical.recallIntents?.[0].characterBudget).toBe(3_000);
     expect(autoCompact.hints).toBe(1);
+    expect(autoCompact.text).toContain(
+      'artifact_id="art_7bdadc7d91" category="codex-tool-result-spool" '
+      + 'sha256="7bdadc7d91f4c2e8a1b0d3f5e6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5"',
+    );
     expect(autoCompact.recallIntents).toBeUndefined();
+  });
+
+  test('a malformed digest hash labels the hint caller-only instead of promising lineage recovery', () => {
+    const raw = anthropicSpoolHistory(spoolDigest({ sha256: 'not-a-sha256' }));
+    const out = buildFoldRecallContext(stateFor(raw), raw, touchTarget(), 'healthy', DEFAULT_FOLD_RECALL_CONFIG);
+
+    expect(out.text).toContain('artifact_id="art_7bdadc7d91" category="codex-tool-result-spool"');
+    expect(out.text).toContain('caller-owned read only; inherited reads require a valid digest sha256');
+    expect(out.text).not.toContain('sha256="not-a-sha256"');
+    expect(out.recallIntents?.[0].expectedSha256).toBeUndefined();
   });
 
   test('claim and exact error signatures earn targeted hydration intents', () => {
