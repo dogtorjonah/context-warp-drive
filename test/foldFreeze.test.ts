@@ -1541,6 +1541,7 @@ describe('vault seal-once across a freeze generation', () => {
         sourceTime: '2026-07-22T01:00:00.000Z',
         liveness: 'answered',
         authorization: 'expired',
+        taskScope: 'current-task',
         priority: Number.POSITIVE_INFINITY,
       }
       : {
@@ -1610,11 +1611,12 @@ describe('vault seal-once across a freeze generation', () => {
     expect(secondBandText).not.toContain(sealedRow.text);
   });
 
-  it('two bands in one generation never contain the same vault row', () => {
+  it('three bands in one generation stack without repeating a vault row', () => {
     const { state, history } = frozenFixture();
     const repeated = vaultRow('user', 'seal me exactly once');
     const firstOnly = vaultRow('assistant', 'first-band verdict');
     const secondOnly = vaultRow('assistant', 'second-band verdict');
+    const thirdOnly = vaultRow('assistant', 'third-band verdict');
     const firstRows = selectVaultDeltaRows([repeated, firstOnly], state.sealedVaultFingerprints);
     const firstRawTail = [msg('user', 'a'.repeat(1000)), msg('assistant', 'b'.repeat(1000))];
     const firstHistory = [...history, ...firstRawTail];
@@ -1644,17 +1646,46 @@ describe('vault seal-once across a freeze generation', () => {
     );
     expect(second.committed).toBe(true);
 
+    const secondHistory = [...firstHistory, ...secondRawTail];
+    const thirdRows = selectVaultDeltaRows(
+      [repeated, firstOnly, secondOnly, thirdOnly],
+      state.sealedVaultFingerprints,
+    );
+    expect(thirdRows.map((row) => row.text)).toEqual([thirdOnly.text]);
+    const thirdRawTail = [msg('user', 'e'.repeat(1000)), msg('assistant', 'f'.repeat(1000))];
+    const third = appendFoldFreezeTailEpoch(
+      state,
+      [...secondHistory, ...thirdRawTail],
+      [msg('assistant', renderVaultRowsBlock(thirdRows, 'delta'))],
+      ctx(),
+      T0 + 12_000,
+      { sealedVaultFingerprints: thirdRows.map(vaultRowFingerprint) },
+    );
+    expect(third.committed).toBe(true);
+
     const firstBand = state.sealedBands[0]!;
     const secondBand = state.sealedBands[1]!;
+    const thirdBand = state.sealedBands[2]!;
     const firstBandText = JSON.stringify(
       state.frozenView?.slice(firstBand.bandStartViewIndex, firstBand.bandEndViewIndex),
     );
     const secondBandText = JSON.stringify(
       state.frozenView?.slice(secondBand.bandStartViewIndex, secondBand.bandEndViewIndex),
     );
+    const thirdBandText = JSON.stringify(
+      state.frozenView?.slice(thirdBand.bandStartViewIndex, thirdBand.bandEndViewIndex),
+    );
+    const stackedText = JSON.stringify(state.frozenView);
     expect(firstBandText).toContain(repeated.text);
     expect(secondBandText).toContain(secondOnly.text);
     expect(secondBandText).not.toContain(repeated.text);
+    expect(thirdBandText).toContain(thirdOnly.text);
+    expect(thirdBandText).not.toContain(repeated.text);
+    expect(thirdBandText).not.toContain(firstOnly.text);
+    expect(thirdBandText).not.toContain(secondOnly.text);
+    for (const row of [repeated, firstOnly, secondOnly, thirdOnly]) {
+      expect(stackedText.split(row.text)).toHaveLength(2);
+    }
   });
 
   it('fingerprint serialization round-trips exactly', () => {

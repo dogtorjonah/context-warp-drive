@@ -20,6 +20,7 @@ export * from './foldProvenance.ts';
 export * from './chronologicalProvenance.ts';
 export * from './continuityReceipt.ts';
 export * from './continuityAudit.ts';
+export * from './epochContinuityCapsule.ts';
 
 export { DEFAULT_FOLD_PRESSURE_CEILING_TOKENS, FoldSession } from './session/FoldSession.ts';
 export type {

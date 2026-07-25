@@ -509,6 +509,179 @@ export const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSecti
   'squadThoughts',
 ];
 
+/**
+ * Tail epochs do not replace live relay state. They conserve the completed
+ * transcript window while the task rail, recall stores, Atlas, membership,
+ * claims, and raw tail remain unfolded and newer-authority. Therefore only
+ * content with no authoritative post-fold backing is copied into every band;
+ * everything else is represented by a structural pointer from the shared
+ * continuity capsule.
+ */
+export type TailEpochContinuitySectionMode = 'render' | 'pointer';
+
+export interface TailEpochContinuitySectionPolicy {
+  readonly mode: TailEpochContinuitySectionMode;
+  /** Stable source the band must render or structurally point to. */
+  readonly authoritativeSource: string;
+  readonly rationale: string;
+}
+
+export const TAIL_EPOCH_CONTINUITY_SECTION_POLICY: Readonly<
+  Record<RawRebirthSeedSectionId, TailEpochContinuitySectionPolicy>
+> = Object.freeze({
+  lastUserAiMessages: {
+    mode: 'render',
+    authoritativeSource: 'sealed user-message vault delta',
+    rationale: 'The folded operator/assistant wording has no live external backing after the raw window is removed.',
+  },
+  currentThread: {
+    mode: 'pointer',
+    authoritativeSource: 'band-local cognitive artifact plus raw-tail frontier',
+    rationale: 'The band body already carries the folded trajectory; a second full Current Thread copy would duplicate it.',
+  },
+  rawTraceCoordinateCloset: {
+    mode: 'pointer',
+    authoritativeSource: 'typed fold receipts and trace-recall coordinate index',
+    rationale: 'Exact paths and ids remain addressable through receipts/recall; the band must point to that index rather than clone it.',
+  },
+  traceNeighborhoods: {
+    mode: 'pointer',
+    authoritativeSource: 'trace-recall neighborhood store',
+    rationale: 'Neighborhoods are generated on demand from conserved coordinates and remain externally retrievable.',
+  },
+  activeEditDelta: {
+    mode: 'render',
+    authoritativeSource: 'global edit-provenance vault delta',
+    rationale: 'The in-memory edit vault is not a durable post-fold source, so affected paths and outcomes must cross the epoch in-band.',
+  },
+  taskRailContext: {
+    mode: 'pointer',
+    authoritativeSource: 'live task rail',
+    rationale: 'The live rail never folds and outranks historical bands; copying it would create a stale competing authority.',
+  },
+  episodicCrossRef: {
+    mode: 'pointer',
+    authoritativeSource: 'episodic recall store',
+    rationale: 'Episode cards persist outside the transcript and can be retrieved by the conserved coordinates.',
+  },
+  lineageGlyphLog: {
+    mode: 'pointer',
+    authoritativeSource: 'persisted glyph/waypoint log',
+    rationale: 'Glyph waypoints are externally persisted and the band cognitive block already carries the relevant bounded verdicts.',
+  },
+  openQuestions: {
+    mode: 'pointer',
+    authoritativeSource: 'persisted blocked-register and episodic recall',
+    rationale: 'Open-question register entries remain retrievable outside the folded transcript and should not be cloned as stale truth.',
+  },
+  atlasCrossRef: {
+    mode: 'pointer',
+    authoritativeSource: 'live Atlas index',
+    rationale: 'Atlas is mutable live state; a query pointer is more authoritative than a frozen handoff snapshot.',
+  },
+  workspaceContext: {
+    mode: 'pointer',
+    authoritativeSource: 'live relay session/workspace state',
+    rationale: 'Workspace identity and branch/session coordinates survive outside the fold and may change after a band is minted.',
+  },
+  starredMoments: {
+    mode: 'pointer',
+    authoritativeSource: 'persisted tap_star waypoint store',
+    rationale: 'Categorized waypoints are durable external records and can be harvested without duplicating their bodies in every band.',
+  },
+  thinkingTrail: {
+    mode: 'pointer',
+    authoritativeSource: 'canonical event trace and cognitive recall',
+    rationale: 'The canonical trace remains the recovery source; provider-private thinking must not be recopied into model-visible bands.',
+  },
+  lifetimeChangelogArc: {
+    mode: 'pointer',
+    authoritativeSource: 'Atlas changelog',
+    rationale: 'The changelog is durable, queryable, and newer than any frozen band snapshot.',
+  },
+  chatroomMembership: {
+    mode: 'pointer',
+    authoritativeSource: 'live chatroom membership state',
+    rationale: 'Membership changes independently of transcript folding, so only a live-state pointer is authoritative.',
+  },
+  delegatedWork: {
+    mode: 'pointer',
+    authoritativeSource: 'live instance/fork presence state',
+    rationale: 'Delegated work is externally tracked and can change after band creation; copying it would become stale.',
+  },
+  coordinationState: {
+    mode: 'pointer',
+    authoritativeSource: 'live claims and coordination stores',
+    rationale: 'Claims and ownership remain unfolded mutable state and must be resolved live.',
+  },
+  squadThoughts: {
+    mode: 'pointer',
+    authoritativeSource: 'live squad thought/presence state',
+    rationale: 'Squad thought state remains external and mutable; a frozen copy cannot be authoritative.',
+  },
+});
+
+export const TAIL_EPOCH_REQUIRED_RENDER_SECTION_IDS: readonly RawRebirthSeedSectionId[] =
+  DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER.filter(
+    (sectionId) => TAIL_EPOCH_CONTINUITY_SECTION_POLICY[sectionId].mode === 'render',
+  );
+
+export const TAIL_EPOCH_REQUIRED_POINTER_SECTION_IDS: readonly RawRebirthSeedSectionId[] =
+  DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER.filter(
+    (sectionId) => TAIL_EPOCH_CONTINUITY_SECTION_POLICY[sectionId].mode === 'pointer',
+  );
+
+/**
+ * Hard-epoch control surfaces that deliberately do not participate in the
+ * budgeted 18-section registry. A tail epoch stays within one live session:
+ * its hard-epoch base/control remains installed while only a completed
+ * transcript window is replaced. Re-rendering these surfaces in every band
+ * would create a second, potentially stale authority.
+ */
+export type TailEpochHardEpochOnlyElementId =
+  | 'forkIdentity'
+  | 'runtimeModel'
+  | 'authorityResolutionOrder';
+
+export interface TailEpochHardEpochOnlyElementPolicy {
+  readonly mode: 'hard-epoch-only';
+  readonly authoritativeSource: string;
+  readonly rationale: string;
+}
+
+export const TAIL_EPOCH_HARD_EPOCH_ONLY_ELEMENT_IDS: readonly TailEpochHardEpochOnlyElementId[] = [
+  'forkIdentity',
+  'runtimeModel',
+  'authorityResolutionOrder',
+];
+
+export const TAIL_EPOCH_HARD_EPOCH_ONLY_ELEMENT_POLICY: Readonly<
+  Record<TailEpochHardEpochOnlyElementId, TailEpochHardEpochOnlyElementPolicy>
+> = Object.freeze({
+  forkIdentity: {
+    mode: 'hard-epoch-only',
+    authoritativeSource: 'surviving hard-epoch rebirth base plus live fork/lineage state',
+    rationale: 'Tail epochs do not create a new instance or fork boundary; repeating inherited fork prose would only duplicate fixed lifecycle history.',
+  },
+  runtimeModel: {
+    mode: 'hard-epoch-only',
+    authoritativeSource: 'live session/provider runtime configuration plus surviving hard-epoch rebirth base',
+    rationale: 'The active provider knows the executing model, while predecessor-to-successor comparison belongs to the hard boundary that selected it.',
+  },
+  authorityResolutionOrder: {
+    mode: 'hard-epoch-only',
+    authoritativeSource: 'surviving continuity control, system policy, live task rail, and later operator turns',
+    rationale: 'Authority is resolved from unfolded live state against the installed hard-epoch control; freezing a second order in each band could compete with newer truth.',
+  },
+});
+
+/**
+ * Additional rendered characters for one-character witnesses in both required
+ * render sections, measured against the same custom-framed seed with all
+ * registry sections disabled. Empty sections add zero characters.
+ */
+export const TAIL_EPOCH_REQUIRED_RENDER_ONE_CHAR_FLOOR_CHARS = 219;
+
 const PATH_MENTION_RE = /(?<![\w./-])\/?(?:[\w.-]+\/)+[\w./@+-]+\b/g;
 const RAW_TRACE_CLOSET_MAX_SOURCE_CHARS_PER_MESSAGE = 24_000;
 const RAW_TRACE_CLOSET_HEADER = 'Conserved high-value literals nominated newest-first from the predecessor trace; use these as exact identifiers, file paths, and values when the raw package body omits the middle.';

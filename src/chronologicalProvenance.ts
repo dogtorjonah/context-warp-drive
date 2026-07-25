@@ -44,12 +44,30 @@ const SYNTHETIC_OBJECTIVE_ARTIFACT_RE = /(?:\[CONTEXT REBIRTH\]|\[Context band \
 // (before or after envelope stripping) is a fold/interrupt artifact, never
 // live operator intent — callers wanting the real ask must walk further back.
 const INTERRUPT_ARTIFACT_WHOLE_TEXT_RE = /^(?:\[Request interrupted by user(?: for tool use)?\]|\[Relay note:[\s\S]*\])$/u;
+/**
+ * Engine-authored transport controls that a provider persists as an ordinary
+ * message. codex-cli 0.145.0 no longer confines the interrupt notice to an aux
+ * `event_msg` row: a 2026-07-25 sample of the 150 most recent live rollouts
+ * carried 105 `role: "developer"` and 25 `role: "user"` `<turn_aborted>`
+ * response_items — a sample floor, not a census. A
+ * user-role one is indistinguishable from a human turn by role or chronology,
+ * so the pause that a fold checkpoint itself requested was being selected as
+ * the newest operator objective — the fold telling its own continuity
+ * machinery that the human had interrupted the work.
+ *
+ * Stripped rather than whole-row rejected, matching the product-envelope rule
+ * above: when a provider concatenates the control with genuine operator text,
+ * that text is still the operator's intent and must survive.
+ */
+const TRANSPORT_CONTROL_ENVELOPE_RE = /<(turn_aborted)>[\s\S]*?<\/\1>/giu;
+const INCOMPLETE_TRANSPORT_CONTROL_ENVELOPE_RE = /<(?:turn_aborted)>[\s\S]*$/giu;
 
 /**
  * Distinguish operator-authored objective text from user-role transport
- * envelopes. A mixed row is usable at medium confidence after its known
- * envelopes are removed; a plain row is high confidence; synthetic-only input
- * stays explicitly unknown instead of being promoted into live intent.
+ * envelopes and engine transport controls. A mixed row is usable at medium
+ * confidence after its known envelopes are removed; a plain row is high
+ * confidence; synthetic-only or control-only input stays explicitly unknown
+ * instead of being promoted into live intent.
  */
 export function classifyOperatorAuthoredObjective(value: string | null | undefined): ClassifiedLiveObjective {
   const raw = value?.trim() ?? '';
@@ -65,8 +83,10 @@ export function classifyOperatorAuthoredObjective(value: string | null | undefin
   });
   let text = strip(raw, OPERATOR_AGENTS_ENVELOPE_RE);
   text = strip(text, OPERATOR_TRANSPORT_ENVELOPE_RE);
+  text = strip(text, TRANSPORT_CONTROL_ENVELOPE_RE);
   text = strip(text, OPERATOR_INCOMPLETE_AGENTS_ENVELOPE_RE);
-  text = strip(text, OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE).trim();
+  text = strip(text, OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE);
+  text = strip(text, INCOMPLETE_TRANSPORT_CONTROL_ENVELOPE_RE).trim();
   if (!text || /^(?:<[^>]+>\s*)+$/u.test(text) || INTERRUPT_ARTIFACT_WHOLE_TEXT_RE.test(text)) {
     return { text: null, confidence: 'unknown', source: 'none' };
   }

@@ -203,6 +203,9 @@ function foldArtifactContract(
 export const TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER =
   'lines are transient flow notes';
 
+const ELDER_TRANSIENT_SUPERSESSION_NOTICE =
+  '— durable waypoints below supersede transient flow notes frozen in elder band(s); elder 🔍/▶/·/💭 narration is replaced working state, not live guidance —';
+
 /** Compact tool trace emitted by birth/CLI transcript hydration. */
 const TOOL_TRACE_SEGMENT_RE = /^⟨tool\s+(\S+?)(?:\s+([\s\S]*))?⟩$/;
 
@@ -790,7 +793,7 @@ export function renderCognitiveBlock(
     // waypoint in THIS window can supersede — without one, elder flow notes
     // remain the freshest (still transient) working state.
     ...(options.supersedesElderTransientNotes && hasDurable
-      ? ['— durable waypoints below supersede transient flow notes frozen in elder band(s); elder 🔍/▶/·/💭 narration is replaced working state, not live guidance —']
+      ? [ELDER_TRANSIENT_SUPERSESSION_NOTICE]
       : []),
     provenance,
     ...lines,
@@ -855,8 +858,20 @@ export function enrichFoldedBandBody(
   options?: ExtractCognitiveArtifactsOptions,
   renderOptions?: RenderCognitiveBlockOptions,
 ): string[] {
-  if (parts.some(containsCognitiveBlock)) return parts;
   const artifacts = extractCognitiveArtifacts(rawMessages, options);
+  if (parts.some(containsCognitiveBlock)) {
+    // Artifact mode already rendered this window's waypoint block. Keep that
+    // single copy, but do not let block-level dedupe erase the newer band's
+    // additive cross-epoch supersession declaration.
+    if (
+      renderOptions?.supersedesElderTransientNotes
+      && artifacts.some((artifact) => artifact.trust === 'durable')
+      && !parts.some((part) => part.includes(ELDER_TRANSIENT_SUPERSESSION_NOTICE))
+    ) {
+      parts.push(ELDER_TRANSIENT_SUPERSESSION_NOTICE);
+    }
+    return parts;
+  }
   const block = renderCognitiveBlock(artifacts, renderOptions);
   if (block) {
     parts.push(block);

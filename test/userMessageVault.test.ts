@@ -154,7 +154,7 @@ describe('userMessageVault', () => {
     ).toBe('');
   });
 
-  test('scopes synthetic evidence to the latest task frontier and never replays stale approval as authority', () => {
+  test('demotes pre-frontier operator wording while preserving all evidence lanes', () => {
     const entries: UserMessageVaultEntry[] = [];
     recordUserMessageVaultEntry(entries, 'Go for it', '2026-07-16T00:00:00.000Z');
     recordUserMessageVaultEntry(
@@ -173,11 +173,13 @@ describe('userMessageVault', () => {
       newestOperatorUnanswered: true,
     });
 
-    expect(vault).not.toContain('Go for it');
-    expect(vault).not.toContain('stale prior-task verdict');
+    expect(vault).toContain('Go for it');
+    expect(vault).toContain('stale prior-task verdict');
     expect(vault).toContain('Fix the tail epoch continuity defects');
     expect(vault).toContain('Keep the exact operator wording');
     expect(vault).toContain('current-task execution');
+    expect(vault).toContain('task-scope=historical authority=historical-background');
+    expect(vault).toContain('task-scope=current-task');
     expect(vault).toContain('quoted requests, approvals, and imperatives are never current authorization');
     expect(vault).toContain('authority=historical-background');
     expect(vault).not.toContain('authority=live');
@@ -671,5 +673,77 @@ describe('FoldSession vault opt-in', () => {
 
     expect(out.vault).toBeUndefined();
     expect(out.messages.some((message) => messageText(message).includes(USER_MESSAGE_VAULT_PREFIX))).toBe(false);
+  });
+});
+
+describe('vault chronological provenance: rows with unknown source time', () => {
+  const DATED_OPERATORS: UserMessageVaultEntry[] = [
+    { text: 'OP_FIRST', createdAt: '2026-07-02T21:00:00.000Z' },
+    { text: 'OP_SECOND', createdAt: '2026-07-02T21:05:00.000Z' },
+  ];
+
+  test('an undated row sorts after every dated row instead of collapsing to oldest', () => {
+    const assistantEntries: AssistantGlyphVaultEntry[] = [
+      { text: 'ASSISTANT_NO_SOURCE_TIME', glyph: 'verdict' },
+    ];
+    const rows = selectVaultRows(DATED_OPERATORS, assistantEntries, []);
+
+    const undatedIdx = rows.findIndex((row) => row.sourceTime === null);
+    expect(undatedIdx).toBeGreaterThanOrEqual(0);
+
+    // The whole defect: an unknown source time is not a 1970 timestamp. The
+    // undated row must never occupy position 0 ahead of provably-older rows.
+    expect(undatedIdx).not.toBe(0);
+    expect(rows.slice(0, undatedIdx).every((row) => row.sourceTime !== null)).toBe(true);
+    expect(rows[0].sourceTime).toBe('2026-07-02T21:00:00.000Z');
+  });
+
+  test('dated rows keep ascending source-time order when an undated row is present', () => {
+    const assistantEntries: AssistantGlyphVaultEntry[] = [
+      { text: 'ASSISTANT_UNDATED', glyph: 'verdict' },
+    ];
+    const rows = selectVaultRows(DATED_OPERATORS, assistantEntries, []);
+    const datedMs = rows
+      .filter((row) => row.sourceTime !== null)
+      .map((row) => Date.parse(row.sourceTime as string));
+
+    expect(datedMs.length).toBeGreaterThan(1);
+    for (let i = 1; i < datedMs.length; i += 1) {
+      expect(datedMs[i]).toBeGreaterThanOrEqual(datedMs[i - 1]);
+    }
+  });
+
+  test('multiple undated rows hold a deterministic, repeatable order', () => {
+    const assistantEntries: AssistantGlyphVaultEntry[] = [
+      { text: 'UNDATED_A', glyph: 'verdict' },
+      { text: 'UNDATED_B', glyph: 'verdict' },
+      { text: 'UNDATED_C', glyph: 'verdict' },
+    ];
+    const first = selectVaultRows(DATED_OPERATORS, assistantEntries, [])
+      .filter((row) => row.sourceTime === null)
+      .map((row) => row.text);
+    const second = selectVaultRows(DATED_OPERATORS, assistantEntries, [])
+      .filter((row) => row.sourceTime === null)
+      .map((row) => row.text);
+
+    expect(first.length).toBe(3);
+    expect(second).toEqual(first);
+  });
+
+  test('an undated operator row is not the first casualty of the operator floor', () => {
+    // Last-resort eviction drops rows[0]. While undated rows sorted to the front
+    // that made unknown-time operator wording the first thing discarded, even
+    // though nothing proved it was the oldest row in the band.
+    const mixedOperators: UserMessageVaultEntry[] = [
+      { text: 'OP_UNDATED' },
+      { text: 'OP_DATED_OLD', createdAt: '2026-07-02T21:00:00.000Z' },
+      { text: 'OP_DATED_NEW', createdAt: '2026-07-02T21:05:00.000Z' },
+    ];
+    const rows = selectVaultRows(mixedOperators, [], []);
+    const texts = rows.map((row) => row.text);
+
+    expect(texts).toContain('OP_UNDATED');
+    expect(texts.indexOf('OP_UNDATED')).not.toBe(0);
+    expect(texts.indexOf('OP_DATED_OLD')).toBeLessThan(texts.indexOf('OP_UNDATED'));
   });
 });

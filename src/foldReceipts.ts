@@ -29,6 +29,7 @@ import {
   extractToolCalls,
   formatFoldTime,
   isMutatingBash,
+  normalizeToolPath,
   skeletonizeTool,
   type ExtractedToolCall,
   type FoldConfig,
@@ -406,7 +407,10 @@ export interface FoldReceiptCompileOptions {
 // Classification tables
 // ══════════════════════════════════════════════════════════════════════
 
-const EDIT_TOOLS = new Set(['Edit', 'NotebookEdit', 'edit_file']);
+// `apply_patch` is how the codex transport performs every file edit. Without it
+// an entire engine's edits produced no ACTION receipts at all, so a codex fold
+// asserted a clean edit ledger for work that did change files on disk.
+const EDIT_TOOLS = new Set(['Edit', 'NotebookEdit', 'edit_file', 'apply_patch']);
 const WRITE_TOOLS = new Set(['Write', 'write_file']);
 const BASH_TOOLS = new Set(['Bash', 'run_bash']);
 const SPAWN_TOOLS = new Set(['spawn', 'spawn_instance', 'fork_sidequest']);
@@ -505,9 +509,109 @@ interface ReceiptToolCall extends ExtractedToolCall {
   sourceIdentity: string | null;
   /** Whether the fold window contains a matching outcome row. */
   completion: 'completed' | 'pending';
+  /**
+   * True only for a flattened Codex trace that was given a synthetic
+   * `codex-step-*` boundary. These are historical tool calls, not fresh
+   * pending calls; the flag lets the renderer shed bulky edit bodies without
+   * changing first-generation structured receipt bytes.
+   */
+  compactTraceRecovered?: true;
 }
 
 type ProvenancedFoldMessage = FoldMessage & { sourceIdentity?: unknown };
+
+interface PendingReceiptToolCall extends ExtractedToolCall {
+  completion: ReceiptToolCall['completion'];
+  compactTraceRecovered?: true;
+}
+
+interface CompactTraceRecovery {
+  input: Record<string, unknown>;
+  resultText: string;
+  completion: ReceiptToolCall['completion'];
+  compactTraceRecovered: true;
+}
+
+const COMPACT_TRACE_CALL_RE = /^⟨tool\s+(?!result\b)([^\s⟩]+)(?:\s+([^⟩]+))?⟩/;
+const COMPACT_TRACE_RESULT_RE =
+  /(?:^|\n\n)⟨tool\s+result(?:\s+([^:\n⟩]+))?:\s*([\s\S]*?)⟩(?:\n\n|$)/;
+const COMPACT_TRACE_PATH_FIELD_RE =
+  /"(file_path|path|filePath|file)"\s*:\s*"((?:\\.|[^"\\])+)"/g;
+const COMPACT_TRACE_SHED_KEYS = new Set([
+  'old_string', 'new_string', 'content',
+]);
+
+function shedCompactTraceBodies(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(shedCompactTraceBodies);
+  if (!value || typeof value !== 'object') return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (COMPACT_TRACE_SHED_KEYS.has(key)) continue;
+    result[key] = shedCompactTraceBodies(nested);
+  }
+  return result;
+}
+
+function decodeCompactTraceJsonString(value: string): string {
+  try {
+    return JSON.parse(`"${value}"`) as string;
+  } catch {
+    return value.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+}
+
+/**
+ * Recover the historical identity/outcome carried by the compact trace that
+ * Codex birth hydration flattened into assistant text before adding a
+ * synthetic `codex-step-*` boundary. The boundary's `{}` arguments exist only
+ * for marathon segmentation; treating them as a real pending call produced
+ * unreachable `target="unknown"` receipts on the next fold generation.
+ *
+ * Recovery is deliberately narrow:
+ * - the structural synthetic id must be present;
+ * - the message must open with the matching canonical trace wrapper;
+ * - bulky edit/write bodies shed before the recovered input reaches rendering;
+ * - malformed clipped JSON may recover only its cheap path field;
+ * - an outcome becomes completed only when the matching result wrapper exists.
+ */
+function recoverCompactTraceCall(
+  message: FoldMessage,
+  toolId: string,
+  toolName: string,
+): CompactTraceRecovery | null {
+  if (!toolId.startsWith('codex-step-') || typeof message.content !== 'string') return null;
+  const trace = COMPACT_TRACE_CALL_RE.exec(message.content);
+  if (!trace || trace[1] !== toolName) return null;
+
+  const payload = trace[2] ?? '';
+  let input: Record<string, unknown> = {};
+  if (payload) {
+    try {
+      const parsed = JSON.parse(payload);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        input = shedCompactTraceBodies(parsed) as Record<string, unknown>;
+      }
+    } catch {
+      COMPACT_TRACE_PATH_FIELD_RE.lastIndex = 0;
+      let pathField: RegExpExecArray | null;
+      while ((pathField = COMPACT_TRACE_PATH_FIELD_RE.exec(payload)) !== null) {
+        input[pathField[1]] = decodeCompactTraceJsonString(pathField[2]);
+      }
+    }
+  }
+
+  const result = COMPACT_TRACE_RESULT_RE.exec(message.content);
+  const resultName = result?.[1]?.trim();
+  const matchingResult = result && (!resultName || resultName === toolName)
+    ? result[2].trim()
+    : '';
+  return {
+    input,
+    resultText: matchingResult,
+    completion: matchingResult ? 'completed' : 'pending',
+    compactTraceRecovered: true,
+  };
+}
 
 function sourceIdentityForCall(
   call: ExtractedToolCall,
@@ -523,8 +627,16 @@ function sourceIdentityForCall(
  * extractor. Only durable mutations are promoted by the compiler; pending
  * reads remain ordinary live-tail work rather than receipts.
  */
-function extractPendingToolCalls(windowMessages: readonly FoldMessage[]): ExtractedToolCall[] {
-  const pending = new Map<string, { name: string; input: Record<string, unknown>; messageIndex: number }>();
+function extractPendingToolCalls(windowMessages: readonly FoldMessage[]): PendingReceiptToolCall[] {
+  const pending = new Map<string, {
+    name: string;
+    input: Record<string, unknown>;
+    resultText?: string;
+    messageIndex: number;
+    tsMs?: number;
+    completion?: ReceiptToolCall['completion'];
+    compactTraceRecovered?: true;
+  }>();
   for (let messageIndex = 0; messageIndex < windowMessages.length; messageIndex += 1) {
     const msg = windowMessages[messageIndex];
     if (msg.role === 'assistant' && Array.isArray(msg.content)) {
@@ -556,7 +668,18 @@ function extractPendingToolCalls(windowMessages: readonly FoldMessage[]): Extrac
           const parsed = JSON.parse(typeof fn.arguments === 'string' ? fn.arguments : '{}');
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) input = parsed;
         } catch { /* malformed arguments stay empty, but the attempt remains */ }
-        pending.set(raw.id, { name: fn.name, input, messageIndex });
+        const recovered = recoverCompactTraceCall(msg, raw.id, fn.name);
+        pending.set(raw.id, recovered
+          ? {
+              name: fn.name,
+              input: recovered.input,
+              resultText: recovered.resultText,
+              messageIndex,
+              ...(typeof msg.tsMs === 'number' ? { tsMs: msg.tsMs } : {}),
+              completion: recovered.completion,
+              compactTraceRecovered: true,
+            }
+          : { name: fn.name, input, messageIndex });
       }
     }
     if (msg.role === 'tool' && typeof msg.tool_call_id === 'string') {
@@ -584,9 +707,12 @@ function extractPendingToolCalls(windowMessages: readonly FoldMessage[]): Extrac
   return [...pending.entries()].map(([toolId, call]) => ({
     name: call.name,
     input: call.input,
-    resultText: '',
+    resultText: call.resultText ?? '',
     toolId,
     messageIndex: call.messageIndex,
+    ...(call.tsMs !== undefined ? { tsMs: call.tsMs } : {}),
+    completion: call.completion ?? 'pending',
+    ...(call.compactTraceRecovered ? { compactTraceRecovered: true as const } : {}),
   }));
 }
 
@@ -1260,17 +1386,49 @@ function receiptText(kind: FoldReceiptKind, call: ReceiptToolCall): string {
     case 'spawn': return renderSpawnReceipt(call);
     case 'lifecycle': return `💀 ${shortToolName(call.name)} ${truncateReceipt(String(call.input.target ?? call.input.instance ?? ''), 30)}`.trim();
     case 'git-op': return renderGitReceipt(call);
-    // edit / write / bash-mutation / atlas-commit: skeletonizeTool already
+    // A recovered compact trace intentionally keeps the cheap target and sheds
+    // old/new/content bodies. Do not render the resulting absence as a fake
+    // empty edit or zero-byte write. First-generation structured calls stay on
+    // skeletonizeTool and remain byte-identical.
+    case 'edit':
+      if (call.compactTraceRecovered) return `✏️ ${extractPath(call.input)}`;
+      return skeletonizeTool(call);
+    case 'write':
+      if (call.compactTraceRecovered) return `📝 ${extractPath(call.input)}`;
+      return skeletonizeTool(call);
+    // bash-mutation / atlas-commit: skeletonizeTool already
     // renders the canonical one-liner for these — byte-parity with what the
     // skeleton showed keeps the consumer's learned grammar stable.
     default: return skeletonizeTool(call);
   }
 }
 
+/**
+ * File targets of a codex `apply_patch` call. Its argument is not a structured
+ * `file_path` but a raw V4A patch body, so `extractPath` returns '' and the
+ * receipt would render `target="unknown"` — asserting the target could not be
+ * determined when the patch header names it exactly. Multi-file patches keep
+ * every path, '|'-joined, matching the claim-op convention above.
+ */
+const APPLY_PATCH_FILE_HEADER_RE = /^\*\*\* (?:Update|Add|Delete) File: (.+)$/gmu;
+
+function applyPatchTargets(input: Record<string, unknown>): string {
+  const body = typeof input.input === 'string'
+    ? input.input
+    : typeof input.patch === 'string' ? input.patch : '';
+  if (!body) return '';
+  const targets: string[] = [];
+  for (const match of body.matchAll(APPLY_PATCH_FILE_HEADER_RE)) {
+    const normalized = normalizeToolPath(match[1]?.trim() ?? '');
+    if (normalized && !targets.includes(normalized)) targets.push(normalized);
+  }
+  return targets.join('|');
+}
+
 function targetIdentity(kind: FoldReceiptKind, call: ReceiptToolCall): string {
   switch (kind) {
     case 'edit':
-    case 'write': return extractPath(call.input);
+    case 'write': return extractPath(call.input) || applyPatchTargets(call.input);
     case 'atlas-commit': return extractPath(call.input);
     case 'chatroom-post': return String(call.input.room ?? call.input.name ?? '');
     case 'rail-op': return String(call.input.step_id ?? call.input.ack_step_id ?? '');
@@ -1346,7 +1504,7 @@ export function compileFoldReceipts(
   const completedCalls = extractToolCalls(windowMessages as FoldMessage[])
     .map((call) => normalizeReceiptToolCall(call, windowMessages, 'completed'));
   const pendingActions = extractPendingToolCalls(windowMessages)
-    .map((call) => normalizeReceiptToolCall(call, windowMessages, 'pending'))
+    .map((call) => normalizeReceiptToolCall(call, windowMessages, call.completion))
     .filter((call) => classifyDurableActionKind(call) !== null
       || CLAIM_TOOLS.has(shortToolName(call.name))
       || isDecisionCall(call));

@@ -423,6 +423,25 @@ describe('cognitiveArtifacts', () => {
       expect(parts[0]).toContain('· short untagged diagnosis line');
     });
 
+    it('adds only the elder supersession notice when artifact mode already rendered the waypoint block', () => {
+      const rawMessages: FoldMessage[] = [
+        { role: 'assistant', content: '🏁 Shipped: the render path is fixed.' },
+      ];
+      const resident = renderCognitiveBlock(extractCognitiveArtifacts(rawMessages));
+      const parts = [resident];
+
+      enrichFoldedBandBody(parts, rawMessages, undefined, {
+        supersedesElderTransientNotes: true,
+      });
+
+      expect(parts).toHaveLength(2);
+      expect(parts.join('\n').split('[cognitive —').length - 1).toBe(1);
+      expect(parts.join('\n').split('🏁 Shipped: the render path is fixed.').length - 1).toBe(1);
+      expect(parts[1]).toContain(
+        'durable waypoints below supersede transient flow notes frozen in elder band(s)',
+      );
+    });
+
     it('returns the same array reference', () => {
       const parts: string[] = [];
       const rawMessages: FoldMessage[] = [];

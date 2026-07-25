@@ -1022,6 +1022,81 @@ describe('typed claim and decision vocabularies', () => {
 });
 
 describe('compileFoldReceipts — provenance and determinism', () => {
+  it('recovers target, outcome, and source time from a second-generation Codex trace', () => {
+    const refoldedStep = {
+      role: 'assistant',
+      tsMs: T2,
+      content:
+        '⟨tool Edit {"file_path":"/repo/src/refold.ts","old_string":"before","new_string":"clipped…⟩'
+        + '\n\n⟨tool result Edit: modified: /repo/src/refold.ts⟩'
+        + '\n\n🏁 Edit applied.',
+      tool_calls: [{
+        id: 'codex-step-12',
+        type: 'function',
+        function: { name: 'Edit', arguments: '{}' },
+      }],
+    } as FoldMessage;
+
+    const compiled = compileFoldReceipts([refoldedStep]);
+    expect(compiled.receipts).toHaveLength(1);
+    expect(compiled.receipts[0]).toMatchObject({
+      recordType: 'action',
+      kind: 'edit',
+      targetIdentity: '/repo/src/refold.ts',
+      outcome: 'applied',
+      reconciliationRequired: false,
+      sourceTimeMs: T2,
+    });
+
+    const rendered = renderFoldReceipts(compiled).join('\n');
+    expect(rendered).toContain(
+      '[8:05 AM] ACTION kind=edit outcome=applied reconciliation-required=false '
+      + 'target="/repo/src/refold.ts" action-id="tool-call:codex-step-12" — ✏️ /repo/src/refold.ts',
+    );
+    expect(rendered).not.toContain('[time unknown]');
+    expect(rendered).not.toContain('"" → ""');
+
+    const recoverOutcome = (id: string, resultText: string) => {
+      const step = {
+        ...refoldedStep,
+        content:
+          '⟨tool Edit {"file_path":"/repo/src/refold.ts","old_string":"a","new_string":"b"}⟩'
+          + `\n\n⟨tool result Edit: ${resultText}⟩`,
+        tool_calls: [{
+          id,
+          type: 'function',
+          function: { name: 'Edit', arguments: '{}' },
+        }],
+      } as FoldMessage;
+      return compileFoldReceipts([step]).receipts[0];
+    };
+    expect(recoverOutcome('codex-step-13', 'Error: old_string was not found')).toMatchObject({
+      targetIdentity: '/repo/src/refold.ts',
+      outcome: 'failed',
+      reconciliationRequired: false,
+      sourceTimeMs: T2,
+    });
+    expect(recoverOutcome('codex-step-14', '[Request interrupted by user]')).toMatchObject({
+      targetIdentity: '/repo/src/refold.ts',
+      outcome: 'unknown',
+      reconciliationRequired: true,
+      sourceTimeMs: T2,
+    });
+
+    // The recovery branch is second-generation-only. A genuine structured
+    // first-generation call keeps the established byte shape, including its
+    // bounded old/new preview.
+    const firstGeneration = renderFoldReceipts(compileFoldReceipts([
+      toolUse('e1', 'Edit', {
+        file_path: '/repo/src/refold.ts', old_string: 'before', new_string: 'after',
+      }, T1),
+      toolResult('e1', 'modified: /repo/src/refold.ts', { tsMs: T2 }),
+    ])).join('\n');
+    expect(firstGeneration).toContain(
+      'action-id="tool-call:e1" — ✏️ /repo/src/refold.ts — "before" → "after"',
+    );
+  });
+
   it('timestamp-less windows stay explicitly unknown and deterministic', () => {
     const window: FoldMessage[] = [
       toolUse('e1', 'Edit', { file_path: '/home/jonah/repo/src/a.ts', old_string: 'a', new_string: 'b' }),

@@ -970,11 +970,17 @@ export function normalizeContinuityReceiptRail(value: unknown): ContinuityReceip
 
 export interface RenderContinuityReceiptControlOptions {
   /**
-   * Deprecated compatibility hook. Active request text now has one readable
-   * home in Last User + AI Messages (READ FIRST), so the continuity boundary
-   * deliberately never invokes this renderer.
+   * Deprecated compatibility hook. Active request text has one readable home,
+   * so the continuity boundary deliberately never invokes this renderer.
    */
   readonly formatActiveRequest?: (text: string) => string;
+  /**
+   * Renderer-owned location of the exact request text. This is metadata, not a
+   * second copy of the request. Persisted-package readers use the character
+   * count to recover the request from its canonical section without searching
+   * arbitrary prose for user-controlled marker strings.
+   */
+  readonly activeRequestLocation?: 'last-user-ai-messages';
 }
 
 export const LIVE_CONTINUITY_STATE_HEADER = '── Continuity Boundary (RECOVERY COORDINATES) ──';
@@ -1002,21 +1008,170 @@ export const CONTINUITY_CONTROL_HEADERS: readonly string[] = [
   HISTORICAL_CONTINUITY_CONTROL_HEADER,
 ];
 
-/** Earliest control-capsule header present in `text`, with its offset, or null. */
+export interface ContinuityControlSectionMatch {
+  readonly index: number;
+  readonly endIndex: number;
+  readonly header: string;
+  readonly text: string;
+}
+
+function findSectionEnd(text: string, contentStart: number): number {
+  const match = /\n── [^\n]+ ──[ \t]*(?=\r?\n|$)/gu.exec(text.slice(contentStart));
+  return match ? contentStart + match.index : text.length;
+}
+
+function isStructurallyValidControlSection(
+  header: string,
+  sectionText: string,
+): boolean {
+  if (!/^boundary(?:=|:)\S*/mu.test(sectionText)) return false;
+  if (header === LIVE_CONTINUITY_STATE_HEADER) {
+    return /^authority resolution · winner=/mu.test(sectionText);
+  }
+  return /^active request(?:(?: \((?:verbatim;|EXCERPT\b)[^\n]*\):)|: none bundled)/mu.test(sectionText)
+    || /^truth order:/mu.test(sectionText);
+}
+
+/**
+ * Resolve a renderer-owned control section rather than an arbitrary matching
+ * substring. Current packages place this typed section immediately before the
+ * Orientation footer; that tail position wins over matching literals quoted
+ * in Current Thread, edit deltas, or source snippets. Historical packages
+ * retain a validated line-level fallback.
+ */
+export function findContinuityControlSection(text: string): ContinuityControlSectionMatch | null {
+  const candidates: ContinuityControlSectionMatch[] = [];
+  for (const header of CONTINUITY_CONTROL_HEADERS) {
+    let fromIndex = 0;
+    while (fromIndex <= text.length) {
+      const index = text.indexOf(header, fromIndex);
+      if (index < 0) break;
+      fromIndex = index + header.length;
+      const startsLine = index === 0 || text[index - 1] === '\n';
+      const afterHeader = index + header.length;
+      const endsLine = afterHeader === text.length
+        || text[afterHeader] === '\n'
+        || (text[afterHeader] === '\r' && text[afterHeader + 1] === '\n');
+      if (!startsLine || !endsLine) continue;
+      const endIndex = findSectionEnd(text, afterHeader);
+      const sectionText = text.slice(index, endIndex);
+      if (isStructurallyValidControlSection(header, sectionText)) {
+        candidates.push({ index, endIndex, header, text: sectionText });
+      }
+    }
+  }
+  if (candidates.length === 0) return null;
+  const orientationIndex = text.lastIndexOf('\n── Orientation ──');
+  if (orientationIndex >= 0) {
+    const tailCandidate = candidates
+      .filter((candidate) => candidate.endIndex === orientationIndex)
+      .sort((left, right) => right.index - left.index)[0];
+    if (tailCandidate) return tailCandidate;
+  }
+  return candidates.sort((left, right) => left.index - right.index)[0] ?? null;
+}
+
+/** Structurally identified control-capsule header, with its offset, or null. */
 export function findContinuityControlHeader(
   text: string,
 ): { readonly index: number; readonly header: string } | null {
-  let found: { index: number; header: string } | null = null;
-  for (const header of CONTINUITY_CONTROL_HEADERS) {
-    const index = text.indexOf(header);
-    if (index >= 0 && (found === null || index < found.index)) found = { index, header };
-  }
-  return found;
+  const section = findContinuityControlSection(text);
+  return section ? { index: section.index, header: section.header } : null;
 }
 
-/** True when `text` carries a control capsule in any known spelling. */
+/** True when `text` carries a structurally identified control capsule. */
 export function hasContinuityControlHeader(text: string): boolean {
-  return CONTINUITY_CONTROL_HEADERS.some((header) => text.includes(header));
+  return findContinuityControlSection(text) !== null;
+}
+
+export const ACTIVE_REQUEST_REFERENCE_PREFIX = 'active request ref';
+export const TRIGGERING_USER_MESSAGE_HEADER = '[TRIGGERING USER MESSAGE]';
+export const TRIGGERING_USER_MESSAGE_FRAME_SCHEMA = 'triggering-user-message/v1';
+
+export interface ContinuityActiveRequestReference {
+  readonly section: 'last-user-ai-messages';
+  readonly chars: number;
+}
+
+/** Parse the typed request-location record from a validated control section. */
+export function parseContinuityActiveRequestReference(
+  sectionText: string,
+): ContinuityActiveRequestReference | null {
+  const match = sectionText.match(
+    /^active request ref · section=(last-user-ai-messages) · chars=(\d+)$/mu,
+  );
+  if (!match) return null;
+  const chars = Number(match[2]);
+  return Number.isSafeInteger(chars) && chars > 0
+    ? { section: match[1] as 'last-user-ai-messages', chars }
+    : null;
+}
+
+export interface TriggeringUserMessageTrailerMatch {
+  readonly index: number;
+  readonly bodyStart: number;
+  readonly body: string;
+  readonly framed: boolean;
+}
+
+/**
+ * Frame a delivery-only operator trailer with its exact body length. The
+ * explanation remains human-readable, while parsers key off the versioned
+ * frame and end-of-message length rather than marker-shaped user prose.
+ */
+export function renderTriggeringUserMessageTrailer(
+  body: string,
+  explanation: string,
+): string {
+  return `\n\n${TRIGGERING_USER_MESSAGE_HEADER}\n`
+    + `schema=${TRIGGERING_USER_MESSAGE_FRAME_SCHEMA} · chars=${body.length}\n`
+    + `${explanation}\n\n${body}`;
+}
+
+/** Resolve a framed trailer, with a positional fallback for persisted legacy packages. */
+export function findTriggeringUserMessageTrailer(
+  text: string,
+): TriggeringUserMessageTrailerMatch | null {
+  const marker = `\n${TRIGGERING_USER_MESSAGE_HEADER}\n`;
+  let fromIndex = 0;
+  while (fromIndex < text.length) {
+    const markerIndex = text.indexOf(marker, fromIndex);
+    if (markerIndex < 0) break;
+    const index = markerIndex + 1;
+    fromIndex = index + TRIGGERING_USER_MESSAGE_HEADER.length;
+    const frameStart = index + TRIGGERING_USER_MESSAGE_HEADER.length + 1;
+    const frameEnd = text.indexOf('\n', frameStart);
+    if (frameEnd < 0) continue;
+    const frame = text.slice(frameStart, frameEnd);
+    const match = frame.match(/^schema=triggering-user-message\/v1 · chars=(\d+)$/u);
+    if (!match) continue;
+    const chars = Number(match[1]);
+    if (!Number.isSafeInteger(chars) || chars < 0) continue;
+    const bodyStart = text.indexOf('\n\n', frameEnd + 1);
+    if (bodyStart < 0) continue;
+    const contentStart = bodyStart + 2;
+    if (text.length - contentStart !== chars) continue;
+    return {
+      index,
+      bodyStart: contentStart,
+      body: text.slice(contentStart),
+      framed: true,
+    };
+  }
+
+  const orientationIndex = text.lastIndexOf('\n── Orientation ──');
+  const legacySearchStart = orientationIndex >= 0 ? orientationIndex : 0;
+  const legacyIndex = text.indexOf(marker, legacySearchStart);
+  if (legacyIndex < 0) return null;
+  const index = legacyIndex + 1;
+  const afterHeader = index + TRIGGERING_USER_MESSAGE_HEADER.length + 1;
+  if (text.slice(afterHeader).startsWith('schema=triggering-user-message/')) return null;
+  const bodySeparator = text.indexOf('\n\n', afterHeader);
+  const bodyStart = bodySeparator >= 0 ? bodySeparator + 2 : afterHeader;
+  const body = text.slice(bodyStart).trim();
+  return body
+    ? { index, bodyStart, body, framed: false }
+    : null;
 }
 
 function stringList(value: unknown): string[] {
@@ -1099,13 +1254,23 @@ function renderContinuityLiveState(
  */
 export function renderContinuityReceiptControl(
   receipt: ContinuityReceipt,
-  _options: RenderContinuityReceiptControlOptions = {},
+  options: RenderContinuityReceiptControlOptions = {},
 ): string {
   const authorityLine = renderContinuityAuthorityResolution(
     resolveContinuityReceiptAuthority(receipt),
   );
+  const activeRequest = receipt.liveState?.request.status === 'current'
+    ? receipt.liveState.request.value
+    : receipt.activeRequest;
+  const activeRequestReference = options.activeRequestLocation && activeRequest?.text
+    ? `${ACTIVE_REQUEST_REFERENCE_PREFIX} · section=${options.activeRequestLocation} · chars=${activeRequest.text.length}`
+    : '';
   if (receipt.liveState) {
-    return [renderContinuityLiveState(receipt, receipt.liveState), authorityLine].join('\n');
+    return [
+      renderContinuityLiveState(receipt, receipt.liveState),
+      activeRequestReference,
+      authorityLine,
+    ].filter(Boolean).join('\n');
   }
   const canonical = receipt.canonicalRange
     ? `${receipt.canonicalRange.traceId}@event#${receipt.canonicalRange.eventCount}`
@@ -1125,6 +1290,7 @@ export function renderContinuityReceiptControl(
       ? `validation=${truncateContinuity(receipt.validation.fact, 240)}`
       : '',
     ...(receipt.hazards.length > 0 ? [`unresolved hazards: ${receipt.hazards.join('; ')}`] : []),
+    activeRequestReference,
     authorityLine,
   ].filter(Boolean).join('\n');
 }
