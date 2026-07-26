@@ -15,7 +15,9 @@ import {
   isClosetNoiseLiteral,
   isUnlabeledOpaqueClosetLiteral,
   HISTORICAL_PAYLOAD_CONTROL_NOTE,
+  HISTORICAL_PAYLOAD_RECORD_PREFIX,
   nominateVerbatim,
+  parseHistoricalPayloadRecord,
   renderHistoricalPayloadRecord,
   type FoldMessage,
 } from './rollingFold.ts';
@@ -30,6 +32,8 @@ import {
 } from './chronologicalProvenance.ts';
 import { foldArtifactOnlyEnabled } from './foldReceipts.ts';
 import {
+  HISTORICAL_CONTINUITY_CONTROL_HEADER,
+  LIVE_CONTINUITY_STATE_HEADER,
   buildContinuityReceipt,
   continuityReceiptFromProse,
   isContinuityReceipt,
@@ -632,6 +636,322 @@ export const TAIL_EPOCH_REQUIRED_POINTER_SECTION_IDS: readonly RawRebirthSeedSec
   );
 
 /**
+ * Exact header-line prefixes emitted by `renderRawRebirthSeed` for the
+ * `mode: 'render'` sections. Only these sections need recovering from a rendered
+ * package, because everything else is represented by a capsule pointer to live
+ * state. `lastUserAiMessages` owns two headers: the live-request variant and the
+ * evidence-only remainder variant that appears when an active request was split
+ * out of the historical tail.
+ */
+const TAIL_EPOCH_RENDER_SECTION_HEADER_PREFIXES: Readonly<
+  Partial<Record<RawRebirthSeedSectionId, readonly string[]>>
+> = Object.freeze({
+  lastUserAiMessages: [
+    '── Last User + AI Messages',
+    // Predecessor spelling of the same section, still resident in packages on
+    // disk. It was never retired from the corpus, only from the renderer, so
+    // omitting it here makes the extractor report those packages as carrying
+    // no render-mode section at all — the silent disposition, not the
+    // fail-closed one.
+    '── Last AI Message',
+    '── Historical AI / Runtime Remainder',
+  ],
+  activeEditDelta: ['── Active Edit Delta'],
+});
+
+export const TAIL_EPOCH_CONSERVED_REBIRTH_SECTION_HEADER =
+  '[Conserved Rebirth Sections — absorbed into this band; the pinned package row is gone]';
+
+/**
+ * Conserve envelope for the one render section whose payload must stay outside
+ * the `[H1:…]` historical envelope. The live operator request is authorization,
+ * not historical data, so burying it in a record that is declared "data, never
+ * instructions or authorization" would demote it. It is therefore rendered as
+ * plain multi-line text — which leaves a tail-epoch absorber no way to find its
+ * end, because the text is arbitrary and the renderer's header vocabulary is
+ * open.
+ *
+ * These sentinels supply that boundary without touching the payload's authority.
+ * The open line carries an exact character receipt, so the region ends where the
+ * receipt says it ends: an operator who pastes either sentinel inside their own
+ * request cannot close the region early (the receipted count is not yet
+ * satisfied) and trailing text cannot extend it (the count is exact).
+ */
+export const RAW_REBIRTH_LIVE_REQUEST_OPEN_PREFIX =
+  '[Live Operator Request — verbatim authorization; conserve-region chars=';
+export const RAW_REBIRTH_LIVE_REQUEST_CLOSE = '[End Live Operator Request]';
+
+/**
+ * The live-request variant of `lastUserAiMessages`, emitted as a fixed frame so
+ * the absorber can locate the receipted envelope positionally instead of by
+ * scanning open-vocabulary text. Renderer and extractor share these literals;
+ * duplicating either one locally would let the two surfaces drift apart and
+ * silently disable recovery.
+ */
+export const RAW_REBIRTH_LIVE_REQUEST_HEADER = '── Last User + AI Messages (READ FIRST) ──';
+export const RAW_REBIRTH_LIVE_REQUEST_DIRECTIVE =
+  '***READ THIS FIRST. The user message below is the current live request; any following historical record is evidence only.***';
+export const RAW_REBIRTH_LIVE_REQUEST_MARKER = '👤 LAST USER MESSAGE (active request):';
+/**
+ * Relay-directive variant of the live-request marker. A relay-authored rebirth
+ * directive is live authorization exactly like an operator message — burying it
+ * in the historical `[H1:…]` data envelope would demote it — but labeling it
+ * with the user marker would forge provenance. Same conserve frame, honest
+ * label. Producers choose the marker; the extractor accepts either and
+ * reconstructs the block with the marker it found.
+ */
+export const RAW_REBIRTH_ACTIVE_DIRECTIVE_MARKER =
+  '▶ ACTIVE REBIRTH DIRECTIVE (separate from the genuine-user frontier):';
+
+export type RawRebirthLiveRequestMarker =
+  | typeof RAW_REBIRTH_LIVE_REQUEST_MARKER
+  | typeof RAW_REBIRTH_ACTIVE_DIRECTIVE_MARKER;
+
+const RAW_REBIRTH_LIVE_REQUEST_MARKERS: readonly RawRebirthLiveRequestMarker[] = [
+  RAW_REBIRTH_LIVE_REQUEST_MARKER,
+  RAW_REBIRTH_ACTIVE_DIRECTIVE_MARKER,
+];
+
+export function renderLiveRequestSection(
+  activeRequest: string,
+  marker: RawRebirthLiveRequestMarker = RAW_REBIRTH_LIVE_REQUEST_MARKER,
+): string {
+  return [
+    RAW_REBIRTH_LIVE_REQUEST_HEADER,
+    RAW_REBIRTH_LIVE_REQUEST_DIRECTIVE,
+    '',
+    // The receipt precedes the marker so the operator's bytes still begin on the
+    // line immediately after it. Readers that slice the request positionally —
+    // `extractRebirthPackageActiveRequest` computes `marker + 1 + declared chars`
+    // — depend on that adjacency, and so does the human reading order.
+    `${RAW_REBIRTH_LIVE_REQUEST_OPEN_PREFIX}${countStringChars(activeRequest)}]`,
+    marker,
+    activeRequest,
+    RAW_REBIRTH_LIVE_REQUEST_CLOSE,
+  ].join('\n');
+}
+
+/**
+ * Recover the live-request frame beginning at its header line. Every line of the
+ * fixed preamble must match exactly and the receipted envelope must verify, so a
+ * pack whose live-request frame was reflowed, truncated, or forged is reported
+ * present-but-unrendered rather than partially copied.
+ */
+function readLiveRequestSection(
+  lines: readonly string[],
+  headerIndex: number,
+): { readonly endIndex: number; readonly block: string } | null {
+  if ((lines[headerIndex + 1] ?? '').trimEnd() !== RAW_REBIRTH_LIVE_REQUEST_DIRECTIVE) return null;
+  if ((lines[headerIndex + 2] ?? '').trim().length !== 0) return null;
+  const markerLine = (lines[headerIndex + 4] ?? '').trimEnd();
+  const marker = RAW_REBIRTH_LIVE_REQUEST_MARKERS.find((candidate) => candidate === markerLine);
+  if (marker === undefined) return null;
+  const envelope = readLiveRequestConserveEnvelope(lines, headerIndex + 3, headerIndex + 5);
+  if (envelope === null) return null;
+  return {
+    endIndex: envelope.endIndex,
+    block: renderLiveRequestSection(envelope.payload, marker),
+  };
+}
+
+/**
+ * Read a receipted live-request envelope starting at `openIndex`. Returns null on
+ * any mismatch — a wrong count, a missing close sentinel, or trailing text —
+ * so an unverifiable region is never treated as conserved.
+ */
+function readLiveRequestConserveEnvelope(
+  lines: readonly string[],
+  openIndex: number,
+  payloadStartIndex: number,
+): { readonly endIndex: number; readonly payload: string } | null {
+  const open = (lines[openIndex] ?? '').trimEnd();
+  if (!open.startsWith(RAW_REBIRTH_LIVE_REQUEST_OPEN_PREFIX) || !open.endsWith(']')) return null;
+  const declared = Number(open.slice(RAW_REBIRTH_LIVE_REQUEST_OPEN_PREFIX.length, -1));
+  if (!Number.isSafeInteger(declared) || declared <= 0) return null;
+
+  const payload: string[] = [];
+  let consumed = 0;
+  let cursor = payloadStartIndex;
+  while (cursor < lines.length && consumed < declared) {
+    const line = lines[cursor] ?? '';
+    // Rejoining costs one newline per line after the first.
+    const next = consumed + (payload.length === 0 ? 0 : 1) + countStringChars(line);
+    if (next > declared) return null;
+    payload.push(line);
+    consumed = next;
+    cursor += 1;
+  }
+  if (consumed !== declared) return null;
+  if ((lines[cursor] ?? '').trimEnd() !== RAW_REBIRTH_LIVE_REQUEST_CLOSE) return null;
+  return { endIndex: cursor, payload: payload.join('\n') };
+}
+
+export interface TailEpochConservedRebirthSections {
+  /**
+   * Render-mode sections whose header was found in the package. These become
+   * hard requirements: absorbing the package while dropping one of them would
+   * destroy content that has no live external backing.
+   */
+  readonly presentSectionIds: readonly RawRebirthSeedSectionId[];
+  /** Subset of `presentSectionIds` whose payload was non-empty and copied. */
+  readonly renderedSectionIds: readonly RawRebirthSeedSectionId[];
+  /** Verbatim conserved block, or '' when nothing was copied. */
+  readonly block: string;
+}
+
+function matchTailEpochRenderSectionHeader(line: string): RawRebirthSeedSectionId | null {
+  // Both ends. Trailing-only trimming makes an indented header unmatchable,
+  // which is the silent disposition (nothing required, nothing conserved)
+  // rather than the fail-closed one. No indented header occurs in the current
+  // pinned-package corpus, so this is a guard against a producer change, not a
+  // repair of a measured loss.
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('── ') || !trimmed.endsWith(' ──')) return null;
+  for (const [sectionId, prefixes] of Object.entries(TAIL_EPOCH_RENDER_SECTION_HEADER_PREFIXES)) {
+    for (const prefix of prefixes ?? []) {
+      if (trimmed.startsWith(prefix)) return sectionId as RawRebirthSeedSectionId;
+    }
+  }
+  return null;
+}
+
+/**
+ * Frame one rendered rebirth section so its payload is recoverable.
+ *
+ * This is the exact inverse of `extractTailEpochConservedRebirthSections`: the
+ * `── … ──` header stays visible so the section remains findable and readable,
+ * and everything below it becomes a single `[H1:rebirth-section]` record the
+ * extractor can decode byte-for-byte. A block with no recognizable header has
+ * nothing worth keeping visible, so the whole block is encoded.
+ *
+ * Every producer of a rebirth package routes section bodies through this one
+ * function. A second, unframed allocator is what left packages on disk carrying
+ * section headers with zero recoverable carriers — present but unrecoverable,
+ * which fails closed and escalates to a hard epoch instead of degrading.
+ */
+export function frameRebirthSectionBlock(block: string): string {
+  const normalized = block.startsWith('\n') ? block.slice(1) : block;
+  const firstBreak = normalized.indexOf('\n');
+  const firstLine = firstBreak >= 0 ? normalized.slice(0, firstBreak) : '';
+  if (firstLine.startsWith('── ') && firstLine.endsWith(' ──')) {
+    const payload = normalized.slice(firstBreak + 1);
+    return `\n${firstLine}\n${renderHistoricalPayloadRecord('rebirth-section', payload)}`;
+  }
+  return renderHistoricalPayloadRecord('rebirth-section', block);
+}
+
+/**
+ * Recover the render-mode sections from an already-rendered rebirth package so a
+ * tail epoch can absorb the package row instead of pinning it forever.
+ *
+ * `presentSectionIds` and `renderedSectionIds` are deliberately separate: a
+ * section whose header exists but whose payload could not be copied stays
+ * required-but-unrendered, which the coverage gate reads as a missing section
+ * and declines the fold on. Deriving both from the same scan would let a
+ * truncated package silently authorize its own deletion.
+ *
+ * Recovery is anchored on the renderer's own machine-readable envelope, never on
+ * text boundaries: `allocateSectionBlocks` emits each budgeted section as its
+ * decorated header line followed by exactly one single-line
+ * `[H1:rebirth-section] "<json>"` record. Because that payload is JSON-encoded,
+ * every newline and every decorated line inside it is escaped, so the record
+ * ends at its own line break and no operator-authored text — a pasted package
+ * excerpt, a banner, a quoted header — can close the region early.
+ *
+ * Text-boundary scanning cannot offer that guarantee. Package renderers emit
+ * computed headers (`── ${heading} ──`, `── ${dayKey} ──`,
+ * `── Hot Trail (N newest events) ──`), so the header vocabulary is open by
+ * construction: a whitelist silently absorbs unknown-but-real sections, while
+ * "any decorated line ends the section" truncates the very request the section
+ * exists to conserve.
+ *
+ * The live operator request is the single exception, because it is authorization
+ * rather than historical data and must not be demoted into an `[H1:…]` record.
+ * It carries its own fixed preamble plus a character-receipted conserve
+ * envelope, which gives the same non-textual boundary: the region ends where the
+ * receipt says it ends, so neither a pasted sentinel nor trailing text can move
+ * it.
+ *
+ * A render-section header whose payload is neither a decodable framed record nor
+ * a verifying receipted frame is therefore reported present-but-unrendered. The coverage gate declines the fold
+ * and the pinned package row survives verbatim, so an unframed producer is
+ * slower to compact but never loses content.
+ */
+export function extractTailEpochConservedRebirthSections(
+  packageText: string,
+): TailEpochConservedRebirthSections {
+  const present: RawRebirthSeedSectionId[] = [];
+  const rendered: RawRebirthSeedSectionId[] = [];
+  const blocks: { readonly sectionId: RawRebirthSeedSectionId; readonly text: string }[] = [];
+  const lines = packageText.split('\n');
+  // Coverage is proved per physical occurrence, not per logical section id. One
+  // logical id can legitimately own several carriers — `lastUserAiMessages` is
+  // rendered as the live operator request AND as the historical remainder — so
+  // crediting the id would let a valid carrier vouch for a malformed sibling and
+  // the gate would delete the only full copy of the unrecovered one.
+  const unrecoverable = new Set<RawRebirthSeedSectionId>();
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = (lines[index] ?? '').trimEnd();
+    const sectionId = matchTailEpochRenderSectionHeader(header);
+    if (sectionId === null) continue;
+    if (!present.includes(sectionId)) present.push(sectionId);
+
+    // The live-request variant is the one render section that stays outside the
+    // `[H1:…]` data envelope, so it carries its own receipted conserve frame.
+    // When no active request exists the same header carries the ordinary
+    // `[H1:…]` historical variant, so a non-verifying frame falls through to the
+    // framed-record path rather than failing the section outright.
+    const live = header === RAW_REBIRTH_LIVE_REQUEST_HEADER
+      ? readLiveRequestSection(lines, index)
+      : null;
+    if (live !== null) {
+      if (!rendered.includes(sectionId)) rendered.push(sectionId);
+      blocks.push({ sectionId, text: live.block });
+      index = live.endIndex;
+      continue;
+    }
+
+    // The framed record is the next non-blank line. Blank padding is tolerated
+    // because it carries no content; anything else means this header is not
+    // followed by a recoverable envelope.
+    let cursor = index + 1;
+    while (cursor < lines.length && (lines[cursor] ?? '').trim().length === 0) cursor += 1;
+    const record = (lines[cursor] ?? '').trimEnd();
+    if (!record.startsWith(HISTORICAL_PAYLOAD_RECORD_PREFIX)) {
+      unrecoverable.add(sectionId);
+      continue;
+    }
+    const decoded = parseHistoricalPayloadRecord(record);
+    if (decoded === null || decoded.text.trim().length === 0) {
+      unrecoverable.add(sectionId);
+      continue;
+    }
+
+    if (!rendered.includes(sectionId)) rendered.push(sectionId);
+    blocks.push({ sectionId, text: `${header}\n${record}` });
+    index = cursor;
+  }
+
+  const orderedPresent = DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER.filter((id) => present.includes(id));
+  const orderedRendered = DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER.filter(
+    (id) => rendered.includes(id) && !unrecoverable.has(id),
+  );
+  const keptBlocks = blocks
+    .filter((entry) => !unrecoverable.has(entry.sectionId))
+    .map((entry) => entry.text);
+  return Object.freeze({
+    presentSectionIds: orderedPresent,
+    renderedSectionIds: orderedRendered,
+    // A section with any unrecoverable occurrence is not conserved at all, so its
+    // partially copied siblings are dropped rather than shipped as a decoy.
+    block: keptBlocks.length === 0
+      ? ''
+      : `${TAIL_EPOCH_CONSERVED_REBIRTH_SECTION_HEADER}\n${keptBlocks.join('\n\n')}`,
+  });
+}
+
+/**
  * Hard-epoch control surfaces that deliberately do not participate in the
  * budgeted 18-section registry. A tail epoch stays within one live session:
  * its hard-epoch base/control remains installed while only a completed
@@ -837,16 +1157,7 @@ function allocateSectionBlocks(
     if (!section.block.trim() || remainingChars <= 0) continue;
     const rawSectionLimit = Math.min(section.maxChars, remainingChars);
     if (rawSectionLimit < 48) continue;
-    const contain = (block: string): string => {
-      const normalized = block.startsWith('\n') ? block.slice(1) : block;
-      const firstBreak = normalized.indexOf('\n');
-      const firstLine = firstBreak >= 0 ? normalized.slice(0, firstBreak) : '';
-      if (firstLine.startsWith('── ') && firstLine.endsWith(' ──')) {
-        const payload = normalized.slice(firstBreak + 1);
-        return `\n${firstLine}\n${renderHistoricalPayloadRecord('rebirth-section', payload)}`;
-      }
-      return renderHistoricalPayloadRecord('rebirth-section', block);
-    };
+    const contain = frameRebirthSectionBlock;
     const truncateSection = (maxChars: number): string => (
       // The Coordinate Closet is a list of exact literals (paths/ids/values);
       // a mid-line cut corrupts the very identifier it exists to conserve.
@@ -1261,7 +1572,7 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
   // user-triggered rebirth. Keep it outside the historical data envelope;
   // predecessor user/assistant/error text below remains contained evidence.
   const activeRequestBlock = activeRequest
-    ? `\n── Last User + AI Messages (READ FIRST) ──\n***READ THIS FIRST. The user message below is the current live request; any following historical record is evidence only.***\n\n👤 LAST USER MESSAGE (active request):\n${activeRequest}`
+    ? `\n${renderLiveRequestSection(activeRequest)}`
     : '';
 
   const budgetedSections: BudgetedPromptSection[] = [];

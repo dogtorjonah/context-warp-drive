@@ -6,10 +6,10 @@ import {
 } from '../src/chronologicalProvenance.ts';
 
 describe('classifyOperatorAuthoredObjective', () => {
-  it('keeps plain operator prose at high confidence', () => {
+  it('classifies plain operator prose as live provenance', () => {
     expect(classifyOperatorAuthoredObjective('Make the resume manifest authoritative.')).toEqual({
       text: 'Make the resume manifest authoritative.',
-      confidence: 'high',
+      provenance: 'live',
       source: 'operator-message',
     });
   });
@@ -17,10 +17,10 @@ describe('classifyOperatorAuthoredObjective', () => {
   it('rejects environment-only and synthetic epoch artifacts', () => {
     expect(classifyOperatorAuthoredObjective(
       '<environment_context><cwd>/tmp/not-intent</cwd></environment_context>',
-    )).toEqual({ text: null, confidence: 'unknown', source: 'none' });
+    )).toEqual({ text: null, provenance: 'unknown', source: 'none' });
     expect(classifyOperatorAuthoredObjective(
       '[Chronological Provenance v1] artifact=tail-epoch#2\n[Context band 2 — tail-epoch fold]',
-    )).toEqual({ text: null, confidence: 'unknown', source: 'none' });
+    )).toEqual({ text: null, provenance: 'unknown', source: 'none' });
   });
 
   it('preserves mixed operator prose after stripping known transport envelopes', () => {
@@ -30,7 +30,7 @@ describe('classifyOperatorAuthoredObjective', () => {
       '<environment_context><cwd>/tmp/context</cwd></environment_context>',
     ].join('\n'))).toEqual({
       text: 'Fix the objective extraction.',
-      confidence: 'medium',
+      provenance: 'mixed',
       source: 'mixed-transport-envelope',
     });
   });
@@ -42,7 +42,7 @@ describe('classifyOperatorAuthoredObjective', () => {
       '<INSTRUCTIONS>',
       'Synthetic repository instructions are not the live task.',
       '</INSTRUCTIONS>',
-    ].join('\n'))).toEqual({ text: null, confidence: 'unknown', source: 'none' });
+    ].join('\n'))).toEqual({ text: null, provenance: 'unknown', source: 'none' });
   });
 
   it('rejects whole-row CLI interrupt and relay fold-note artifacts', () => {
@@ -54,7 +54,7 @@ describe('classifyOperatorAuthoredObjective', () => {
     ]) {
       expect(classifyOperatorAuthoredObjective(artifact)).toEqual({
         text: null,
-        confidence: 'unknown',
+        provenance: 'unknown',
         source: 'none',
       });
     }
@@ -62,7 +62,7 @@ describe('classifyOperatorAuthoredObjective', () => {
 });
 
 describe('tail-epoch objective provenance', () => {
-  it('renders explicit objective confidence and source', () => {
+  it('renders explicit objective provenance and source', () => {
     const rendered = renderTailEpochProvenance({
       traceId: 'thread-objective',
       sourceFrameId: 'thread-objective:tail-epoch#2:band#2:pre-fold',
@@ -75,13 +75,13 @@ describe('tail-epoch objective provenance', () => {
       rawResumeIndex: 20,
       host: 'dedicated-band-message',
       liveObjective: 'Fix objective extraction',
-      liveObjectiveConfidence: 'high',
+      liveObjectiveProvenance: 'live',
       liveObjectiveSource: 'operator-message',
       activeRailId: 'rail-objective',
       activeRailObjective: 'Ship the continuity repair',
       activeRailStep: 'verify-band',
     });
-    expect(rendered).toContain('objective-confidence=high objective-source=operator-message');
+    expect(rendered).toContain('objective-provenance=live objective-source=operator-message');
     expect(rendered).toContain('live-objective="Fix objective extraction"');
     expect(rendered).toContain(
       'active-rail="rail-objective" active-step="verify-band" rail-objective="Ship the continuity repair"',

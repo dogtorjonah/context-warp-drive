@@ -21,12 +21,12 @@ export type ChronologicalContentClass =
 
 export type ChronologicalCoordinateUnit = 'event' | 'message' | 'row' | 'turn' | 'exchange';
 
-export type LiveObjectiveConfidence = 'high' | 'medium' | 'unknown';
+export type LiveObjectiveProvenance = 'live' | 'historical' | 'mixed' | 'unknown';
 export type LiveObjectiveSource = 'operator-message' | 'mixed-transport-envelope' | 'active-rail' | 'none';
 
 export interface ClassifiedLiveObjective {
   readonly text: string | null;
-  readonly confidence: LiveObjectiveConfidence;
+  readonly provenance: LiveObjectiveProvenance;
   readonly source: LiveObjectiveSource;
 }
 
@@ -64,16 +64,17 @@ const INCOMPLETE_TRANSPORT_CONTROL_ENVELOPE_RE = /<(?:turn_aborted)>[\s\S]*$/giu
 
 /**
  * Distinguish operator-authored objective text from user-role transport
- * envelopes and engine transport controls. A mixed row is usable at medium
- * confidence after its known envelopes are removed; a plain row is high
- * confidence; synthetic-only or control-only input stays explicitly unknown
- * instead of being promoted into live intent.
+ * envelopes and engine transport controls. A row with known envelopes removed
+ * is explicitly mixed provenance; a plain operator row is live provenance;
+ * synthetic-only or control-only input stays unknown instead of being promoted
+ * into live intent. This is a deterministic authority classification, not an
+ * estimated confidence score.
  */
 export function classifyOperatorAuthoredObjective(value: string | null | undefined): ClassifiedLiveObjective {
   const raw = value?.trim() ?? '';
-  if (!raw) return { text: null, confidence: 'unknown', source: 'none' };
+  if (!raw) return { text: null, provenance: 'unknown', source: 'none' };
   if (SYNTHETIC_OBJECTIVE_ARTIFACT_RE.test(raw)) {
-    return { text: null, confidence: 'unknown', source: 'none' };
+    return { text: null, provenance: 'unknown', source: 'none' };
   }
 
   let removedEnvelope = false;
@@ -88,11 +89,11 @@ export function classifyOperatorAuthoredObjective(value: string | null | undefin
   text = strip(text, OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE);
   text = strip(text, INCOMPLETE_TRANSPORT_CONTROL_ENVELOPE_RE).trim();
   if (!text || /^(?:<[^>]+>\s*)+$/u.test(text) || INTERRUPT_ARTIFACT_WHOLE_TEXT_RE.test(text)) {
-    return { text: null, confidence: 'unknown', source: 'none' };
+    return { text: null, provenance: 'unknown', source: 'none' };
   }
   return {
     text,
-    confidence: removedEnvelope ? 'medium' : 'high',
+    provenance: removedEnvelope ? 'mixed' : 'live',
     source: removedEnvelope ? 'mixed-transport-envelope' : 'operator-message',
   };
 }
@@ -184,7 +185,7 @@ export interface ChronologicalProvenanceEnvelope {
   readonly supersededAt?: ChronologicalPoint;
   readonly topology: ChronologicalTopology;
   readonly liveObjective?: string;
-  readonly liveObjectiveConfidence?: LiveObjectiveConfidence;
+  readonly liveObjectiveProvenance?: LiveObjectiveProvenance;
   readonly liveObjectiveSource?: LiveObjectiveSource;
   /** Live executable rail identity captured at the artifact boundary. */
   readonly activeRailId?: string;
@@ -259,7 +260,7 @@ export function validateChronologicalProvenance(
   if (envelope.topology.rawTailCount === 0 && envelope.rawResumesAt) errors.push('rawResumesAt.without-tail');
   if (envelope.supersession === 'explicit' && !envelope.supersededAt) errors.push('supersededAt.missing');
   if (envelope.supersededAt) validatePoint(envelope.supersededAt, 'supersededAt', errors);
-  if (envelope.liveObjectiveConfidence && envelope.liveObjectiveConfidence !== 'unknown' && !envelope.liveObjective?.trim()) {
+  if (envelope.liveObjectiveProvenance && envelope.liveObjectiveProvenance !== 'unknown' && !envelope.liveObjective?.trim()) {
     errors.push('liveObjective.missing');
   }
   if (envelope.liveObjectiveSource && envelope.liveObjectiveSource !== 'none' && !envelope.liveObjective?.trim()) {
@@ -354,8 +355,8 @@ export function renderChronologicalProvenance(
   const activeRailObjective = boundedObjective(envelope.activeRailObjective);
   const activeRailStep = boundedObjective(envelope.activeRailStep, 120);
   const pendingIntent = boundedObjective(envelope.pendingIntent, 220);
-  const objectiveAuthority = envelope.liveObjectiveConfidence
-    ? `objective-confidence=${envelope.liveObjectiveConfidence} objective-source=${envelope.liveObjectiveSource ?? (objective ? 'operator-message' : 'none')}`
+  const objectiveAuthority = envelope.liveObjectiveProvenance
+    ? `objective-provenance=${envelope.liveObjectiveProvenance} objective-source=${envelope.liveObjectiveSource ?? (objective ? 'operator-message' : 'none')}`
     : '';
   const rawFrontier = envelope.rawResumesAt
     ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)} (${envelope.topology.rawTailCount} exact)`
@@ -418,7 +419,7 @@ export interface TailEpochProvenanceInput {
   readonly host: ChronologicalTopology['host'];
   readonly previous?: ChronologicalTopology['previous'];
   readonly liveObjective?: string;
-  readonly liveObjectiveConfidence?: LiveObjectiveConfidence;
+  readonly liveObjectiveProvenance?: LiveObjectiveProvenance;
   readonly liveObjectiveSource?: LiveObjectiveSource;
   readonly activeRailId?: string;
   readonly activeRailObjective?: string;
@@ -697,7 +698,7 @@ export function renderTailEpochProvenance(input: TailEpochProvenanceInput): stri
       rawTailCount: input.rawTailCount,
     },
     liveObjective: input.liveObjective,
-    liveObjectiveConfidence: input.liveObjectiveConfidence,
+    liveObjectiveProvenance: input.liveObjectiveProvenance,
     liveObjectiveSource: input.liveObjectiveSource,
     activeRailId: input.activeRailId,
     activeRailObjective: input.activeRailObjective,
