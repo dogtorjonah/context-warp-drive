@@ -476,8 +476,16 @@ export interface ContinuityPackageProvenanceInput {
   readonly artifact: string;
   readonly traceId?: string;
   readonly sourceEventCount?: number;
+  /** Authoritative source time of event#0. Never inferred from package creation. */
+  readonly sourceFirstTimestamp?: string;
+  /** Authoritative source time of the final included event. */
+  readonly sourceLastTimestamp?: string;
+  /** Package capture/creation time, distinct from every source event time. */
+  readonly createdTimestamp?: string;
   /** Exact raw rows that follow the package in the model-visible prompt. */
   readonly rawTailCount: number;
+  /** Authoritative source time of the first exact raw row after the package. */
+  readonly rawResumeTimestamp?: string;
 }
 
 export interface EmbeddedContinuityArtifactProvenanceInput {
@@ -542,19 +550,37 @@ export function renderContinuityPackageProvenance(
     && input.sourceEventCount >= 0
     ? input.sourceEventCount
     : undefined;
+  const knownTimestamp = (value: string | undefined): string | undefined => {
+    const normalized = value?.trim();
+    return normalized && validTimestamp(normalized) ? normalized : undefined;
+  };
   const frontier: ChronologicalPoint = sourceEventCount !== undefined
     ? { traceId: input.traceId, unit: 'event', index: sourceEventCount }
     : { traceId: input.traceId, unit: 'event', id: 'live-frontier' };
+  const transformedAt: ChronologicalPoint = {
+    ...frontier,
+    timestamp: knownTimestamp(input.createdTimestamp),
+  };
+  const rawResumesAt: ChronologicalPoint = {
+    ...frontier,
+    timestamp: knownTimestamp(input.rawResumeTimestamp),
+  };
   return renderChronologicalProvenance({
     artifact: input.artifact,
     contentClass: 'reconstructed-state',
     source: {
-      start: { traceId: input.traceId, unit: 'event', index: sourceEventCount !== undefined ? 0 : undefined },
+      start: {
+        traceId: input.traceId,
+        unit: 'event',
+        index: sourceEventCount !== undefined ? 0 : undefined,
+        timestamp: knownTimestamp(input.sourceFirstTimestamp),
+      },
       endExclusive: frontier,
       ...(sourceEventCount !== undefined ? { count: sourceEventCount } : {}),
+      lastTimestamp: knownTimestamp(input.sourceLastTimestamp),
     },
-    transformedAt: frontier,
-    ...(input.rawTailCount > 0 ? { rawResumesAt: frontier } : {}),
+    transformedAt,
+    ...(input.rawTailCount > 0 ? { rawResumesAt } : {}),
     authority: 'current-as-of-frontier',
     supersession: input.rawTailCount > 0 ? 'later-raw-wins' : 'none-known',
     topology: {

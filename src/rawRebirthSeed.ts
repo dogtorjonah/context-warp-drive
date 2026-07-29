@@ -325,6 +325,11 @@ export interface RawRebirthSeedInput {
   readonly runtimeModelBlock?: string;
   readonly relayBootTime?: string;
   readonly traceEventCount?: number;
+  /** Exact trace/package clocks used only for chronological provenance. */
+  readonly sourceFirstTimestamp?: string;
+  readonly sourceLastTimestamp?: string;
+  readonly createdTimestamp?: string;
+  readonly rawResumeTimestamp?: string;
   readonly forkContext?: RawRebirthForkContext;
   readonly lifecycleBoundary?: RawRebirthLifecycleBoundary;
   readonly mergedFromLineages?: readonly RawRebirthMergedLineage[];
@@ -391,6 +396,11 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly runtimeModel?: RawRebirthRuntimeModelContext;
   readonly relayBootTime?: string;
   readonly traceEventCount?: number;
+  /** Exact trace/package clocks; absent values remain explicitly unknown. */
+  readonly sourceFirstTimestamp?: string;
+  readonly sourceLastTimestamp?: string;
+  readonly createdTimestamp?: string;
+  readonly rawResumeTimestamp?: string;
   readonly workspaceContext?: RawRebirthWorkspaceContext | string;
   readonly activeEditDelta?: string;
   readonly taskRailContext?: string;
@@ -1543,13 +1553,25 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
   const defaultHeader = formatLifecycleHeader(input, lifecycleBoundary);
   const customHeader = input.headerOverride?.trim();
   const controlSafePredecessorName = JSON.stringify(input.predecessorName).slice(1, -1);
+  const receipt = isContinuityReceipt(input.continuityReceipt)
+    ? input.continuityReceipt
+    : undefined;
+  const receiptFrontier = receipt?.liveState?.rawTailFrontier.value;
+  const rawTailCount = receiptFrontier?.exactCount
+    ?? (input.userMessageTriggered === true && Boolean(input.triggeringUserMessage?.trim()) ? 1 : 0);
   const chronology = renderContinuityPackageProvenance({
     artifact: customHeader
       ? 'continuity-package#custom'
       : `rebirth-package#${lifecycleBoundary}`,
     traceId: controlSafePredecessorName,
-    sourceEventCount: input.traceEventCount,
-    rawTailCount: input.userMessageTriggered === true && Boolean(input.triggeringUserMessage?.trim()) ? 1 : 0,
+    sourceEventCount: receipt?.canonicalRange?.eventCount ?? input.traceEventCount,
+    sourceFirstTimestamp: receipt?.canonicalRange?.firstEventTimestamp
+      ?? input.sourceFirstTimestamp,
+    sourceLastTimestamp: receipt?.canonicalRange?.lastEventTimestamp
+      ?? input.sourceLastTimestamp,
+    createdTimestamp: receipt?.capturedAt ?? input.createdTimestamp,
+    rawTailCount,
+    rawResumeTimestamp: receiptFrontier?.sourceTimestamp ?? input.rawResumeTimestamp,
   }) ?? '';
   const historicalHeaderBlocks = [
     formatMergedLineageProvenance(input),
@@ -1981,7 +2003,8 @@ function collectRawTraceCoordinates(
     : coordinates;
 }
 
-function foldMessageSourceTimestamp(message: FoldMessage): string | undefined {
+function foldMessageSourceTimestamp(message: FoldMessage | undefined): string | undefined {
+  if (!message) return undefined;
   if (typeof message.tsMs !== 'number' || !Number.isFinite(message.tsMs)) return undefined;
   const timestamp = new Date(message.tsMs);
   return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : undefined;
@@ -3019,8 +3042,7 @@ export function buildRawRebirthSeedFromMessages(
       lastUserAiMessages,
       activeRequestText,
     });
-    const lastSourceTimestampMs = [...messages.slice(0, traceEnd)].reverse()
-      .find((message) => typeof message.tsMs === 'number' && Number.isFinite(message.tsMs))?.tsMs;
+    const rawResumeTimestamp = foldMessageSourceTimestamp(messages[traceEnd]);
     continuityReceipt = buildContinuityReceipt({
       boundary: 'same_instance_hard_epoch',
       predecessorName,
@@ -3054,9 +3076,7 @@ export function buildRawRebirthSeedFromMessages(
         unit: 'message',
         index: traceEnd,
         exactCount: Math.max(0, messages.length - traceEnd),
-        ...(lastSourceTimestampMs !== undefined
-          ? { sourceTimestamp: new Date(lastSourceTimestampMs).toISOString() }
-          : {}),
+        ...(rawResumeTimestamp ? { sourceTimestamp: rawResumeTimestamp } : {}),
       },
       extraDisagreements: legacyReceipt.disagreements,
     });
@@ -3067,6 +3087,13 @@ export function buildRawRebirthSeedFromMessages(
     runtimeModel: options.runtimeModel,
     relayBootTime: options.relayBootTime,
     traceEventCount: options.traceEventCount ?? traceEnd,
+    sourceFirstTimestamp: options.sourceFirstTimestamp
+      ?? foldMessageSourceTimestamp(messages[0]),
+    sourceLastTimestamp: options.sourceLastTimestamp
+      ?? foldMessageSourceTimestamp(messages[traceEnd - 1]),
+    createdTimestamp: options.createdTimestamp ?? options.capturedAt,
+    rawResumeTimestamp: options.rawResumeTimestamp
+      ?? foldMessageSourceTimestamp(messages[traceEnd]),
     sectionMaxChars: options.sectionMaxChars,
     sectionPriority: options.sectionPriority,
     renderOrder: options.renderOrder,

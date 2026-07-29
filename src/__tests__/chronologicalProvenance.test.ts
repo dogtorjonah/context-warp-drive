@@ -172,14 +172,42 @@ describe('chronological provenance', () => {
       artifact: 'rebirth-package#same_instance_hard_epoch',
       traceId: 'instance-1',
       sourceEventCount: 42,
+      sourceFirstTimestamp: '2026-07-11T04:00:00.000Z',
+      sourceLastTimestamp: '2026-07-11T04:41:00.000Z',
+      createdTimestamp: '2026-07-11T04:42:00.000Z',
       rawTailCount: 1,
+      rawResumeTimestamp: '2026-07-11T04:43:00.000Z',
     });
 
     expect(rendered).toContain('artifact=rebirth-package#same_instance_hard_epoch class=reconstructed-state');
-    expect(rendered).toContain('source=instance-1:event#0..instance-1:event#42 n=42');
-    expect(rendered).toContain('created=instance-1:event#42');
+    expect(rendered).toContain(
+      'source=instance-1:event#0..instance-1:event#42 n=42 @ 2026-07-11T04:00:00.000Z..2026-07-11T04:41:00.000Z',
+    );
+    expect(rendered).toContain('created=instance-1:event#42 @ 2026-07-11T04:42:00.000Z');
     expect(rendered).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
-    expect(rendered).toContain('raw-resumes=instance-1:event#42 @ time unknown (1 exact)');
+    expect(rendered).toContain(
+      'raw-resumes=instance-1:event#42 @ 2026-07-11T04:43:00.000Z (1 exact)',
+    );
+  });
+
+  it('keeps malformed continuity-package clocks unknown instead of borrowing another clock', () => {
+    const rendered = renderContinuityPackageProvenance({
+      artifact: 'rebirth-package#continuation',
+      traceId: 'instance-1',
+      sourceEventCount: 2,
+      sourceFirstTimestamp: 'not-a-time',
+      sourceLastTimestamp: 'also-not-a-time',
+      createdTimestamp: 'still-not-a-time',
+      rawTailCount: 1,
+      rawResumeTimestamp: 'bad-resume-time',
+    });
+
+    expect(rendered).not.toContain('provenance=invalid');
+    expect(rendered).toContain(
+      'source=instance-1:event#0..instance-1:event#2 n=2 @ time unknown..time unknown',
+    );
+    expect(rendered).toContain('created=instance-1:event#2 @ time unknown');
+    expect(rendered).toContain('raw-resumes=instance-1:event#2 @ time unknown (1 exact)');
   });
 
   it('makes a transient boundary notice an explicit alias of the canonical epoch', () => {

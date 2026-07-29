@@ -2,7 +2,9 @@
  * Rolling Fold Compaction — deterministic heuristic compression of old
  * conversation turns into structural skeletons.
  *
- * Zero LLM calls. Character-count triggered. Session-agnostic.
+ * Zero LLM calls. Triggered by provider/relay-measured token pressure at the
+ * single context ceiling. Character counts only bound deterministic rendering
+ * and compression after a fold has been selected. Session-agnostic.
  *
  * Pipeline position: raw transcript -> stepCompaction -> thinContext() -> foldContext() -> repair -> API.
  * Raw transcript is NEVER mutated. Folding produces a view.

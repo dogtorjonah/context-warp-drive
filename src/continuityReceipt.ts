@@ -102,6 +102,8 @@ export interface ContinuityReceiptCanonicalRange {
   readonly traceId: string;
   /** Number of events in the trace (range is event#0..event#eventCount). */
   readonly eventCount: number;
+  /** Authoritative source time of event#0, when known. */
+  readonly firstEventTimestamp?: string;
   /** Stable identity of the newest event included at capture, when known. */
   readonly lastEventId?: string;
   /** Authoritative source time of the newest included event, when known. */

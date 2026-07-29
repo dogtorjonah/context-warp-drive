@@ -104,6 +104,9 @@ describe('raw rebirth seed renderer', () => {
         changed: false,
       },
       traceEventCount: 42,
+      sourceFirstTimestamp: '2026-07-28T21:00:00.000Z',
+      sourceLastTimestamp: '2026-07-28T21:41:00.000Z',
+      createdTimestamp: '2026-07-28T21:42:00.000Z',
       lastUserAiMessages: '[11:44 PM] user\nOk go',
       currentThread: '[11:44 PM] user\nOk go\n\n[11:48 PM] assistant\nWorking',
       starredMoments: '⭐ Starred Waypoints (1 of 1 trace-captured; chronological):\n⭐ [decision] Keep this waypoint.',
@@ -120,7 +123,10 @@ describe('raw rebirth seed renderer', () => {
 
     expect(seed.startsWith('[CONTEXT REBIRTH] Lifecycle boundary: continuation for "source-agent"')).toBe(true);
     expect(seed).toContain('artifact=rebirth-package#continuation class=reconstructed-state authority=current-as-of-frontier');
-    expect(seed).toContain('source=source-agent:event#0..source-agent:event#42 n=42');
+    expect(seed).toContain(
+      'source=source-agent:event#0..source-agent:event#42 n=42 @ 2026-07-28T21:00:00.000Z..2026-07-28T21:41:00.000Z',
+    );
+    expect(seed).toContain('created=source-agent:event#42 @ 2026-07-28T21:42:00.000Z');
     expect(seed).toContain('topology=raw-history>artifact>seam>none host=continuity-package');
     expect(seed).toContain('raw-resumes=none (0 exact)');
     expect(seed).toContain('── Continuity Boundary (RECOVERY COORDINATES) ──');

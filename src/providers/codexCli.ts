@@ -155,11 +155,11 @@ export function serializeFoldedMessagesToResponsesItems(
 // ════════════════════════════════════════════════════════════════════════
 // Epoch predicate
 //
-// The codex analog of the FC char-threshold fold trigger. FC folds on
-// model-visible char count every turn; codex history lives server-side, so we
-// trigger reconstruction off cumulative token usage vs the model context
-// window. Hysteresis (reconstructIntervalTokens) prevents re-reading the full
-// transcript every turn once usage sits inside the fold band.
+// Codex and FC both trigger from provider/relay-measured token pressure. Codex
+// history lives server-side, so reconstruction uses cumulative token usage
+// against the model context window. Hysteresis (reconstructIntervalTokens)
+// prevents re-reading the full transcript every turn once usage sits inside
+// the fold band.
 // ════════════════════════════════════════════════════════════════════════
 
 export interface CodexEpochConfig {
