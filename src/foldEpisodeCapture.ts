@@ -60,6 +60,12 @@ import {
 } from './foldEpisodes.ts';
 import { canonicalizeExtractedPaths, type CanonContext } from './foldPathCanon.ts';
 import { createCognitiveArtifactEnvelope } from './cognitiveArtifactEnvelope.ts';
+import {
+  isCaptureBoundaryArtifact,
+  isCaptureOutcomeStatus,
+  type EpisodeCaptureAttribution,
+  type EpisodeCaptureOutcome,
+} from './captureContract.ts';
 import { extractPathsFromBashCommand, extractRecallSignals } from './foldRecall.ts';
 import { extractUserText, isSyntheticContextText, normalizeToolPath, type FoldMessage, type SyntheticContextOptions } from './rollingFold.ts';
 
@@ -122,6 +128,8 @@ export interface EpisodeCaptureIdentity {
   nowIso: string;
   railId?: string;
   railStep?: string;
+  /** Active intention identity, when the host has one. */
+  intentionId?: string;
   /** Active task-rail objective, when the host can supply it cheaply. */
   railObjective?: string;
   /** Active task-rail title, used as a summary fallback only inside the rail window. */
@@ -598,6 +606,141 @@ function isTaskRailLifecycleBoundary(call: ToolCallView): boolean {
     || (mode === 'load' && operation === 'start');
 }
 
+interface TaskRailCaptureFacts {
+  eventIndex: number;
+  boundary: 'open' | 'close';
+  attributions: EpisodeCaptureAttribution[];
+  outcomes: EpisodeCaptureOutcome[];
+}
+
+function nonEmptyStringField(
+  record: Record<string, unknown>,
+  ...keys: readonly string[]
+): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+  }
+  return undefined;
+}
+
+/**
+ * Preserve every task-rail lifecycle fact carried by one tool event. The tool
+ * call id is the stable provider/canonical source-event identity. Source time
+ * comes only from the aligned message clock; null stays unknown for worker
+ * quarantine. Batched shoot.acks[] members retain their original ordinal.
+ */
+function taskRailCaptureFacts(
+  call: ToolCallView,
+  sourceAt: string | undefined,
+  identity: EpisodeCaptureIdentity,
+): TaskRailCaptureFacts | null {
+  if (!isTaskRailLifecycleBoundary(call) || call.id === null) return null;
+  const mode = nonEmptyStringField(call.input, 'mode') ?? '';
+  const boundary = mode === 'shoot' || mode === 'audit' ? 'close' : 'open';
+  const rawAcks = Array.isArray(call.input.acks) ? call.input.acks : null;
+  const records = rawAcks && rawAcks.length > 0
+    ? rawAcks.map(asRecord)
+    : [call.input];
+  const attributions: EpisodeCaptureAttribution[] = [];
+  const outcomes: EpisodeCaptureOutcome[] = [];
+
+  for (let ordinal = 0; ordinal < records.length; ordinal++) {
+    const record = records[ordinal];
+    if (!record) continue;
+    const railId = nonEmptyStringField(record, 'rail_id', 'railId')
+      ?? nonEmptyStringField(call.input, 'rail_id', 'railId')
+      ?? (typeof identity.railId === 'string' && identity.railId.trim().length > 0
+        ? identity.railId.trim() : undefined);
+    const stepId = nonEmptyStringField(
+      record,
+      'step_id',
+      'stepId',
+      'ack_step_id',
+      'ackStepId',
+      'id',
+    );
+    const intentionId = nonEmptyStringField(record, 'intention_id', 'intentionId')
+      ?? nonEmptyStringField(call.input, 'intention_id', 'intentionId')
+      ?? (typeof identity.intentionId === 'string' && identity.intentionId.trim().length > 0
+        ? identity.intentionId.trim() : undefined);
+    attributions.push({
+      ...(railId !== undefined ? { railId } : {}),
+      ...(stepId !== undefined ? { stepId } : {}),
+      ...(intentionId !== undefined ? { intentionId } : {}),
+      sourceEventId: call.id,
+      sourceAt: sourceAt ?? null,
+      ordinal,
+    });
+
+    const status = nonEmptyStringField(record, 'ack_status', 'ackStatus', 'status');
+    if (!isCaptureOutcomeStatus(status)) continue;
+    const verdict = nonEmptyStringField(record, 'review_verdict', 'reviewVerdict', 'verdict');
+    const evidenceRef = nonEmptyStringField(record, 'evidence');
+    outcomes.push({
+      status,
+      sealedBySourceEventId: call.id,
+      sealedByReason: 'release',
+      sourceAt: sourceAt ?? null,
+      ordinal,
+      ...(stepId !== undefined ? { stepId } : {}),
+      ...(verdict !== undefined ? { verdict } : {}),
+      ...(evidenceRef !== undefined ? { evidenceRef } : {}),
+    });
+  }
+
+  return { eventIndex: call.eventIndex, boundary, attributions, outcomes };
+}
+
+function lifecycleBurstIndex(
+  fact: TaskRailCaptureFacts,
+  sealed: readonly EpisodeBurst[],
+  openBurst: EpisodeBurst | null,
+): number | null {
+  if (fact.boundary === 'open') {
+    for (let index = 0; index < sealed.length; index++) {
+      if (fact.eventIndex <= sealed[index].endEventIndex) return index;
+    }
+    return null;
+  }
+  if (openBurst && fact.eventIndex >= openBurst.startEventIndex) return null;
+  for (let index = sealed.length - 1; index >= 0; index--) {
+    if (fact.eventIndex >= sealed[index].startEventIndex) return index;
+  }
+  return null;
+}
+
+function captureSourceTimeMs(sourceAt: string | null): number | null {
+  if (sourceAt === null) return null;
+  const parsed = Date.parse(sourceAt);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compareCaptureAttributions(
+  left: EpisodeCaptureAttribution,
+  right: EpisodeCaptureAttribution,
+): number {
+  const leftTime = captureSourceTimeMs(left.sourceAt);
+  const rightTime = captureSourceTimeMs(right.sourceAt);
+  if (leftTime !== null && rightTime !== null && leftTime !== rightTime) return leftTime - rightTime;
+  if (leftTime !== null && rightTime === null) return -1;
+  if (leftTime === null && rightTime !== null) return 1;
+  return left.sourceEventId.localeCompare(right.sourceEventId) || left.ordinal - right.ordinal;
+}
+
+function compareCaptureOutcomes(
+  left: EpisodeCaptureOutcome,
+  right: EpisodeCaptureOutcome,
+): number {
+  const leftTime = captureSourceTimeMs(left.sourceAt);
+  const rightTime = captureSourceTimeMs(right.sourceAt);
+  if (leftTime !== null && rightTime !== null && leftTime !== rightTime) return leftTime - rightTime;
+  if (leftTime !== null && rightTime === null) return -1;
+  if (leftTime === null && rightTime !== null) return 1;
+  return left.sealedBySourceEventId.localeCompare(right.sealedBySourceEventId)
+    || left.ordinal - right.ordinal;
+}
+
 /** Concatenated assistant text blocks of one message ('' for non-assistant). */
 function assistantTextOf(message: FoldMessage): string {
   if (message.role !== 'assistant') return '';
@@ -901,6 +1044,15 @@ function structuralStep(call: ToolCallView, outcome: 'ok' | 'error' | undefined,
  * FULL messages array (not just [startIndex, …]) so an ask issued in a PRIOR
  * epoch still anchors the burst it motivated. Pure CPU, no I/O.
  */
+function isEpisodeIntentCandidate(
+  text: string,
+  syntheticContext: SyntheticContextOptions,
+): boolean {
+  return text.length > 0
+    && !isSyntheticContextText(text, syntheticContext)
+    && !isCaptureBoundaryArtifact({ initiator: 'unknown', markerText: text });
+}
+
 function mineIntentForBurst(
   messages: readonly FoldMessage[],
   burstStartIndex: number,
@@ -910,8 +1062,10 @@ function mineIntentForBurst(
     const message = messages[i];
     if (message.role !== 'user') continue;
     const text = extractUserText([message], syntheticContext).trim();
-    if (text.length === 0) continue;            // tool_result-only / empty user turn
-    if (isSyntheticContextText(text, syntheticContext)) continue; // fold / recall / vault / epoch synthetic
+    // Fail closed on a known CLI interrupt marker when the portable message
+    // lacks host-authoritative initiator metadata. Fold/rebirth/provider
+    // artifacts must not impersonate either operator intent or terminal voice.
+    if (!isEpisodeIntentCandidate(text, syntheticContext)) continue;
     return truncateVerbatim(text, INTENT_TEXT_CAP_CHARS);
   }
   return undefined;
@@ -948,7 +1102,7 @@ function groupCaptureBursts(
     const msg = messages[i];
     if (msg.role !== 'user') continue;
     const text = extractUserText([msg], options.syntheticContext).trim();
-    if (text.length === 0 || isSyntheticContextText(text, options.syntheticContext)) continue;
+    if (!isEpisodeIntentCandidate(text, options.syntheticContext)) continue;
     intentEventIndexes.push(i);
   }
 
@@ -1023,6 +1177,7 @@ export function deriveEpisodesFromMessages(
   const touches: EpisodeTouch[] = [];
   const pivots: EpisodePivotMarker[] = [];
   const railSealEventIndexes: number[] = [];
+  const railCaptureFacts: TaskRailCaptureFacts[] = [];
   const annotated: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
   const steps: CaptureStepEntry[] = [];
   const syntheticContext = options.syntheticContext ?? {};
@@ -1030,7 +1185,11 @@ export function deriveEpisodesFromMessages(
     sourceTimestampAt(messages, options.timestamps, index);
 
   for (const call of iterToolCalls(messages, startIndex)) {
-    if (isTaskRailLifecycleBoundary(call)) railSealEventIndexes.push(call.eventIndex);
+    if (isTaskRailLifecycleBoundary(call)) {
+      railSealEventIndexes.push(call.eventIndex);
+      const facts = taskRailCaptureFacts(call, timestampAt(call.eventIndex), identity);
+      if (facts) railCaptureFacts.push(facts);
+    }
     const touched = extractTouchPaths(call.input, options.canon);
     const kind = isEditTool(call.name) ? 'edit' as const : 'read' as const;
     const ts = timestampAt(call.eventIndex);
@@ -1158,6 +1317,21 @@ export function deriveEpisodesFromMessages(
     return target;
   };
 
+  const captureFactsPerBurst = sealed.map(() => ({
+    attributions: [] as EpisodeCaptureAttribution[],
+    outcomes: [] as EpisodeCaptureOutcome[],
+  }));
+  for (const facts of railCaptureFacts) {
+    const target = lifecycleBurstIndex(facts, sealed, openBurst);
+    if (target === null) continue;
+    captureFactsPerBurst[target].attributions.push(...facts.attributions);
+    captureFactsPerBurst[target].outcomes.push(...facts.outcomes);
+  }
+  for (const facts of captureFactsPerBurst) {
+    facts.attributions.sort(compareCaptureAttributions);
+    facts.outcomes.sort(compareCaptureOutcomes);
+  }
+
   const episodes: Episode[] = sealed.map((burst, index) => {
     const burstStepEntries = steps
       .filter((s) => s.step.voice
@@ -1211,6 +1385,7 @@ export function deriveEpisodesFromMessages(
       && identity.railTitle.trim().length > 0
       ? identity.railTitle.trim()
       : undefined;
+    const captureFacts = captureFactsPerBurst[index];
     return {
       workspace: identity.workspace,
       instanceId: identity.instanceId,
@@ -1227,6 +1402,8 @@ export function deriveEpisodesFromMessages(
       ...(intent !== undefined ? { intent } : {}),
       ...(identity.railId !== undefined ? { railId: identity.railId } : {}),
       ...(identity.railStep !== undefined ? { railStep: identity.railStep } : {}),
+      ...(captureFacts.attributions.length > 0 ? { attributions: captureFacts.attributions } : {}),
+      ...(captureFacts.outcomes.length > 0 ? { outcomes: captureFacts.outcomes } : {}),
       members: burst.members,
       trace: buildBranchTrace(burstSteps),
       annotations,

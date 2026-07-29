@@ -199,6 +199,17 @@ export interface Episode {
   railId?: string;
   railStep?: string;
   /**
+   * Source-event-preserving intention/rail/step facts associated with this
+   * burst. Plural because one burst may span several steps or ACK calls.
+   */
+  attributions?: import('./captureContract.ts').EpisodeCaptureAttribution[];
+  /**
+   * Append-only terminal facts associated with this burst. Consumers derive a
+   * current outcome by authoritative source time plus stable provenance tie,
+   * never by array position.
+   */
+  outcomes?: import('./captureContract.ts').EpisodeCaptureOutcome[];
+  /**
    * TRUE when the capturing session was force-siloed (sealed experiment /
    * blinded research arm) at the moment of record. Siloed rows are visible
    * to other siloed callers only; unsealed callers never see them. The
@@ -2205,6 +2216,8 @@ export interface EpisodicRecallCardDebugLike {
   baselineRank?: number;
   observationalShadowScore?: number;
   observationalShadowRank?: number;
+  /** Stable worker-owned identity joining candidate, exposure, use, and explicit open events. */
+  recallCandidateId?: string;
 }
 
 export interface EpisodicRecallCardLike {

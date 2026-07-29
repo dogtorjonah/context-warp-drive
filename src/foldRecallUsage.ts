@@ -6,6 +6,8 @@ export type FoldRecallUtilityOutcome = 'exposed' | 'useful' | 'ignored';
 export interface FoldRecallUsageCardInput {
   /** Optional transport-owned exposure identity; card/path/episode/boundary are still folded into the correlation id. */
   exposureId?: string;
+  /** Worker card metadata; candidate identity becomes the correlation identity when present. */
+  debug?: { recallCandidateId?: string };
   targetPath: string;
   renderedCard: string;
   chapterIds: readonly number[];
@@ -116,7 +118,9 @@ export function makeFoldRecallUsageCorrelationId(
   episodeId: number,
   boundarySeq: number,
 ): string {
-  const source = [card.exposureId?.trim() ?? '', card.kind, card.targetPath].join('\x00');
+  const candidateId = card.exposureId?.trim() || card.debug?.recallCandidateId?.trim();
+  if (candidateId) return candidateId;
+  const source = [card.kind, card.targetPath].join('\x00');
   return `fru:${boundarySeq}:${episodeId}:${encodeURIComponent(source)}`;
 }
 

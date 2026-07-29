@@ -45,6 +45,15 @@ describe('fold recall usage detector', () => {
     expect(result.watches[0].terms).toContain('boundary');
   });
 
+  test('uses the worker candidate identity as the exposure correlation identity', () => {
+    const result = addInjectedFoldRecallUsageCards([], [card({
+      debug: { recallCandidateId: 'erc1:request:101:path' },
+    })], 3, { nowMs: 10 });
+
+    expect(result.watches[0]?.correlationId).toBe('erc1:request:101:path');
+    expect(result.events[0]?.correlationId).toBe('erc1:request:101:path');
+  });
+
   test('detects member-path reuse on a later boundary and removes the watch', () => {
     const added = addInjectedFoldRecallUsageCards([], [card()], 3, { nowMs: 10 });
     const advanced = advanceFoldRecallUsageWatches(

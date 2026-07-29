@@ -111,6 +111,31 @@ describe('computeOpenBurst — read-burst fold-guard boundary', () => {
     expect(guard.heldPaths).toEqual(['/repo/src/b.ts', '/repo/src/c.ts']);
   });
 
+  test('quarantines a synthetic interrupt as neither episode intent nor voice-floor authority', () => {
+    const idle = (prefix: string) => Array.from({ length: 30 }, (_, i) => assistantMsg(`${prefix} ${i}`));
+    const messages: FoldMessage[] = [
+      userMsg('inspect the three related files'),
+      toolUse('Read', { file_path: '/repo/src/a.ts' }, 'a'),
+      ...idle('after-a'),
+      userMsg('[Request interrupted by user] (relay fold epoch)'),
+      toolUse('Read', { file_path: '/repo/src/b.ts' }, 'b'),
+      ...idle('after-b'),
+      toolUse('Read', { file_path: '/repo/src/c.ts' }, 'c'),
+    ];
+
+    const guard = computeOpenBurst(messages);
+    const capture = deriveEpisodesFromMessages(messages, 0, ID, { sealTrailing: true });
+
+    expect(capture.episodes).toHaveLength(2);
+    expect(capture.episodes[1]?.members.map((member) => member.path)).toEqual([
+      '/repo/src/b.ts',
+      '/repo/src/c.ts',
+    ]);
+    expect(capture.episodes[1]?.intent).toBe('inspect the three related files');
+    expect(guard.burstCount).toBe(2);
+    expect(guard.heldPaths).toEqual(['/repo/src/b.ts', '/repo/src/c.ts']);
+  });
+
   test('value fidelity is explicit and shared by capture and the open-burst guard', () => {
     const messages: FoldMessage[] = [
       toolUse('Read', { file_path: '/repo/src/a.ts' }, 'a1'),
@@ -172,8 +197,157 @@ describe('computeOpenBurst — read-burst fold-guard boundary', () => {
     expect(result.episodes).toHaveLength(1);
     expect(result.episodes[0].authorName).toBe('recall-cartographer');
     expect(result.episodes[0].railId).toBe('rail-fixture');
+    expect(result.episodes[0].railStep).toBe('metadata-step');
     expect(result.episodes[0].intent).toBe('Populate dormant metadata');
     expect(result.episodes[0].summary).toBe('Episodic richness hardening');
+  });
+
+  test('preserves every batched task-rail attribution and terminal outcome', () => {
+    const sourceTime = '2026-06-18T19:00:00.000Z';
+    const messages: FoldMessage[] = [
+      userMsg('finish both reviewed steps'),
+      toolUse('Edit', { file_path: '/repo/src/card.ts' }, 'edit-1'),
+      toolResult('edit-1', 'ok'),
+      toolUse('task_rail', {
+        mode: 'shoot',
+        rail_id: 'rail-fixture',
+        acks: [
+          {
+            step_id: 'step-a',
+            ack_status: 'done',
+            review_verdict: 'clean',
+            evidence: 'tests:a',
+          },
+          {
+            step_id: 'step-b',
+            ack_status: 'blocked',
+            review_verdict: 'blocked',
+            evidence: 'blocker:b',
+          },
+        ],
+      }, 'rail-event-1'),
+      toolResult('rail-event-1', 'acked'),
+    ];
+    const timestamps = messages.map((_, index) => index === 3 ? sourceTime : undefined);
+    const result = deriveEpisodesFromMessages(messages, 0, {
+      ...ID,
+      railId: 'rail-fixture',
+      railStep: 'legacy-current-step',
+      intentionId: 'intent-fixture',
+    }, { sealTrailing: true, timestamps });
+
+    expect(result.episodes).toHaveLength(1);
+    expect(result.episodes[0].railId).toBe('rail-fixture');
+    expect(result.episodes[0].railStep).toBe('legacy-current-step');
+    expect(result.episodes[0].attributions).toEqual([
+      {
+        railId: 'rail-fixture',
+        stepId: 'step-a',
+        intentionId: 'intent-fixture',
+        sourceEventId: 'rail-event-1',
+        sourceAt: sourceTime,
+        ordinal: 0,
+      },
+      {
+        railId: 'rail-fixture',
+        stepId: 'step-b',
+        intentionId: 'intent-fixture',
+        sourceEventId: 'rail-event-1',
+        sourceAt: sourceTime,
+        ordinal: 1,
+      },
+    ]);
+    expect(result.episodes[0].outcomes).toEqual([
+      {
+        status: 'done',
+        sealedBySourceEventId: 'rail-event-1',
+        sealedByReason: 'release',
+        sourceAt: sourceTime,
+        ordinal: 0,
+        stepId: 'step-a',
+        verdict: 'clean',
+        evidenceRef: 'tests:a',
+      },
+      {
+        status: 'blocked',
+        sealedBySourceEventId: 'rail-event-1',
+        sealedByReason: 'release',
+        sourceAt: sourceTime,
+        ordinal: 1,
+        stepId: 'step-b',
+        verdict: 'blocked',
+        evidenceRef: 'blocker:b',
+      },
+    ]);
+  });
+
+  test('orders malformed task-rail clocks as unknown without a NaN comparator', () => {
+    const sourceTime = '2026-06-18T19:00:00.000Z';
+    const messages: FoldMessage[] = [
+      userMsg('preserve deterministic source chronology'),
+      toolUse('Edit', { file_path: '/repo/src/chronology.ts' }, 'edit-chronology'),
+      toolResult('edit-chronology', 'ok'),
+      toolUse('task_rail', {
+        mode: 'shoot',
+        rail_id: 'rail-fixture',
+        acks: [{ step_id: 'step-unknown', ack_status: 'done' }],
+      }, 'rail-event-unknown'),
+      toolResult('rail-event-unknown', 'acked'),
+      toolUse('task_rail', {
+        mode: 'shoot',
+        rail_id: 'rail-fixture',
+        acks: [{ step_id: 'step-known', ack_status: 'done' }],
+      }, 'rail-event-known'),
+      toolResult('rail-event-known', 'acked'),
+    ];
+    const timestamps = messages.map((_, index) => (
+      index === 3 ? 'not-a-source-clock' : index === 5 ? sourceTime : undefined
+    ));
+    const result = deriveEpisodesFromMessages(messages, 0, {
+      ...ID,
+      railId: 'rail-fixture',
+      intentionId: 'intent-fixture',
+    }, { sealTrailing: true, timestamps });
+
+    expect(result.episodes).toHaveLength(1);
+    expect(result.episodes[0].attributions?.map((entry) => ({
+      stepId: entry.stepId,
+      sourceAt: entry.sourceAt,
+    }))).toEqual([
+      { stepId: 'step-known', sourceAt: sourceTime },
+      { stepId: 'step-unknown', sourceAt: null },
+    ]);
+    expect(result.episodes[0].outcomes?.map((entry) => ({
+      stepId: entry.stepId,
+      sourceAt: entry.sourceAt,
+    }))).toEqual([
+      { stepId: 'step-known', sourceAt: sourceTime },
+      { stepId: 'step-unknown', sourceAt: null },
+    ]);
+  });
+
+  test('keeps unknown task-rail source time null and excludes non-terminal outcomes', () => {
+    const messages: FoldMessage[] = [
+      toolUse('Edit', { file_path: '/repo/src/card.ts' }, 'edit-1'),
+      toolResult('edit-1', 'ok'),
+      toolUse('task_rail', {
+        mode: 'shoot',
+        rail_id: 'rail-fixture',
+        acks: [{ step_id: 'step-a', ack_status: 'in_progress' }],
+      }, 'rail-event-unknown-time'),
+      toolResult('rail-event-unknown-time', 'acked'),
+    ];
+    const result = deriveEpisodesFromMessages(messages, 0, ID, { sealTrailing: true });
+
+    expect(result.episodes).toHaveLength(1);
+    expect(result.episodes[0].attributions).toEqual([{
+      railId: 'rail-fixture',
+      stepId: 'step-a',
+      sourceEventId: 'rail-event-unknown-time',
+      sourceAt: null,
+      ordinal: 0,
+    }]);
+    expect(result.episodes[0].outcomes).toBeUndefined();
   });
 
   test('links exact glyph rows while star and rail tool clocks remain unlinked', () => {

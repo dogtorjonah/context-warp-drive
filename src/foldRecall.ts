@@ -4655,7 +4655,7 @@ export type ExplicitFoldRecallQuery =
   | { kind: 'path'; path: string }
   | { kind: 'term'; term: string }
   | { kind: 'waypoint'; waypoint: string }
-  | { kind: 'episode'; chapterId: number };
+  | { kind: 'episode'; chapterId: number; exposureId?: string };
 
 export interface ExplicitFoldRecallOptions {
   /**
