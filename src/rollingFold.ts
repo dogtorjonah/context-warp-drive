@@ -2126,9 +2126,10 @@ export function isClosetNoiseLiteral(value: string): boolean {
   // Short hex refs / rail / instance ids (≤16) and dashed UUIDs are KEPT.
   if (/^[0-9a-f]{40,}$/i.test(v)) return true;
   // ── Numeric / counter / date exhaust ──
-  // N/M progress counters (17/17, 8/17, 0/17), calendar dates (6/20/2026), and
-  // leading-number code ratios (1/zoom, 2/scale).
-  if (/^\d{1,4}\/\d{1,4}$/.test(v)) return true;
+  // N/M progress counters (17/17, 8/17, 0/17), decimal aspect/scale ratios
+  // (2/1.5, 1/.75, 1.5/1), calendar dates (6/20/2026), and leading-number code
+  // ratios (1/zoom, 2/scale).
+  if (/^(?:\d{1,4}(?:\.\d+)?|\.\d{1,4})\/(?:\d{1,4}(?:\.\d+)?|\.\d{1,4})$/.test(v)) return true;
   if (/^[A-Za-z_][\w.-]{0,40}[=:][ ]?\d{1,4}\/\d{1,4}$/.test(v)) return true;
   if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(v)) return true;
   if (/^\d{1,4}\/[A-Za-z]{2,}$/.test(v)) return true;
@@ -2141,6 +2142,14 @@ export function isClosetNoiseLiteral(value: string): boolean {
   // Requires an interior hyphen AND a pure-digit right side, so real 2-segment
   // paths (relay/src, app-solid/foo) never match.
   if (/^[A-Za-z][\w-]*-[\w-]+\/\d{1,3}$/.test(v)) return true;
+  // Variant-prefixed utility tokens (hover:bg-red-500/30, md:hover:text-white/80)
+  // — the state/breakpoint prefix hides the utility from the rule above. Single-
+  // colon key:value coordinates (port:3002, model:codex-5.5) carry no /NN
+  // opacity tail and never match.
+  if (/^[a-z][\w-]*(?::[\w-]+)*:[A-Za-z][\w-]*-[\w-]+\/\d{1,3}$/.test(v)) return true;
+  // XML-namespace boilerplate (http://www.w3.org/1999/xhtml, …/2000/svg) —
+  // markup exhaust from DOM dumps, never a navigable coordinate.
+  if (/^https?:\/\/(?:www\.)?w3\.org\//i.test(v)) return true;
   // ── Decontextualized grep/read line fragments ──
   // Bare basename:line(:col) (PanesView.tsx:2832, foo.ts:84:12). Path-qualified
   // file:line (relay/src/foo.ts:84) carries a slash and survives; line RANGES

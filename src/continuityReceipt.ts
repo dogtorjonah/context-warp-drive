@@ -1221,6 +1221,19 @@ function renderCurrentTaskRailStep(
   return lines;
 }
 
+/**
+ * recent-edits boundary field. "none" from the live capture means "none in
+ * this boundary window", not "no edit evidence exists": when an Active Edit
+ * Delta section rode along in the same package, say so explicitly so the two
+ * surfaces can never silently contradict each other (a successor otherwise
+ * burns a tool call resolving which section is right).
+ */
+function renderRecentEditsField(edits: string, activeEditDeltaSupplied: boolean): string {
+  return edits === 'none' && activeEditDeltaSupplied
+    ? 'none this boundary window (older edits: see Active Edit Delta)'
+    : edits;
+}
+
 function renderContinuityLiveState(
   receipt: ContinuityReceipt,
   liveState: ContinuityReceiptLiveState,
@@ -1242,7 +1255,7 @@ function renderContinuityLiveState(
     `boundary=${receipt.boundary} · identity=${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)} · runtime=${runtimeStatus}`,
     `captured=${liveState.capturedAt} · frontier=${renderLiveFrontier(liveState.rawTailFrontier.value)}`,
     ...activeStepLines,
-    `active files · claims=${renderLiveList(liveState.claims.value)} · recent edits=${renderLiveList(liveState.edits.value)}`,
+    `active files · claims=${renderLiveList(liveState.claims.value)} · recent edits=${renderRecentEditsField(renderLiveList(liveState.edits.value), receipt.editClaim.supplied || receipt.editClaim.editEvidenceFiles.length > 0)}`,
     ...(validation ? [`validation=${validation}`] : []),
     ...(receipt.hazards.length > 0 ? [`unresolved hazards: ${receipt.hazards.join('; ')}`] : []),
   ].join('\n');
@@ -1287,7 +1300,7 @@ export function renderContinuityReceiptControl(
     `boundary=${receipt.boundary} · identity=${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)} · runtime=${receipt.sourceStatus ?? 'unknown'}`,
     `frontier=${canonical}`,
     ...activeStepLines,
-    `active files · claims=${receipt.editClaim.claims.join(', ') || 'none'} · recent edits=${receipt.editClaim.editEvidenceFiles.join(', ') || 'none'}`,
+    `active files · claims=${receipt.editClaim.claims.join(', ') || 'none'} · recent edits=${renderRecentEditsField(receipt.editClaim.editEvidenceFiles.join(', ') || 'none', receipt.editClaim.supplied)}`,
     receipt.validation.fact !== undefined
       ? `validation=${truncateContinuity(receipt.validation.fact, 240)}`
       : '',
