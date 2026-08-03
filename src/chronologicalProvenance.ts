@@ -22,12 +22,44 @@ export type ChronologicalContentClass =
 export type ChronologicalCoordinateUnit = 'event' | 'message' | 'row' | 'turn' | 'exchange';
 
 export type LiveObjectiveProvenance = 'live' | 'historical' | 'mixed' | 'unknown';
-export type LiveObjectiveSource = 'operator-message' | 'mixed-transport-envelope' | 'active-rail' | 'none';
+export type LiveObjectiveSource =
+  | 'operator-message'
+  | 'mixed-transport-envelope'
+  | 'active-rail'
+  | 'peer-message'
+  | 'delegated-task'
+  | 'relay-runtime'
+  // An objective whose authoring surface was never declared by the builder.
+  // Distinct from 'none' (no objective at all): text exists, authority does not.
+  | 'unknown'
+  | 'none';
 
 export interface ClassifiedLiveObjective {
   readonly text: string | null;
   readonly provenance: LiveObjectiveProvenance;
   readonly source: LiveObjectiveSource;
+}
+
+/**
+ * Authority class of one user-role transcript row (authority-contract/v1).
+ * Transports persist peer traffic, relay control dispatches, and delegated
+ * tasks as ordinary user rows; role alone therefore proves nothing about who
+ * authored a row. Only 'operator' rows may become the live objective;
+ * 'delegated-task' rows are objective-eligible solely when no operator ask
+ * exists (precedence: operator > delegated-task > active-rail > none); every
+ * other class is never objective-eligible.
+ */
+export type UserRowAuthority = 'operator' | 'peer' | 'delegated-task' | 'relay-runtime' | 'synthetic' | 'none';
+
+export interface ClassifiedUserRowAuthority {
+  /** Deterministic authority class; never an estimated confidence. */
+  readonly authority: UserRowAuthority;
+  /** Stable key of the banner that decided a non-plain class; null for plain operator rows. */
+  readonly banner: string | null;
+  /** Objective-eligible payload for operator/delegated-task rows; null otherwise. */
+  readonly text: string | null;
+  /** True when a product/transport envelope was removed around the payload. */
+  readonly strippedEnvelope: boolean;
 }
 
 // These envelopes are relay/provider context, even when a transport serializes
@@ -63,20 +95,64 @@ const TRANSPORT_CONTROL_ENVELOPE_RE = /<(turn_aborted)>[\s\S]*?<\/\1>/giu;
 const INCOMPLETE_TRANSPORT_CONTROL_ENVELOPE_RE = /<(?:turn_aborted)>[\s\S]*$/giu;
 
 /**
- * Distinguish operator-authored objective text from user-role transport
- * envelopes and engine transport controls. A row with known envelopes removed
- * is explicitly mixed provenance; a plain operator row is live provenance;
- * synthetic-only or control-only input stays unknown instead of being promoted
- * into live intent. This is a deterministic authority classification, not an
- * estimated confidence score.
+ * Peer-agent delivery banners (authority-contract/v1). The relay mints these
+ * user-role rows when another agent's traffic reaches this instance's
+ * transcript — chatroom wakes, signals, directed posts, broadcasts, squad
+ * asks, and cross-instance messages. The author is a peer, never the
+ * operator, so such a row is never objective-eligible. Prefixes mirror the
+ * relay dispatch templates verbatim; anchored startsWith matching keeps a
+ * genuine operator row that merely *quotes* a banner mid-text classified as
+ * operator.
  */
-export function classifyOperatorAuthoredObjective(value: string | null | undefined): ClassifiedLiveObjective {
-  const raw = value?.trim() ?? '';
-  if (!raw) return { text: null, provenance: 'unknown', source: 'none' };
-  if (SYNTHETIC_OBJECTIVE_ARTIFACT_RE.test(raw)) {
-    return { text: null, provenance: 'unknown', source: 'none' };
-  }
+export const PEER_DISPATCH_BANNER_PREFIXES: readonly { readonly key: string; readonly prefix: string }[] = Object.freeze([
+  { key: 'chat-room', prefix: '[Chat Room "' },
+  { key: 'signal', prefix: '[Signal from "' },
+  { key: 'control-signal', prefix: '[Control Signal from "' },
+  { key: 'directed-post', prefix: '[Directed post from "' },
+  { key: 'broadcast', prefix: '[Broadcast from "' },
+  { key: 'squad-ask', prefix: '[SQUAD ASK from "' },
+  { key: 'squad-tap', prefix: '[SQUAD TAP from "' },
+  { key: 'cross-instance-message', prefix: '[Cross-instance message from "' },
+  { key: 'instance-message', prefix: '[Message from "' },
+  { key: 'mention', prefix: '[MENTION]' },
+]);
 
+/**
+ * Relay/runtime control dispatches persisted as user rows: queued-signal
+ * digests, fixer-mode batches, watchdog rebirth prompts, and fold/redirect
+ * interrupt markers. Runtime machinery authored these, so they are never
+ * objective-eligible.
+ */
+export const RELAY_RUNTIME_DISPATCH_BANNER_PREFIXES: readonly { readonly key: string; readonly prefix: string }[] = Object.freeze([
+  { key: 'queued-signals', prefix: '[Queued Signals' },
+  { key: 'fixer-mode', prefix: '[FIXER MODE' },
+  { key: 'watchdog-rebirth', prefix: '[WATCHDOG_REBIRTH]' },
+  { key: 'relay-interrupt-marker', prefix: '[relay_interrupt ' },
+]);
+
+/**
+ * Parent-delegated task dispatch (`[Task <id> from "<name>"]: <prompt>`).
+ * Real work authored by a parent agent, not the operator: objective-eligible
+ * only when no operator ask exists, and always labeled 'delegated-task' so
+ * fold headers never launder it into operator authority.
+ */
+const DELEGATED_TASK_BANNER_RE = /^\[Task [^\]\n]+ from "[^"\n]*"\]:?\s*/u;
+
+// Relay-authored paired wrappers around a dispatched payload. USER REDIRECT
+// certifies its payload as the operator's verbatim interrupting message, so
+// removing that wrapper alone does not demote provenance to mixed. RELAY
+// INTERRUPT wraps server-originated traffic delivered mid-turn; its payload
+// is classified on its own banners and a bannerless payload fails closed to
+// relay-runtime instead of being promoted into operator intent. RETRIEVED
+// CONTEXT is relay-selected supplemental context prepended to a dispatch; the
+// block itself is never operator text.
+const USER_REDIRECT_BLOCK_RE = /^\[USER REDIRECT\][\s\S]*?\[END USER REDIRECT\]\s*/u;
+const RELAY_INTERRUPT_BLOCK_RE = /^\[RELAY INTERRUPT\][\s\S]*?\[END RELAY INTERRUPT\]\s*/u;
+const RETRIEVED_CONTEXT_BLOCK_RE = /\[RETRIEVED CONTEXT\][\s\S]*?\[END RETRIEVED CONTEXT\]\s*/gu;
+const INCOMPLETE_RETRIEVED_CONTEXT_BLOCK_RE = /\[RETRIEVED CONTEXT\][\s\S]*$/u;
+
+/** Strip known product/transport envelopes and report whether any were removed. */
+function extractOperatorText(raw: string): { text: string | null; strippedEnvelope: boolean } {
   let removedEnvelope = false;
   const strip = (input: string, pattern: RegExp): string => input.replace(pattern, () => {
     removedEnvelope = true;
@@ -85,17 +161,153 @@ export function classifyOperatorAuthoredObjective(value: string | null | undefin
   let text = strip(raw, OPERATOR_AGENTS_ENVELOPE_RE);
   text = strip(text, OPERATOR_TRANSPORT_ENVELOPE_RE);
   text = strip(text, TRANSPORT_CONTROL_ENVELOPE_RE);
+  text = strip(text, RETRIEVED_CONTEXT_BLOCK_RE);
   text = strip(text, OPERATOR_INCOMPLETE_AGENTS_ENVELOPE_RE);
   text = strip(text, OPERATOR_INCOMPLETE_TRANSPORT_ENVELOPE_RE);
-  text = strip(text, INCOMPLETE_TRANSPORT_CONTROL_ENVELOPE_RE).trim();
+  text = strip(text, INCOMPLETE_TRANSPORT_CONTROL_ENVELOPE_RE);
+  text = strip(text, INCOMPLETE_RETRIEVED_CONTEXT_BLOCK_RE).trim();
   if (!text || /^(?:<[^>]+>\s*)+$/u.test(text) || INTERRUPT_ARTIFACT_WHOLE_TEXT_RE.test(text)) {
-    return { text: null, provenance: 'unknown', source: 'none' };
+    return { text: null, strippedEnvelope: removedEnvelope };
   }
-  return {
-    text,
-    provenance: removedEnvelope ? 'mixed' : 'live',
-    source: removedEnvelope ? 'mixed-transport-envelope' : 'operator-message',
-  };
+  return { text, strippedEnvelope: removedEnvelope };
+}
+
+/**
+ * Classify one user-role row's authority (authority-contract/v1). Anchored
+ * delivery-banner prefixes are checked before the unanchored synthetic
+ * artifact sniff so a peer message that merely quotes a continuity artifact
+ * stays classified as the peer delivery it is. Deterministic; no confidence
+ * estimates.
+ */
+export function classifyUserRowAuthority(value: string | null | undefined): ClassifiedUserRowAuthority {
+  const raw = value?.trim() ?? '';
+  if (!raw) return { authority: 'none', banner: null, text: null, strippedEnvelope: false };
+  for (const { key, prefix } of PEER_DISPATCH_BANNER_PREFIXES) {
+    if (raw.startsWith(prefix)) return { authority: 'peer', banner: key, text: null, strippedEnvelope: false };
+  }
+  for (const { key, prefix } of RELAY_RUNTIME_DISPATCH_BANNER_PREFIXES) {
+    if (raw.startsWith(prefix)) return { authority: 'relay-runtime', banner: key, text: null, strippedEnvelope: false };
+  }
+  if (raw.startsWith('[RELAY INTERRUPT]')) {
+    // A row still headed by the marker means the wrapper never had its
+    // [END RELAY INTERRUPT] marker (truncated row, or an operator literally
+    // typing the banner): the block replace would be a no-op and the payload
+    // recursion would re-enter this branch unboundedly. Fail closed instead.
+    if (!RELAY_INTERRUPT_BLOCK_RE.test(raw)) {
+      return { authority: 'relay-runtime', banner: 'relay-interrupt', text: null, strippedEnvelope: true };
+    }
+    const payload = raw.replace(RELAY_INTERRUPT_BLOCK_RE, '').trim();
+    if (!payload) return { authority: 'relay-runtime', banner: 'relay-interrupt', text: null, strippedEnvelope: true };
+    const inner = classifyUserRowAuthority(payload);
+    if (inner.authority === 'operator' || inner.authority === 'none') {
+      // Fail closed: the relay chose this payload, not the operator.
+      return { authority: 'relay-runtime', banner: 'relay-interrupt', text: null, strippedEnvelope: true };
+    }
+    return { authority: inner.authority, banner: inner.banner ?? 'relay-interrupt', text: inner.text, strippedEnvelope: true };
+  }
+  if (raw.startsWith('[USER REDIRECT]')) {
+    // Same incomplete-marker discipline: a truncated redirect cannot certify
+    // its payload as the operator's verbatim interrupting message, so fail
+    // closed rather than leaking the wrapper literal into objective text.
+    if (!USER_REDIRECT_BLOCK_RE.test(raw)) {
+      return { authority: 'relay-runtime', banner: 'user-redirect', text: null, strippedEnvelope: true };
+    }
+    const payload = raw.replace(USER_REDIRECT_BLOCK_RE, '').trim();
+    const operator = payload ? extractOperatorText(payload) : { text: null, strippedEnvelope: false };
+    if (!operator.text) return { authority: 'none', banner: 'user-redirect', text: null, strippedEnvelope: true };
+    return { authority: 'operator', banner: 'user-redirect', text: operator.text, strippedEnvelope: operator.strippedEnvelope };
+  }
+  const delegated = raw.match(DELEGATED_TASK_BANNER_RE);
+  if (delegated) {
+    const payload = raw.slice(delegated[0].length).trim();
+    return payload
+      ? { authority: 'delegated-task', banner: 'delegated-task', text: payload, strippedEnvelope: false }
+      : { authority: 'none', banner: 'delegated-task', text: null, strippedEnvelope: false };
+  }
+  if (SYNTHETIC_OBJECTIVE_ARTIFACT_RE.test(raw)) {
+    return { authority: 'synthetic', banner: 'synthetic-continuity-artifact', text: null, strippedEnvelope: false };
+  }
+  const operator = extractOperatorText(raw);
+  if (!operator.text) return { authority: 'none', banner: null, text: null, strippedEnvelope: operator.strippedEnvelope };
+  return { authority: 'operator', banner: null, text: operator.text, strippedEnvelope: operator.strippedEnvelope };
+}
+
+/**
+ * Distinguish operator-authored objective text from everything else a
+ * transport persists in user role: peer deliveries, relay/runtime control
+ * dispatches, delegated tasks, transport envelopes, and engine transport
+ * controls. Peer and relay-runtime rows never yield objective text; a
+ * delegated task keeps its payload under the honest 'delegated-task' label so
+ * selection walks can apply operator > delegated-task > active-rail
+ * precedence. This is a deterministic authority classification, not an
+ * estimated confidence score.
+ */
+export function classifyOperatorAuthoredObjective(value: string | null | undefined): ClassifiedLiveObjective {
+  const row = classifyUserRowAuthority(value);
+  switch (row.authority) {
+    case 'operator':
+      return {
+        text: row.text,
+        provenance: row.strippedEnvelope ? 'mixed' : 'live',
+        source: row.strippedEnvelope ? 'mixed-transport-envelope' : 'operator-message',
+      };
+    case 'delegated-task':
+      return { text: row.text, provenance: 'live', source: 'delegated-task' };
+    case 'peer':
+      return { text: null, provenance: 'unknown', source: 'peer-message' };
+    case 'relay-runtime':
+      return { text: null, provenance: 'unknown', source: 'relay-runtime' };
+    case 'synthetic':
+    case 'none':
+      return { text: null, provenance: 'unknown', source: 'none' };
+  }
+}
+
+/** Empty objective slot — no candidate has been accepted yet. */
+export const NO_LIVE_OBJECTIVE: ClassifiedLiveObjective = Object.freeze({
+  text: null,
+  provenance: 'unknown',
+  source: 'none',
+} as const);
+
+/**
+ * Authority rank under authority-contract/v1: operator > delegated-task >
+ * active-rail > nothing. Rank is independent of recency, because recency is a
+ * property of the transport and authority is a property of the author. Classes
+ * that are never objective-eligible rank 0.
+ */
+export function liveObjectiveAuthorityRank(source: LiveObjectiveSource): number {
+  switch (source) {
+    case 'operator-message':
+    case 'mixed-transport-envelope':
+      return 3;
+    case 'delegated-task':
+      return 2;
+    case 'active-rail':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/** Highest rank any candidate can reach; a walk may stop once it is held. */
+export const MAX_LIVE_OBJECTIVE_AUTHORITY_RANK = 3;
+
+/**
+ * Accept `candidate` over `incumbent` only on strictly higher authority.
+ * Selection walks run newest-first and therefore already hold the most recent
+ * candidate at each rank, so equal rank keeps the incumbent and recency stays
+ * the tie-break *within* an authority class rather than across classes. Without
+ * this, a parent's delegated task or a rail fallback that happened to be newer
+ * displaced a real operator ask and then carried operator framing forward
+ * through every subsequent fold.
+ */
+export function outranksLiveObjective(
+  candidate: ClassifiedLiveObjective,
+  incumbent: ClassifiedLiveObjective,
+): boolean {
+  if (!candidate.text) return false;
+  return liveObjectiveAuthorityRank(candidate.source) > liveObjectiveAuthorityRank(incumbent.source);
 }
 
 export interface ChronologicalPoint {
@@ -356,7 +568,12 @@ export function renderChronologicalProvenance(
   const activeRailStep = boundedObjective(envelope.activeRailStep, 120);
   const pendingIntent = boundedObjective(envelope.pendingIntent, 220);
   const objectiveAuthority = envelope.liveObjectiveProvenance
-    ? `objective-provenance=${envelope.liveObjectiveProvenance} objective-source=${envelope.liveObjectiveSource ?? (objective ? 'operator-message' : 'none')}`
+    // Fail closed on an undeclared source. Defaulting to 'operator-message'
+    // whenever objective text existed printed operator authority for any
+    // builder that had not yet threaded the field, which is how peer and
+    // rail-derived objectives were read as the operator's ask across folds.
+    // Absent authority is 'unknown'; only a builder may assert 'operator-message'.
+    ? `objective-provenance=${envelope.liveObjectiveProvenance} objective-source=${envelope.liveObjectiveSource ?? (objective ? 'unknown' : 'none')}`
     : '';
   const rawFrontier = envelope.rawResumesAt
     ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)} (${envelope.topology.rawTailCount} exact)`

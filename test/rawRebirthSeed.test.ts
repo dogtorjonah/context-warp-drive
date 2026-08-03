@@ -1107,6 +1107,82 @@ describe('raw rebirth seed renderer', () => {
     expect(lastAi).not.toContain('older verdict that is no longer the frontier');
   });
 
+  test('rejoins adjacent mid-sentence assistant fragments at the head citation marker', () => {
+    const seed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: 'Confirm the restart result.' },
+      { role: 'assistant', content: 'The fresh ghost is coherent, which itself validates' },
+      { role: 'assistant', content: ' the restart flag:' },
+      { role: 'assistant', content: ' and closes the observed fragment chain.' },
+    ], {
+      predecessorName: 'fragment-rejoin-agent',
+      packageBudget: 30_000,
+    });
+    const lastAi = seed.split('── Last User + AI Messages (READ FIRST) ──')[1]!
+      .split('\n── ', 1)[0]!;
+
+    expect(lastAi).toContain('🤖 LAST AI MESSAGE [message 1]');
+    expect(lastAi).toContain(
+      'The fresh ghost is coherent, which itself validates the restart flag: and closes the observed fragment chain.',
+    );
+    expect(lastAi).not.toContain('role:assistant\ncontent:\n the restart flag:');
+  });
+
+  test.each([
+    ['uppercase opening', 'Fresh standalone status.'],
+    ['register glyph opening', '🏁 Standalone status verified.'],
+    ['long lowercase row', `x${'y'.repeat(199)}`],
+  ])('keeps a %s as its own latest assistant row', (_label, tail) => {
+    const seed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: 'Report status.' },
+      { role: 'assistant', content: 'Earlier complete assistant turn.' },
+      { role: 'assistant', content: tail },
+    ], {
+      predecessorName: 'fragment-negative-agent',
+      packageBudget: 30_000,
+    });
+    const lastAi = seed.split('── Last User + AI Messages (READ FIRST) ──')[1]!
+      .split('\n── ', 1)[0]!;
+
+    expect(lastAi).toContain('🤖 LAST AI MESSAGE [message 2]');
+    expect(lastAi).toContain(tail);
+    expect(lastAi).not.toContain('Earlier complete assistant turn.');
+  });
+
+  test('does not rejoin across a user boundary', () => {
+    const seed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: 'Initial request.' },
+      { role: 'assistant', content: 'Earlier complete assistant turn.' },
+      { role: 'user', content: 'Interrupting operator turn.' },
+      { role: 'assistant', content: ' continuation-shaped but independent.' },
+    ], {
+      predecessorName: 'fragment-user-boundary-agent',
+      packageBudget: 30_000,
+    });
+    const lastAi = seed.split('── Last User + AI Messages (READ FIRST) ──')[1]!
+      .split('\n── ', 1)[0]!;
+
+    expect(lastAi).toContain('🤖 LAST AI MESSAGE [message 3]');
+    expect(lastAi).not.toContain('Earlier complete assistant turn.');
+  });
+
+  test('does not use an empty tool-only assistant row as fragment glue', () => {
+    const seed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: 'Initial request.' },
+      { role: 'assistant', content: 'Earlier complete assistant turn.' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'call-1', function: { name: 'inspect' } }] },
+      { role: 'assistant', content: ' continuation-shaped but independent.' },
+    ], {
+      predecessorName: 'fragment-tool-boundary-agent',
+      packageBudget: 30_000,
+    });
+    const lastAi = seed.split('── Last User + AI Messages (READ FIRST) ──')[1]!
+      .split('\n── ', 1)[0]!;
+
+    expect(lastAi).toContain('🤖 LAST AI MESSAGE [message 3]');
+    expect(lastAi).not.toContain('Earlier complete assistant turn.');
+    expect(lastAi).not.toContain('call-1');
+  });
+
   test('kill-switch restores the complete legacy raw closet and neighborhood layout', () => {
     vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1');
     const messages: FoldMessage[] = [

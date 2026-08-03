@@ -203,7 +203,28 @@ describe('FoldSession marathon pressure folding', () => {
     expect(preparedText.length).toBeLessThan(20_000);
     expect(preparedText).toContain('Continuity refresh: a same-instance hard epoch (context reset) just completed.');
     expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
-    expect(preparedText).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
+    // Canonical v6 hard-epoch semantic (retired the v4 flat Raw Trace Coordinate
+    // Closet forensic section): the hard-epoch package renders the fixed six-frame
+    // model in canonical order — boundary/task, execution, active edits, cognition,
+    // conditional conversation, recovery. Assert each frame opens with its
+    // `[REBIRTH-V6-SECTION id=<id> chars=` marker and that the frames appear in
+    // canonical order (boundary before recovery), while the old v4 Closet header
+    // is gone from the rendered package.
+    const v6FrameIds = [
+      'boundaryAndActiveTask',
+      'executionState',
+      'activeEditDelta',
+      'cognitiveArtifacts',
+      'recentConversation',
+      'recoveryIndex',
+    ];
+    for (const frameId of v6FrameIds) {
+      expect(preparedText).toContain(`[REBIRTH-V6-SECTION id=${frameId} chars=`);
+    }
+    expect(preparedText.indexOf('[REBIRTH-V6-SECTION id=boundaryAndActiveTask'))
+      .toBeLessThan(preparedText.indexOf('[REBIRTH-V6-SECTION id=recoveryIndex'));
+    expect(preparedText).not.toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
+    // The planted full literal survives into the v6 conversation/cognition output.
     expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_27.ts');
     expect(preparedText).not.toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
   });
@@ -1270,7 +1291,7 @@ describe('FoldSession per-band vault sealing', () => {
     expect(joined).toContain(directive);
   });
 
-  it('re-renders the current-task vault on a cold full recompute (sealed set reset)', () => {
+  it('re-renders the scope-labeled full vault on a cold full recompute (sealed set reset)', () => {
     let now = 1_000;
     const session = vaultSession({ now: () => now });
     session.recordOperatorMessage('OPERATOR-EPSILON one', '2026-06-19T10:00:00Z');
@@ -1284,11 +1305,17 @@ describe('FoldSession per-band vault sealing', () => {
 
     expect(recomputed.cacheHot).toBe(false);
     const joined = vaultText(recomputed.messages);
-    // Recording ZETA advances the explicit task frontier, so a full render
-    // preserves the complete current task without resurrecting Epsilon's
-    // superseded task wording.
-    expect(joined).not.toContain('OPERATOR-EPSILON one');
+    // Recording ZETA advances the explicit task frontier. A full render keeps
+    // Epsilon only as expired historical evidence and marks Zeta current, so
+    // older wording remains available without regaining instruction authority.
+    expect(joined).toContain('OPERATOR-EPSILON one');
+    expect(joined).toContain(
+      'liveness=answered authorization=expired task-scope=historical authority=historical-background ordinal=1/4',
+    );
     expect(joined).toContain('OPERATOR-ZETA two');
+    expect(joined).toContain(
+      'liveness=answered authorization=expired task-scope=current-task ordinal=3/4',
+    );
     // One full block, not a stale prefix delta plus a full render.
     expect(joined.split('[User Message Vault]').length - 1).toBe(1);
   });

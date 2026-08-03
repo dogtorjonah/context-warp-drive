@@ -195,6 +195,7 @@ describe('buildContinuityReceipt (typed assembly)', () => {
       claims: ['src/a.ts'],
       hasActiveEditDelta: true,
     });
+    expect(receipt.captureSourceId).toBe('capture-1');
     expect(receipt.activeRequest).toEqual({ text: '  Do the thing.  ', totalChars: 17 });
     expect(receipt.liveState?.request.source).toEqual({
       kind: 'operator-message',
@@ -208,6 +209,21 @@ describe('buildContinuityReceipt (typed assembly)', () => {
       id: 'capture-1',
     });
     expect(receipt.liveState?.edits.status).toBe('current');
+  });
+
+  test('emits the derived capture identity when the caller omits one', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      instance: {
+        instanceId: 'instance-7',
+        instanceName: 'worker-7',
+        runtimeStatus: 'working',
+      },
+    });
+
+    expect(receipt.captureSourceId).toBe('rebirth-boundary:instance-7');
+    expect(receipt.liveState?.validation.source.id).toBe('rebirth-boundary:instance-7');
   });
 
   test('edit/claim supplied defaults from claims and edits, or explicit flag', () => {

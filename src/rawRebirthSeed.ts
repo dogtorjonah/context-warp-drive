@@ -50,6 +50,12 @@ import {
   isGenuineRebirthOperatorMessage,
   selectRoleAwareRebirthDialogueWindow,
 } from './rebirthDialogue.ts';
+import {
+  adaptLegacyRebirthPackageToV6,
+  isRebirthPackageV6Model,
+  renderRebirthPackageV6,
+  type RebirthPackageV6Model,
+} from './rebirthPackageV6.ts';
 
 /**
  * Build a portable lineage glyph log from the message trace: scan assistant
@@ -315,6 +321,8 @@ export interface RawRebirthSummonVaultEntry {
 
 export interface RawRebirthSeedInput {
   readonly predecessorName: string;
+  /** Frozen canonical v6 model. When supplied, no legacy prose is re-derived. */
+  readonly rebirthV6?: RebirthPackageV6Model;
   readonly packageBudget?: number;
   readonly sectionMaxChars?: Partial<Record<RawRebirthSeedSectionId, number>>;
   readonly sectionPriority?: Partial<Record<RawRebirthSeedSectionId, number>>;
@@ -380,6 +388,12 @@ export interface RawRebirthSeedInput {
 
 export interface RawRebirthSeedFromMessagesOptions {
   readonly predecessorName?: string;
+  /**
+   * Render the host-unavailable lifecycle boundary through the canonical v6
+   * contract. Fold-window micro-seeds deliberately leave this false because
+   * they are internal band artifacts rather than successor handoffs.
+   */
+  readonly canonicalV6Fallback?: boolean;
   readonly packageBudget?: number;
   readonly sectionMaxChars?: Partial<Record<RawRebirthSeedSectionId, number>>;
   readonly sectionPriority?: Partial<Record<RawRebirthSeedSectionId, number>>;
@@ -390,6 +404,16 @@ export interface RawRebirthSeedFromMessagesOptions {
   readonly includeTrailingUserTurn?: boolean;
   /** Exact active request kept outside the trace frontier but promoted into READ FIRST. */
   readonly triggeringUserMessage?: string;
+  /**
+   * Provenance for a host-supplied triggering message that is absent from the
+   * retained trace. Kept separate from the request bytes so source chronology
+   * is never inferred from package capture time.
+   */
+  readonly triggeringUserMessageSource?: {
+    readonly sourceId?: string;
+    readonly sourceTimestamp?: string;
+    readonly sourceCoordinate?: string;
+  };
   readonly currentThreadMessageLimit?: number;
   readonly currentThreadMessageChars?: number;
   readonly activityMessageChars?: number;
@@ -1543,6 +1567,48 @@ function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLi
 }
 
 export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
+  if (isRebirthPackageV6Model(input.rebirthV6)) {
+    // The v6 hard-epoch raw path must carry the SAME protected boundary
+    // envelope the relay rich formatters emit above the six framed sections,
+    // so host-unavailable fallback is promotionally consistent with the live
+    // host path (which adds `[CONTEXT REBIRTH]` + chronological provenance).
+    // Compose it from the raw input's own lifecycle/provenance fields and
+    // reserve envelope + the `\n\n` separator in packageBudget, so every
+    // produced character is covered by the declared budget.
+    const lifecycleBoundary = resolveLifecycleBoundary(input);
+    const defaultHeader = input.headerOverride?.trim()
+      ? input.headerOverride.trim()
+      : formatLifecycleHeader(input, lifecycleBoundary);
+    const controlSafeName = JSON.stringify(input.predecessorName).slice(1, -1);
+    const receipt = isContinuityReceipt(input.continuityReceipt)
+      ? input.continuityReceipt
+      : undefined;
+    const receiptFrontier = receipt?.liveState?.rawTailFrontier.value;
+    const rawTailCount = receiptFrontier?.exactCount
+      ?? (input.userMessageTriggered === true && Boolean(input.triggeringUserMessage?.trim()) ? 1 : 0);
+    const chronology = renderContinuityPackageProvenance({
+      artifact: input.headerOverride?.trim()
+        ? 'continuity-package#custom'
+        : `rebirth-package#${lifecycleBoundary}`,
+      traceId: controlSafeName,
+      sourceEventCount: receipt?.canonicalRange?.eventCount ?? input.traceEventCount,
+      sourceFirstTimestamp: receipt?.canonicalRange?.firstEventTimestamp
+        ?? input.sourceFirstTimestamp,
+      sourceLastTimestamp: receipt?.canonicalRange?.lastEventTimestamp
+        ?? input.sourceLastTimestamp,
+      createdTimestamp: receipt?.capturedAt ?? input.createdTimestamp,
+      rawTailCount,
+      rawResumeTimestamp: receiptFrontier?.sourceTimestamp ?? input.rawResumeTimestamp,
+    }) ?? '';
+    const envelopeText = chronology ? `${defaultHeader}\n${chronology}` : defaultHeader;
+    const sections = renderRebirthPackageV6(input.rebirthV6, {
+      packageBudget: input.packageBudget,
+      // Account for the envelope→sections `\n\n` separator in the allocator's
+      // prefix-overhead reservation so the produced total stays in budget.
+      envelopeChars: envelopeText.length + 2,
+    });
+    return `${envelopeText}\n\n${sections}`;
+  }
   const packageBudget = finitePositive(input.packageBudget, DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS);
   const runtimeBlock = input.runtimeModelBlock?.trim()
     ? input.runtimeModelBlock
@@ -2833,6 +2899,30 @@ function hasMicroSeedTrajectory(messages: readonly FoldMessage[]): boolean {
   return false;
 }
 
+const RAW_ASSISTANT_TAIL_FRAGMENT_MAX_CHARS = 200;
+const RAW_ASSISTANT_FRAGMENT_OPENING_RE = /^[a-z,.…;:!?)\]}'’"”]/u;
+
+/**
+ * Return plain provider speech only. Tool/reasoning rows remain independent
+ * trace records and must never become glue between assistant text fragments.
+ */
+function rawAssistantSpeechFragment(message: FoldMessage | undefined): string {
+  if (!message || (message.role !== 'assistant' && message.role !== 'model')) return '';
+  if (typeof message.content !== 'string') return '';
+  if (messagePartsToText(message).trim()) return '';
+  if (message.tool_call_id !== undefined
+    || message.tool_calls !== undefined
+    || message.reasoning_content !== undefined) return '';
+  return message.content;
+}
+
+function isRawAssistantTailFragment(message: FoldMessage | undefined): boolean {
+  const speech = rawAssistantSpeechFragment(message).trim();
+  return speech.length > 0
+    && speech.length < RAW_ASSISTANT_TAIL_FRAGMENT_MAX_CHARS
+    && RAW_ASSISTANT_FRAGMENT_OPENING_RE.test(speech);
+}
+
 function buildLastUserAiMessagesFromMessages(
   messages: readonly FoldMessage[],
   traceEnd: number,
@@ -2843,6 +2933,7 @@ function buildLastUserAiMessagesFromMessages(
   let lastUserIndex = -1;
   let lastAssistant = '';
   let lastAssistantIndex = -1;
+  let lastAssistantTailIndex = -1;
   for (let i = 0; i < traceEnd; i++) {
     if (excludedMessageIndexes.has(i)) continue;
     const message = messages[i];
@@ -2859,8 +2950,22 @@ function buildLastUserAiMessagesFromMessages(
     if (message.role === 'assistant' || message.role === 'model') {
       const text = providerMessageToTraceText(message);
       if (text) {
+        const predecessor = messages[i - 1];
+        const joinsPriorAssistant = i === lastAssistantTailIndex + 1
+          && lastAssistantIndex >= 0
+          && isRawAssistantTailFragment(message)
+          && rawAssistantSpeechFragment(predecessor).trim().length > 0;
+        if (joinsPriorAssistant) {
+          // Preserve the head row's provider envelope and citation coordinate;
+          // append only the split speech bytes so one logical sentence remains
+          // contiguous in READ FIRST. Chains walk forward through the tail.
+          lastAssistant += rawAssistantSpeechFragment(message);
+          lastAssistantTailIndex = i;
+          continue;
+        }
         lastAssistant = text;
         lastAssistantIndex = i;
+        lastAssistantTailIndex = i;
       }
     }
   }
@@ -3025,12 +3130,24 @@ export function buildRawRebirthSeedFromMessages(
     const trailingStart = trailingUserRunStartIndex(messages);
     const activeRequestMessages = messages.slice(trailingStart)
       .filter((message) => message.role === 'user' && typeof message.content === 'string');
-    const activeRequestText = activeRequestMessages
+    const tracedActiveRequestText = activeRequestMessages
       .map((message) => message.content as string)
       .filter((text) => text.trim().length > 0)
       .join('\n\n') || undefined;
+    const suppliedActiveRequestText = options.triggeringUserMessage?.trim()
+      ? options.triggeringUserMessage
+      : undefined;
+    const activeRequestText = tracedActiveRequestText ?? suppliedActiveRequestText;
     const activeRequestSourceTimestamp = [...activeRequestMessages].reverse()
       .find((message) => typeof message.tsMs === 'number' && Number.isFinite(message.tsMs))?.tsMs;
+    const suppliedRequestSource = !tracedActiveRequestText && suppliedActiveRequestText
+      ? options.triggeringUserMessageSource
+      : undefined;
+    const suppliedSourceTimestamp = suppliedRequestSource?.sourceTimestamp?.trim();
+    const knownSuppliedSourceTimestamp = suppliedSourceTimestamp
+      && Number.isFinite(Date.parse(suppliedSourceTimestamp))
+      ? suppliedSourceTimestamp
+      : undefined;
     const legacyReceipt = continuityReceiptFromProse({
       boundary: 'same_instance_hard_epoch',
       predecessorName,
@@ -3057,13 +3174,13 @@ export function buildRawRebirthSeedFromMessages(
       rail: legacyReceipt.rail,
       nextAction: legacyReceipt.nextAction,
       activeRequestText,
-      activeRequestSourceId: 'unknown',
-      activeRequestSourceCoordinate: activeRequestText
+      activeRequestSourceId: suppliedRequestSource?.sourceId?.trim() || 'unknown',
+      activeRequestSourceCoordinate: tracedActiveRequestText
         ? `message#${trailingStart}..message#${messages.length - 1}`
-        : undefined,
+        : suppliedRequestSource?.sourceCoordinate?.trim() || undefined,
       activeRequestSourceTimestamp: activeRequestSourceTimestamp !== undefined
         ? new Date(activeRequestSourceTimestamp).toISOString()
-        : undefined,
+        : knownSuppliedSourceTimestamp,
       claims: legacyReceipt.editClaim.claims,
       editEvidenceFiles: legacyReceipt.editClaim.editEvidenceFiles,
       claimsAreLive: false,
@@ -3081,7 +3198,7 @@ export function buildRawRebirthSeedFromMessages(
       extraDisagreements: legacyReceipt.disagreements,
     });
   }
-  return renderRawRebirthSeed({
+  const rawInput: RawRebirthSeedInput = {
     predecessorName,
     packageBudget: options.packageBudget,
     runtimeModel: options.runtimeModel,
@@ -3118,7 +3235,26 @@ export function buildRawRebirthSeedFromMessages(
     userMessageTriggered: options.userMessageTriggered ?? Boolean(options.triggeringUserMessage?.trim()),
     headerOverride: options.headerOverride,
     footerOverride: options.footerOverride,
+  };
+  if (!options.canonicalV6Fallback) return renderRawRebirthSeed(rawInput);
+
+  const rebirthV6 = adaptLegacyRebirthPackageToV6({
+    predecessorName,
+    lifecycleBoundary: options.lifecycleBoundary,
+    triggeringUserMessage: options.triggeringUserMessage,
+    lastUserAiMessages,
+    currentThread,
+    activeEditDelta,
+    starredMoments,
+    taskRailContext,
+    resumePoint,
+    workspaceContext: options.workspaceContext,
+    runtimeModel: options.runtimeModel,
+    continuityReceipt,
+  }, {
+    predecessorName,
   });
+  return renderRawRebirthSeed({ ...rawInput, rebirthV6 });
 }
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -40,6 +40,7 @@
  * provider-cache invariant.
  */
 export * from './fold.ts';
+export * from './editMutationTargets.ts';
 export * from './foldReceipts.ts';
 export * from './foldReconciliation.ts';
 export * from './foldProvenance.ts';
@@ -49,6 +50,7 @@ export * from './episodes.ts';
 export * from './foldRecallUsage.ts';
 export * from './foldRailPrefetch.ts';
 export * from './rebirthDialogue.ts';
+export * from './rebirthPackageV6.ts';
 export * from './episodes/runtime.ts';
 export * from './glyphs.ts';
 export * from './taskRail.ts';

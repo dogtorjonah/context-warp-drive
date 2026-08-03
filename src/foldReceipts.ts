@@ -39,6 +39,7 @@ import {
   extractCognitiveArtifacts,
   renderCognitiveBlock,
 } from './cognitiveArtifacts.ts';
+import { extractApplyPatchTargetPaths } from './editMutationTargets.ts';
 import {
   renderEmbeddedContinuityArtifactProvenance,
 } from './chronologicalProvenance.ts';
@@ -1403,32 +1404,10 @@ function receiptText(kind: FoldReceiptKind, call: ReceiptToolCall): string {
   }
 }
 
-/**
- * File targets of a codex `apply_patch` call. Its argument is not a structured
- * `file_path` but a raw V4A patch body, so `extractPath` returns '' and the
- * receipt would render `target="unknown"` — asserting the target could not be
- * determined when the patch header names it exactly. Multi-file patches keep
- * every path, '|'-joined, matching the claim-op convention above.
- */
-const APPLY_PATCH_FILE_HEADER_RE = /^\*\*\* (?:Update|Add|Delete) File: (.+)$/gmu;
-
-function applyPatchTargets(input: Record<string, unknown>): string {
-  const body = typeof input.input === 'string'
-    ? input.input
-    : typeof input.patch === 'string' ? input.patch : '';
-  if (!body) return '';
-  const targets: string[] = [];
-  for (const match of body.matchAll(APPLY_PATCH_FILE_HEADER_RE)) {
-    const normalized = normalizeToolPath(match[1]?.trim() ?? '');
-    if (normalized && !targets.includes(normalized)) targets.push(normalized);
-  }
-  return targets.join('|');
-}
-
 function targetIdentity(kind: FoldReceiptKind, call: ReceiptToolCall): string {
   switch (kind) {
     case 'edit':
-    case 'write': return extractPath(call.input) || applyPatchTargets(call.input);
+    case 'write': return extractPath(call.input) || extractApplyPatchTargetPaths(call.input).join('|');
     case 'atlas-commit': return extractPath(call.input);
     case 'chatroom-post': return String(call.input.room ?? call.input.name ?? '');
     case 'rail-op': return String(call.input.step_id ?? call.input.ack_step_id ?? '');

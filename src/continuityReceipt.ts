@@ -177,6 +177,8 @@ export interface ContinuityReceipt {
   readonly predecessorName: string;
   /** ISO capture time for builder-assembled receipts; absent for prose synthesis. */
   readonly capturedAt?: string;
+  /** Stable identity of the boundary capture. Optional only for persisted v1 receipts predating this field. */
+  readonly captureSourceId?: string;
   readonly sourceStatus?: string;
   readonly rail?: ContinuityReceiptRail;
   /**
@@ -430,6 +432,7 @@ function parseChatroomNames(value: string | undefined): string[] {
 
 function buildReceiptLiveState(args: {
   capturedAt: string;
+  captureSourceId: string;
   parts: ContinuityReceiptParts;
   activeRequest?: { readonly text: string; readonly totalChars: number };
   validationFact?: string;
@@ -437,9 +440,18 @@ function buildReceiptLiveState(args: {
   claims: readonly string[];
   editEvidenceFiles: readonly string[];
 }): ContinuityReceiptLiveState {
-  const { capturedAt, parts, activeRequest, validationFact, disagreements, claims, editEvidenceFiles } = args;
+  const {
+    capturedAt,
+    captureSourceId,
+    parts,
+    activeRequest,
+    validationFact,
+    disagreements,
+    claims,
+    editEvidenceFiles,
+  } = args;
   const instanceId = parts.instance?.instanceId ?? parts.predecessorName;
-  const captureId = parts.captureSourceId ?? `rebirth-boundary:${instanceId}`;
+  const captureId = captureSourceId;
   const captureSource = (kind: string, id = captureId, options: { coordinate?: string; sourceTimestamp?: string } = {}) => (
     liveSource(capturedAt, kind, id, options)
   );
@@ -648,6 +660,8 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
   }
   const activeRequestText = parts.activeRequestText?.trim() ? parts.activeRequestText : undefined;
   const capturedAt = parts.capturedAt ?? new Date().toISOString();
+  const captureSourceId = parts.captureSourceId?.trim()
+    || `rebirth-boundary:${parts.instance?.instanceId ?? parts.predecessorName}`;
   const activeRequest = activeRequestText
     ? { text: activeRequestText, totalChars: activeRequestText.length }
     : undefined;
@@ -657,6 +671,7 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
     boundary: parts.boundary,
     predecessorName: parts.predecessorName,
     capturedAt,
+    captureSourceId,
     sourceStatus: parts.sourceStatus?.trim() || undefined,
     rail: parts.rail,
     nextAction: parts.nextAction ?? parts.rail?.activeStep?.instruction,
@@ -674,6 +689,7 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
     disagreements,
     liveState: buildReceiptLiveState({
       capturedAt,
+      captureSourceId,
       parts,
       activeRequest,
       validationFact,

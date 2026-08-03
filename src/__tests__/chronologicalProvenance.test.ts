@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  classifyOperatorAuthoredObjective,
+  classifyUserRowAuthority,
+  liveObjectiveAuthorityRank,
+  outranksLiveObjective,
+  MAX_LIVE_OBJECTIVE_AUTHORITY_RANK,
+  NO_LIVE_OBJECTIVE,
   renderContinuityPackageProvenance,
   renderChronologicalProvenance,
   renderChronologicalProvenanceCompact,
@@ -334,5 +340,256 @@ describe('chronological provenance', () => {
       'stack=frozen-prefix>tail-epoch#27[row:900..940)>seam@2026-07-11T05:00:00.000Z>raw-tail@row#940(+3)',
     ]);
     expect(stackLines(later)[0]).not.toContain('tail-epoch#1');
+  });
+});
+
+describe('user row authority classification (authority-contract/v1)', () => {
+  it('classifies every peer delivery banner as peer and never objective-eligible', () => {
+    const rows: Array<[string, string]> = [
+      ['chat-room', '[Chat Room "fix-lane"] atlas-roi-liaison: please pick up the review'],
+      ['signal', '[Signal from "peer-agent" (abc123)]: lane B is blocked on you'],
+      ['control-signal', '[Control Signal from "peer-agent" (abc123)]: pause lane B'],
+      ['directed-post', '[Directed post from "peer-agent"]: 📬 [note] "title" (entry 7) — use blackboard_read for details'],
+      ['broadcast', '[Broadcast from "peer-agent"]: standup in room alpha'],
+      ['squad-ask', '[SQUAD ASK from "peer-agent"] can you take lane C?'],
+      ['squad-tap', '[SQUAD TAP from "peer-agent"] the seam moved\n\nYour squad member interrupted you to discuss this.'],
+      ['cross-instance-message', '[Cross-instance message from "peer-agent"]: sync the seam'],
+      ['instance-message', '[Message from "peer-agent" instance]: seam frozen at v2'],
+      ['mention', '[MENTION] @me review packet posted'],
+    ];
+    for (const [banner, row] of rows) {
+      const authority = classifyUserRowAuthority(row);
+      expect(authority.authority, row).toBe('peer');
+      expect(authority.banner, row).toBe(banner);
+      expect(authority.text, row).toBeNull();
+      const objective = classifyOperatorAuthoredObjective(row);
+      expect(objective.text, row).toBeNull();
+      expect(objective.source, row).toBe('peer-message');
+    }
+  });
+
+  it('classifies relay/runtime control dispatches as relay-runtime', () => {
+    const rows: Array<[string, string]> = [
+      ['queued-signals', '[Queued Signals — 2 arrived while busy]\n1. [Signal from "x"]: hi'],
+      ['fixer-mode', '[FIXER MODE BATCH #3] patch the imports'],
+      ['watchdog-rebirth', '[WATCHDOG_REBIRTH] resume from the persisted seed'],
+      ['relay-interrupt-marker', '[relay_interrupt kind=context_fold initiator=relay user_initiated=false]'],
+    ];
+    for (const [banner, row] of rows) {
+      const authority = classifyUserRowAuthority(row);
+      expect(authority.authority, row).toBe('relay-runtime');
+      expect(authority.banner, row).toBe(banner);
+      const objective = classifyOperatorAuthoredObjective(row);
+      expect(objective.text, row).toBeNull();
+      expect(objective.source, row).toBe('relay-runtime');
+    }
+  });
+
+  it('keeps a delegated task objective-eligible only under its honest label', () => {
+    const row = '[Task tsk-42 from "parent-orchestrator"]: audit the worker pool for sync IO';
+    expect(classifyUserRowAuthority(row)).toEqual({
+      authority: 'delegated-task',
+      banner: 'delegated-task',
+      text: 'audit the worker pool for sync IO',
+      strippedEnvelope: false,
+    });
+    expect(classifyOperatorAuthoredObjective(row)).toEqual({
+      text: 'audit the worker pool for sync IO',
+      provenance: 'live',
+      source: 'delegated-task',
+    });
+  });
+
+  it('certifies a USER REDIRECT payload as live operator intent', () => {
+    const row = [
+      '[USER REDIRECT]',
+      'The user interrupted the previous turn. Treat the message below as the active request; do not continue the superseded task unless it is directly relevant.',
+      '[END USER REDIRECT]',
+      '',
+      'stop the migration and audit the fold headers instead',
+    ].join('\n');
+    expect(classifyOperatorAuthoredObjective(row)).toEqual({
+      text: 'stop the migration and audit the fold headers instead',
+      provenance: 'live',
+      source: 'operator-message',
+    });
+  });
+
+  it('fails a bannerless RELAY INTERRUPT payload closed to relay-runtime', () => {
+    const row = [
+      '[RELAY INTERRUPT]',
+      'The relay interrupted the previous turn to deliver the message below. No human rejected anything:',
+      '[END RELAY INTERRUPT]',
+      '',
+      'the sweep finished; consider rerunning the audit',
+    ].join('\n');
+    const authority = classifyUserRowAuthority(row);
+    expect(authority.authority).toBe('relay-runtime');
+    expect(authority.banner).toBe('relay-interrupt');
+    expect(classifyOperatorAuthoredObjective(row)).toEqual({ text: null, provenance: 'unknown', source: 'relay-runtime' });
+  });
+
+  it('classifies a RELAY INTERRUPT wrapping a peer signal as peer', () => {
+    const row = [
+      '[RELAY INTERRUPT]',
+      'Handle the message below, then resume the interrupted task.',
+      '[END RELAY INTERRUPT]',
+      '',
+      '[Signal from "peer-agent" (abc123)]: lane B handed off',
+    ].join('\n');
+    const authority = classifyUserRowAuthority(row);
+    expect(authority.authority).toBe('peer');
+    expect(authority.banner).toBe('signal');
+    expect(classifyOperatorAuthoredObjective(row).source).toBe('peer-message');
+  });
+
+  it('fails closed on truncated RELAY INTERRUPT wrappers without recursing', () => {
+    for (const row of ['[RELAY INTERRUPT]', '[RELAY INTERRUPT] partial payload with no end marker']) {
+      const authority = classifyUserRowAuthority(row);
+      expect(authority.authority, row).toBe('relay-runtime');
+      expect(authority.banner, row).toBe('relay-interrupt');
+      expect(authority.text, row).toBeNull();
+      expect(classifyOperatorAuthoredObjective(row), row).toEqual({
+        text: null,
+        provenance: 'unknown',
+        source: 'relay-runtime',
+      });
+    }
+  });
+
+  it('fails closed on truncated USER REDIRECT wrappers without leaking the wrapper literal', () => {
+    for (const row of ['[USER REDIRECT]', '[USER REDIRECT] make the fixes now']) {
+      const authority = classifyUserRowAuthority(row);
+      expect(authority.authority, row).toBe('relay-runtime');
+      expect(authority.banner, row).toBe('user-redirect');
+      expect(authority.text, row).toBeNull();
+      const objective = classifyOperatorAuthoredObjective(row);
+      expect(objective.text, row).toBeNull();
+      expect(objective.source, row).toBe('relay-runtime');
+    }
+  });
+
+  it('strips a RETRIEVED CONTEXT block as relay envelope around operator text', () => {
+    const row = [
+      '[RETRIEVED CONTEXT]',
+      'Supplemental relay-selected context. Use it only when relevant; do not answer this block directly.',
+      'relay-selected background paragraph',
+      '[END RETRIEVED CONTEXT]',
+      '',
+      'ship the classifier with tests',
+    ].join('\n');
+    expect(classifyOperatorAuthoredObjective(row)).toEqual({
+      text: 'ship the classifier with tests',
+      provenance: 'mixed',
+      source: 'mixed-transport-envelope',
+    });
+  });
+
+  it('keeps plain operator rows live even when they quote a banner mid-text', () => {
+    const row = 'Investigate why [Signal from "x"] rows were promoted to operator authority';
+    expect(classifyUserRowAuthority(row).authority).toBe('operator');
+    expect(classifyOperatorAuthoredObjective(row)).toEqual({ text: row, provenance: 'live', source: 'operator-message' });
+  });
+
+  it('still refuses synthetic continuity artifacts as objectives', () => {
+    const row = '[CONTEXT REBIRTH]\nSeed follows';
+    expect(classifyUserRowAuthority(row).authority).toBe('synthetic');
+    expect(classifyOperatorAuthoredObjective(row)).toEqual({ text: null, provenance: 'unknown', source: 'none' });
+  });
+});
+
+describe('live objective authority precedence (authority-contract/v1)', () => {
+  it('ranks operator above delegated task above rail above nothing', () => {
+    expect(liveObjectiveAuthorityRank('operator-message')).toBe(MAX_LIVE_OBJECTIVE_AUTHORITY_RANK);
+    expect(liveObjectiveAuthorityRank('mixed-transport-envelope')).toBe(MAX_LIVE_OBJECTIVE_AUTHORITY_RANK);
+    expect(liveObjectiveAuthorityRank('delegated-task')).toBeLessThan(liveObjectiveAuthorityRank('operator-message'));
+    expect(liveObjectiveAuthorityRank('active-rail')).toBeLessThan(liveObjectiveAuthorityRank('delegated-task'));
+    for (const source of ['peer-message', 'relay-runtime', 'unknown', 'none'] as const) {
+      expect(liveObjectiveAuthorityRank(source), source).toBe(0);
+    }
+  });
+
+  it('lets a stale operator ask outrank a newer delegated task', () => {
+    // Newest-first walk: the delegated task is seen first and accepted, then
+    // the older operator ask must still displace it.
+    const delegated = classifyOperatorAuthoredObjective('[Task tsk-9 from "parent"]: audit the worker pool');
+    const operator = classifyOperatorAuthoredObjective('rewrite the fold headers');
+
+    let selected = NO_LIVE_OBJECTIVE;
+    for (const candidate of [delegated, operator]) {
+      if (outranksLiveObjective(candidate, selected)) selected = candidate;
+    }
+    expect(selected).toEqual(operator);
+  });
+
+  it('keeps the newest candidate within one authority class', () => {
+    const older = classifyOperatorAuthoredObjective('first ask');
+    const newer = classifyOperatorAuthoredObjective('second ask');
+    // Walking newest-first means `newer` is the incumbent; equal rank must not
+    // let the older row overwrite it.
+    expect(outranksLiveObjective(older, newer)).toBe(false);
+  });
+
+  it('never selects a peer or relay-runtime row at any position', () => {
+    for (const row of [
+      '[Chat Room "lane"] peer: take this over',
+      '[SQUAD TAP from "peer"] look at the seam',
+      '[FIXER MODE BATCH #2] patch imports',
+    ]) {
+      expect(outranksLiveObjective(classifyOperatorAuthoredObjective(row), NO_LIVE_OBJECTIVE), row).toBe(false);
+    }
+  });
+});
+
+describe('objective-source header fails closed (authority-contract/v1)', () => {
+  const baseEnvelope = {
+    artifact: 'tail-epoch',
+    contentClass: 'reconstructed-state' as const,
+    source: {
+      start: { traceId: 'trace-obj', unit: 'event' as const, index: 0, timestamp: '2026-08-02T00:00:00.000Z' },
+      endExclusive: { traceId: 'trace-obj', unit: 'event' as const, index: 4, timestamp: '2026-08-02T01:00:00.000Z' },
+      count: 4,
+    },
+    transformedAt: { traceId: 'trace-obj', unit: 'event' as const, index: 4, timestamp: '2026-08-02T01:00:00.000Z' },
+    authority: 'current-as-of-frontier' as const,
+    supersession: 'none-known' as const,
+    topology: {
+      host: 'dedicated-synthetic-message' as const,
+      previous: 'raw-history' as const,
+      next: 'none' as const,
+      representation: 'canonical' as const,
+      rawTailCount: 0,
+    },
+  };
+
+  it('reports an undeclared source as unknown rather than operator-message', () => {
+    const rendered = renderChronologicalProvenance({
+      ...baseEnvelope,
+      liveObjective: 'finish the erasure subsystem',
+      liveObjectiveProvenance: 'live' as const,
+    });
+    expect(rendered).toContain('objective-source=unknown');
+    expect(rendered).not.toContain('objective-source=operator-message');
+  });
+
+  it('preserves an explicitly declared non-operator source', () => {
+    for (const source of ['delegated-task', 'active-rail'] as const) {
+      const rendered = renderChronologicalProvenance({
+        ...baseEnvelope,
+        liveObjective: 'finish the erasure subsystem',
+        liveObjectiveProvenance: 'live' as const,
+        liveObjectiveSource: source,
+      });
+      expect(rendered, source).toContain(`objective-source=${source}`);
+      expect(rendered, source).not.toContain('objective-source=operator-message');
+    }
+  });
+
+  it('still reports none when there is no objective at all', () => {
+    const rendered = renderChronologicalProvenance({
+      ...baseEnvelope,
+      liveObjectiveProvenance: 'unknown' as const,
+    });
+    expect(rendered).toContain('objective-source=none');
   });
 });

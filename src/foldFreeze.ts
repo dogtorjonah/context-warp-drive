@@ -568,6 +568,15 @@ export const DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS = DEFAULT_RAW_REBIRTH_SEED_PA
 export const DEFAULT_RAW_HARD_EPOCH_CLOSET_CHARS =
   DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset;
 
+export interface AuthoritativeLiveRequest {
+  /** Exact text of the genuinely in-flight (open) operator request. */
+  readonly text: string;
+  /** Source identity of the live request when the host knows it. */
+  readonly sourceEventId?: string;
+  /** Authoritative source time of the live request when known. */
+  readonly sourceAt?: string;
+}
+
 export interface RawHardEpochSeedOptions {
   /**
    * Bound the raw trace seed by characters. This is a package budget, not token
@@ -589,6 +598,15 @@ export interface RawHardEpochSeedOptions {
    * still promotes that exact turn into READ FIRST as the active request.
    */
   readonly includeTrailingUserTurn?: boolean;
+  /**
+   * Authoritative live (in-flight) request supplied by the host/session when the
+   * traced trailing user turn fell outside the retained tail (e.g. a long
+   * mid-turn tool loop). This is a BYPASS: it only drives triggeringUserMessage /
+   * the provider-visible live-turn append when the traced trailing user turn is
+   * genuinely absent. Never inferred from a historical user after a completed
+   * turn. Backward-compatible (undefined => zero behavior change).
+   */
+  readonly authoritativeLiveRequest?: AuthoritativeLiveRequest;
   /** Trace-derived episodic recall text (portable-mode memory section). */
   readonly episodicCrossRef?: string;
   /** Lineage glyph log — chronological verdict/hazard register trail (portable-mode memory section). */
@@ -628,17 +646,40 @@ export function buildRawHardEpochSeed(
   };
   const includeTrailingUserTurn = options.includeTrailingUserTurn === true;
   const traceEnd = findRawRebirthSeedTraceEnd(messages, includeTrailingUserTurn);
-  const triggeringUserMessage = includeTrailingUserTurn
+  // Prefer the traced trailing user turn (the genuine in-trace request). When a
+  // long mid-turn tool loop pushed the originating user row outside the retained
+  // tail (trace truncation), the host-supplied AUTHORITATIVE live request is the
+  // only source that can still recover the in-flight request. This must drive
+  // triggeringUserMessage + userMessageTriggered so the v6 model derives
+  // `[EXACT ACTIVE REQUEST]` — not just a provider-visible body append. It is a
+  // BYPASS that only applies when the traced trailing user turn is genuinely
+  // absent, and never infers 'active' from a historical user after a completed
+  // turn (the host owns that authority gate).
+  const tracedTriggeringUserMessage = includeTrailingUserTurn
     ? undefined
     : extractTrailingUserTurnText(messages, traceEnd) || undefined;
+  const authority = options.authoritativeLiveRequest;
+  const normalizedAuthorityText = authority?.text?.trim() || undefined;
+  const triggeringUserMessage = includeTrailingUserTurn
+    ? undefined
+    : (tracedTriggeringUserMessage || normalizedAuthorityText);
+  const authorityWasUsed = Boolean(!tracedTriggeringUserMessage && normalizedAuthorityText);
+  const userMessageTriggered = Boolean(triggeringUserMessage);
   return buildRawRebirthSeedFromMessages(messages, {
     predecessorName: options.predecessorName ?? 'predecessor',
+    canonicalV6Fallback: true,
     packageBudget: maxChars,
     sectionMaxChars: compactSectionMaxChars,
     rawTraceCoordinateClosetChars: closetBudget,
     includeTrailingUserTurn,
     triggeringUserMessage,
-    userMessageTriggered: Boolean(triggeringUserMessage),
+    ...(authorityWasUsed ? {
+      triggeringUserMessageSource: {
+        sourceId: authority?.sourceEventId,
+        sourceTimestamp: authority?.sourceAt,
+      },
+    } : {}),
+    userMessageTriggered,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
     capturedAt: options.capturedAt,
@@ -663,9 +704,21 @@ export function buildRawHardEpochSeed(
 export function buildHardEpochSeedView(
   messages: readonly FoldMessage[],
   seedPrompt: string,
+  authoritativeLiveRequest?: AuthoritativeLiveRequest,
 ): FoldMessage[] {
   const traceEnd = findRawHardEpochTraceEnd(messages);
-  const liveTurnText = extractTrailingUserTurnText(messages, traceEnd);
+  // Prefer the traced trailing user turn; when a long mid-turn tool loop pushed
+  // the originating user row outside the retained tail, use the host-supplied
+  // authoritative live request so the in-flight question still reaches the
+  // provider-visible body (dedup guard below prevents a double append).
+  //
+  // NOTE: extractTrailingUserTurnText returns '' when absent (not nullish), so a
+  // `??` fallback would preserve the empty string and never reach the authority.
+  // Use a trimmed/non-empty traced value with `||`, and normalize the authority
+  // text the same way — matching buildRawHardEpochSeed's `|| undefined` handling.
+  const tracedLiveTurnText = extractTrailingUserTurnText(messages, traceEnd);
+  const normalizedAuthorityText = authoritativeLiveRequest?.text?.trim() || undefined;
+  const liveTurnText = (tracedLiveTurnText && tracedLiveTurnText.trim()) || normalizedAuthorityText || undefined;
   const seedBody = ensureHardEpochContinuityDirective(seedPrompt);
   const readFirstStart = seedBody.indexOf('── Last User + AI Messages (READ FIRST) ──');
   const readFirstEnd = readFirstStart >= 0
@@ -674,8 +727,16 @@ export function buildHardEpochSeedView(
   const readFirstBlock = readFirstStart >= 0
     ? seedBody.slice(readFirstStart, readFirstEnd >= 0 ? readFirstEnd : undefined)
     : '';
-  const liveRequestAlreadyBundled = Boolean(liveTurnText)
-    && (readFirstBlock.includes(liveTurnText)
+  const exactRequestStart = seedBody.indexOf('[EXACT ACTIVE REQUEST ·');
+  const exactRequestEnd = exactRequestStart >= 0
+    ? seedBody.indexOf('[/EXACT ACTIVE REQUEST]', exactRequestStart)
+    : -1;
+  const exactRequestBlock = exactRequestStart >= 0 && exactRequestEnd >= 0
+    ? seedBody.slice(exactRequestStart, exactRequestEnd + '[/EXACT ACTIVE REQUEST]'.length)
+    : '';
+  const liveRequestAlreadyBundled = typeof liveTurnText === 'string'
+    && (exactRequestBlock.includes(liveTurnText)
+      || readFirstBlock.includes(liveTurnText)
       || (seedBody.includes(LIVE_CONTINUITY_STATE_HEADER) && seedBody.includes('active request (')));
   const content = liveTurnText && !liveRequestAlreadyBundled
     ? `${seedBody}\n\n${HARD_EPOCH_LIVE_TURN_HEADER}\n${liveTurnText}`

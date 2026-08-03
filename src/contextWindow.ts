@@ -15,8 +15,8 @@
  * limit" (instance wEO2Ch8H, 2026-06-12). Corrected to the spec's guaranteed
  * 512K floor. Exceptions set above 200k are deliberate, not advertised-max
  * traps: claude-fable-5 at 1M is evidence-backed (≥351k live context was billed
- * on it, disproving the 200k floor); the modern Claude 4.x API family at 1M
- * (Opus 4-6/4-7/4-8 and Sonnet 4-6) is provider-documented and
+ * on it, disproving the 200k floor); the modern Claude API family at 1M
+ * (Opus 4-6/4-7/4-8/5 and Sonnet 4-6/5) is provider-documented and
  * operator-confirmed, so the 200k rollout entries were the real bug. Do NOT
  * revert these to 200k as a MiniMax-style correction; the 1M is intended.
  */
@@ -33,6 +33,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'claude-opus-4-8': 1_000_000, // Opus 4.x ships a 1M window — operator-directed (Jonah, 2026-06-13); mirrors the fable-5 exception (see invariant doc above)
   'claude-opus-4-7': 1_000_000, // same Opus 4.x family window
   'claude-opus-4-6': 1_000_000, // same Opus 4.x family window
+  'claude-opus-5': 1_000_000, // Opus 5: provider-documented as "both the default and the maximum; there is no smaller context variant" — the 1M IS the guaranteed floor here, not an advertised-max trap. Without this row claude-api fell through to the 200k fallback and tripped AUTO_COMPACT ~5x early.
   'claude-3-5-sonnet-20241022': 200_000,
   'claude-3-5-sonnet': 200_000,
   'claude-3-5-haiku-20241022': 200_000,
@@ -91,6 +92,8 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'gemini-3-pro-preview': 1_048_576,
   'gemini-3-flash-preview': 1_048_576,
   'gemini-3-pro-image-preview': 65_536,
+  'gemini-3.6-flash': 1_048_576,
+  'gemini-3.5-flash-lite': 1_048_576,
   'gemini-2.5-pro': 1_048_576,
   'gemini-2.5-pro-preview-05-06': 1_048_576,
   'gemini-2.5-flash': 1_048_576,

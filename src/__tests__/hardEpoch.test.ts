@@ -61,6 +61,52 @@ describe('buildHardEpochSeedView — provider-safe single-message merge', () => 
     expect(view[0].role).toBe('user');
   });
 
+  it('uses host authority exactly once when the retained trace has no user row', () => {
+    const authorityText = 'LIVE AUTHORITY 771 finish the interrupted migration';
+    const view = buildHardEpochSeedView(
+      [
+        { role: 'assistant', content: 'tool loop result one' },
+        { role: 'assistant', content: 'tool loop result two' },
+      ],
+      SEED,
+      {
+        text: authorityText,
+        sourceEventId: 'turn-live-authority-771',
+        sourceAt: '2026-08-02T21:27:00.000Z',
+      },
+    );
+    expect(view).toHaveLength(1);
+    const content = view[0].content as string;
+    expect(content).toContain(HARD_EPOCH_LIVE_TURN_HEADER);
+    expect(content.match(/LIVE AUTHORITY 771 finish the interrupted migration/gu)).toHaveLength(1);
+  });
+
+  it('prefers the genuine traced user row over a host fallback', () => {
+    const content = buildHardEpochSeedView(bigHistory(), SEED, {
+      text: 'STALE HOST FALLBACK MUST NOT WIN',
+    })[0].content as string;
+    expect(content).toContain('LIVE CURRENT QUESTION');
+    expect(content).not.toContain('STALE HOST FALLBACK MUST NOT WIN');
+  });
+
+  it('does not append a second copy when canonical v6 already bundles the exact request', () => {
+    const authorityText = 'LIVE AUTHORITY 772 preserve this request once';
+    const seedWithV6Request = [
+      SEED,
+      '[EXACT ACTIVE REQUEST · 45 chars · source=turn-live-authority-772 · source-time=unknown · status=known]',
+      authorityText,
+      '[/EXACT ACTIVE REQUEST]',
+    ].join('\n');
+    const content = buildHardEpochSeedView(
+      [{ role: 'assistant', content: 'tool loop result' }],
+      seedWithV6Request,
+      { text: authorityText },
+    )[0].content as string;
+
+    expect(content.match(/LIVE AUTHORITY 772 preserve this request once/gu)).toHaveLength(1);
+    expect(content).not.toContain(HARD_EPOCH_LIVE_TURN_HEADER);
+  });
+
   it('prepends the continuity directive when the host seed omits it', () => {
     const content = buildHardEpochSeedView(bigHistory(), SEED)[0].content as string;
     expect(content.startsWith(`${HARD_EPOCH_CONTINUITY_DIRECTIVE}\n\n${SEED}`)).toBe(true);
@@ -155,10 +201,25 @@ describe('FoldSession hard-epoch consume', () => {
     const content = out.messages[0].content as string;
     expect(content).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
     expect(content).toContain('old question one');
-    expect(content.match(/── Continuity Boundary \(RECOVERY COORDINATES\) ──/gu)).toHaveLength(1);
-    expect(content.match(/LIVE CURRENT QUESTION/gu)).toHaveLength(1);
-    expect(content).toContain('captured=1970-01-01T00:00:01.000Z · frontier=predecessor@message#4 (1 exact row after frontier)');
+    // v6 raw hard-epoch: the v4 `── Continuity Boundary (RECOVERY COORDINATES) ──`
+    // header retired; assert the canonical v6 boundary frame marker exactly once.
+    expect(content.match(/\[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=/gu)).toHaveLength(1);
+    // The live question is carried only by the canonical exact-request block.
+    // The provider merge must recognize it and avoid appending a second trailer.
+    expect(content).toContain('LIVE CURRENT QUESTION');
+    expect(content.match(/\[EXACT ACTIVE REQUEST ·/gu)).toHaveLength(1);
     expect(content).not.toContain(HARD_EPOCH_LIVE_TURN_HEADER);
+    // The v4 `captured=...·frontier=...` provenance line migrated to the v6
+    // Recovery Index's source/frontier semantics; assert that semantic actually
+    // rendered rather than omitting it. For this 5-message fixture the raw tail
+    // frontier is event#4 (each of the 5 folded rows is a canonical event and the
+    // live turn is the trailing event), with unavailable recoverability because
+    // the immutable capture/backing stores are absent here.
+    expect(content).toContain('frontier=event#4');
+    // The retired v4 `── Continuity Boundary (RECOVERY COORDINATES) ──` header is
+    // gone; the v6 raw seed renders the live turn behind the (still-current)
+    // HARD_EPOCH_LIVE_TURN_HEADER trailer, which is asserted above.
+    expect(content).not.toContain('── Continuity Boundary (RECOVERY COORDINATES) ──');
   });
 
   it('freezes categorized tap_star waypoints into a local raw hard-epoch seed', () => {
@@ -183,11 +244,17 @@ describe('FoldSession hard-epoch consume', () => {
     const out = ceilingSession().prepare(messages, { measuredInputTokens: 80_000 });
     expect(out.stats.epochReason).toBe('hard-epoch');
     const content = out.messages[0].content as string;
-    expect(content).toContain('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
+    // v6 raw hard-epoch: the retired v4 `── Starred Moments ... ──` header is
+    // gone; the starred waypoint content now lives in the v6 Cognitive Artifacts
+    // frame. Assert the frame marker preserving the exact starred decision and
+    // source-time/source-id provenance (assertions below), and that the retired
+    // header is absent.
+    expect(content).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts chars=');
     expect(content).toContain('⭐ [decision] Freeze intentional waypoints into raw hard epochs.');
     expect(content).toContain(
       'source-time=2026-07-18T20:29:00.000Z · source-id=call_hard_epoch_star',
     );
+    expect(content).not.toContain('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
     expect(content).toContain('LIVE STARRED QUESTION');
   });
 

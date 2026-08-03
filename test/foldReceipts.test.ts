@@ -104,6 +104,31 @@ describe('compileFoldReceipts — receipt classes', () => {
     expect(totalitySum(c.counts)).toBe(c.counts.totalToolCalls);
   });
 
+  it('preserves the pipe-joined receipt identity for multi-file apply_patch calls', () => {
+    const patch = [
+      '*** Begin Patch',
+      '*** Update File: /home/jonah/voxxo-swarm/relay/src/a.ts',
+      '@@',
+      '-old',
+      '+new',
+      '*** Add File: relay/src/b.ts',
+      '+created',
+      '*** End Patch',
+    ].join('\n');
+    const compiled = compileFoldReceipts([
+      toolUse('patch-1', 'apply_patch', { input: patch }, T1),
+      toolResult('patch-1', 'Done!', { tsMs: T2 }),
+    ]);
+
+    expect(compiled.receipts[0]).toMatchObject({
+      kind: 'edit',
+      targetIdentity: 'relay/src/a.ts|relay/src/b.ts',
+    });
+    expect(renderFoldReceipts(compiled).join('\n')).toContain(
+      'kind=edit outcome=applied reconciliation-required=false target="relay/src/a.ts|relay/src/b.ts"',
+    );
+  });
+
   it('does not let an earlier applied edit supersede a later unresolved edit', () => {
     const path = '/home/jonah/repo/src/a.ts';
     const laterPending = compileFoldReceipts([
