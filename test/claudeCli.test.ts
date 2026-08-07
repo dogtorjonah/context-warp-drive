@@ -19,7 +19,7 @@ import {
 import { resolveContextBudget } from '../src/contextBudget.ts';
 import { DEFAULT_CODEX_FOLD_BAND_FRACTION } from '../src/providers/codexCli.ts';
 import { DEFAULT_BIRTH_FOLD_MAX_CHARS, type BirthFoldSourceRow } from '../src/foldBirthHydration.ts';
-import { HARD_EPOCH_LIVE_TURN_HEADER, HARD_EPOCH_CONTINUITY_DIRECTIVE } from '../src/foldFreeze.ts';
+import { HARD_EPOCH_CONTINUITY_DIRECTIVE } from '../src/foldFreeze.ts';
 import type { FoldMessage } from '../src/rollingFold.ts';
 
 // ── Determinism harness ──
@@ -282,7 +282,8 @@ describe('buildClaudeCliHardEpochChain — pressure-ceiling live-turn preservati
     // The default seed now uses buildRawHardEpochSeed (rich rebirth package),
     // not the old static DEFAULT_CLAUDE_CLI_HARD_EPOCH_SEED_PROMPT.
     expect(seed).toContain('[CONTEXT REBIRTH]');
-    expect(seed).toContain(HARD_EPOCH_LIVE_TURN_HEADER);
+    expect(seed).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(seed).toContain('[EXACT ACTIVE REQUEST');
     expect(seed).toContain('LIVE-MARKER-9931'); // live turn never silently trimmed
   });
 

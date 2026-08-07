@@ -13,10 +13,15 @@ import {
   computeProgress,
   createDraft,
   createTaskRailStep,
+  dedupeModelTargets,
   isDraftEditable,
+  isSameModelTarget,
   lockRail,
   parseStepsFileText,
+  planStepModelTransition,
   railToTemplate,
+  resolveReviewWindow,
+  resolveStepModelRoute,
   restoreTaskRail,
   serializeTaskRail,
   shoot,
@@ -29,6 +34,7 @@ import {
 import type {
   TaskRailMode,
   TaskRailRoleRegistration,
+  TaskRailStep,
 } from '../src/taskRail.ts';
 
 describe('portable task rail', () => {
@@ -47,7 +53,11 @@ describe('portable task rail', () => {
       ],
     });
 
-    const reservation = sprint(rail, { sprintCount: 2, note: 'local CLI reservation' }, { now: '2026-06-17T22:01:00.000Z' });
+    const reservation = sprint(rail, { sprintCount: 2, note: 'local CLI reservation' }, {
+      now: '2026-06-17T22:01:00.000Z',
+      actorId: 'local-agent',
+      actorName: 'Local Agent',
+    });
 
     expect(reservation.steps?.map((step) => [step.id, step.status])).toEqual([
       ['s1', 'active'],
@@ -56,6 +66,10 @@ describe('portable task rail', () => {
     expect(reservation.steps?.map((step) => [step.startedAt, step.updatedAt])).toEqual([
       ['2026-06-17T22:01:00.000Z', '2026-06-17T22:01:00.000Z'],
       ['2026-06-17T22:01:00.000Z', '2026-06-17T22:01:00.000Z'],
+    ]);
+    expect(reservation.steps?.map((step) => [step.reservedById, step.reservedByName, step.reservedAt])).toEqual([
+      ['local-agent', 'Local Agent', '2026-06-17T22:01:00.000Z'],
+      ['local-agent', 'Local Agent', '2026-06-17T22:01:00.000Z'],
     ]);
     expect(rail.history.at(-1)?.ts).toBe('2026-06-17T22:01:00.000Z');
 
@@ -104,7 +118,7 @@ describe('portable task rail', () => {
     expect(shoot(rail).step?.id).toBe('ui-step');
   });
 
-  it('preserves blocked-step semantics for custom wrappers', () => {
+  it('keeps ordinary blockers local while unrelated pending work advances', () => {
     const rail = startTaskRail({
       locked: true,
       steps: [
@@ -113,8 +127,22 @@ describe('portable task rail', () => {
       ],
     });
 
+    expect(sprint(rail).steps?.map((step) => step.id)).toEqual(['later']);
+    expect(shoot(rail)).toMatchObject({ step: { id: 'later', status: 'active' } });
+    expect(rail.steps[0].status).toBe('blocked');
+  });
+
+  it('keeps needs_review as a rail-wide gate', () => {
+    const rail = startTaskRail({
+      locked: true,
+      steps: [
+        { id: 'review', instruction: 'Wait for review.', status: 'needs_review' },
+        { id: 'later', instruction: 'Do not advance yet.' },
+      ],
+    });
+
     expect(() => sprint(rail)).toThrow(BlockedSprintError);
-    expect(shoot(rail)).toMatchObject({ paused: true, step: { id: 'blocked' } });
+    expect(shoot(rail)).toMatchObject({ paused: true, step: { id: 'review' } });
   });
 
   it('supports draft create and clean merge semantics', () => {
@@ -256,7 +284,7 @@ describe('portable task rail', () => {
     });
   });
 
-  it('ACKs a sprint batch and stops at the first blocking result', () => {
+  it('ACKs an entire sprint batch while retaining ordinary blockers locally', () => {
     const rail = startTaskRail({
       id: 'rail-batch-ack',
       locked: true,
@@ -279,9 +307,9 @@ describe('portable task rail', () => {
       ],
     }, { now: '2026-07-22T05:12:00.000Z' });
 
-    expect(result.ackedSteps?.map((step) => step.id)).toEqual(['s1', 's2', 's3']);
+    expect(result.ackedSteps?.map((step) => step.id)).toEqual(['s1', 's2', 's3', 's4']);
     expect(result).toMatchObject({ paused: true, step: { id: 's3', status: 'blocked' } });
-    expect(rail.steps.map((step) => step.status)).toEqual(['done', 'done', 'blocked', 'in_progress']);
+    expect(rail.steps.map((step) => step.status)).toEqual(['done', 'done', 'blocked', 'done']);
   });
 
   it('captures reusable plan-only templates without leaking execution state', () => {
@@ -297,6 +325,11 @@ describe('portable task rail', () => {
         acceptanceCriteria: ['It passes'],
         notes: 'Keep this note',
         scope: 'src/taskRail.ts',
+        modelPreference: {
+          target: { engine: 'claude', model: 'opus-4.8' },
+          fallbacks: [{ engine: 'codex', model: 'codex-5.6-sol' }],
+        },
+        reviewCheckpoint: { scope: 'since_last_review', mode: 'review_and_fix' },
         status: 'done',
       }],
     });
@@ -318,6 +351,11 @@ describe('portable task rail', () => {
       acceptanceCriteria: ['It passes'],
       notes: 'Keep this note',
       scope: 'src/taskRail.ts',
+      modelPreference: {
+        target: { engine: 'claude', model: 'opus-4.8' },
+        fallbacks: [{ engine: 'codex', model: 'codex-5.6-sol' }],
+      },
+      reviewCheckpoint: { scope: 'since_last_review', mode: 'review_and_fix' },
     });
     expect(templateIndexEntry(template)).toMatchObject({ id: 'tpl-1', stepCount: 1 });
     expect(templateToStepSeeds(template)).toEqual([{
@@ -326,10 +364,98 @@ describe('portable task rail', () => {
       acceptance_criteria: ['It passes'],
       notes: 'Keep this note',
       scope: 'src/taskRail.ts',
+      model_preference: {
+        target: { engine: 'claude', model: 'opus-4.8' },
+        fallbacks: [{ engine: 'codex', model: 'codex-5.6-sol' }],
+      },
+      review_checkpoint: { scope: 'since_last_review', mode: 'review_and_fix' },
     }]);
 
     template.steps[0].acceptanceCriteria.push('template-only mutation');
+    template.steps[0].modelPreference?.fallbacks?.push({ engine: 'glm', model: 'glm-5.2' });
     expect(rail.steps[0].acceptanceCriteria).toEqual(['It passes']);
+    expect(rail.steps[0].modelPreference?.fallbacks).toEqual([
+      { engine: 'codex', model: 'codex-5.6-sol' },
+    ]);
+  });
+
+  it('resolves operator model overrides ahead of AI preferences and deduplicates fallbacks', () => {
+    const step = createTaskRailStep({
+      id: 'routed',
+      instruction: 'Run on the selected model.',
+      modelPreference: {
+        target: { engine: 'glm', model: 'glm-5.2' },
+      },
+    });
+    step.operatorModelOverride = {
+      target: { engine: 'claude', model: 'opus-4.8' },
+      fallbacks: [
+        { engine: 'claude', model: 'opus-4.8' },
+        { engine: 'codex', model: 'codex-5.6-sol' },
+      ],
+      scope: 'step',
+      sourceTimestamp: '2026-07-22T22:20:00.000Z',
+      setById: 'operator-1',
+      provenanceId: 'override:1',
+    };
+
+    expect(resolveStepModelRoute(step)).toEqual({
+      source: 'operator',
+      candidates: [
+        { engine: 'claude', model: 'opus-4.8' },
+        { engine: 'codex', model: 'codex-5.6-sol' },
+      ],
+      operatorOverrideProvenanceId: 'override:1',
+    });
+    expect(planStepModelTransition(step, { engine: 'claude', model: 'opus-4.8' })).toBeUndefined();
+    expect(dedupeModelTargets([
+      { engine: 'a', model: 'one' },
+      { engine: 'a', model: 'one' },
+      { engine: 'b', model: 'two' },
+    ])).toEqual([
+      { engine: 'a', model: 'one' },
+      { engine: 'b', model: 'two' },
+    ]);
+    expect(isSameModelTarget(
+      { engine: 'codex', model: 'codex-5.6-sol', thinkingLevel: 'medium' },
+      { engine: 'codex', model: 'codex-5.6-sol', thinkingLevel: 'high' },
+    )).toBe(false);
+  });
+
+  it('captures a stable review window since the prior checkpoint', () => {
+    const now = '2026-07-22T22:20:00.000Z';
+    const makeStep = (id: string, status: TaskRailStep['status'], checkpoint = false): TaskRailStep => ({
+      id,
+      title: id,
+      instruction: `Execute ${id}`,
+      acceptanceCriteria: [],
+      status,
+      createdAt: now,
+      updatedAt: now,
+      attempts: 0,
+      ...(checkpoint
+        ? { reviewCheckpoint: { scope: 'since_last_review' as const, mode: 'review_and_fix' as const } }
+        : {}),
+    });
+    const steps = [
+      makeStep('old', 'done'),
+      makeStep('checkpoint-1', 'done', true),
+      makeStep('included-1', 'done'),
+      makeStep('skipped', 'skipped'),
+      makeStep('included-2', 'done'),
+      makeStep('checkpoint-2', 'active', true),
+    ];
+
+    expect(resolveReviewWindow(steps, {
+      checkpointStepId: 'checkpoint-2',
+      capturedAt: now,
+      provenanceId: 'review-window:2',
+    })).toEqual({
+      stepIds: ['included-1', 'included-2'],
+      previousCheckpointStepId: 'checkpoint-1',
+      capturedAt: now,
+      provenanceId: 'review-window:2',
+    });
   });
 
   it('parses JSON arrays, JSONL, and plain-line bulk step sources', () => {

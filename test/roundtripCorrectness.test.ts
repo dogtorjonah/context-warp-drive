@@ -173,14 +173,17 @@ describe('roundtrip correctness — identifiers survive fold → hard-epoch → 
     expect(seedBody).toContain(CHANGELOG_ID);          // changelog reference
     expect(seedBody).toContain(INSTANCE_UUID);          // instance id
 
-    // The Coordinate Closet section must be present
-    expect(seedBody).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
+    // Canonical rebirth-v6 places conserved literals inline in structured
+    // frames instead of duplicating them in the retired flat closet.
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=recoveryIndex chars=');
+    expect(seedBody).not.toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
 
     // The active request must survive (merged into the seed body)
     expect(seedBody).toContain('Continue with the next batch of work');
   });
 
-  test('after hard epoch, path-touch recall pages back the buried content from the raw trace', () => {
+  test('after hard epoch, path-touch recall pages back identifier-rich action context', () => {
     let now = Date.parse('2026-06-16T00:00:00.000Z');
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
@@ -223,22 +226,23 @@ describe('roundtrip correctness — identifiers survive fold → hard-epoch → 
       DEFAULT_FOLD_RECALL_CONFIG,
     );
 
-    // ── The recall card MUST contain the buried payload from the folded turn ──
+    // Artifact-mode recall restores the typed action context rather than the
+    // complete provider payload bytes.
     expect(recallResult.cards).toBeGreaterThan(0);
     expect(recallResult.text).not.toBeNull();
-    expect(recallResult.text!).toContain(BURIED_PAYLOAD);
-
-    // The recall card also preserves the identifier-rich context
+    expect(recallResult.text!).toContain(TARGET_PATH_CANON);
+    expect(recallResult.text!).toContain(GIT_SHA);
+    expect(recallResult.text!).toContain(RAIL_ID);
     expect(recallResult.text!).toContain(CHANGELOG_ID);
   });
 
-  test('Coordinate Closet conserves identifiers even when the fold heavily compresses', () => {
+  test('rebirth-v6 keeps canonical boundary and recovery frames under a tight seed budget', () => {
     let now = Date.parse('2026-06-16T00:00:00.000Z');
     const session = new FoldSession({
       foldConfig: {
         ...ALWAYS_ON_FOLD_CONFIG,
         activeWindowTurns: 1,
-        // Aggressive compression settings to stress the Closet
+        // Aggressive compression settings to stress package prioritization.
         assistantTextBudget: { fullRetentionChars: 500, essenceRetentionChars: 0 },
       },
       freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 },
@@ -266,11 +270,12 @@ describe('roundtrip correctness — identifiers survive fold → hard-epoch → 
     // Under tight budgets, the seed is small
     expect(seedBody.length).toBeLessThan(12_000);
 
-    // But the Coordinate Closet MUST still conserve the high-value identifiers
-    // The closet is allocated its own budget independent of the overall seed clamp
-    expect(seedBody).toContain(TARGET_PATH);
-    expect(seedBody).toContain(GIT_SHA);
-    expect(seedBody).toContain(RAIL_ID);
+    // Required v6 frames and the exact active request outrank optional deep
+    // history when the package is clamped this tightly.
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=recoveryIndex chars=');
+    expect(seedBody).toContain('Continue with the next batch of work');
+    expect(seedBody).not.toContain('── Raw Trace Coordinate Closet');
   });
 
   test('determinism: identical traces produce byte-identical seeds across runs', () => {

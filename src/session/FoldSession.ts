@@ -51,11 +51,10 @@ import {
 } from '../rollingFold.ts';
 import { withArtifactModeConfig } from '../foldReceipts.ts';
 import {
-  containsCognitiveBlock,
   extractCognitiveArtifacts,
-  flattenFoldMessageText,
   renderCognitiveBlock,
   mergeBlockIntoViewTail,
+  viewCarriesSyntheticCognitiveBlock,
 } from '../cognitiveArtifacts.ts';
 import {
   appendDedicatedChronologicalMessage,
@@ -1121,8 +1120,11 @@ export class FoldSession {
       const preparedMessages = stepResult?.messages ?? result.messages;
       // Artifact mode renders the [cognitive] block into the fold body itself,
       // so merging a second one repeats the same waypoints for one fold window.
+      // Synthetic-scoped: a raw turn that merely quotes the header (an agent
+      // reading this module, a diff, a fold preview) must not suppress a real
+      // block — that would lose the waypoints permanently.
       const cognitiveBlock = bookkeepingResult.turnsFolded > 0
-        && !preparedMessages.some((message) => containsCognitiveBlock(flattenFoldMessageText(message.content)))
+        && !viewCarriesSyntheticCognitiveBlock(preparedMessages)
         ? renderCognitiveBlock(extractCognitiveArtifacts(messages))
         : '';
       // Merge (never append): a trailing assistant enrichment message breaks
@@ -1414,9 +1416,10 @@ export class FoldSession {
       // Header-keyed, not block-keyed: artifact mode already rendered a block
       // into the fold body, and its bytes differ from this one (different
       // artifact filter and render options), so an exact-text check would miss
-      // it and seal the same waypoints twice.
+      // it and seal the same waypoints twice. Restricted to SYNTHETIC rows —
+      // the surviving raw tail may quote the header verbatim.
       const enrichedTail = cognitiveBlock
-        && !sealedTail.some((message) => containsCognitiveBlock(flattenFoldMessageText(message.content)))
+        && !viewCarriesSyntheticCognitiveBlock(sealedTail)
         ? mergeBlockIntoViewTail(sealedTail, cognitiveBlock)
         : sealedTail;
       const sourceTime = foldMessageTimestampBounds(tail);
@@ -1567,9 +1570,11 @@ export class FoldSession {
     // Merge (never append) — same terminal-role invariant as the tail-epoch
     // path: the sealed view may be the entire request body. Header-keyed skip:
     // artifact mode already rendered a block into the fold body, and its bytes
-    // differ from this one, so an exact-text check would seal it twice.
+    // differ from this one, so an exact-text check would seal it twice. Scoped
+    // to SYNTHETIC rows — this view carries the whole unfolded active window,
+    // where a raw turn quoting the header would otherwise cancel the block.
     const sealedView = recomputeCognitiveBlock
-      && !sealedBaseView.some((message) => containsCognitiveBlock(flattenFoldMessageText(message.content)))
+      && !viewCarriesSyntheticCognitiveBlock(sealedBaseView)
       ? mergeBlockIntoViewTail(sealedBaseView, recomputeCognitiveBlock)
       : sealedBaseView;
     commitFoldFreeze(

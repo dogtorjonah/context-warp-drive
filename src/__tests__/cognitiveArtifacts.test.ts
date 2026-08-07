@@ -3,6 +3,9 @@ import {
   extractCognitiveArtifacts,
   renderCognitiveBlock,
   enrichFoldedBandBody,
+  COGNITIVE_BLOCK_HEADER,
+  containsSyntheticCognitiveBlock,
+  viewCarriesSyntheticCognitiveBlock,
 } from '../cognitiveArtifacts.ts';
 import type { CognitiveArtifact } from '../cognitiveArtifacts.ts';
 import type { FoldMessage } from '../rollingFold.ts';
@@ -385,6 +388,26 @@ describe('cognitiveArtifacts', () => {
       }))).toBe(
         '↞ msg#7 · blocked · authority=historical_observation · completion=insufficient_alone · source-time=unknown · source-id=fold-window:message:7 · source-identity=synthetic-position',
       );
+    });
+  });
+
+  describe('synthetic cognitive block residency', () => {
+    const quotedHeader = `Agent inspected this literal: ${COGNITIVE_BLOCK_HEADER}`;
+    const syntheticResident = `[Conversation Context — folded]\n\n${COGNITIVE_BLOCK_HEADER}`;
+
+    it('does not treat an ordinary row quoting the header as a resident block', () => {
+      expect(containsSyntheticCognitiveBlock(quotedHeader)).toBe(false);
+      expect(viewCarriesSyntheticCognitiveBlock([
+        { role: 'assistant', content: quotedHeader },
+      ])).toBe(false);
+    });
+
+    it('recognizes the header only when it is carried by a fold-authored synthetic row', () => {
+      expect(containsSyntheticCognitiveBlock(syntheticResident)).toBe(true);
+      expect(viewCarriesSyntheticCognitiveBlock([
+        { role: 'assistant', content: quotedHeader },
+        { role: 'assistant', content: syntheticResident },
+      ])).toBe(true);
     });
   });
 

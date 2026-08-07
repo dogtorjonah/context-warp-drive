@@ -42,7 +42,7 @@ import {
   CARD_GLYPHS,
   type AssistantRegister,
 } from './glyphs.ts';
-import { foldMessageSourceIdentities, type FoldMessage } from './rollingFold.ts';
+import { foldMessageSourceIdentities, isSyntheticContextText, type FoldMessage } from './rollingFold.ts';
 import { renderEmbeddedContinuityArtifactProvenance } from './chronologicalProvenance.ts';
 
 // ══════════════════════════════════════════════════════════════════════
@@ -740,6 +740,35 @@ export const COGNITIVE_BLOCK_HEADER =
  */
 export function containsCognitiveBlock(text: string): boolean {
   return text.includes(COGNITIVE_BLOCK_HEADER);
+}
+
+/**
+ * True only when a fold-authored synthetic row already carries a fully
+ * rendered [cognitive] block.
+ *
+ * Any dedupe whose haystack can include ordinary conversation rows must use
+ * this, never the bare header test. The header is plain text, so an agent that
+ * reads cognitiveArtifacts.ts, diffs a band, or previews a fold puts the exact
+ * literal into an assistant message or tool result. Keyed on the bare header,
+ * one such row suppresses the cognitive block for every LATER fold generation —
+ * a permanent continuity loss strictly worse than the duplicate it prevents.
+ * Synthetic rows are the only ones the fold engine itself authored, so they are
+ * the only safe evidence that this generation's block is already resident.
+ */
+export function containsSyntheticCognitiveBlock(text: string): boolean {
+  return containsCognitiveBlock(text) && isSyntheticContextText(text);
+}
+
+/**
+ * View-level form of containsSyntheticCognitiveBlock for the fold/seal paths
+ * that hold a message array rather than one row.
+ */
+export function viewCarriesSyntheticCognitiveBlock(
+  messages: readonly FoldMessage[],
+): boolean {
+  return messages.some(
+    (message) => containsSyntheticCognitiveBlock(flattenFoldMessageText(message.content)),
+  );
 }
 
 /**

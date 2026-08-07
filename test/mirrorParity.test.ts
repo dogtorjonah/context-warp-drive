@@ -54,6 +54,7 @@ interface ManifestEntry {
 // Same declarations as relay/data/mcp-forge/context-warp-parity MANIFEST.
 const MANIFEST: ManifestEntry[] = [
   { pkg: 'src/boundaryAuction.ts', src: 'relay/src/boundaryAuction.ts', mode: 'shim' },
+  { pkg: 'src/captureContract.ts', src: 'relay/src/captureContract.ts', mode: 'shim' },
   { pkg: 'src/chronologicalProvenance.ts', src: 'relay/src/chronologicalProvenance.ts', mode: 'shim' },
   // Relay re-exports the core and adds async Atlas snapshot hydration.
   { pkg: 'src/cognitiveArtifacts.ts', src: 'relay/src/cognitiveArtifacts.ts', mode: 'shim-host' },

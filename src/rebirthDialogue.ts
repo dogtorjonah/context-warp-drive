@@ -49,6 +49,26 @@ function isChatroomDelivery(text: string): boolean {
 }
 
 /**
+ * Review-wave prompts drive a successor through a user-role provider message,
+ * but they are authored by the relay rather than by the operator. New prompts
+ * carry an explicit marker. The structural fallback keeps already-persisted
+ * pre-marker prompts out of genuine-user quotas without rejecting ordinary
+ * operator prose that merely discusses review waves.
+ */
+export function isRelayGeneratedReviewWaveMessage(text: string | null | undefined): boolean {
+  const trimmed = text?.trimStart() ?? '';
+  if (!trimmed) return false;
+  if (/^\[RELAY WAVE DIRECTIVE\b[^\]]*\]/u.test(trimmed)) return true;
+  if (/^(?:Predecessor Review Protocol|(?:Review \+ Fix|Improve|Investigate|Load-Rail|Decompose|Shoot-Rail|Review Rail Shot|Exploration|Find Work|Bug Hunter|Research|Documentation) Wave Protocol)(?:\n|$)/u.test(trimmed)) {
+    return true;
+  }
+  return trimmed.includes('\nCurrent wave launch\n')
+    && trimmed.includes('\nPhase marker\nCurrent phase:')
+    && trimmed.includes('\nWave room\n')
+    && trimmed.includes('\nWave completion escape hatch\n');
+}
+
+/**
  * Reject relay-authored user-role control rows while retaining operator prose
  * that merely contains or discusses the same words. This predicate is shared
  * by worker hydration and every renderer so coverage cannot drift by path.
@@ -57,11 +77,16 @@ export function isGenuineRebirthOperatorMessage(text: string | null | undefined)
   const trimmed = text?.trim() ?? '';
   if (!trimmed) return false;
   if (isChatroomDelivery(trimmed)) return false;
+  if (isRelayGeneratedReviewWaveMessage(trimmed)) return false;
   if (/^@\w+/u.test(trimmed) && trimmed.length < 200) return false;
   if (/^\[(?:DIGEST DELTA|Digest Delta|RELAY DIGEST DELTA|Control Signals|System)\]/u.test(trimmed)) {
     return false;
   }
   if (/^\[(?:long-horizon-continue|sidequest-cleanup)\b/iu.test(trimmed)) return false;
+  // Atlas-debt nudges are relay-authored lifecycle rows persisted with a user
+  // role (statusChange.ts buildAtlasDebtNudge, persistUserMessage: true). They
+  // are never operator requests and must not consume genuine-user quota.
+  if (/^\[atlas-debt\]/iu.test(trimmed)) return false;
   if (/^🏁 Your agent ".+" \(.+\) is done\./u.test(trimmed)) return false;
   if (/^\[(?:CONTEXT REBIRTH|INSTANCE RESURRECTED|FIXER MODE BATCH #\d+)\]/u.test(trimmed)) {
     return false;

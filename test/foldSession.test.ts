@@ -102,7 +102,7 @@ function makeSession(options: { thresholdChars: number; eviction?: boolean } = {
 }
 
 describe('FoldSession E10 sawtooth eviction', () => {
-  test('default prepare() wiring tombstones old folded turns once the age gate opens', () => {
+  test('default prepare() wiring waits for a safe persistence frontier before tombstoning', () => {
     const session = makeSession({ thresholdChars: 6_000 });
     const messages: FoldMessage[] = [];
     let prepared: FoldMessage[] = [];
@@ -116,10 +116,11 @@ describe('FoldSession E10 sawtooth eviction', () => {
 
     const block = extractFoldBlock(prepared);
     const tombstones = block.split('\n').filter(line => line.startsWith(FOLD_TOMBSTONE_PREFIX));
-    expect(tombstones.length).toBeGreaterThan(0);
+    expect(tombstones).toHaveLength(0);
     expect(block).not.toContain(bodyToken(0));
-    expect(block).toContain(noteToken(22));
-    expect(session.telemetry.evictedTurnCount).toBeGreaterThan(0);
+    expect(block).toContain('reads ×23');
+    expect(block).toContain('/repo/src/mod0.ts');
+    expect(session.telemetry.evictedTurnCount).toBe(0);
   });
 
   test('durableCursorIndex lets hosts block eviction until their own persistence catches up', () => {
@@ -196,21 +197,26 @@ describe('FoldSession E10 sawtooth eviction', () => {
     // the live non-string user payload, so allow a small wrapper margin.
     expect(preparedText.length).toBeLessThan(12_000);
     expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
-    expect(preparedText).toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
-    // Stable closet properties, not a brittle exact deep-history literal:
-    // nomination is newest-first, so the NEWEST touched path must always fit
-    // the compact closet budget, and every admitted path line must be a
-    // complete literal (the build-stage and render-stage closet budgets are
-    // the same number, so lines are fitted whole — never cut mid-literal).
-    expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_27.ts');
-    const closetPathLines = preparedText
-      .split('\n')
-      .filter((line) => line.startsWith('- /home/jonah/context-warp-drive/src/file_'));
-    expect(closetPathLines.length).toBeGreaterThan(0);
-    for (const line of closetPathLines) {
-      expect(line).toMatch(/^- \/home\/jonah\/context-warp-drive\/src\/file_\d+\.ts/);
+    // Canonical v6 hard epochs use the fixed six-frame package instead of the
+    // retired flat Raw Trace Coordinate Closet.
+    const v6FrameIds = [
+      'boundaryAndActiveTask',
+      'executionState',
+      'activeEditDelta',
+      'cognitiveArtifacts',
+      'recentConversation',
+      'recoveryIndex',
+    ];
+    for (const frameId of v6FrameIds) {
+      expect(preparedText).toContain(`[REBIRTH-V6-SECTION id=${frameId} chars=`);
     }
-    expect(preparedText).toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
+    expect(preparedText.indexOf('[REBIRTH-V6-SECTION id=boundaryAndActiveTask'))
+      .toBeLessThan(preparedText.indexOf('[REBIRTH-V6-SECTION id=recoveryIndex'));
+    expect(preparedText).not.toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
+    // The newest planted path survives inline, while the bulky provider result
+    // is intentionally represented by the compact conversation frame.
+    expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_27.ts');
+    expect(preparedText).not.toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
   });
 
   test('eviction:false preserves the pre-E10 monotonic fold block behavior', () => {
@@ -293,7 +299,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(session.telemetry.epochs).toBe(2);
   });
 
-  test('keeps the latest operator message and all successors raw beyond the char budget', () => {
+  test('keeps an unresolved tool call and newer operator message raw beyond the char budget', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -301,17 +307,15 @@ describe('FoldSession tail-epoch runway gate', () => {
       singleCeilingMode: false,
       now: () => 1_000,
     });
-    const first = turn(0);
+    const first: FoldMessage[] = [userMsg('foundation request')];
     session.prepare(first);
     const liveObjective = 'FIX THE CONTINUITY THRASHING NOW';
     const grown: FoldMessage[] = [
       ...first,
       userMsg('Summarize the older completed investigation'),
       assistantMsg(`older foldable analysis ${'A'.repeat(20_000)}`),
-      userMsg(liveObjective),
       anthropicToolUse('Read', { file_path: '/repo/src/live.ts' }, 'toolu_live_anchor'),
-      anthropicToolResult('toolu_live_anchor', `live tool payload ${'B'.repeat(45_000)}`),
-      assistantMsg('live analysis after the operator directive'),
+      userMsg(liveObjective),
     ];
 
     const appended = session.prepare(grown, { measuredInputTokens: 70_000 });
@@ -326,8 +330,8 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(liveObjectiveIndex).toBeGreaterThanOrEqual(0);
     expect(joined).toContain('[Chronological Provenance v1]');
     expect(joined).toContain('artifact=tail-epoch#2');
-    expect(joined).toContain('live-objective="FIX THE CONTINUITY THRASHING NOW"');
-    expect(appended.messages.slice(liveObjectiveIndex)).toEqual(grown.slice(first.length + 2));
+    expect(joined).toContain('raw-resumes=?:message#3 @ time unknown (2 exact)');
+    expect(appended.messages.slice(-2)).toEqual(grown.slice(-2));
   });
 
   test('hot-reuses instead of committing an unprofitable append band', () => {
@@ -440,7 +444,8 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body.split(HARD_EPOCH_CONTINUITY_DIRECTIVE)).toHaveLength(2);
     expect(body).toContain('RAW_PRIOR_TRACE_MARKER');
     expect(body).not.toContain(HARD_EPOCH_LIVE_TURN_HEADER);
-    expect(body).toContain('👤 LAST USER MESSAGE (active request):');
+    expect(body).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(body).not.toContain('👤 LAST USER MESSAGE (active request):');
     expect(body).toContain('LIVE_TRIGGER_MARKER current request');
     expect(body.match(/LIVE_TRIGGER_MARKER/g)).toHaveLength(1);
   });
@@ -481,7 +486,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.messages[0]).toEqual(hardEpoch.messages[0]);
   });
 
-  test('does not duplicate a trailing string user turn when followed by tool-result user content', () => {
+  test('keeps the active request singular when followed by tool-result user content', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
@@ -504,7 +509,8 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
     expect(body.split(HARD_EPOCH_CONTINUITY_DIRECTIVE)).toHaveLength(2);
     expect(body).toContain('RAW_PRIOR_TRACE_MARKER');
-    expect(body).toContain('TOOL_RESULT_MARKER non-string trailing user payload');
+    expect(body).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(body).not.toContain('TOOL_RESULT_MARKER non-string trailing user payload');
     expect(body.match(/LIVE_TRIGGER_MARKER/g)).toHaveLength(1);
   });
 
@@ -722,10 +728,16 @@ describe('FoldSession per-band vault sealing', () => {
     // Two-epoch law: the runway gate escalates to the seeded hard epoch.
     expect(recomputed.stats.epochReason).toBe('tail-runway-gate+hard-epoch');
     const joined = vaultJoin(recomputed.messages);
-    // Recording ZETA advances the current-task frontier; the hard-epoch vault
-    // carries the current task without resurrecting superseded wording.
-    expect(joined).not.toContain('OPERATOR-EPSILON one');
+    // A full render retains older wording only as expired historical evidence,
+    // while the newest answered operator row remains labeled current-task.
+    expect(joined).toContain('OPERATOR-EPSILON one');
+    expect(joined).toContain(
+      'liveness=answered authorization=expired task-scope=historical authority=historical-background ordinal=1/4',
+    );
     expect(joined).toContain('OPERATOR-ZETA two');
+    expect(joined).toContain(
+      'liveness=answered authorization=expired task-scope=current-task ordinal=3/4',
+    );
     expect(joined.split('[User Message Vault]').length - 1).toBe(1);
   });
 });

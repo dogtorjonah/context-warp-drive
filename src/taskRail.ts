@@ -40,6 +40,7 @@ export const TASK_RAIL_LOAD_OPERATIONS = [
   'append',
   'insert',
   'update',
+  'refine',
   'batch_update',
   'remove',
   'move',
@@ -136,6 +137,129 @@ export type TaskRailRoleStatus = (typeof TASK_RAIL_ROLE_STATUSES)[number];
 //  Core domain entities
 // ══════════════════════════════════════════════════════════════════════
 
+/** Provider-neutral model target selected for a rail step. */
+export interface TaskRailModelTarget {
+  engine: string;
+  model: string;
+  thinkingLevel?: string;
+}
+
+export type TaskRailModelRouteSource = 'ai' | 'operator' | 'origin';
+export type TaskRailModelTransitionKind = 'step-route' | 'origin-return';
+
+/** Optional AI-authored routing preference. Absence means keep the live model. */
+export interface TaskRailModelPreference {
+  target: TaskRailModelTarget;
+  fallbacks?: TaskRailModelTarget[];
+  reason?: string;
+}
+
+/** Authenticated operator choice. This always outranks the AI preference. */
+export interface TaskRailOperatorModelOverride {
+  target: TaskRailModelTarget;
+  fallbacks?: TaskRailModelTarget[];
+  scope: 'step' | 'segment';
+  segmentStartStepId?: string;
+  segmentEndStepId?: string;
+  sourceTimestamp: string;
+  setById: string;
+  setByName?: string;
+  provenanceId: string;
+}
+
+/** Effective candidate chain after applying the authoritative override, if any. */
+export interface TaskRailResolvedModelRoute {
+  source: TaskRailModelRouteSource;
+  candidates: TaskRailModelTarget[];
+  operatorOverrideProvenanceId?: string;
+}
+
+export type TaskRailReviewScope = 'since_last_review';
+export type TaskRailReviewMode = 'review_and_fix';
+export type TaskRailReviewVerdict = 'clean' | 'repaired' | 'blocked';
+
+/** AI-authored checkpoint intent. The relay resolves the concrete window on activation. */
+export interface TaskRailReviewCheckpoint {
+  scope: TaskRailReviewScope;
+  mode: TaskRailReviewMode;
+  instructions?: string;
+}
+
+/** Stable review range captured when a checkpoint becomes actionable. */
+export interface TaskRailReviewWindow {
+  stepIds: string[];
+  previousCheckpointStepId?: string;
+  capturedAt: string;
+  provenanceId: string;
+}
+
+/** Append-only outcome for one checkpoint execution. */
+export interface TaskRailReviewReceipt {
+  verdict: TaskRailReviewVerdict;
+  reviewedStepIds: string[];
+  sourceTimestamp: string;
+  provenanceId: string;
+  actorId?: string;
+  actorName?: string;
+  note?: string;
+  evidence?: string;
+}
+
+export type TaskRailModelTransitionStatus =
+  | 'pending'
+  | 'rebirthing'
+  | 'ready'
+  | 'failed'
+  | 'exhausted';
+
+export type TaskRailModelTransitionAttemptStatus = 'ready' | 'failed';
+
+/** One provider/session launch attempt, retained in chronological order. */
+export interface TaskRailModelTransitionAttempt {
+  target: TaskRailModelTarget;
+  status: TaskRailModelTransitionAttemptStatus;
+  sourceTimestamp: string;
+  provenanceId: string;
+  completedAt: string;
+  error?: string;
+}
+
+/** Durable rail cursor hold while the same identity changes model. */
+export interface TaskRailModelTransition {
+  id: string;
+  /** Missing on legacy records and interpreted as `step-route`. */
+  kind?: TaskRailModelTransitionKind;
+  provenanceId: string;
+  sourceTimestamp: string;
+  fromStepId?: string;
+  toStepId: string;
+  source: TaskRailModelRouteSource;
+  candidates: TaskRailModelTarget[];
+  candidateIndex: number;
+  status: TaskRailModelTransitionStatus;
+  effectiveTarget?: TaskRailModelTarget;
+  startedAt?: string;
+  completedAt?: string;
+  lastError?: string;
+  attempts: TaskRailModelTransitionAttempt[];
+}
+
+/** Immutable completion receipt retained after an active transition is cleared. */
+export interface TaskRailModelTransitionReceipt {
+  transitionId: string;
+  /** Missing on legacy records and interpreted as `step-route`. */
+  kind?: TaskRailModelTransitionKind;
+  provenanceId: string;
+  sourceTimestamp: string;
+  outcomeTimestamp: string;
+  fromStepId?: string;
+  toStepId: string;
+  source: TaskRailModelRouteSource;
+  outcome: 'ready' | 'exhausted' | 'superseded';
+  effectiveTarget?: TaskRailModelTarget;
+  attempts: TaskRailModelTransitionAttempt[];
+}
+
 /** A single step within a task rail or draft. */
 export interface TaskRailStep {
   id: string;
@@ -144,14 +268,36 @@ export interface TaskRailStep {
   acceptanceCriteria: string[];
   notes?: string;
   scope?: string;
+  /** Optional and AI-authored. Missing means no model switch is requested. */
+  modelPreference?: TaskRailModelPreference;
+  /** Authenticated operator override; never populated from ordinary agent step input. */
+  operatorModelOverride?: TaskRailOperatorModelOverride;
+  /** Optional AI-placed scoped review-and-fix boundary. */
+  reviewCheckpoint?: TaskRailReviewCheckpoint;
   status: TaskRailStepStatus;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
+  /** Executor that most recently reserved this step through shoot/sprint. */
+  reservedById?: string;
+  reservedByName?: string;
+  reservedAt?: string;
   completedAt?: string;
   lastNote?: string;
   evidence?: string;
+  reviewWindow?: TaskRailReviewWindow;
+  /** Append-only checkpoint outcomes; retries never rewrite older evidence. */
+  reviewReceipts?: TaskRailReviewReceipt[];
   attempts: number;
+}
+
+export type TaskRailRefinableField = 'title' | 'instruction' | 'acceptanceCriteria' | 'notes' | 'scope';
+
+/** Before/after evidence recorded when an executor refines its reserved step. */
+export interface TaskRailFieldChange {
+  field: TaskRailRefinableField;
+  before?: string | string[];
+  after?: string | string[];
 }
 
 /** An entry in a rail or draft's operation history. */
@@ -162,6 +308,7 @@ export interface TaskRailHistoryEntry {
   note?: string;
   actorId?: string;
   actorName?: string;
+  changes?: TaskRailFieldChange[];
 }
 
 /** One requested or approved rail role assignment. */
@@ -200,6 +347,16 @@ export interface TaskRailLifecycle {
   reviewerNotifiedAt?: string;
   /** Requested/approved co-executor and reviewer registrations for this rail. */
   roleRegistrations?: TaskRailRoleRegistration[];
+  /** Present only while a route-changing ACK is handing control to a successor. */
+  activeModelTransition?: TaskRailModelTransition;
+  /** Append-only completed handoffs, including exhausted fallback chains. */
+  modelTransitionReceipts?: TaskRailModelTransitionReceipt[];
+  /** Legacy persisted origin-affinity metadata; new rails do not populate it. */
+  originModelTarget?: TaskRailModelTarget;
+  originModelCapturedAt?: string;
+  originModelProvenanceId?: string;
+  /** Legacy receipt from the retired origin-return enforcement flow. */
+  originModelReturnedAt?: string;
   steps: TaskRailStep[];
   history: TaskRailHistoryEntry[];
 }
@@ -355,15 +512,18 @@ function isResolved(status: TaskRailStepStatus): boolean {
 //  Step queries
 // ══════════════════════════════════════════════════════════════════════
 
-/** Find the first step that is actively blocking progress. */
+/**
+ * Find the step that currently owns the execution cursor.
+ *
+ * A review request is a rail-wide gate and therefore outranks executable work.
+ * Active work outranks ordinary blocked items, which remain unresolved without
+ * preventing unrelated work from advancing. A blocked step is returned only
+ * when no review gate or executable reservation exists.
+ */
 export function findActiveOrBlockingStep(steps: TaskRailStep[]): TaskRailStep | undefined {
-  return steps.find(
-    (s) =>
-      s.status === 'active' ||
-      s.status === 'in_progress' ||
-      s.status === 'blocked' ||
-      s.status === 'needs_review',
-  );
+  return steps.find((step) => step.status === 'needs_review')
+    ?? steps.find((step) => step.status === 'active' || step.status === 'in_progress')
+    ?? steps.find((step) => step.status === 'blocked');
 }
 
 /** Find the first pending step. */
@@ -456,10 +616,12 @@ export function computeProgress(steps: TaskRailStep[]): TaskRailProgress {
  *  2. All steps resolved → review (if currently active/ready/blocked/review)
  *     or complete (if already in review state from a prior refresh).
  *     completedAt is set on first entry to review and again on complete.
- *  3. Active step is blocked/needs_review → blocked.
- *  4. Active step is active/in_progress → active.
- *  5. Rail is locked → ready.
- *  6. Otherwise → draft.
+ *  3. Any needs_review step → blocked (rail-wide approval/review gate).
+ *  4. Any active/in_progress step → active.
+ *  5. Pending work remains → ready when locked, otherwise draft. Ordinary
+ *     blocked items stay unresolved but do not hide runnable work.
+ *  6. Only ordinary blocked work remains → blocked.
+ *  7. Otherwise → ready when locked, otherwise draft.
  */
 export function refreshRailState(rail: TaskRailLifecycle, now?: string): void {
   if (rail.state === 'abandoned') return;
@@ -476,15 +638,25 @@ export function refreshRailState(rail: TaskRailLifecycle, now?: string): void {
   }
 
   rail.completedAt = undefined;
-  const active = findActiveOrBlockingStep(rail.steps);
+  const current = findActiveOrBlockingStep(rail.steps);
 
-  if (active?.status === 'blocked' || active?.status === 'needs_review') {
+  if (current?.status === 'needs_review') {
     rail.state = 'blocked';
     return;
   }
 
-  if (active?.status === 'active' || active?.status === 'in_progress') {
+  if (current?.status === 'active' || current?.status === 'in_progress') {
     rail.state = 'active';
+    return;
+  }
+
+  if (findFirstPendingStep(rail.steps)) {
+    rail.state = rail.lockedAt ? 'ready' : 'draft';
+    return;
+  }
+
+  if (current?.status === 'blocked') {
+    rail.state = 'blocked';
     return;
   }
 
@@ -659,6 +831,8 @@ export interface StepUpdateFields {
   acceptanceCriteria?: string[];
   notes?: string | null;
   scope?: string | null;
+  modelPreference?: TaskRailModelPreference | null;
+  reviewCheckpoint?: TaskRailReviewCheckpoint | null;
   status?: TaskRailStepStatus;
 }
 
@@ -682,10 +856,15 @@ export function updateStepFields(
   if (changes.acceptanceCriteria !== undefined) step.acceptanceCriteria = changes.acceptanceCriteria;
   if (changes.notes !== undefined) step.notes = changes.notes ?? undefined;
   if (changes.scope !== undefined) step.scope = changes.scope ?? undefined;
+  if (changes.modelPreference !== undefined) step.modelPreference = changes.modelPreference ?? undefined;
+  if (changes.reviewCheckpoint !== undefined) step.reviewCheckpoint = changes.reviewCheckpoint ?? undefined;
   if (changes.status !== undefined) {
     step.status = changes.status;
     if (changes.status === 'pending') {
       step.startedAt = undefined;
+      step.reservedById = undefined;
+      step.reservedByName = undefined;
+      step.reservedAt = undefined;
       step.completedAt = undefined;
     }
   }
@@ -728,10 +907,15 @@ export function batchUpdateStepFields(
     if (changes.acceptanceCriteria !== undefined) step.acceptanceCriteria = changes.acceptanceCriteria;
     if (changes.notes !== undefined) step.notes = changes.notes ?? undefined;
     if (changes.scope !== undefined) step.scope = changes.scope ?? undefined;
+    if (changes.modelPreference !== undefined) step.modelPreference = changes.modelPreference ?? undefined;
+    if (changes.reviewCheckpoint !== undefined) step.reviewCheckpoint = changes.reviewCheckpoint ?? undefined;
     if (changes.status !== undefined) {
       step.status = changes.status;
       if (changes.status === 'pending') {
         step.startedAt = undefined;
+        step.reservedById = undefined;
+        step.reservedByName = undefined;
+        step.reservedAt = undefined;
         step.completedAt = undefined;
       }
     }
@@ -881,7 +1065,8 @@ export function ackStep(
 /**
  * Find the first pending step and activate it (status → 'active',
  * startedAt set, attempts incremented). Used by shoot mode after
- * an ACK when there is no active/blocking step remaining.
+ * an ACK when there is no active or review-gated step remaining. Ordinary
+ * blocked items do not prevent a different pending step from activating.
  *
  * Returns the activated step, or undefined if no pending steps exist.
  */
@@ -895,6 +1080,9 @@ export function activateNextStep(
   const timestamp = ts(ctx?.now);
   pending.status = 'active';
   pending.startedAt = timestamp;
+  pending.reservedById = ctx?.actorId;
+  pending.reservedByName = ctx?.actorName;
+  pending.reservedAt = timestamp;
   pending.updatedAt = timestamp;
   pending.attempts += 1;
 
@@ -904,12 +1092,12 @@ export function activateNextStep(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  reset — reset a blocking step back to pending
+//  reset — reset an unresolved step back to pending
 // ══════════════════════════════════════════════════════════════════════
 
 /**
  * Reset a step's status to 'pending', clearing its startedAt/completedAt.
- * Useful for unblocking a rail without removing the step.
+ * Useful for making a blocked or review-gated item runnable again.
  */
 export function resetStepToPending(
   rail: TaskRailLifecycle,
@@ -920,7 +1108,6 @@ export function resetStepToPending(
     status: 'pending',
   }, ctx);
 }
-
 // ══════════════════════════════════════════════════════════════════════
 //  Source: @voxxo/task-rail/src/drafts.ts
 // ══════════════════════════════════════════════════════════════════════
@@ -1325,6 +1512,12 @@ export interface ShootArgs {
   acks?: ShootAckInput[];
   note?: string;
   evidence?: string;
+  /**
+   * Leave the next pending step untouched when an external scheduler must
+   * complete a durable handoff before that step may become active. Pure
+   * callers decide the boundary; this package performs no routing or I/O.
+   */
+  deferNextActivation?: (step: TaskRailStep) => boolean;
 }
 
 export interface ShootAckInput {
@@ -1341,10 +1534,12 @@ export interface ShootResult {
   step?: TaskRailStep;
   /** Steps acknowledged during this shoot call. */
   ackedSteps?: TaskRailStep[];
-  /** True when the step is blocking progress (blocked/needs_review). */
+  /** True when no other work can advance past this unresolved step. */
   paused?: boolean;
   /** True when the rail is complete (all steps resolved). */
   complete?: boolean;
+  /** True when the next pending step was deliberately left pending. */
+  deferred?: boolean;
 }
 
 export interface SprintArgs {
@@ -1397,11 +1592,11 @@ export class InvalidAckStatusError extends Error {
   }
 }
 
-/** Error thrown when sprint is called while a blocking step exists. */
+/** Error thrown when sprint has no reservable work or hits a review gate. */
 export class BlockedSprintError extends Error {
   constructor(stepId: string, status: string) {
     super(
-      `Rail is paused on step "${stepId}" (${status}). Sprint mode will not reserve more steps while the rail is blocked.`,
+      `Rail cannot reserve more pending work while step "${stepId}" remains ${status}. Resolve or adapt that step before sprinting again.`,
     );
     this.name = 'BlockedSprintError';
   }
@@ -1454,9 +1649,11 @@ function validateRailForExecution(rail: TaskRailLifecycle): void {
  *  2. Capture `wasCompleteOnLoad`.
  *  3. If ACK status provided → ack the step.
  *  4. Refresh rail state.
- *  5. If active/blocking step exists → return it (paused if blocked/needs_review).
- *  6. If pending step exists → activate it and return.
- *  7. Otherwise → mark complete (if not already) and return complete signal.
+ *  5. If needs_review exists → return it paused as a rail-wide gate.
+ *  6. If active/in_progress work exists → return it.
+ *  7. If pending work exists → activate it and return.
+ *  8. If only blocked work remains → return it paused.
+ *  9. Otherwise → mark complete (if not already) and return complete signal.
  *
  * Mutates the rail in place. Returns a structured result.
  */
@@ -1491,7 +1688,7 @@ export function shoot(
     });
     ackedSteps.push(acked);
 
-    if (ackStatus === 'blocked' || ackStatus === 'needs_review') {
+    if (ackStatus === 'needs_review') {
       break;
     }
   }
@@ -1499,18 +1696,38 @@ export function shoot(
   // ── Step resolution phase ──
   refreshRailState(rail);
 
-  const active = findActiveOrBlockingStep(rail.steps);
+  const reviewGate = rail.steps.find((step) => step.status === 'needs_review');
+  if (reviewGate) {
+    return { step: reviewGate, paused: true, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
+  }
+
+  const active = rail.steps.find(
+    (step) => step.status === 'active' || step.status === 'in_progress',
+  );
   if (active) {
-    if (active.status === 'blocked' || active.status === 'needs_review') {
-      return { step: active, paused: true, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
-    }
     return { step: active, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
   }
 
-  // No active/blocking step — try to activate the next pending
+  // No executable or review-gated step — let an external scheduler hold a pending step
+  // at a durable handoff boundary before activation.
+  const pending = rail.steps.find((step) => step.status === 'pending');
+  if (pending && args.deferNextActivation?.(pending)) {
+    return {
+      step: pending,
+      deferred: true,
+      ...(ackedSteps.length > 0 ? { ackedSteps } : {}),
+    };
+  }
+
+  // No deferred boundary — activate the next pending normally.
   const next = activateNextStep(rail, ctx);
   if (next) {
     return { step: next, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
+  }
+
+  const blocked = rail.steps.find((step) => step.status === 'blocked');
+  if (blocked) {
+    return { step: blocked, paused: true, ...(ackedSteps.length > 0 ? { ackedSteps } : {}) };
   }
 
   // Nothing left — refresh state (review → complete or stays terminal)
@@ -1542,7 +1759,7 @@ function resolveSprintCount(args: SprintArgs): number {
  * Flow:
  *  1. Validate rail (not abandoned, has steps, not draft).
  *  2. Capture `wasCompleteOnLoad`.
- *  3. If a blocking step exists → throw BlockedSprintError.
+ *  3. If a needs_review gate exists → throw BlockedSprintError.
  *  4. Check for an existing active step to avoid dual-active state.
  *  5. Iterate steps in order, reserving only `pending` steps up to limit.
  *     First reserved → 'active' (only if no active step already exists);
@@ -1552,8 +1769,9 @@ function resolveSprintCount(args: SprintArgs): number {
  *  8. Otherwise → mark complete and return complete signal.
  *
  * Only reserves pending steps — skips active/in_progress (already claimed
- * by another executor). This enables concurrent squad sprints where each
- * caller gets a different batch.
+ * by another executor) and ordinary blocked work. This enables concurrent
+ * squad sprints where each caller gets a different batch without letting a
+ * local blocker freeze unrelated work.
  *
  * Mutates the rail in place. Returns a structured result.
  */
@@ -1564,12 +1782,10 @@ export function sprint(
 ): SprintResult {
   validateRailForExecution(rail);
 
-  const wasTerminalOnLoad = rail.state === 'complete' || rail.state === 'review';
-
-  // ── Blocking guard ──
-  const blocking = findActiveOrBlockingStep(rail.steps);
-  if (blocking?.status === 'blocked' || blocking?.status === 'needs_review') {
-    throw new BlockedSprintError(blocking.id, blocking.status);
+  // ── Rail-wide review gate ──
+  const reviewGate = rail.steps.find((step) => step.status === 'needs_review');
+  if (reviewGate) {
+    throw new BlockedSprintError(reviewGate.id, reviewGate.status);
   }
 
   // ── Reserve phase ──
@@ -1588,6 +1804,9 @@ export function sprint(
 
     step.status = (selected.length === 0 && !hasActiveStep) ? 'active' : 'in_progress';
     step.startedAt ??= now;
+    step.reservedById = ctx?.actorId;
+    step.reservedByName = ctx?.actorName;
+    step.reservedAt = now;
     step.updatedAt = now;
     step.attempts += 1;
     selected.push(step);
@@ -1608,11 +1827,12 @@ export function sprint(
     return { steps: selected };
   }
 
-  // Nothing left — refresh state (review → complete or stays terminal)
+  // Nothing reservable — only report completion when every step is resolved.
+  // An active reservation or a blocked-only tail must remain unresolved.
   refreshRailState(rail);
-  if (!wasTerminalOnLoad && rail.state !== 'complete' && rail.state !== 'review') {
-    rail.state = 'complete';
-    rail.completedAt ??= ctx?.now ?? new Date().toISOString();
+  const unresolved = findActiveOrBlockingStep(rail.steps);
+  if (unresolved) {
+    throw new BlockedSprintError(unresolved.id, unresolved.status);
   }
   return { complete: true };
 }
@@ -1630,6 +1850,8 @@ export interface TaskRailStepSeed {
   acceptanceCriteria?: string[];
   notes?: string;
   scope?: string;
+  modelPreference?: TaskRailModelPreference;
+  reviewCheckpoint?: TaskRailReviewCheckpoint;
   status?: TaskRailStepStatus;
 }
 
@@ -1655,6 +1877,8 @@ export function createTaskRailStep(seed: TaskRailStepSeed, now?: string): TaskRa
     acceptanceCriteria: seed.acceptanceCriteria ?? [],
     ...(seed.notes ? { notes: seed.notes } : {}),
     ...(seed.scope ? { scope: seed.scope } : {}),
+    ...(seed.modelPreference ? { modelPreference: cloneModelPreference(seed.modelPreference) } : {}),
+    ...(seed.reviewCheckpoint ? { reviewCheckpoint: cloneReviewCheckpoint(seed.reviewCheckpoint) } : {}),
     status: seed.status ?? 'pending',
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -1707,38 +1931,202 @@ export function restoreTaskRail(serialized: SerializedTaskRail): TaskRailLifecyc
   return serialized.rail;
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  Source: @voxxo/task-rail/src/modelRouting.ts
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * @voxxo/task-rail — Model Route and Review Checkpoint Planning
+ *
+ * Pure helpers for resolving optional step routing intent and stable review
+ * windows. These functions perform no persistence, provider probes, rebirths,
+ * or other I/O; the relay owns those effects.
+ */
+
+export interface TaskRailModelTransitionPlan {
+  toStepId: string;
+  route: TaskRailResolvedModelRoute;
+}
+
+export interface ResolveReviewWindowArgs {
+  checkpointStepId: string;
+  capturedAt: string;
+  provenanceId: string;
+}
+
+/** Exact route identity used to decide whether same-identity rebirth is needed. */
+export function isSameModelTarget(
+  left: TaskRailModelTarget,
+  right: TaskRailModelTarget,
+): boolean {
+  return left.engine === right.engine
+    && left.model === right.model
+    && (left.thinkingLevel ?? '') === (right.thinkingLevel ?? '');
+}
+
+/** Keep the first occurrence of each route without changing fallback order. */
+export function dedupeModelTargets(
+  targets: readonly TaskRailModelTarget[],
+): TaskRailModelTarget[] {
+  const unique: TaskRailModelTarget[] = [];
+  for (const target of targets) {
+    if (!unique.some((candidate) => isSameModelTarget(candidate, target))) {
+      unique.push({ ...target });
+    }
+  }
+  return unique;
+}
+
+/**
+ * Resolve explicit intent for one step. Operator state is authoritative;
+ * otherwise the optional AI preference is used. Undefined means the step
+ * deliberately inherits the model that is already executing the rail.
+ */
+export function resolveStepModelRoute(
+  step: TaskRailStep,
+): TaskRailResolvedModelRoute | undefined {
+  const operatorOverride = step.operatorModelOverride;
+  if (operatorOverride) {
+    return {
+      source: 'operator',
+      candidates: dedupeModelTargets([
+        operatorOverride.target,
+        ...(operatorOverride.fallbacks ?? []),
+      ]),
+      operatorOverrideProvenanceId: operatorOverride.provenanceId,
+    };
+  }
+
+  const preference = step.modelPreference;
+  if (!preference) return undefined;
+  return {
+    source: 'ai',
+    candidates: dedupeModelTargets([
+      preference.target,
+      ...(preference.fallbacks ?? []),
+    ]),
+  };
+}
+
+/**
+ * Plan a handoff only when explicit intent changes the live route. Returning
+ * undefined is the zero-overhead path for inherited or already-active routes.
+ */
+export function planStepModelTransition(
+  step: TaskRailStep,
+  currentTarget: TaskRailModelTarget,
+): TaskRailModelTransitionPlan | undefined {
+  const route = resolveStepModelRoute(step);
+  if (!route || isSameModelTarget(route.candidates[0], currentTarget)) {
+    return undefined;
+  }
+  return { toStepId: step.id, route };
+}
+
+/**
+ * Capture the completed segment immediately before a checkpoint. The segment
+ * begins after the nearest preceding checkpoint and stores stable step IDs so
+ * later rail edits cannot silently change what was reviewed.
+ */
+export function resolveReviewWindow(
+  steps: readonly TaskRailStep[],
+  args: ResolveReviewWindowArgs,
+): TaskRailReviewWindow {
+  const checkpointIndex = steps.findIndex((step) => step.id === args.checkpointStepId);
+  if (checkpointIndex < 0) {
+    throw new Error(`Review checkpoint step not found: ${args.checkpointStepId}`);
+  }
+  if (!steps[checkpointIndex].reviewCheckpoint) {
+    throw new Error(`Step is not a review checkpoint: ${args.checkpointStepId}`);
+  }
+
+  let previousCheckpointIndex = -1;
+  for (let index = checkpointIndex - 1; index >= 0; index -= 1) {
+    if (steps[index].reviewCheckpoint) {
+      previousCheckpointIndex = index;
+      break;
+    }
+  }
+
+  const stepIds = steps
+    .slice(previousCheckpointIndex + 1, checkpointIndex)
+    .filter((step) => step.status === 'done')
+    .map((step) => step.id);
+
+  return {
+    stepIds,
+    ...(previousCheckpointIndex >= 0
+      ? { previousCheckpointStepId: steps[previousCheckpointIndex].id }
+      : {}),
+    capturedAt: args.capturedAt,
+    provenanceId: args.provenanceId,
+  };
+}
+
 
 // ══════════════════════════════════════════════════════════════════════
 //  Source: @voxxo/task-rail/src/template.ts
 // ══════════════════════════════════════════════════════════════════════
 
-/** Current persisted template schema version. Bump on shape changes. */
-export const TASK_RAIL_TEMPLATE_VERSION = 1;
+/**
+ * @voxxo/task-rail — Reusable Templates
+ *
+ * Pure helpers for turning a live task rail into a reusable, plan-only
+ * template and expanding a template back into step "seeds" for a fresh
+ * rail. A template captures the PLAN — titles, instructions, acceptance
+ * criteria, notes, scope — and deliberately DROPS all execution state
+ * (step ids, statuses, timestamps, attempts, evidence, history). Summoning
+ * a template produces brand-new pending steps, never a fossil of one run.
+ *
+ * No persistence, no MCP transport, no I/O — the relay adapter owns storage
+ * (the task_rail_templates category + index), id generation, and access
+ * control. The shape is intentionally forward-compatible with a future
+ * generator flavor (a recipe that regenerates steps from a live source at
+ * summon time) layered beside the static `steps` array.
+ */
 
-/** A plan-only template step with all execution state removed. */
+/** Current persisted template schema version. Bump on shape changes. */
+export const TASK_RAIL_TEMPLATE_VERSION = 2;
+
+/**
+ * A single plan-only step in a template — no id, status, timestamps,
+ * attempts, or evidence. Just the authored plan fields.
+ */
 export interface TaskRailTemplateStep {
   title: string;
   instruction: string;
   acceptanceCriteria: string[];
   notes?: string;
   scope?: string;
+  modelPreference?: TaskRailModelPreference;
+  reviewCheckpoint?: TaskRailReviewCheckpoint;
 }
 
-/** A reusable task rail template. Persistence remains caller-owned. */
+/** A reusable task rail template — the plan, stripped of execution state. */
 export interface TaskRailTemplate {
+  /** Stable template id, e.g. "tpl-1a2b3c4d". */
   id: string;
+  /** Human-facing name used for summon/show/delete by name. */
   name: string;
+  /** Optional longer description of what the template is for. */
   description?: string;
+  /** Default objective applied to summoned rails. */
   objective?: string;
+  /** Default rail title applied to summoned rails (falls back to name). */
   title?: string;
+  /** Persisted schema version for forward compatibility. */
   version: number;
+  /** Rail id this template was captured from, if any. */
   sourceRailId?: string;
+  /** Instance id that saved the template, if known. */
   createdBy?: string;
+  /** ISO timestamp the template was saved. */
   createdAt: string;
+  /** Plan-only steps replayed on summon. */
   steps: TaskRailTemplateStep[];
 }
 
-/** Lightweight index row for listing caller-persisted templates. */
+/** Lightweight index row for listing templates without loading every step array. */
 export interface TaskRailTemplateIndexEntry {
   id: string;
   name: string;
@@ -1749,26 +2137,47 @@ export interface TaskRailTemplateIndexEntry {
   createdAt: string;
 }
 
-/** Metadata supplied when capturing a live rail as a template. */
+/** Metadata supplied by the relay adapter when capturing a rail as a template. */
 export interface SnapshotTemplateMeta {
+  /** Stable template id minted by the adapter. */
   id: string;
+  /** Human-facing template name. */
   name: string;
   description?: string;
+  /** Objective override; falls back to the source rail's objective. */
   objective?: string;
+  /** Title override; falls back to the source rail's title. */
   title?: string;
+  /** Instance id that saved the template. */
   createdBy?: string;
+  /** Capture timestamp; defaults to now. */
   now?: string;
 }
 
-/** Plan-only seed shape accepted by task-rail adapters. */
+/** A plan-only step seed in the exact shape the task_rail `steps` arg accepts. */
 export interface TaskRailTemplateStepSeed {
   title: string;
   instruction: string;
   acceptance_criteria: string[];
   notes?: string;
   scope?: string;
+  model_preference?: TaskRailModelPreference;
+  review_checkpoint?: TaskRailReviewCheckpoint;
 }
 
+function cloneModelPreference(value: TaskRailModelPreference): TaskRailModelPreference {
+  return {
+    target: { ...value.target },
+    ...(value.fallbacks ? { fallbacks: value.fallbacks.map((target) => ({ ...target })) } : {}),
+    ...(value.reason ? { reason: value.reason } : {}),
+  };
+}
+
+function cloneReviewCheckpoint(value: TaskRailReviewCheckpoint): TaskRailReviewCheckpoint {
+  return { ...value };
+}
+
+/** Reduce a live rail step to its plan-only template form. */
 function toTemplateStep(step: TaskRailStep): TaskRailTemplateStep {
   return {
     title: step.title,
@@ -1776,10 +2185,16 @@ function toTemplateStep(step: TaskRailStep): TaskRailTemplateStep {
     acceptanceCriteria: [...step.acceptanceCriteria],
     ...(step.notes ? { notes: step.notes } : {}),
     ...(step.scope ? { scope: step.scope } : {}),
+    ...(step.modelPreference ? { modelPreference: cloneModelPreference(step.modelPreference) } : {}),
+    ...(step.reviewCheckpoint ? { reviewCheckpoint: cloneReviewCheckpoint(step.reviewCheckpoint) } : {}),
   };
 }
 
-/** Capture a live rail as a plan-only template with fresh-array isolation. */
+/**
+ * Capture a live rail as a reusable, plan-only template. Drops every
+ * execution-state field (ids, status, timestamps, attempts, evidence,
+ * history) so the template is a recipe, not a snapshot of one run.
+ */
 export function railToTemplate(
   rail: TaskRailLifecycle,
   meta: SnapshotTemplateMeta,
@@ -1798,7 +2213,7 @@ export function railToTemplate(
   };
 }
 
-/** Build a lightweight list entry for a caller-owned template index. */
+/** Build the lightweight index row for a template. */
 export function templateIndexEntry(template: TaskRailTemplate): TaskRailTemplateIndexEntry {
   return {
     id: template.id,
@@ -1811,7 +2226,12 @@ export function templateIndexEntry(template: TaskRailTemplate): TaskRailTemplate
   };
 }
 
-/** Expand a template into fresh plan-only step seeds. */
+/**
+ * Expand a template into plain step seeds in the exact shape the task_rail
+ * `steps` argument accepts, so the relay adapter normalizes them into fresh
+ * TaskRailStep objects (new ids, pending status, fresh timestamps, zero
+ * attempts) identically to hand-authored steps. Pure: assigns no ids.
+ */
 export function templateToStepSeeds(template: TaskRailTemplate): TaskRailTemplateStepSeed[] {
   return template.steps.map((step) => ({
     title: step.title,
@@ -1819,10 +2239,10 @@ export function templateToStepSeeds(template: TaskRailTemplate): TaskRailTemplat
     acceptance_criteria: [...step.acceptanceCriteria],
     ...(step.notes ? { notes: step.notes } : {}),
     ...(step.scope ? { scope: step.scope } : {}),
+    ...(step.modelPreference ? { model_preference: cloneModelPreference(step.modelPreference) } : {}),
+    ...(step.reviewCheckpoint ? { review_checkpoint: cloneReviewCheckpoint(step.reviewCheckpoint) } : {}),
   }));
 }
-
-
 // ══════════════════════════════════════════════════════════════════════
 //  Source: @voxxo/task-rail/src/stepsFile.ts
 // ══════════════════════════════════════════════════════════════════════
