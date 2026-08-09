@@ -6,9 +6,29 @@
  * It performs no filesystem, Git, Atlas, transcript, or relay-state reads.
  */
 
+import { createHash } from 'node:crypto';
+
 import type { ContinuityLiveFieldSource, ContinuityReceipt } from './continuityReceipt.ts';
+import {
+  collapseUnits,
+  type CollapseResult,
+  type CollapseUnit,
+  type CollapseUnitPlacement,
+} from './generationalCollapse.ts';
+import { redactContinuityModel } from './redactionLane.ts';
 
 export const REBIRTH_PACKAGE_V6_VERSION = 'rebirth-package-v6/v1' as const;
+/**
+ * Generational contract (spec docs/rebirth-package-generational-spec.md). The
+ * model shape is a superset of v6: the three lineage sections are optional, so
+ * a persisted v6 package remains a valid model and renders unchanged apart from
+ * the rebalanced caps.
+ */
+export const REBIRTH_PACKAGE_V7_VERSION = 'rebirth-package-v7/v1' as const;
+
+export type RebirthPackageVersion =
+  | typeof REBIRTH_PACKAGE_V6_VERSION
+  | typeof REBIRTH_PACKAGE_V7_VERSION;
 
 export const REBIRTH_PACKAGE_V6_SECTION_IDS = [
   'boundaryAndActiveTask',
@@ -16,8 +36,21 @@ export const REBIRTH_PACKAGE_V6_SECTION_IDS = [
   'activeEditDelta',
   'cognitiveArtifacts',
   'recentConversation',
+  'operatorVault',
+  'episodeChapterIndex',
+  'lifeLedger',
   'recoveryIndex',
 ] as const;
+
+/** Lineage sections introduced by the generational contract. */
+export const REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS = [
+  'operatorVault',
+  'episodeChapterIndex',
+  'lifeLedger',
+] as const;
+
+export type RebirthPackageV7LineageSectionId =
+  (typeof REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS)[number];
 
 export type RebirthPackageV6SectionId = (typeof REBIRTH_PACKAGE_V6_SECTION_IDS)[number];
 
@@ -203,13 +236,41 @@ export interface RebirthPackageV6RecoveryHandle {
   readonly inlineEvidence?: string;
 }
 
+/**
+ * A lineage section's content is a list of collapse units: the generational
+ * engine decides each unit's tier from the section's budget, so the model
+ * carries the whole lineage and the renderer carries the arithmetic.
+ */
+export type RebirthPackageV7LineageUnit = CollapseUnit;
+
+export interface RebirthPackageV7LineageSection {
+  readonly units: readonly RebirthPackageV7LineageUnit[];
+  /** Exact range-recovery command used by T4 rollups. */
+  readonly rangeRecover: string | null;
+  /** Explicit reason when the feeder could not read the whole store. */
+  readonly partialReason?: string | null;
+}
+
+export const EMPTY_REBIRTH_PACKAGE_V7_LINEAGE_SECTION: RebirthPackageV7LineageSection =
+  Object.freeze({ units: [], rangeRecover: null, partialReason: null });
+
 export interface RebirthPackageV6Model {
-  readonly version: typeof REBIRTH_PACKAGE_V6_VERSION;
+  readonly version: RebirthPackageVersion;
   readonly boundaryAndActiveTask: RebirthPackageV6BoundaryAndActiveTask;
   readonly executionState: RebirthPackageV6ExecutionState;
   readonly activeEditDelta: RebirthPackageV6ActiveEditDelta;
   readonly cognitiveArtifacts: readonly RebirthPackageV6CognitiveArtifact[];
   readonly recentConversation: readonly RebirthPackageV6ConversationRow[];
+  // Lineage sections are optional on the model because `isRebirthPackageV6Model`
+  // accepts persisted v6 packages that predate them. `buildRebirthPackageV6Model`
+  // always populates all three; readers must still treat absence as empty so the
+  // type never promises more than the validator enforces.
+  /** Every operator message ever, tiered by the generational engine. */
+  readonly operatorVault?: RebirthPackageV7LineageSection;
+  /** Episode/chapter history newest-verbatim, older eras collapsed. */
+  readonly episodeChapterIndex?: RebirthPackageV7LineageSection;
+  /** One line per life/boundary; older lives fuse into era lines. */
+  readonly lifeLedger?: RebirthPackageV7LineageSection;
   readonly recoveryIndex: readonly RebirthPackageV6RecoveryHandle[];
 }
 
@@ -219,6 +280,9 @@ export interface BuildRebirthPackageV6ModelInput {
   readonly activeEditDelta?: RebirthPackageV6ActiveEditDelta;
   readonly cognitiveArtifacts?: readonly RebirthPackageV6CognitiveArtifact[];
   readonly recentConversation?: readonly RebirthPackageV6ConversationRow[];
+  readonly operatorVault?: RebirthPackageV7LineageSection;
+  readonly episodeChapterIndex?: RebirthPackageV7LineageSection;
+  readonly lifeLedger?: RebirthPackageV7LineageSection;
   readonly recoveryIndex?: readonly RebirthPackageV6RecoveryHandle[];
 }
 
@@ -256,10 +320,21 @@ export interface AdaptLegacyRebirthPackageV6Options {
   readonly activeEditDelta?: RebirthPackageV6ActiveEditDelta;
   readonly cognitiveArtifacts?: readonly RebirthPackageV6CognitiveArtifact[];
   readonly recentConversation?: readonly RebirthPackageV6ConversationRow[];
+  readonly operatorVault?: RebirthPackageV7LineageSection;
+  readonly episodeChapterIndex?: RebirthPackageV7LineageSection;
+  readonly lifeLedger?: RebirthPackageV7LineageSection;
   readonly recoveryIndex?: readonly RebirthPackageV6RecoveryHandle[];
 }
 
 export interface RenderRebirthPackageV6Options {
+  /**
+   * Soft total-package target (protected relay envelope included). When the
+   * first render is larger, collapse-citizen sections are re-rendered at
+   * reduced caps before the hard package ceiling is allowed to elide a whole
+   * section. Defaults to `packageBudget`, preserving the 100k production
+   * ceiling while giving callers a lower push target when desired.
+   */
+  readonly pushTargetChars?: number;
   readonly packageBudget?: number;
   readonly sectionMaxChars?: Partial<Record<RebirthPackageV6SectionId, number>>;
   /**
@@ -272,6 +347,12 @@ export interface RenderRebirthPackageV6Options {
    * package that is actually over its declared budget.
    */
   readonly envelopeChars?: number;
+  /**
+   * Adaptive Backfill (spec §7) is on by default: unspent global budget is
+   * redistributed to lineage memory in priority order. Set false for golden
+   * fixtures that must render at exactly the declared section caps.
+   */
+  readonly adaptiveBackfill?: boolean;
 }
 
 export interface RenderedRebirthPackageV6Section {
@@ -279,6 +360,12 @@ export interface RenderedRebirthPackageV6Section {
   readonly title: string;
   readonly text: string;
   readonly complete: boolean;
+  /**
+   * Final generational-collapse result for lineage sections: the exact
+   * placements behind `text`. Absent for non-lineage sections; null for an
+   * admitted lineage section that rendered with zero units.
+   */
+  readonly collapse?: CollapseResult | null;
 }
 
 const SECTION_TITLES: Readonly<Record<RebirthPackageV6SectionId, string>> = Object.freeze({
@@ -287,21 +374,60 @@ const SECTION_TITLES: Readonly<Record<RebirthPackageV6SectionId, string>> = Obje
   activeEditDelta: 'Active Edit Delta',
   cognitiveArtifacts: 'Cognitive Artifacts',
   recentConversation: 'Recent Conversation',
+  operatorVault: 'Operator Vault',
+  episodeChapterIndex: 'Episode Chapter Index',
+  lifeLedger: 'Life Ledger',
   recoveryIndex: 'Recovery Index',
 });
 
+/**
+ * Generational caps (spec §4). These are caps, not guarantees: unspent capacity
+ * flows to Adaptive Backfill (§7). This 95k content profile leaves 5k for framing
+ * inside the 100k package ceiling. Under pressure, older lineage units collapse
+ * through the Continuity Ledger while active-task and recovery sections remain
+ * must-push.
+ */
 export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
   Record<RebirthPackageV6SectionId, number>
 > = Object.freeze({
-  boundaryAndActiveTask: 58_000,
-  executionState: 18_000,
-  activeEditDelta: 70_000,
-  cognitiveArtifacts: 28_000,
-  recentConversation: 12_000,
-  recoveryIndex: 9_000,
+  boundaryAndActiveTask: 15_000,
+  executionState: 4_000,
+  activeEditDelta: 10_000,
+  cognitiveArtifacts: 6_000,
+  recentConversation: 20_000,
+  operatorVault: 20_000,
+  episodeChapterIndex: 10_000,
+  lifeLedger: 5_000,
+  recoveryIndex: 5_000,
 });
 
-export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 200_000;
+export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 100_000;
+
+/**
+ * Smallest cap the push-shrink gear assigns to a collapse citizen. Matches the
+ * collapse engine's fragmentation guard: below 2k, preserve the section's
+ * eviction envelope instead of pretending a sliver is useful continuity.
+ */
+export const REBIRTH_PACKAGE_V7_COLLAPSE_FLOOR_CHARS = 2_000;
+
+/**
+ * Section envelopes, provenance headers, and the chronology block. Never
+ * allocated to content, so a fully-backfilled package still has room for its
+ * own framing (spec §4 row 10).
+ */
+export const REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS = 5_000;
+
+/**
+ * Adaptive Backfill priority (spec §7.1). Unspent budget flows left to right;
+ * hard-pressure degradation (§8) returns it right to left.
+ */
+export const REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY = [
+  'operatorVault',
+  'episodeChapterIndex',
+  'recentConversation',
+  'lifeLedger',
+  'cognitiveArtifacts',
+] as const satisfies readonly RebirthPackageV6SectionId[];
 
 const V6_SECTION_OPEN_PREFIX = '[REBIRTH-V6-SECTION';
 const V6_SECTION_CLOSE = '[/REBIRTH-V6-SECTION]';
@@ -434,13 +560,42 @@ function normalizeConversationRows(
     });
 }
 
+/**
+ * Lineage units are deduped on stable source identity and never reordered here:
+ * chronological placement is the collapse engine's job and is authoritative
+ * source time, tie-broken by stable id (God Rule 8).
+ */
+function normalizeLineageSection(
+  section: RebirthPackageV7LineageSection | undefined,
+): RebirthPackageV7LineageSection {
+  if (!section || section.units.length === 0) {
+    return {
+      units: [],
+      rangeRecover: section?.rangeRecover ?? null,
+      partialReason: section?.partialReason ?? null,
+    };
+  }
+  const seen = new Set<string>();
+  const units = section.units.filter((unit) => {
+    if (!unit.id || seen.has(unit.id)) return false;
+    if (!unit.verbatim.trim() && !unit.digest.trim()) return false;
+    seen.add(unit.id);
+    return true;
+  });
+  return {
+    units,
+    rangeRecover: section.rangeRecover ?? null,
+    partialReason: section.partialReason ?? null,
+  };
+}
+
 export function buildRebirthPackageV6Model(
   input: BuildRebirthPackageV6ModelInput,
 ): RebirthPackageV6Model {
   const activeRequest = nonEmpty(input.boundaryAndActiveTask.activeRequest?.text);
   const lastAssistant = nonEmpty(input.boundaryAndActiveTask.lastMaterialAssistant?.text);
   const model: RebirthPackageV6Model = {
-    version: REBIRTH_PACKAGE_V6_VERSION,
+    version: REBIRTH_PACKAGE_V7_VERSION,
     boundaryAndActiveTask: input.boundaryAndActiveTask,
     executionState: input.executionState ?? { facts: [], unknownReasons: ['execution capture unavailable'] },
     activeEditDelta: input.activeEditDelta ?? {
@@ -460,6 +615,9 @@ export function buildRebirthPackageV6Model(
       activeRequest,
       lastAssistant,
     ),
+    operatorVault: normalizeLineageSection(input.operatorVault),
+    episodeChapterIndex: normalizeLineageSection(input.episodeChapterIndex),
+    lifeLedger: normalizeLineageSection(input.lifeLedger),
     recoveryIndex: [...(input.recoveryIndex ?? [])],
   };
   return deepFreeze(model) as RebirthPackageV6Model;
@@ -468,7 +626,10 @@ export function buildRebirthPackageV6Model(
 export function isRebirthPackageV6Model(value: unknown): value is RebirthPackageV6Model {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const candidate = value as Partial<RebirthPackageV6Model>;
-  return candidate.version === REBIRTH_PACKAGE_V6_VERSION
+  // Persisted v6 packages remain valid: the lineage sections are additive, and
+  // the renderer treats an absent section as empty rather than unknown.
+  return (candidate.version === REBIRTH_PACKAGE_V6_VERSION
+      || candidate.version === REBIRTH_PACKAGE_V7_VERSION)
     && Boolean(candidate.boundaryAndActiveTask)
     && Boolean(candidate.executionState)
     && Boolean(candidate.activeEditDelta)
@@ -931,6 +1092,9 @@ export function adaptLegacyRebirthPackageToV6(
     activeEditDelta,
     cognitiveArtifacts: cognition,
     recentConversation: conversation,
+    ...(options.operatorVault ? { operatorVault: options.operatorVault } : {}),
+    ...(options.episodeChapterIndex ? { episodeChapterIndex: options.episodeChapterIndex } : {}),
+    ...(options.lifeLedger ? { lifeLedger: options.lifeLedger } : {}),
     recoveryIndex: recovery,
   });
 }
@@ -1034,8 +1198,91 @@ function contributorSummary(contributors: readonly RebirthPackageV6EditContribut
   return parts.join('; ');
 }
 
-function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
+function editFileStats(file: RebirthPackageV6EditFile): string {
+  return file.insertions === null || file.deletions === null
+    ? '+?/−?'
+    : `+${file.insertions}/−${file.deletions}`;
+}
+
+function editFileHeaderLine(file: RebirthPackageV6EditFile): string {
+  return `${file.changeKind.toUpperCase()} ${file.filePath} · ${file.ownership} · baseline=${file.baselineQuality} · ${editFileStats(file)} · validation=${file.validationState} · closure=${file.closureState}`;
+}
+
+/** Exact per-file block the Active Edit Delta section renders for one capture row. */
+function editFileBlockLines(file: RebirthPackageV6EditFile): string[] {
+  const lines = [editFileHeaderLine(file)];
+  if (file.state === 'withheld_sensitive' || file.baselineQuality === 'withheld_sensitive') {
+    lines.push('  sensitive content withheld');
+    return lines;
+  }
+  const contributors = contributorSummary(file.contributors);
+  if (contributors) lines.push(`  contributors: ${contributors}`);
+  if (file.preview?.text) {
+    lines.push(file.preview.text.split('\n').map((line) => `  ${line}`).join('\n'));
+    if (!file.preview.complete) {
+      lines.push(`  preview partial: omitted-hunks=${file.preview.omittedHunks} omitted-lines=${file.preview.omittedLines} recover=${file.diffHandle ?? 'unavailable'}`);
+    }
+  } else {
+    lines.push(`  preview=${file.state === 'unknown' ? 'unknown' : 'unavailable'}${file.reason ? ` · ${file.reason}` : ''}`);
+  }
+  if (file.diffHandle) lines.push(`  exact-diff=${file.diffHandle}`);
+  if (file.snapshotHandle) lines.push(`  exact-snapshot=${file.snapshotHandle}`);
+  return lines;
+}
+
+/**
+ * Active Edit Delta collapse citizenship (kind 'edit'): each captured file row
+ * becomes one collapse unit whose T0 verbatim is exactly the block the section
+ * renders, so demotion receipts and ledger rows describe the bytes that would
+ * have shipped. Mint gate: a receipt requires an exact Atlas diff or snapshot
+ * handle — rows without exact recovery floor at the t2 era block, because a
+ * dead pointer is worse than spent chars. Legacy bounded-log mode (no capture
+ * id) carries no per-file identity and stays outside the collapse engine.
+ */
+export function buildActiveEditCollapseUnits(model: RebirthPackageV6Model): readonly CollapseUnit[] {
   const delta = model.activeEditDelta;
+  if (delta.captureId === null) return [];
+  const captureHandle = model.recoveryIndex.find((entry) => entry.id === 'atlas-edit-capture')?.handle ?? null;
+  return delta.files.map((file) => {
+    const verbatim = editFileBlockLines(file).join('\n');
+    const exactHandle = file.diffHandle ?? file.snapshotHandle;
+    const sourceAt = file.sourceAt ?? delta.capturedSourceAt ?? null;
+    return {
+      id: file.provenanceId,
+      sourceAt,
+      kind: 'edit' as const,
+      verbatim,
+      digest: editFileHeaderLine(file),
+      eraKey: sourceAt ? sourceAt.slice(0, 10) : null,
+      claim: `${file.changeKind} ${file.filePath} ${editFileStats(file)} validation=${file.validationState} closure=${file.closureState}`,
+      recover: exactHandle ?? captureHandle ?? 'unavailable',
+      sha256: exactHandle ? createHash('sha256').update(verbatim, 'utf8').digest('hex') : null,
+      verified: Boolean(exactHandle),
+    };
+  });
+}
+
+function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): RenderedV6SectionBody {
+  const delta = model.activeEditDelta;
+  const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'atlas-edit-capture')?.handle ?? null;
+  // Legacy bounded-edit-log mode: when the immutable Atlas capture was
+  // unavailable, the adapter wraps the raw edit log in one synthetic file row
+  // whose every field is honestly unknown. Rendering those fields sprays the
+  // same unknown seven ways; God Rule 8 wants the unknown declared once. The
+  // timestamped edit log itself is real evidence and renders untouched.
+  const legacyLog = delta.captureId === null
+    && delta.files.length === 1
+    && delta.files[0].provenanceId.startsWith('legacy-edit-delta:')
+    ? delta.files[0]
+    : null;
+  if (legacyLog) {
+    const reason = delta.reasons[0] ?? 'immutable Atlas edit capture unavailable';
+    const legacyLines = [
+      `evidence=bounded edit log; immutable capture unavailable: ${reason}`,
+      ...(legacyLog.preview?.text ? [legacyLog.preview.text] : []),
+    ];
+    return boundedText(legacyLines.join('\n'), maxChars, recoveryHandle);
+  }
   const lines = [
     `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · source-time=${delta.capturedSourceAt ?? 'unknown'} · observed-at=${delta.completedObservedAt ?? 'unknown'}`,
   ];
@@ -1044,45 +1291,60 @@ function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): { te
   } else if (delta.state === 'unknown' && delta.files.length === 0) {
     lines.push('Active edit state is unknown; absence of evidence is not rendered as none.');
   }
-  for (const file of delta.files) {
-    const stats = file.insertions === null || file.deletions === null
-      ? '+?/−?'
-      : `+${file.insertions}/−${file.deletions}`;
-    lines.push('', `${file.changeKind.toUpperCase()} ${file.filePath} · ${file.ownership} · baseline=${file.baselineQuality} · ${stats} · validation=${file.validationState} · closure=${file.closureState}`);
-    if (file.state === 'withheld_sensitive' || file.baselineQuality === 'withheld_sensitive') {
-      lines.push('  sensitive content withheld');
-      continue;
-    }
-    const contributors = contributorSummary(file.contributors);
-    if (contributors) lines.push(`  contributors: ${contributors}`);
-    if (file.preview?.text) {
-      lines.push(file.preview.text.split('\n').map((line) => `  ${line}`).join('\n'));
-      if (!file.preview.complete) {
-        lines.push(`  preview partial: omitted-hunks=${file.preview.omittedHunks} omitted-lines=${file.preview.omittedLines} recover=${file.diffHandle ?? 'unavailable'}`);
-      }
-    } else {
-      lines.push(`  preview=${file.state === 'unknown' ? 'unknown' : 'unavailable'}${file.reason ? ` · ${file.reason}` : ''}`);
-    }
-    if (file.diffHandle) lines.push(`  exact-diff=${file.diffHandle}`);
-    if (file.snapshotHandle) lines.push(`  exact-snapshot=${file.snapshotHandle}`);
-  }
-  if (delta.inheritedCaptureIds.length > 0) lines.push(`inherited-captures=${delta.inheritedCaptureIds.join(',')}`);
+  const trailer: string[] = [];
+  if (delta.inheritedCaptureIds.length > 0) trailer.push(`inherited-captures=${delta.inheritedCaptureIds.join(',')}`);
   if (delta.truncated || delta.omittedFiles > 0) {
-    const recovery = model.recoveryIndex.find((entry) => entry.id === 'atlas-edit-capture')?.handle || 'unavailable';
-    lines.push(`capture partial: omitted-files=${delta.omittedFiles} recover=${recovery}`);
+    trailer.push(`capture partial: omitted-files=${delta.omittedFiles} recover=${recoveryHandle || 'unavailable'}`);
   }
-  for (const reason of delta.reasons) lines.push(`reason=${reason}`);
-  const recovery = model.recoveryIndex.find((entry) => entry.id === 'atlas-edit-capture')?.handle ?? null;
-  return boundedText(lines.join('\n'), maxChars, recovery);
+  for (const reason of delta.reasons) trailer.push(`reason=${reason}`);
+  const units = buildActiveEditCollapseUnits(model);
+  if (units.length === 0) {
+    return boundedText([...lines, ...trailer].join('\n'), maxChars, recoveryHandle);
+  }
+  // Collapse citizenship: the state header and capture-honesty trailer stay
+  // verbatim-protected; per-file blocks demote through the generational engine
+  // so an over-budget AED leaves receipts and ledger rows, never a bare cut.
+  const headerText = lines.join('\n');
+  const trailerText = trailer.length > 0 ? `\n${trailer.join('\n')}` : '';
+  const body = collapseWithReceipt(
+    units,
+    maxChars - headerText.length - 1 - trailerText.length,
+    recoveryHandle,
+  );
+  return {
+    text: `${headerText}\n${body.text}${trailerText}`,
+    complete: body.complete,
+    collapse: body.collapse,
+  };
+}
+
+/**
+ * Star-family provenance ids historically embedded the entire note as their
+ * final path segment, so `source=` reprinted the row body and the section paid
+ * roughly twice for every pointer-authority artifact. The embedded copy adds no
+ * recovery power — instance, kind, and source time already resolve the star —
+ * so the renderer keeps the resolving prefix and drops the duplicated body.
+ * Identities are never rewritten; this is a render-surface compaction only,
+ * which also heals persisted legacy models re-rendered at later boundaries.
+ */
+function compactCognitionSource(provenanceId: string, noteText: string): string {
+  const note = noteText.trim();
+  if (note.length < 24) return provenanceId;
+  const probe = note.replace(/…+\s*$/u, '').slice(0, 120);
+  if (probe.length < 24) return provenanceId;
+  const index = provenanceId.indexOf(probe);
+  if (index <= 8) return provenanceId;
+  const head = provenanceId.slice(0, index).replace(/[\s/:]+$/u, '');
+  return head ? `${head}/…` : provenanceId;
 }
 
 function renderCognition(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
   const known = model.cognitiveArtifacts.filter((row) => row.sourceAt);
   const unknown = model.cognitiveArtifacts.filter((row) => !row.sourceAt);
-  const lines = known.map((row) => `${row.sourceAt} · ${row.kind} · ${row.text} · source=${row.provenanceId} · authority=${row.authority}`);
+  const lines = known.map((row) => `${row.sourceAt} · ${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · authority=${row.authority}`);
   if (unknown.length > 0) {
     lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
-    for (const row of unknown) lines.push(`- ${row.kind} · ${row.text} · source=${row.provenanceId} · authority=${row.authority}`);
+    for (const row of unknown) lines.push(`- ${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · authority=${row.authority}`);
   }
   if (lines.length === 0) lines.push('No relevant current cognitive artifacts captured.');
   return boundedText(lines.join('\n'), maxChars, model.recoveryIndex.find((entry) => entry.id === 'cognition')?.handle ?? null);
@@ -1313,6 +1575,67 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
   return { text: lines.join('\n'), complete: !elided };
 }
 
+/**
+ * Lineage sections render through the generational collapse engine: newest
+ * units stay verbatim, older units demote one tier at a time (digest → era →
+ * receipt → rollup) until the section fits. Nothing is dropped — every demotion
+ * leaves an exact, mint-verified pointer (spec §5–§6).
+ */
+/**
+ * Shared two-pass collapse for every section that owns collapse units. The
+ * first pass spends the whole allowance. If nothing collapsed there is no
+ * receipt line to emit, so the section keeps every char. Otherwise re-collapse
+ * with the receipt line reserved: a collapse notice must never be the thing
+ * that pushes a section past its cap. On the bounded path the second pass is
+ * the one whose text ships, so its placements are the authoritative record of
+ * where every unit actually landed.
+ */
+function collapseWithReceipt(
+  units: readonly CollapseUnit[],
+  budget: number,
+  recover: string | null,
+): { text: string; collapse: CollapseResult; complete: boolean } {
+  const collapse = (chars: number) => collapseUnits({
+    units,
+    maxChars: Math.max(0, chars),
+    rangeRecover: recover,
+    floorRecover: recover,
+  });
+  const tierReceipt = (result: CollapseResult): string => (
+    `\n[COLLAPSE units=${units.length} t0=${result.tierCounts.t0}`
+    + ` t1=${result.tierCounts.t1} t2=${result.tierCounts.t2}`
+    + ` t3=${result.tierCounts.t3} t4=${result.tierCounts.t4}`
+    + ` recover=${recover ?? 'unavailable'}]`
+  );
+  const full = collapse(budget);
+  if (full.complete) return { text: full.text, collapse: full, complete: true };
+  // +16 pads for digit-width drift between the two passes' tier counts.
+  const reserve = tierReceipt(full).length + 16;
+  const bounded = collapse(budget - reserve);
+  return { text: `${bounded.text}${tierReceipt(bounded)}`, collapse: bounded, complete: false };
+}
+
+function renderLineage(
+  section: RebirthPackageV7LineageSection,
+  maxChars: number,
+  fallbackRecover: string | null,
+): RenderedV6SectionBody {
+  const header: string[] = [];
+  if (section.partialReason) header.push(`partial=${section.partialReason}`);
+  if (section.units.length === 0) {
+    header.push('No lineage units captured for this section.');
+    return { text: header.join('\n'), complete: !section.partialReason, collapse: null };
+  }
+  const headerText = header.length > 0 ? `${header.join('\n')}\n` : '';
+  const recover = section.rangeRecover ?? fallbackRecover;
+  const body = collapseWithReceipt(section.units, maxChars - headerText.length, recover);
+  return {
+    text: `${headerText}${body.text}`,
+    complete: body.complete && !section.partialReason,
+    collapse: body.collapse,
+  };
+}
+
 function frameSection(id: RebirthPackageV6SectionId, body: string): string {
   return [
     `── ${SECTION_TITLES[id]} ──`,
@@ -1322,49 +1645,528 @@ function frameSection(id: RebirthPackageV6SectionId, body: string): string {
   ].join('\n');
 }
 
-export function renderRebirthPackageV6Sections(
+/**
+ * Persisted v6 packages predate the lineage sections and carry none of them, and
+ * `isRebirthPackageV6Model` deliberately still accepts those. The renderer must
+ * therefore read lineage through this accessor: an absent section is empty, not
+ * a crash. Rendering a stored package is a continuity-recovery path — it must
+ * never throw on the shape it was told is valid.
+ */
+const EMPTY_LINEAGE_SECTION: RebirthPackageV7LineageSection = Object.freeze({
+  units: [],
+  rangeRecover: null,
+  partialReason: null,
+});
+
+function lineageSection(
   model: RebirthPackageV6Model,
-  options: RenderRebirthPackageV6Options = {},
-): readonly RenderedRebirthPackageV6Section[] {
-  const limits = { ...DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, ...options.sectionMaxChars };
-  const rendered: Record<RebirthPackageV6SectionId, { text: string; complete: boolean }> = {
+  id: RebirthPackageV7LineageSectionId,
+): RebirthPackageV7LineageSection {
+  const section = model[id];
+  if (!section || !Array.isArray(section.units)) return EMPTY_LINEAGE_SECTION;
+  return section;
+}
+
+/**
+ * One rendered section body. `collapse` is populated only by the lineage
+ * renderer: it is the final CollapseResult whose text actually shipped (or
+ * null when the section had no units), so downstream continuity-ledger capture
+ * records what the render truly did rather than recomputing an approximation.
+ */
+interface RenderedV6SectionBody {
+  readonly text: string;
+  readonly complete: boolean;
+  readonly collapse?: CollapseResult | null;
+}
+
+function renderSectionBodies(
+  model: RebirthPackageV6Model,
+  limits: Record<RebirthPackageV6SectionId, number>,
+): Record<RebirthPackageV6SectionId, RenderedV6SectionBody> {
+  const transcriptHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle || null;
+  return {
     boundaryAndActiveTask: renderBoundary(model, limits.boundaryAndActiveTask),
     executionState: renderExecution(model, limits.executionState),
     activeEditDelta: renderActiveEdits(model, limits.activeEditDelta),
     cognitiveArtifacts: renderCognition(model, limits.cognitiveArtifacts),
     recentConversation: renderConversation(model, limits.recentConversation),
+    operatorVault: renderLineage(
+      lineageSection(model, 'operatorVault'),
+      limits.operatorVault,
+      transcriptHandle,
+    ),
+    episodeChapterIndex: renderLineage(
+      lineageSection(model, 'episodeChapterIndex'),
+      limits.episodeChapterIndex,
+      model.recoveryIndex.find((entry) => entry.id === 'context-warp-stores')?.handle || null,
+    ),
+    lifeLedger: renderLineage(
+      lineageSection(model, 'lifeLedger'),
+      limits.lifeLedger,
+      model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle || null,
+    ),
     recoveryIndex: renderRecovery(model, limits.recoveryIndex),
   };
-  return REBIRTH_PACKAGE_V6_SECTION_IDS
-    .filter((id) => id !== 'recentConversation' || model.recentConversation.length > 0)
-    .map((id) => ({
-      id,
-      title: SECTION_TITLES[id],
-      text: frameSection(id, rendered[id].text),
-      complete: rendered[id].complete,
-    }));
 }
 
-export function renderRebirthPackageV6(
+function admittedSectionIds(model: RebirthPackageV6Model): readonly RebirthPackageV6SectionId[] {
+  return REBIRTH_PACKAGE_V6_SECTION_IDS.filter((id) => {
+    if (id === 'recentConversation') return model.recentConversation.length > 0;
+    if ((REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id)) {
+      const section = lineageSection(model, id as RebirthPackageV7LineageSectionId);
+      return section.units.length > 0 || Boolean(section.partialReason);
+    }
+    return true;
+  });
+}
+
+function packageBudgetChars(options: RenderRebirthPackageV6Options): number {
+  return options.packageBudget ?? DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS;
+}
+
+function pushTargetChars(options: RenderRebirthPackageV6Options): number {
+  const budget = packageBudgetChars(options);
+  if (!Number.isFinite(budget) || budget <= 0) return budget;
+  const configured = options.pushTargetChars;
+  if (typeof configured !== 'number' || !Number.isFinite(configured) || configured <= 0) return budget;
+  return Math.min(Math.floor(budget), Math.floor(configured));
+}
+
+/**
+ * Adaptive Backfill (spec §7): after every section renders inside its cap, the
+ * unspent global budget is handed out in priority order. Each grant raises one
+ * section's cap by the entire remaining pool; the section takes only what its
+ * next tier promotion needs, and the measured growth is what leaves the pool.
+ * The result is a young lineage that ships nearly all-verbatim and an old
+ * lineage that ships recent-verbatim plus a digest middle and an era/receipt
+ * deep past — the O(log lifetime) curve emerging from one rule at every age.
+ */
+export function resolveAdaptiveSectionCaps(
   model: RebirthPackageV6Model,
   options: RenderRebirthPackageV6Options = {},
+): Record<RebirthPackageV6SectionId, number> {
+  const limits = { ...DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, ...options.sectionMaxChars };
+  const budget = pushTargetChars(options);
+  if (options.adaptiveBackfill === false || !Number.isFinite(budget) || budget <= 0) return limits;
+  const envelopeChars = Number.isFinite(options.envelopeChars)
+    ? Math.max(0, Math.floor(options.envelopeChars ?? 0))
+    : 0;
+
+  const admitted = admittedSectionIds(model);
+  let bodies = renderSectionBodies(model, limits);
+  const framedLength = (): number => admitted
+    .map((id) => frameSection(id, bodies[id].text).length)
+    .reduce((total, length, index) => total + length + (index > 0 ? 2 : 0), 0);
+
+  let spare = budget
+    - envelopeChars
+    - REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS
+    - framedLength();
+  if (spare <= 0) return limits;
+
+  // An explicitly supplied cap is a hard ceiling the caller asked for; backfill
+  // may only grow the defaults. Silently inflating a requested cap would make
+  // every caller-imposed bound advisory.
+  const explicitCaps = new Set<RebirthPackageV6SectionId>(
+    Object.keys(options.sectionMaxChars ?? {}) as RebirthPackageV6SectionId[],
+  );
+
+  for (const id of REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY) {
+    if (spare < 1) break;
+    if (!admitted.includes(id)) continue;
+    if (explicitCaps.has(id)) continue;
+    if (bodies[id].complete) continue;
+    const before = bodies[id].text.length;
+    limits[id] += spare;
+    bodies = renderSectionBodies(model, limits);
+    // The section takes only what its next promotion needs; the unconsumed part
+    // of the grant stays in the pool for the next section in priority order.
+    // The inflated cap is kept because it is what produced this measured body.
+    const growth = bodies[id].text.length - before;
+    spare -= Math.max(0, growth);
+  }
+  return limits;
+}
+
+export function renderRebirthPackageV6Sections(
+  model: RebirthPackageV6Model,
+  options: RenderRebirthPackageV6Options = {},
+): readonly RenderedRebirthPackageV6Section[] {
+  // Redaction lane: nothing republishes before it (pure, idempotent, cached).
+  model = redactContinuityModel(model).model;
+  const limits = resolveAdaptiveSectionCaps(model, options);
+  return renderSectionsWithLimits(model, limits);
+}
+
+function renderSectionsWithLimits(
+  model: RebirthPackageV6Model,
+  limits: Record<RebirthPackageV6SectionId, number>,
+): readonly RenderedRebirthPackageV6Section[] {
+  const rendered = renderSectionBodies(model, limits);
+  return admittedSectionIds(model).map((id) => ({
+    id,
+    title: SECTION_TITLES[id],
+    text: frameSection(id, rendered[id].text),
+    complete: rendered[id].complete,
+    ...(rendered[id].collapse !== undefined ? { collapse: rendered[id].collapse } : {}),
+  }));
+}
+
+/**
+ * Per-lineage-section collapse outcome of one actual render: the exact
+ * placements behind the shipped text plus whether the whole framed section was
+ * omitted by the package-level budget compose. This is the record the
+ * continuity ledger persists — computed once by the render, never re-derived.
+ */
+/** Sections owning collapse units: the v7 lineage trio plus the Active Edit Delta. */
+export type RebirthPackageV7CollapseSectionId = RebirthPackageV7LineageSectionId | 'activeEditDelta';
+
+export interface RebirthPackageV7SectionCollapseReport {
+  readonly sectionId: RebirthPackageV7CollapseSectionId;
+  readonly placements: readonly CollapseUnitPlacement[];
+  readonly demotions: number;
+  readonly droppedToFloorRollup: number;
+  /** True when the composed package omitted this section entirely. */
+  readonly sectionElided: boolean;
+}
+
+export interface RebirthPackageV7CollapseReport {
+  readonly sections: readonly RebirthPackageV7SectionCollapseReport[];
+  /** Every optional section the budget compose omitted (lineage or not). */
+  readonly omittedSectionIds: readonly RebirthPackageV6SectionId[];
+  /** Per-render counters from the graceful push-shrink and final compose. */
+  readonly telemetry: RebirthPackageV7EvictionTelemetry;
+}
+
+export interface RebirthPackageV7EvictionTelemetry {
+  readonly budgetChars: number;
+  readonly pushTargetChars: number;
+  readonly envelopeChars: number;
+  readonly initialTotalChars: number;
+  readonly finalTotalChars: number;
+  readonly oversubscribedChars: number;
+  readonly targetMissChars: number;
+  readonly hardOverrunChars: number;
+  readonly shrinkRenders: number;
+  readonly sectionsShrunk: number;
+  readonly capReductionChars: number;
+  readonly unitsDemoted: number;
+  readonly demotionSteps: number;
+  readonly unitsFloorRolledUp: number;
+  readonly unitsSectionElided: number;
+  readonly sectionsElided: number;
+  readonly evictionEnvelopes: number;
+}
+
+export interface RenderedRebirthPackageV6WithReport {
+  readonly text: string;
+  readonly collapse: RebirthPackageV7CollapseReport;
+}
+
+function buildCollapseReport(
+  sections: readonly RenderedRebirthPackageV6Section[],
+  omittedSectionIds: readonly RebirthPackageV6SectionId[],
+  telemetry: RebirthPackageV7EvictionTelemetry,
+): RebirthPackageV7CollapseReport {
+  const omitted = new Set<RebirthPackageV6SectionId>(omittedSectionIds);
+  const citizens = sections.filter((section): section is RenderedRebirthPackageV6Section & { collapse: CollapseResult } => (
+    section.collapse != null
+    && ((REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(section.id)
+      || section.id === 'activeEditDelta')
+  ));
+  return {
+    sections: citizens.map((section) => ({
+      sectionId: section.id as RebirthPackageV7CollapseSectionId,
+      placements: section.collapse.placements,
+      demotions: section.collapse.demotions,
+      droppedToFloorRollup: section.collapse.droppedToFloorRollup,
+      sectionElided: omitted.has(section.id),
+    })),
+    omittedSectionIds,
+    telemetry,
+  };
+}
+
+function oneLineClaim(value: string, maxChars = 140): string {
+  const flattened = value.replace(/\s+/gu, ' ').replace(/"/gu, "'").trim();
+  return flattened.length <= maxChars ? flattened : `${flattened.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+/**
+ * Skeletal era census for an eviction envelope: one line per era (count, span,
+ * one claim sample), oldest first, unknown-time quarantine last, bounded so an
+ * envelope stays a signpost, never a second body. Overflowing eras fuse into a
+ * declared tail count instead of silently vanishing.
+ */
+function buildEvictionEraCensus(units: readonly CollapseUnit[], maxChars: number): string[] {
+  const eras = new Map<string, CollapseUnit[]>();
+  for (const unit of units) {
+    const key = unit.sourceAt ? (unit.eraKey ?? unit.sourceAt.slice(0, 10)) : 'unknown-time';
+    const bucket = eras.get(key);
+    if (bucket) bucket.push(unit); else eras.set(key, [unit]);
+  }
+  const keys = [...eras.keys()].sort((a, b) => (
+    a === 'unknown-time' ? 1 : b === 'unknown-time' ? -1 : a.localeCompare(b)
+  ));
+  const lines: string[] = [];
+  let spent = 0;
+  for (let index = 0; index < keys.length; index += 1) {
+    const bucket = eras.get(keys[index])!;
+    const times = bucket
+      .map((unit) => unit.sourceAt)
+      .filter((value): value is string => Boolean(value))
+      .sort();
+    const span = times.length > 0 ? `${times[0]}..${times.at(-1)}` : 'unknown';
+    const line = `· era=${keys[index]} n=${bucket.length} span=${span} "${oneLineClaim(bucket[0].claim)}"`;
+    if (spent + line.length + 1 > maxChars) {
+      const remaining = keys.slice(index);
+      const remainingUnits = remaining.reduce((total, key) => total + (eras.get(key)?.length ?? 0), 0);
+      lines.push(`· … ${remaining.length} more era(s) (${remainingUnits} units)`);
+      break;
+    }
+    lines.push(line);
+    spent += line.length + 1;
+  }
+  return lines;
+}
+
+/**
+ * Eviction envelope for a whole section the package-level budget omitted: unit
+ * count, source span, a skeletal era census, and the one continuity-ledger
+ * handle where every evicted unit's placement row lives (spec: per-section
+ * pointers to the ledger, not per-unit receipt spam). A missing ledger handle
+ * renders the declared degradation line — never a dead pointer.
+ */
+function buildSectionEvictionEnvelope(args: {
+  sectionId: RebirthPackageV7CollapseSectionId;
+  units: readonly CollapseUnit[];
+  ledgerHandle: string | null;
+  includeCensus: boolean;
+}): string {
+  const times = args.units
+    .map((unit) => unit.sourceAt)
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  const span = times.length > 0 ? `${times[0]}..${times.at(-1)}` : 'unknown..unknown';
+  const header = args.ledgerHandle
+    ? `[EVICTED section=${args.sectionId} units=${args.units.length} span=${span} ledger=${args.ledgerHandle}]`
+    : `[EVICTED section=${args.sectionId} units=${args.units.length} span=${span}]`
+      + `\n${args.units.length} units evicted; ledger unreachable`;
+  if (!args.includeCensus) return header;
+  return [header, ...buildEvictionEraCensus(args.units, 900)].join('\n');
+}
+
+/** Reverse backfill order: deep lineage yields before operator truth and AED. */
+const REBIRTH_PACKAGE_V7_SHRINK_PRIORITY = [
+  'lifeLedger',
+  'episodeChapterIndex',
+  'operatorVault',
+  'activeEditDelta',
+] as const satisfies readonly RebirthPackageV7CollapseSectionId[];
+
+function joinRenderedSections(
+  sections: readonly RenderedRebirthPackageV6Section[],
+  declaration: string | null,
 ): string {
-  const sections = renderRebirthPackageV6Sections(model, options);
-  const rendered = sections.map((section) => section.text).join('\n\n');
-  const budget = options.packageBudget ?? DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS;
-  if (!Number.isFinite(budget) || budget <= 0) return rendered;
+  const sectionsText = sections.map((section) => section.text).join('\n\n');
+  return declaration ? `${declaration}\n\n${sectionsText}` : sectionsText;
+}
+
+interface RebirthPackageV7ShrinkOutcome {
+  readonly sections: readonly RenderedRebirthPackageV6Section[];
+  readonly text: string;
+  readonly shrinkRenders: number;
+  readonly sectionsShrunk: number;
+  readonly capReductionChars: number;
+}
+
+/**
+ * Missing middle gear between adaptive backfill and package-level section
+ * elision. The binary searches keep the largest cap that reaches the target,
+ * so pressure demotes only as much history as the measured overflow requires.
+ * Every collapse citizen keeps a 2k floor; fixed must-push sections are never
+ * touched here, and Active Edit Delta remains protected by the final compose.
+ */
+function shrinkCollapseSectionsToTarget(args: {
+  model: RebirthPackageV6Model;
+  declaration: string | null;
+  initialLimits: Record<RebirthPackageV6SectionId, number>;
+  initialSections: readonly RenderedRebirthPackageV6Section[];
+  initialText: string;
+  targetChars: number;
+}): RebirthPackageV7ShrinkOutcome {
+  let limits = { ...args.initialLimits };
+  let sections = args.initialSections;
+  let rendered = args.initialText;
+  let shrinkRenders = 0;
+  const shrunk = new Set<RebirthPackageV7CollapseSectionId>();
+
+  const evaluate = (
+    id: RebirthPackageV7CollapseSectionId,
+    cap: number,
+  ): { limits: Record<RebirthPackageV6SectionId, number>; sections: readonly RenderedRebirthPackageV6Section[]; text: string } => {
+    const candidateLimits = { ...limits, [id]: cap };
+    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits);
+    shrinkRenders += 1;
+    return {
+      limits: candidateLimits,
+      sections: candidateSections,
+      text: joinRenderedSections(candidateSections, args.declaration),
+    };
+  };
+
+  for (const id of REBIRTH_PACKAGE_V7_SHRINK_PRIORITY) {
+    if (rendered.length <= args.targetChars) break;
+    const section = sections.find((candidate) => candidate.id === id);
+    if (!section?.collapse) continue;
+    const startingCap = limits[id];
+    const floorCap = Math.min(startingCap, REBIRTH_PACKAGE_V7_COLLAPSE_FLOOR_CHARS);
+    if (startingCap <= floorCap) continue;
+
+    const floor = evaluate(id, floorCap);
+    // A collapse receipt can occasionally cost more than a tiny amount of body
+    // text. Never commit a cap reduction that fails to reduce the package.
+    if (floor.text.length >= rendered.length) continue;
+    let best = floor;
+
+    if (floor.text.length <= args.targetChars) {
+      // Preserve the most content that still meets the target. Collapse output
+      // is monotone by cap; the final exact render remains the authority.
+      let low = floorCap + 1;
+      let high = startingCap - 1;
+      let probes = 0;
+      while (low <= high && probes < 8) {
+        const middle = low + Math.floor((high - low) / 2);
+        const candidate = evaluate(id, middle);
+        probes += 1;
+        if (candidate.text.length <= args.targetChars) {
+          best = candidate;
+          low = middle + 1;
+        } else {
+          high = middle - 1;
+        }
+      }
+    }
+
+    limits = best.limits;
+    sections = best.sections;
+    rendered = best.text;
+    shrunk.add(id);
+  }
+
+  const capReductionChars = REBIRTH_PACKAGE_V7_SHRINK_PRIORITY.reduce(
+    (total, id) => total + Math.max(0, args.initialLimits[id] - limits[id]),
+    0,
+  );
+  return {
+    sections,
+    text: rendered,
+    shrinkRenders,
+    sectionsShrunk: shrunk.size,
+    capReductionChars,
+  };
+}
+
+export function renderRebirthPackageV6WithReport(
+  model: RebirthPackageV6Model,
+  options: RenderRebirthPackageV6Options = {},
+): RenderedRebirthPackageV6WithReport {
+  // Redaction lane first: sections, eviction envelopes, and ledger capture
+  // must all derive from the same redacted model, and the aggregate
+  // declaration must ride INSIDE the budget math, never appended beyond it.
+  const lane = redactContinuityModel(model);
+  model = lane.model;
+  const declaration = lane.declaration;
+  const budget = packageBudgetChars(options);
+  const pushTarget = pushTargetChars(options);
+  const envelopeChars = Number.isFinite(options.envelopeChars)
+    ? Math.max(0, Math.floor(options.envelopeChars ?? 0))
+    : 0;
+  const initialLimits = resolveAdaptiveSectionCaps(model, options);
+  const initialSections = renderSectionsWithLimits(model, initialLimits);
+  const initialRendered = joinRenderedSections(initialSections, declaration);
+  const targetSectionChars = Number.isFinite(pushTarget) && pushTarget > 0
+    ? Math.max(0, Math.floor(pushTarget) - envelopeChars)
+    : Number.POSITIVE_INFINITY;
+  const shrink = initialRendered.length > targetSectionChars
+    ? shrinkCollapseSectionsToTarget({
+      model,
+      declaration,
+      initialLimits,
+      initialSections,
+      initialText: initialRendered,
+      targetChars: targetSectionChars,
+    })
+    : {
+      sections: initialSections,
+      text: initialRendered,
+      shrinkRenders: 0,
+      sectionsShrunk: 0,
+      capReductionChars: 0,
+    };
+  const sections = shrink.sections;
+  const rendered = shrink.text;
+  const finish = (
+    text: string,
+    omittedSectionIds: readonly RebirthPackageV6SectionId[],
+  ): RenderedRebirthPackageV6WithReport => {
+    const citizens = sections.filter((section): section is RenderedRebirthPackageV6Section & { collapse: CollapseResult } => (
+      section.collapse != null
+    ));
+    const omitted = new Set(omittedSectionIds);
+    const finalTotalChars = text.length + envelopeChars;
+    const initialTotalChars = initialRendered.length + envelopeChars;
+    const telemetry: RebirthPackageV7EvictionTelemetry = {
+      budgetChars: Number.isFinite(budget) && budget > 0 ? Math.floor(budget) : 0,
+      pushTargetChars: Number.isFinite(pushTarget) && pushTarget > 0 ? Math.floor(pushTarget) : 0,
+      envelopeChars,
+      initialTotalChars,
+      finalTotalChars,
+      oversubscribedChars: Number.isFinite(pushTarget) && pushTarget > 0
+        ? Math.max(0, initialTotalChars - Math.floor(pushTarget))
+        : 0,
+      targetMissChars: Number.isFinite(pushTarget) && pushTarget > 0
+        ? Math.max(0, finalTotalChars - Math.floor(pushTarget))
+        : 0,
+      hardOverrunChars: Number.isFinite(budget) && budget > 0
+        ? Math.max(0, finalTotalChars - Math.floor(budget))
+        : 0,
+      shrinkRenders: shrink.shrinkRenders,
+      sectionsShrunk: shrink.sectionsShrunk,
+      capReductionChars: shrink.capReductionChars,
+      unitsDemoted: citizens.reduce(
+        (total, section) => total + section.collapse.placements.filter((placement) => placement.tier !== 't0').length,
+        0,
+      ),
+      demotionSteps: citizens.reduce((total, section) => total + section.collapse.demotions, 0),
+      unitsFloorRolledUp: citizens.reduce(
+        (total, section) => total + section.collapse.droppedToFloorRollup,
+        0,
+      ),
+      unitsSectionElided: citizens.reduce(
+        (total, section) => total + (omitted.has(section.id) ? section.collapse.placements.length : 0),
+        0,
+      ),
+      sectionsElided: omittedSectionIds.length,
+      evictionEnvelopes: citizens.filter(
+        (section) => omitted.has(section.id) && section.collapse.placements.length > 0,
+      ).length,
+    };
+    return {
+      text,
+      collapse: buildCollapseReport(sections, omittedSectionIds, telemetry),
+    };
+  };
+  if (!Number.isFinite(budget) || budget <= 0) return finish(rendered, []);
 
   // The protected lifecycle envelope (emitted by the relay above these sections)
   // is reserved from the section budget so the produced total never silently
   // exceeds the declared packageBudget. When the envelope alone consumes the
   // entire budget, record a protected-overrun and admit no optional sections —
   // the envelope is protected, so the overrun must be visible, never hidden.
-  const envelopeChars = Number.isFinite(options.envelopeChars)
-    ? Math.max(0, Math.floor(options.envelopeChars ?? 0))
-    : 0;
   const envelopeOverrun = envelopeChars > budget;
   const sectionBudget = envelopeOverrun ? 0 : Math.max(0, budget - envelopeChars);
-  if (!envelopeOverrun && rendered.length <= sectionBudget) return rendered;
+  if (!envelopeOverrun && rendered.length <= sectionBudget) return finish(rendered, []);
 
   // Authorization, execution truth, active edits, and recovery stay whole.
   // Never slice a framed section mid-line: that can hide an omitted-file or
@@ -1378,6 +2180,14 @@ export function renderRebirthPackageV6(
   ]);
   const optional = sections.filter((section) => !protectedIds.has(section.id));
   const recover = model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle || 'unavailable';
+  const ledgerHandle = model.recoveryIndex.find((entry) => entry.id === 'continuity-ledger')?.handle || null;
+  const citizenUnits = (id: RebirthPackageV6SectionId): readonly CollapseUnit[] => {
+    if (id === 'activeEditDelta') return buildActiveEditCollapseUnits(model);
+    if ((REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id)) {
+      return lineageSection(model, id as RebirthPackageV7LineageSectionId).units;
+    }
+    return [];
+  };
 
   const compose = (
     includedOptional: ReadonlySet<RebirthPackageV6SectionId>,
@@ -1386,11 +2196,11 @@ export function renderRebirthPackageV6(
     const omitted = optional
       .filter((section) => !includedOptional.has(section.id))
       .map((section) => section.id);
-    const blocks: string[] = [];
+    const blocks: string[] = declaration ? [declaration] : [];
     for (const section of sections) {
       if (section.id === 'recoveryIndex' && (omitted.length > 0 || protectedOverrun)) {
         blocks.push(
-          `[REBIRTH-V6-PACKAGE-ELISION original-chars=${rendered.length} budget=${budget}`
+          `[REBIRTH-V6-PACKAGE-ELISION original-chars=${initialRendered.length} budget=${budget}`
           + ` envelope-chars=${envelopeChars} omitted-sections=${omitted.join(',') || 'none'}`
           + ` protected-overrun=${protectedOverrun || envelopeOverrun}`
           + ` recover=${recover}]`,
@@ -1398,6 +2208,20 @@ export function renderRebirthPackageV6(
       }
       if (protectedIds.has(section.id) || includedOptional.has(section.id)) {
         blocks.push(section.text);
+        continue;
+      }
+      // A whole omitted collapse-citizen section leaves an eviction envelope at
+      // its chronological slot: count + span + skeletal era census + the one
+      // ledger handle. Under protected-overrun the census is dropped so the
+      // declared overrun never grows an unbounded tail.
+      const units = citizenUnits(section.id);
+      if (units.length > 0) {
+        blocks.push(buildSectionEvictionEnvelope({
+          sectionId: section.id as RebirthPackageV7CollapseSectionId,
+          units,
+          ledgerHandle,
+          includeCensus: !protectedOverrun,
+        }));
       }
     }
     return blocks.join('\n\n');
@@ -1405,14 +2229,133 @@ export function renderRebirthPackageV6(
 
   const included = new Set<RebirthPackageV6SectionId>();
   const protectedOnly = compose(included);
-  if (protectedOnly.length > sectionBudget) return compose(included, true);
+  if (protectedOnly.length > sectionBudget) {
+    return finish(compose(included, true), optional.map((section) => section.id));
+  }
 
   for (const section of optional) {
     const candidate = new Set(included).add(section.id);
-    if (compose(candidate).length > sectionBudget) break;
+    if (compose(candidate).length > sectionBudget) continue;
     included.add(section.id);
   }
-  return compose(included);
+  return finish(
+    compose(included),
+    optional.filter((section) => !included.has(section.id)).map((section) => section.id),
+  );
+}
+
+export function renderRebirthPackageV6(
+  model: RebirthPackageV6Model,
+  options: RenderRebirthPackageV6Options = {},
+): string {
+  return renderRebirthPackageV6WithReport(model, options).text;
+}
+
+/** Why a ledger row is at its tier in the build that produced it. */
+export type ContinuityLedgerTierBasis =
+  | 'cap-overflow'
+  | 'section-elision'
+  | 'tier-demotion'
+  | 'rendered';
+
+/**
+ * One persistable continuity-ledger row assembled from an actual render.
+ * Field-for-field aligned with the relay worker's ContinuityLedgerUnitInput:
+ * `verbatim` exists so the store can verify `sha256` at write and is then
+ * discarded — the ledger persists placements and proofs, never bodies.
+ */
+export interface ContinuityLedgerCaptureUnit {
+  readonly unitId: string;
+  readonly kind: string;
+  readonly sectionId: RebirthPackageV7CollapseSectionId;
+  readonly sourceInstanceId: string | null;
+  readonly sourceTime: string | null;
+  readonly sourceEndTime: string | null;
+  readonly eraKey: string | null;
+  readonly tier: string;
+  readonly tierBasis: ContinuityLedgerTierBasis;
+  readonly claim: string;
+  readonly verbatim: string;
+  readonly sha256: string;
+  readonly origin: 'declared' | 'heuristic' | null;
+  readonly recover: string;
+  readonly workspace: string | null;
+}
+
+export interface ContinuityLedgerCaptureRecord {
+  readonly ownerInstanceId: string;
+  readonly captureId: string;
+  readonly workspace: string | null;
+  readonly units: readonly ContinuityLedgerCaptureUnit[];
+}
+
+/**
+ * Assemble the continuity-ledger record for one ACTUAL package render.
+ *
+ * The caller decides whether the render was real (delivered to a successor) —
+ * previews and ghost taps simply never persist what this returns. Placements
+ * come from the render's own CollapseResult, never recomputed, so the ledger
+ * records what the shipped package truly did: every unit of every lineage
+ * section, tagged with the tier it landed at and why ('rendered' rows keep the
+ * census complete and let a later build's upsert supersede a stale demotion).
+ * Returns null when the model carries no addressable identity or no units —
+ * absence of a record, never an invented one.
+ */
+export function buildContinuityLedgerCaptureFromV6Render(
+  model: RebirthPackageV6Model,
+  report: RebirthPackageV7CollapseReport,
+): ContinuityLedgerCaptureRecord | null {
+  // Same lane as the render: capture rows must attest the shipped (redacted)
+  // bytes even when the caller holds the pre-lane model reference.
+  model = redactContinuityModel(model).model;
+  const boundary = model.boundaryAndActiveTask;
+  const ownerInstanceId = boundary.instanceId?.trim();
+  const captureId = boundary.captureId?.trim();
+  if (!ownerInstanceId || !captureId) return null;
+  const workspace = boundary.workspace && boundary.workspace !== 'unknown'
+    ? boundary.workspace
+    : null;
+
+  const units: ContinuityLedgerCaptureUnit[] = [];
+  for (const sectionReport of report.sections) {
+    const sectionUnits = sectionReport.sectionId === 'activeEditDelta'
+      ? buildActiveEditCollapseUnits(model)
+      : lineageSection(model, sectionReport.sectionId).units;
+    if (sectionUnits.length === 0) continue;
+    const byId = new Map(sectionUnits.map((unit) => [unit.id, unit]));
+    for (const placement of sectionReport.placements) {
+      const unit = byId.get(placement.id);
+      // A placement without a matching unit would be a collapse-engine bug;
+      // skipping is honest (the worker sees fewer rows), inventing is not.
+      if (!unit) continue;
+      const tierBasis: ContinuityLedgerTierBasis = sectionReport.sectionElided
+        ? 'section-elision'
+        : sectionReport.droppedToFloorRollup > 0
+          ? 'cap-overflow'
+          : placement.tier === 't0'
+            ? 'rendered'
+            : 'tier-demotion';
+      units.push({
+        unitId: unit.id,
+        kind: unit.kind,
+        sectionId: sectionReport.sectionId,
+        sourceInstanceId: unit.sourceInstanceId ?? null,
+        sourceTime: unit.sourceAt ?? null,
+        sourceEndTime: unit.sourceEndAt ?? null,
+        eraKey: unit.eraKey ?? null,
+        tier: placement.tier,
+        tierBasis,
+        claim: unit.claim,
+        verbatim: unit.verbatim,
+        sha256: createHash('sha256').update(unit.verbatim, 'utf8').digest('hex'),
+        origin: unit.origin ?? null,
+        recover: unit.recover,
+        workspace,
+      });
+    }
+  }
+  if (units.length === 0) return null;
+  return { ownerInstanceId, captureId, workspace, units };
 }
 
 /**

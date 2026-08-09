@@ -51,6 +51,7 @@ export * from './foldRecallUsage.ts';
 export * from './foldRailPrefetch.ts';
 export * from './rebirthDialogue.ts';
 export * from './rebirthPackageV6.ts';
+export * from './redactionLane.ts';
 export * from './episodes/runtime.ts';
 export * from './glyphs.ts';
 export * from './taskRail.ts';

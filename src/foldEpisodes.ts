@@ -2218,6 +2218,9 @@ export interface EpisodicRecallCardDebugLike {
   observationalShadowRank?: number;
   /** Stable worker-owned identity joining candidate, exposure, use, and explicit open events. */
   recallCandidateId?: string;
+  /** Durable source object behind this card; absent means a legacy episode. */
+  sourceKind?: 'episode' | 'continuity_ledger';
+  sourceId?: string;
 }
 
 export interface EpisodicRecallCardLike {
@@ -2225,7 +2228,7 @@ export interface EpisodicRecallCardLike {
   renderedCard: string;
   chapterIds: number[];
   memberPaths: string[];
-  kind: 'chain' | 'walk' | 'mention' | 'pointer' | 'term' | 'rail';
+  kind: 'chain' | 'walk' | 'mention' | 'pointer' | 'term' | 'rail' | 'ledger';
   /** Optional worker-provided scoring trace; render-agnostic and safe to omit. */
   debug?: EpisodicRecallCardDebugLike;
 }
@@ -2392,6 +2395,7 @@ export function anchorKindScore(kind: EpisodicRecallCardLike['kind'] | undefined
       return 0.5;
     case 'pointer':
     case 'term':
+    case 'ledger':
       return 0.3;
     default:
       return 0.5;
@@ -3295,9 +3299,11 @@ export const EPISODIC_NARRATION_REMINDER =
  */
 export function formatEpisodicCardProvenance(card: EpisodicRecallCardLike): string {
   const ids = card.chapterIds ?? [];
-  const source = ids.length > 0
-    ? `ep#${ids[0]}${ids.length > 1 ? `+${ids.length - 1}` : ''}`
-    : 'ep#?';
+  const source = card.debug?.sourceKind === 'continuity_ledger' && card.debug.sourceId
+    ? card.debug.sourceId.slice(0, 180)
+    : ids.length > 0
+      ? `ep#${ids[0]}${ids.length > 1 ? `+${ids.length - 1}` : ''}`
+      : 'ep#?';
   const gate = card.debug?.annotationBoostKind
     ? ` · gate:${card.debug.annotationBoostKind.replace(/^star:/, '')}`
     : '';
@@ -3316,6 +3322,9 @@ export function formatEpisodicCardProvenance(card: EpisodicRecallCardLike): stri
       break;
     case 'mention':
       why = 'mention-match';
+      break;
+    case 'ledger':
+      why = 'ledger-match';
       break;
     default:
       why = 'path-match';
@@ -3336,7 +3345,7 @@ export function renderEpisodicBoundaryBlock(
   narrationReminder?: string,
 ): string | null {
   if (cards.length === 0) return null;
-  const header = `${syntheticPrefix} ${cards.length} zone card(s) — trace-derived episodic recall; each card's ↞ why line shows the match (term/path/rail). Touch a path card's target to unfold its zone]`;
+  const header = `${syntheticPrefix} ${cards.length} zone card(s) — trace-derived episodic recall; each card's ↞ why line shows the match (term/path/rail/ledger). Touch a path card's target to unfold its zone]`;
   const parts = [header, ...cards.map((c) => `${formatEpisodicCardProvenance(c)}\n${c.renderedCard}`)];
   if (counterFooter) parts.push(counterFooter);
   // Self-bootstrapping compliance: append the reminder ONLY when the agent is

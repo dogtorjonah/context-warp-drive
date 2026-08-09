@@ -374,6 +374,7 @@ describe('user row authority classification (authority-contract/v1)', () => {
       ['fixer-mode', '[FIXER MODE BATCH #3] patch the imports'],
       ['watchdog-rebirth', '[WATCHDOG_REBIRTH] resume from the persisted seed'],
       ['relay-interrupt-marker', '[relay_interrupt kind=context_fold initiator=relay user_initiated=false]'],
+      ['atlas-debt', '[atlas-debt] You went idle with 2 edited file(s) that have no Atlas writeback.'],
     ];
     for (const [banner, row] of rows) {
       const authority = classifyUserRowAuthority(row);

@@ -119,7 +119,7 @@ export function buildOpenQuestionsFromMessages(messages, options = {}) {
     }
     return `${header}\n${body}`;
 }
-export const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 200_000;
+export const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 100_000;
 export const DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS = {
     lastUserAiMessages: 50_000,
     currentThread: 50_000,

@@ -198,7 +198,7 @@ interface VisibleTraceMessage {
     readonly type: string;
     readonly text?: string | null;
 }
-export declare const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 200000;
+export declare const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 100000;
 export declare const DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS: Record<RawRebirthSeedSectionId, number>;
 export declare const DEFAULT_RAW_REBIRTH_SEED_SECTION_PRIORITY: Record<RawRebirthSeedSectionId, number>;
 export declare const DEFAULT_RAW_REBIRTH_SEED_RENDER_ORDER: readonly RawRebirthSeedSectionId[];

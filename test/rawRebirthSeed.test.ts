@@ -318,7 +318,7 @@ describe('raw rebirth seed renderer', () => {
   });
 
   test('exports the relay raw package defaults', () => {
-    expect(DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS).toBe(200_000);
+    expect(DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS).toBe(100_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.lastUserAiMessages).toBe(50_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.currentThread).toBe(50_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset).toBe(8_000);

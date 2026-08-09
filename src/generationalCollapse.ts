@@ -1,0 +1,502 @@
+/**
+ * Generational collapse engine for the rebirth package.
+ *
+ * The package stops being a container of history and becomes an index of
+ * forever: anything that leaves the package collapses exactly one tier and
+ * leaves an exact receipt. This module owns that tier arithmetic.
+ *
+ * Deliberately pure: no filesystem, SQLite, Atlas, Git, or relay-state reads.
+ * Same units + same budget ⇒ byte-identical output.
+ *
+ * Tiers (spec §5):
+ *   T0 verbatim  — full text
+ *   T1 digest    — one line per unit
+ *   T2 era       — one paragraph per contiguous era of units
+ *   T3 receipt   — one exact pointer line per unit (mint-verified)
+ *   T4 rollup    — one line covering N contiguous receipts
+ *
+ * Chronology (God Rule 8): ordering is authoritative source time, tie-broken by
+ * stable id. A unit with unknown source time never participates in the
+ * chronology; it renders in an explicit quarantine block and is demoted before
+ * any known-time unit, because it can make no recency claim.
+ */
+
+export const COLLAPSE_TIERS = ['t0', 't1', 't2', 't3', 't4'] as const;
+export type CollapseTier = (typeof COLLAPSE_TIERS)[number];
+
+export const COLLAPSE_TIER_NAMES: Readonly<Record<CollapseTier, string>> = Object.freeze({
+  t0: 'verbatim',
+  t1: 'digest',
+  t2: 'era',
+  t3: 'receipt',
+  t4: 'rollup',
+});
+
+export type CollapseUnitKind =
+  | 'operator'
+  | 'episode'
+  | 'life'
+  | 'era'
+  | 'package'
+  | 'star'
+  | 'conversation'
+  | 'edit';
+
+export interface CollapseUnit {
+  /** Stable source-owned identity. Never an ingestion index or file position. */
+  readonly id: string;
+  /** Authoritative source-event time. Null stays unknown (quarantined). */
+  readonly sourceAt: string | null;
+  /** Optional authoritative end of this unit's source span (episodes, lives). */
+  readonly sourceEndAt?: string | null;
+  readonly kind: CollapseUnitKind;
+  /** T0 body, already provenance-labelled by the feeder. */
+  readonly verbatim: string;
+  /** T1 one-line digest, already provenance-labelled by the feeder. */
+  readonly digest: string;
+  /** Era grouping key (e.g. an ISO date or week). Null groups by kind alone. */
+  readonly eraKey?: string | null;
+  /** One-line claim carried into the T3 receipt. */
+  readonly claim: string;
+  /** Exact, copy-pasteable recovery command for this unit. */
+  readonly recover: string;
+  /**
+   * Mint gate (spec §6, invariant 2): a receipt is minted only when the feeder
+   * verified the target exists and hashed it. Without a verified hash the unit
+   * cannot fall below T2 — content is truth, and a dead pointer is worse than
+   * spent chars.
+   */
+  readonly sha256?: string | null;
+  /** Feeder-declared mint verification for this unit's recovery target. */
+  readonly verified?: boolean;
+  /**
+   * Authorship provenance carried from the source store. 'declared' means the
+   * row was tagged at the authenticated operator ingress; 'heuristic' means it
+   * was attributed by the legacy content denylist (pre-tag era). A hash proves
+   * bytes; this proves author — the two are deliberately separate. Absent when
+   * the unit kind has no authorship question.
+   */
+  readonly origin?: 'declared' | 'heuristic';
+  /**
+   * Instance whose store sourced this unit (lineage feeds span incarnations).
+   * Pure carry-through metadata: it never affects rendering or ordering, but a
+   * continuity ledger persisting placements needs it so instance erasure can
+   * find rows sourced from a purged identity. Null/absent = unknown source.
+   */
+  readonly sourceInstanceId?: string | null;
+}
+
+export interface CollapseOptions {
+  readonly units: readonly CollapseUnit[];
+  readonly maxChars: number;
+  /** Range recovery command used by T4 rollups; falls back to the unit's own. */
+  readonly rangeRecover?: string | null;
+  /** Emitted when even the floor representation cannot fit. */
+  readonly floorRecover?: string | null;
+}
+
+export interface CollapseUnitPlacement {
+  readonly id: string;
+  readonly tier: CollapseTier;
+}
+
+export interface CollapseResult {
+  readonly text: string;
+  /** True only when every unit rendered at T0. */
+  readonly complete: boolean;
+  readonly chars: number;
+  readonly placements: readonly CollapseUnitPlacement[];
+  readonly demotions: number;
+  /** Units that could not fit even at their floor tier; explicit, never silent. */
+  readonly droppedToFloorRollup: number;
+  readonly tierCounts: Readonly<Record<CollapseTier, number>>;
+}
+
+const MIN_BACKFILL_CHARS = 2_000;
+const BLOCK_SEPARATOR = '\n';
+const QUARANTINE_BANNER = 'Unknown source time (quarantined; not part of the chronology):';
+
+function isoOrUnknown(value: string | null | undefined): string {
+  if (!value) return 'unknown';
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : 'unknown';
+}
+
+function unitSpan(unit: CollapseUnit): string {
+  const start = isoOrUnknown(unit.sourceAt);
+  const end = isoOrUnknown(unit.sourceEndAt ?? unit.sourceAt);
+  return `${start}..${end}`;
+}
+
+function oneLine(value: string, maxChars = 180): string {
+  const flattened = value.replace(/\s+/gu, ' ').trim();
+  if (flattened.length <= maxChars) return flattened;
+  return `${flattened.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+/** Exact T3 receipt line (spec §6). Minted only for verified, hashed targets. */
+export function formatCollapseReceipt(unit: CollapseUnit): string {
+  const sha = (unit.sha256 ?? '').slice(0, 12) || 'unknown';
+  return `[RECEIPT kind=${unit.kind} id=${unit.id} span=${unitSpan(unit)}`
+    + ` sha256=${sha} chars=${unit.verbatim.length}`
+    + ` claim="${oneLine(unit.claim, 160).replace(/"/gu, "'")}" recover=${unit.recover}]`;
+}
+
+/** Exact T4 rollup line (spec §6) covering N contiguous receipts. */
+export function formatCollapseRollup(
+  units: readonly CollapseUnit[],
+  rangeRecover: string | null | undefined,
+): string {
+  const kinds = [...new Set(units.map((unit) => unit.kind))].sort();
+  const times = units
+    .map((unit) => unit.sourceAt)
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  const span = times.length > 0
+    ? `${isoOrUnknown(times[0])}..${isoOrUnknown(times.at(-1))}`
+    : 'unknown..unknown';
+  const recover = rangeRecover || units[0]?.recover || 'unavailable';
+  return `[ROLLUP kind=${kinds.join('+')} n=${units.length} span=${span} recover=${recover}]`;
+}
+
+/** T2 era block: one paragraph per contiguous era of demoted units. */
+export function formatCollapseEraBlock(units: readonly CollapseUnit[]): string {
+  const first = units[0];
+  const times = units
+    .map((unit) => unit.sourceAt)
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  const span = times.length > 0
+    ? `${isoOrUnknown(times[0])}..${isoOrUnknown(times.at(-1))}`
+    : 'unknown..unknown';
+  const samples = units.slice(0, 3).map((unit) => `· ${oneLine(unit.claim, 140)}`);
+  const chars = units.reduce((total, unit) => total + unit.verbatim.length, 0);
+  return [
+    `[ERA kind=${first.kind} key=${first.eraKey ?? first.kind} span=${span}`
+    + ` n=${units.length} chars=${chars} recover=${first.recover}]`,
+    ...samples,
+    units.length > samples.length ? `· … ${units.length - samples.length} more in this era` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function compareUnits(left: CollapseUnit, right: CollapseUnit): number {
+  const leftMs = left.sourceAt ? Date.parse(left.sourceAt) : Number.NaN;
+  const rightMs = right.sourceAt ? Date.parse(right.sourceAt) : Number.NaN;
+  const leftKnown = Number.isFinite(leftMs);
+  const rightKnown = Number.isFinite(rightMs);
+  if (leftKnown && rightKnown && leftMs !== rightMs) return leftMs - rightMs;
+  if (leftKnown !== rightKnown) return leftKnown ? -1 : 1;
+  return left.id.localeCompare(right.id);
+}
+
+/** A unit without a verified hash can never mint a receipt: T2 is its floor. */
+function floorTier(unit: CollapseUnit): CollapseTier {
+  return unit.verified === true && Boolean(unit.sha256) ? 't4' : 't2';
+}
+
+function nextTier(tier: CollapseTier): CollapseTier | null {
+  const index = COLLAPSE_TIERS.indexOf(tier);
+  return index >= 0 && index < COLLAPSE_TIERS.length - 1 ? COLLAPSE_TIERS[index + 1] : null;
+}
+
+function previousTier(tier: CollapseTier): CollapseTier | null {
+  const index = COLLAPSE_TIERS.indexOf(tier);
+  return index > 0 ? COLLAPSE_TIERS[index - 1] : null;
+}
+
+interface RenderState {
+  readonly known: readonly CollapseUnit[];
+  readonly unknown: readonly CollapseUnit[];
+  readonly tiers: Map<string, CollapseTier>;
+}
+
+function renderRun(
+  units: readonly CollapseUnit[],
+  tier: CollapseTier,
+  rangeRecover: string | null | undefined,
+): string {
+  switch (tier) {
+    case 't0':
+      return units.map((unit) => unit.verbatim).join(BLOCK_SEPARATOR);
+    case 't1':
+      return units.map((unit) => unit.digest).join(BLOCK_SEPARATOR);
+    case 't2':
+      return formatCollapseEraBlock(units);
+    case 't3':
+      return units.map(formatCollapseReceipt).join(BLOCK_SEPARATOR);
+    case 't4':
+    default:
+      return formatCollapseRollup(units, rangeRecover);
+  }
+}
+
+/**
+ * Fuse the chronological unit sequence into runs. Adjacent units sharing a tier
+ * fuse when that tier is aggregate (t2 era blocks fuse per era key; t4 rollups
+ * fuse per kind). Non-aggregate tiers render per unit.
+ */
+function renderSequence(
+  units: readonly CollapseUnit[],
+  tiers: ReadonlyMap<string, CollapseTier>,
+  rangeRecover: string | null | undefined,
+): string {
+  const blocks: string[] = [];
+  let run: CollapseUnit[] = [];
+  let runTier: CollapseTier | null = null;
+  let runKey: string | null = null;
+
+  const flush = (): void => {
+    if (run.length === 0 || !runTier) return;
+    blocks.push(renderRun(run, runTier, rangeRecover));
+    run = [];
+    runTier = null;
+    runKey = null;
+  };
+
+  for (const unit of units) {
+    const tier = tiers.get(unit.id) ?? 't0';
+    const aggregate = tier === 't2' || tier === 't4';
+    const key = tier === 't2' ? `${unit.kind}\0${unit.eraKey ?? unit.kind}` : unit.kind;
+    if (aggregate && runTier === tier && runKey === key) {
+      run.push(unit);
+      continue;
+    }
+    flush();
+    run = [unit];
+    runTier = tier;
+    runKey = aggregate ? key : `${unit.id}`;
+    if (!aggregate) flush();
+  }
+  flush();
+  return blocks.filter((block) => block.length > 0).join(BLOCK_SEPARATOR);
+}
+
+function renderState(state: RenderState, rangeRecover: string | null | undefined): string {
+  const chronological = renderSequence(state.known, state.tiers, rangeRecover);
+  if (state.unknown.length === 0) return chronological;
+  const quarantined = renderSequence(state.unknown, state.tiers, rangeRecover);
+  return [chronological, '', QUARANTINE_BANNER, quarantined]
+    .filter((block, index) => index === 1 || block.length > 0)
+    .join(BLOCK_SEPARATOR);
+}
+
+/**
+ * Demotion order: unknown-time units first (they can claim no recency), then
+ * the oldest known-time unit. Units never skip a tier in one step, and a unit
+ * without a mint-verified hash stops at its floor.
+ */
+function nextDemotionCandidate(state: RenderState): CollapseUnit | null {
+  for (const unit of state.unknown) {
+    const tier = state.tiers.get(unit.id) ?? 't0';
+    if (tier !== floorTier(unit)) return unit;
+  }
+  for (const unit of state.known) {
+    const tier = state.tiers.get(unit.id) ?? 't0';
+    if (tier !== floorTier(unit)) return unit;
+  }
+  return null;
+}
+
+export function collapseUnits(options: CollapseOptions): CollapseResult {
+  const maxChars = Math.max(0, Math.floor(options.maxChars));
+  const sorted = [...options.units].sort(compareUnits);
+  const known = sorted.filter((unit) => unit.sourceAt);
+  const unknown = sorted.filter((unit) => !unit.sourceAt);
+  const tiers = new Map<string, CollapseTier>(sorted.map((unit) => [unit.id, 't0' as CollapseTier]));
+  const state: RenderState = { known, unknown, tiers };
+
+  if (sorted.length === 0) {
+    return {
+      text: '',
+      complete: true,
+      chars: 0,
+      placements: [],
+      demotions: 0,
+      droppedToFloorRollup: 0,
+      tierCounts: { t0: 0, t1: 0, t2: 0, t3: 0, t4: 0 },
+    };
+  }
+
+  let text = renderState(state, options.rangeRecover);
+  let demotions = 0;
+  // Each unit can be demoted at most COLLAPSE_TIERS.length - 1 times, so this
+  // loop is bounded by construction and always terminates.
+  const demotionCeiling = sorted.length * (COLLAPSE_TIERS.length - 1);
+  const unitSizeAt = (unit: CollapseUnit, tier: CollapseTier): number => (
+    renderRun([unit], tier, options.rangeRecover).length
+  );
+  // Demote in estimate-sized batches, then re-render exactly. Aggregate tiers
+  // (era/rollup fusion) make the per-unit estimate conservative, so a batch can
+  // undershoot — the outer loop simply runs again. It never overshoots into
+  // demoting more than the overflow justifies, and the exact rendered text is
+  // always the authority for whether the section fits.
+  while (text.length > maxChars && demotions < demotionCeiling) {
+    const overflow = text.length - maxChars;
+    let saved = 0;
+    let applied = 0;
+    while (saved < overflow && demotions < demotionCeiling) {
+      const candidate = nextDemotionCandidate(state);
+      if (!candidate) break;
+      const current = tiers.get(candidate.id) ?? 't0';
+      const demoted = nextTier(current);
+      if (!demoted) break;
+      saved += Math.max(1, unitSizeAt(candidate, current) - unitSizeAt(candidate, demoted));
+      tiers.set(candidate.id, demoted);
+      demotions += 1;
+      applied += 1;
+    }
+    if (applied === 0) break;
+    text = renderState(state, options.rangeRecover);
+  }
+
+  let droppedToFloorRollup = 0;
+  if (text.length > maxChars) {
+    // Floor pressure: everything is already at its floor and still overflows.
+    // Degrade to a single honest rollup line rather than a truncated body that
+    // would make partial evidence look complete (spec §8).
+    droppedToFloorRollup = sorted.length;
+    const rollup = formatCollapseRollup(sorted, options.floorRecover ?? options.rangeRecover);
+    text = rollup.length <= maxChars || maxChars === 0 ? rollup : rollup.slice(0, maxChars);
+  }
+
+  const tierCounts: Record<CollapseTier, number> = { t0: 0, t1: 0, t2: 0, t3: 0, t4: 0 };
+  for (const unit of sorted) tierCounts[tiers.get(unit.id) ?? 't0'] += 1;
+
+  return {
+    text,
+    complete: demotions === 0 && droppedToFloorRollup === 0,
+    chars: text.length,
+    placements: sorted.map((unit) => ({ id: unit.id, tier: tiers.get(unit.id) ?? 't0' })),
+    demotions,
+    droppedToFloorRollup,
+    tierCounts,
+  };
+}
+
+export interface AdaptiveBackfillSection<TId extends string = string> {
+  readonly id: TId;
+  readonly units: readonly CollapseUnit[];
+  readonly baseCap: number;
+  readonly rangeRecover?: string | null;
+  readonly floorRecover?: string | null;
+}
+
+export interface AdaptiveBackfillGrant<TId extends string = string> {
+  readonly id: TId;
+  readonly cap: number;
+  readonly granted: number;
+  readonly result: CollapseResult;
+}
+
+export interface AdaptiveBackfillOutcome<TId extends string = string> {
+  readonly grants: readonly AdaptiveBackfillGrant<TId>[];
+  readonly spareRemaining: number;
+  readonly rounds: number;
+}
+
+/**
+ * Adaptive Backfill (spec §7): unspent global budget is redistributed in
+ * priority order, promoting the newest demoted unit one tier per pass and
+ * round-robining across sections after each full pass. Stops when the remaining
+ * pool falls below the fragmentation guard.
+ *
+ * Implemented as a cap grant rather than a mutation of tier state: granting a
+ * section the exact chars its next promotion needs makes collapseUnits produce
+ * that promotion deterministically, so the result is identical to promoting in
+ * place and stays byte-reproducible from (units, caps).
+ */
+export function adaptiveBackfill<TId extends string = string>(
+  sections: readonly AdaptiveBackfillSection<TId>[],
+  spareChars: number,
+  options: { readonly minChunk?: number; readonly maxRounds?: number } = {},
+): AdaptiveBackfillOutcome<TId> {
+  const minChunk = Math.max(1, options.minChunk ?? MIN_BACKFILL_CHARS);
+  const maxRounds = Math.max(0, options.maxRounds ?? 64);
+  const granted = new Map<TId, number>(sections.map((section) => [section.id, 0]));
+  const evaluate = (section: AdaptiveBackfillSection<TId>): CollapseResult => collapseUnits({
+    units: section.units,
+    maxChars: section.baseCap + (granted.get(section.id) ?? 0),
+    rangeRecover: section.rangeRecover ?? null,
+    floorRecover: section.floorRecover ?? null,
+  });
+
+  let spare = Math.max(0, Math.floor(spareChars));
+  let rounds = 0;
+  let results = new Map<TId, CollapseResult>(
+    sections.map((section) => [section.id, evaluate(section)]),
+  );
+
+  while (spare >= minChunk && rounds < maxRounds) {
+    let promotedThisRound = false;
+    for (const section of sections) {
+      if (spare < minChunk) break;
+      const current = results.get(section.id)!;
+      if (current.complete) continue;
+      const cost = promotionCost(section, current, granted.get(section.id) ?? 0);
+      if (cost === null || cost > spare) continue;
+      granted.set(section.id, (granted.get(section.id) ?? 0) + cost);
+      spare -= cost;
+      results.set(section.id, evaluate(section));
+      promotedThisRound = true;
+    }
+    rounds += 1;
+    if (!promotedThisRound) break;
+  }
+
+  results = new Map(sections.map((section) => [section.id, evaluate(section)]));
+  return {
+    grants: sections.map((section) => ({
+      id: section.id,
+      cap: section.baseCap + (granted.get(section.id) ?? 0),
+      granted: granted.get(section.id) ?? 0,
+      result: results.get(section.id)!,
+    })),
+    spareRemaining: spare,
+    rounds,
+  };
+}
+
+/**
+ * Chars required to promote a section's newest demoted unit exactly one tier.
+ * Newest-first promotion (spec §7.2). Returns null when nothing can be promoted.
+ */
+function promotionCost<TId extends string>(
+  section: AdaptiveBackfillSection<TId>,
+  current: CollapseResult,
+  alreadyGranted: number,
+): number | null {
+  const byId = new Map(section.units.map((unit) => [unit.id, unit]));
+  const demoted = current.placements.filter((placement) => placement.tier !== 't0');
+  if (demoted.length === 0) return null;
+  // placements are chronological; the newest demoted unit is the last one.
+  const target = demoted.at(-1)!;
+  const unit = byId.get(target.id);
+  if (!unit) return null;
+  const promoted = previousTier(target.tier);
+  if (!promoted) return null;
+  const probeUnits = section.units;
+  const cap = section.baseCap + alreadyGranted;
+  // Grow the cap until the target unit actually reaches the promoted tier. The
+  // step is the measured size delta of that unit's own representation, so the
+  // search converges in a couple of probes instead of scanning char by char.
+  const sizeAt = (tier: CollapseTier): number => renderRun([unit], tier, section.rangeRecover ?? null).length;
+  let step = Math.max(1, sizeAt(promoted) - sizeAt(target.tier));
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const probeCap = cap + step;
+    const probe = collapseUnits({
+      units: probeUnits,
+      maxChars: probeCap,
+      rangeRecover: section.rangeRecover ?? null,
+      floorRecover: section.floorRecover ?? null,
+    });
+    const placed = probe.placements.find((placement) => placement.id === unit.id);
+    if (placed && COLLAPSE_TIERS.indexOf(placed.tier) <= COLLAPSE_TIERS.indexOf(promoted)) {
+      return step;
+    }
+    step *= 2;
+  }
+  return null;
+}
+
+export const GENERATIONAL_COLLAPSE_MIN_BACKFILL_CHARS = MIN_BACKFILL_CHARS;
+export const GENERATIONAL_COLLAPSE_QUARANTINE_BANNER = QUARANTINE_BANNER;

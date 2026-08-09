@@ -119,15 +119,16 @@ export const PEER_DISPATCH_BANNER_PREFIXES: readonly { readonly key: string; rea
 
 /**
  * Relay/runtime control dispatches persisted as user rows: queued-signal
- * digests, fixer-mode batches, watchdog rebirth prompts, and fold/redirect
- * interrupt markers. Runtime machinery authored these, so they are never
- * objective-eligible.
+ * digests, fixer-mode batches, watchdog rebirth prompts, fold/redirect
+ * interrupt markers, and atlas-debt idle nudges. Runtime machinery authored
+ * these, so they are never objective-eligible.
  */
 export const RELAY_RUNTIME_DISPATCH_BANNER_PREFIXES: readonly { readonly key: string; readonly prefix: string }[] = Object.freeze([
   { key: 'queued-signals', prefix: '[Queued Signals' },
   { key: 'fixer-mode', prefix: '[FIXER MODE' },
   { key: 'watchdog-rebirth', prefix: '[WATCHDOG_REBIRTH]' },
   { key: 'relay-interrupt-marker', prefix: '[relay_interrupt ' },
+  { key: 'atlas-debt', prefix: '[atlas-debt]' },
 ]);
 
 /**

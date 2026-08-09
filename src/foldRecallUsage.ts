@@ -7,7 +7,11 @@ export interface FoldRecallUsageCardInput {
   /** Optional transport-owned exposure identity; card/path/episode/boundary are still folded into the correlation id. */
   exposureId?: string;
   /** Worker card metadata; candidate identity becomes the correlation identity when present. */
-  debug?: { recallCandidateId?: string };
+  debug?: {
+    recallCandidateId?: string;
+    sourceKind?: 'episode' | 'continuity_ledger';
+    sourceId?: string;
+  };
   targetPath: string;
   renderedCard: string;
   chapterIds: readonly number[];
@@ -18,6 +22,9 @@ export interface FoldRecallUsageCardInput {
 export interface FoldRecallUsageWatch {
   correlationId: string;
   episodeId: number;
+  /** Ledger watches use episodeId=0 and carry this explicit durable source. */
+  sourceKind?: 'episode' | 'continuity_ledger';
+  sourceId?: string;
   cardKind: string;
   targetPath: string;
   memberPaths: readonly string[];
@@ -32,6 +39,8 @@ export interface FoldRecallUsageWatch {
 export interface FoldRecallUsageEvent {
   correlationId: string;
   episodeId: number;
+  sourceKind?: 'episode' | 'continuity_ledger';
+  sourceId?: string;
   kind: FoldRecallUsageEventKind;
   outcome: FoldRecallUtilityOutcome;
   boundarySeq: number;
@@ -141,13 +150,17 @@ function watchFromCard(
   boundarySeq: number,
   opts: FoldRecallUsageOptions,
 ): FoldRecallUsageWatch | null {
-  if (!Number.isInteger(episodeId) || episodeId <= 0) return null;
+  const sourceKind = card.debug?.sourceKind;
+  const sourceId = card.debug?.sourceId?.trim();
+  const ledgerSource = sourceKind === 'continuity_ledger' && Boolean(sourceId);
+  if (!Number.isInteger(episodeId) || (episodeId <= 0 && !ledgerSource)) return null;
   const termCap = Math.max(1, Math.floor(opts.termCap ?? DEFAULT_TERM_CAP));
   const window = Math.max(1, Math.floor(opts.windowBoundaries ?? FOLD_RECALL_USAGE_DEFAULT_WINDOW_BOUNDARIES));
   const memberPaths = uniqSorted([card.targetPath, ...card.memberPaths]);
   return {
     correlationId: makeFoldRecallUsageCorrelationId(card, episodeId, boundarySeq),
     episodeId,
+    ...(ledgerSource ? { sourceKind, sourceId } : {}),
     cardKind: card.kind,
     targetPath: card.targetPath,
     memberPaths,
@@ -170,7 +183,10 @@ export function addInjectedFoldRecallUsageCards(
   const events: FoldRecallUsageEvent[] = [];
   const known = new Set(existing.map(normalizedWatchKey));
   for (const card of cards) {
-    for (const episodeId of new Set(card.chapterIds)) {
+    const sourceEpisodeIds = card.debug?.sourceKind === 'continuity_ledger' && card.debug.sourceId
+      ? [0]
+      : [...new Set(card.chapterIds)];
+    for (const episodeId of sourceEpisodeIds) {
       const watch = watchFromCard(card, episodeId, boundarySeq, opts);
       if (!watch) continue;
       if (known.has(watch.correlationId)) continue;
@@ -179,6 +195,8 @@ export function addInjectedFoldRecallUsageCards(
       events.push({
         correlationId: watch.correlationId,
         episodeId,
+        ...(watch.sourceKind ? { sourceKind: watch.sourceKind } : {}),
+        ...(watch.sourceId ? { sourceId: watch.sourceId } : {}),
         kind: 'injected',
         outcome: 'exposed',
         boundarySeq,
@@ -213,6 +231,15 @@ function firstMatchedPath(watch: FoldRecallUsageWatch, touched: ReadonlySet<stri
     if (touched.has(path)) return path;
   }
   return null;
+}
+
+function recallUsageSourceFields(
+  watch: FoldRecallUsageWatch,
+): Pick<FoldRecallUsageEvent, 'sourceKind' | 'sourceId'> {
+  return {
+    ...(watch.sourceKind ? { sourceKind: watch.sourceKind } : {}),
+    ...(watch.sourceId ? { sourceId: watch.sourceId } : {}),
+  };
 }
 
 function includesVerbatimKey(watch: FoldRecallUsageWatch, text: string): boolean {
@@ -255,15 +282,15 @@ export function advanceFoldRecallUsageWatches(
 
     const matchedPath = firstMatchedPath(watch, edited);
     if (matchedPath) {
-      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'path_edited', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath, matchedPath });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, ...recallUsageSourceFields(watch), kind: 'path_edited', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath, matchedPath });
       continue;
     }
     if (includesVerbatimKey(watch, `${toolText}\n${assistantText}`)) {
-      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'verbatim_reused', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, ...recallUsageSourceFields(watch), kind: 'verbatim_reused', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath });
       continue;
     }
     if (termEchoMatched(watch, assistantTerms, opts)) {
-      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, kind: 'term_echo', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath });
+      events.push({ correlationId: watch.correlationId, episodeId: watch.episodeId, ...recallUsageSourceFields(watch), kind: 'term_echo', outcome: 'useful', boundarySeq, tsMs, cardKind: watch.cardKind, targetPath: watch.targetPath });
       continue;
     }
     const unmatchedActivityBoundaries = watch.unmatchedActivityBoundaries + (hasActivity ? 1 : 0);
@@ -271,6 +298,7 @@ export function advanceFoldRecallUsageWatches(
       events.push({
         correlationId: watch.correlationId,
         episodeId: watch.episodeId,
+        ...recallUsageSourceFields(watch),
         kind: 'expired',
         outcome: 'ignored',
         boundarySeq,
@@ -305,6 +333,9 @@ export function rankFoldRecallUtility(events: readonly FoldRecallUsageEvent[]): 
   for (const event of events) unique.set(`${event.correlationId}\x00${event.kind}`, event);
   const rows = new Map<number, FoldRecallUtilityRank & { weightTotal: number; weightedOutcomes: number }>();
   for (const event of unique.values()) {
+    // Episode utility is intentionally not projected onto content-free ledger
+    // sources. Their events remain durable audit/telemetry in recall_events.
+    if (event.sourceKind === 'continuity_ledger') continue;
     const row = rows.get(event.episodeId) ?? {
       evidence: 'observational_proxy' as const,
       episodeId: event.episodeId,

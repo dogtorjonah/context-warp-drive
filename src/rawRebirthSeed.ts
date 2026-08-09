@@ -482,7 +482,7 @@ interface VisibleTraceMessage {
   readonly sourceTimestamp?: string;
 }
 
-export const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 200_000;
+export const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 100_000;
 
 export const DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS: Record<RawRebirthSeedSectionId, number> = {
   lastUserAiMessages: 50_000,

@@ -3,9 +3,11 @@ import { buildContinuityReceipt } from '../continuityReceipt.ts';
 import { buildRawHardEpochSeed } from '../foldFreeze.ts';
 import {
   REBIRTH_PACKAGE_V6_SECTION_IDS,
+  REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS,
   adaptLegacyRebirthPackageToV6,
   adaptRebirthPackageV6SectionsToLegacyKeys,
   buildRebirthPackageV6Model,
+  isRebirthPackageV6Model,
   renderRebirthPackageV6,
   renderRebirthPackageV6Sections,
   type RebirthPackageV6ActiveEditDelta,
@@ -157,7 +159,13 @@ describe('Rebirth Package v6', () => {
   it('renders the fixed six-section order and de-duplicates promoted dialogue', () => {
     const value = model();
     const sections = renderRebirthPackageV6Sections(value);
-    expect(sections.map((section) => section.id)).toEqual(REBIRTH_PACKAGE_V6_SECTION_IDS);
+    // Lineage sections are admitted only when they carry units or a partial
+    // reason, so a lineage-free model renders the original v6 six in order.
+    expect(sections.map((section) => section.id)).toEqual(
+      REBIRTH_PACKAGE_V6_SECTION_IDS.filter(
+        (id) => !(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id),
+      ),
+    );
 
     const rendered = renderRebirthPackageV6(value);
     expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
@@ -167,6 +175,25 @@ describe('Rebirth Package v6', () => {
       expect(rendered.indexOf(sections[index - 1].text))
         .toBeLessThan(rendered.indexOf(sections[index].text));
     }
+  });
+
+  it('renders a persisted v6 package that predates the lineage sections', () => {
+    // isRebirthPackageV6Model deliberately accepts stored v6 packages that carry
+    // no lineage keys at all. Rendering one is a continuity-recovery path, so an
+    // absent lineage section must read as empty rather than throwing.
+    const persisted = JSON.parse(JSON.stringify(model())) as Record<string, unknown>;
+    for (const id of REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS) delete persisted[id];
+    persisted.version = 'rebirth-package-v6/v1';
+    expect(isRebirthPackageV6Model(persisted)).toBe(true);
+
+    const legacy = persisted as unknown as RebirthPackageV6Model;
+    const sections = renderRebirthPackageV6Sections(legacy);
+    expect(sections.map((section) => section.id)).toEqual(
+      REBIRTH_PACKAGE_V6_SECTION_IDS.filter(
+        (id) => !(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id),
+      ),
+    );
+    expect(renderRebirthPackageV6(legacy)).toContain('contract=rebirth-package-v6/v1');
   });
 
   it('omits Recent Conversation when every row was promoted', () => {
@@ -255,6 +282,78 @@ describe('Rebirth Package v6', () => {
     expect(renderRebirthPackageV6(none)).toContain(
       'Exact immutable capture proved zero open attributable diffs.',
     );
+  });
+
+  it('renders a legacy bounded edit log behind one declared banner instead of an unknown-field spray', () => {
+    const editLog = '[06:51 PM UTC] Edit → relay/src/example.ts\n  ⊕ added line';
+    const legacy = adaptLegacyRebirthPackageToV6({
+      predecessorName: 'legacy',
+      currentThread: '',
+      activeEditDelta: editLog,
+    });
+    const section = renderRebirthPackageV6Sections(legacy)
+      .find((candidate) => candidate.id === 'activeEditDelta');
+    expect(section).toBeTruthy();
+    expect(section!.text).toContain(
+      'evidence=bounded edit log; immutable capture unavailable: legacy Active Edit Delta adapted without an immutable Atlas capture',
+    );
+    // The timestamped edit log is real evidence and survives untouched.
+    expect(section!.text).toContain('[06:51 PM UTC] Edit → relay/src/example.ts');
+    // The seven-way unknown-field spray is gone: one declared banner instead.
+    expect(section!.text).not.toContain('(legacy bounded edit evidence)');
+    expect(section!.text).not.toContain('baseline=baseline_unknown');
+    expect(section!.text).not.toContain('+?/−?');
+    expect(section!.text).not.toContain('preview partial:');
+    expect(section!.text).not.toContain('capture=unknown');
+  });
+
+  it('compacts provenance ids that embed the artifact note so each note renders once', () => {
+    const note = 'Continuity Ledger locked: one store, two write sides, two read sides; never conclude absence without checking the ledger index first.';
+    const value = model({
+      cognitiveArtifacts: [{
+        provenanceId: `instance:inst-a/star:2026-08-02T17:59:40.000Z/decision/${note}`,
+        sourceAt: '2026-08-02T17:59:40.000Z',
+        kind: 'decision',
+        text: note,
+        authority: 'current',
+        supersededBy: null,
+      }, {
+        provenanceId: 'decision:compact',
+        sourceAt: '2026-08-02T17:59:41.000Z',
+        kind: 'decision',
+        text: 'Use one immutable model.',
+        authority: 'current',
+        supersededBy: null,
+      }],
+    });
+    const section = renderRebirthPackageV6Sections(value)
+      .find((candidate) => candidate.id === 'cognitiveArtifacts');
+    expect(section).toBeTruthy();
+    // The note body appears exactly once; the pointer keeps its resolving prefix.
+    expect(section!.text.match(/Continuity Ledger locked:/gu)).toHaveLength(1);
+    expect(section!.text).toContain('source=instance:inst-a/star:2026-08-02T17:59:40.000Z/decision/…');
+    // Compact ids that embed nothing stay byte-identical.
+    expect(section!.text).toContain('source=decision:compact');
+  });
+
+  it('compacts embedded-note ids even when the rendered text is a truncated head of the note', () => {
+    const note = `Episodic recall blackout root cause synthesis: ${'detail '.repeat(40)}end of the long note body`;
+    const value = model({
+      cognitiveArtifacts: [{
+        provenanceId: `instance:inst-a/star:2026-08-02T17:59:40.000Z/discovery/${note}`,
+        sourceAt: '2026-08-02T17:59:40.000Z',
+        kind: 'discovery',
+        text: `${note.slice(0, 180)}…`,
+        authority: 'current',
+        supersededBy: null,
+      }],
+    });
+    const section = renderRebirthPackageV6Sections(value)
+      .find((candidate) => candidate.id === 'cognitiveArtifacts');
+    expect(section).toBeTruthy();
+    expect(section!.text).toContain('source=instance:inst-a/star:2026-08-02T17:59:40.000Z/discovery/…');
+    // The untruncated tail of the note never re-enters through the pointer.
+    expect(section!.text).not.toContain('end of the long note body');
   });
 
   it('publishes only executable recovery commands and marks unexposed stores unavailable', () => {

@@ -114,7 +114,7 @@ export interface FoldSessionOptions {
     /**
      * Character budget for the standalone-computed raw hard-epoch seed used when
      * the host does not pass FoldPrepareContext.hardEpochSeed. This is a clamp for
-     * local string size, not token telemetry. Defaults to the helper's 200K-char
+     * local string size, not token telemetry. Defaults to the helper's 100K-char
      * budget.
      */
     readonly rawHardEpochSeedMaxChars?: number;

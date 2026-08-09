@@ -32,7 +32,7 @@ Set `includeTrailingUserTurn: false` when you will later merge the live user tur
 ```ts
 const session = new FoldSession({
   pressureCeiling: 120_000,
-  rawHardEpochSeedMaxChars: 200_000,
+  rawHardEpochSeedMaxChars: 100_000,
 });
 
 const outcome = session.prepare(history, {
@@ -101,7 +101,7 @@ import { renderRawRebirthSeed } from 'context-warp-drive/raw-rebirth-seed';
 
 const seed = renderRawRebirthSeed({
   predecessorName: 'source-agent',
-  packageBudget: 200_000,
+  packageBudget: 100_000,
   lastUserAiMessages,
   currentThread,
   rawTraceCoordinateCloset,
@@ -136,7 +136,7 @@ Default section budgets mirror the relay-style raw hard-epoch policy:
 | Squad Awareness | 4,000 |
 | Delegated Work | 2,500 |
 
-The global package budget defaults to 200,000 characters. Character budgets are size clamps only; they are not token telemetry and should not be used for billing or pressure gauges.
+The global package budget defaults to 100,000 characters. Character budgets are size clamps only; they are not token telemetry and should not be used for billing or pressure gauges.
 
 ## Relay Parity Boundaries
 
