@@ -20,6 +20,8 @@ import {
   routeRawTraceCoordinates,
 } from '../src/rawRebirthSeed.ts';
 import { parseHistoricalPayloadRecord } from '../src/rollingFold.ts';
+import { renderEpochContinuityCapsule } from '../src/epochContinuityCapsule.ts';
+import { unresolvedPendingAssistantContinuityState } from '../src/pendingAssistantAction.ts';
 import type { RawTraceCoordinate, RawTraceCoordinateArtifact } from '../src/rawRebirthSeed.ts';
 import type { FoldMessage } from '../src/fold.ts';
 
@@ -1056,6 +1058,65 @@ describe('raw rebirth seed renderer', () => {
     expect(seed).toContain('Latest genuine assistant handoff.');
     expect(replayLiterals).not.toContain('rail-hidden-123456');
     expect(replayLiterals).toContain('/repo/src/visible.ts');
+  });
+
+  test('carries a trusted folded pending action through standalone hard rebirth', () => {
+    const carried = unresolvedPendingAssistantContinuityState({
+      text: 'Okay, let me check whether the QR code works.',
+      status: 'unresolved',
+      basis: 'assistant-commitment',
+      source: {
+        id: 'standalone-qr-promise',
+        timestamp: '2026-08-10T00:52:45.000Z',
+        unit: 'message',
+        index: 42,
+      },
+    });
+    const capsule = renderEpochContinuityCapsule({
+      pendingAssistantState: carried,
+      source: { unit: 'message', sourceStart: 40, sourceEndExclusive: 45 },
+    });
+    const seed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: capsule, contextWarpSynthetic: 'folded-context' },
+      { role: 'user', content: 'Keep the current card visible.' },
+      { role: 'assistant', content: 'The inventory has three rows.' },
+    ], {
+      predecessorName: 'standalone-pending-action-agent',
+      lifecycleBoundary: 'same_instance_hard_epoch',
+      packageBudget: 30_000,
+    });
+
+    expect(seed).toContain('pending assistant action · Okay, let me check whether the QR code works.');
+    expect(seed).toContain('Okay, let me check whether the QR code works.');
+    expect(seed).toContain('id=standalone-qr-promise');
+    expect(seed).toContain('status=unresolved · outranks=live-task-rail');
+  });
+
+  test('honors a later settlement tombstone during standalone hard rebirth', () => {
+    const capsule = renderEpochContinuityCapsule({
+      pendingAssistantState: unresolvedPendingAssistantContinuityState({
+        text: 'Let me verify the QR code.',
+        status: 'unresolved',
+        basis: 'assistant-commitment',
+        source: { id: 'qr-open', timestamp: null, unit: 'message', index: 9 },
+      }),
+      source: { unit: 'message', sourceStart: 8, sourceEndExclusive: 10 },
+    });
+    const seed = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: capsule, contextWarpSynthetic: 'folded-context' },
+      { role: 'assistant', content: '🏁 QR code verified.' },
+    ], {
+      predecessorName: 'standalone-settled-action-agent',
+      lifecycleBoundary: 'same_instance_hard_epoch',
+      packageBudget: 30_000,
+    });
+
+    // The later "🏁 QR code verified." assistant message settles the open loop.
+    // The capsule text persists verbatim in the Activity Log transcript (historical
+    // record), but the authoritative Continuity Boundary must NOT re-render the
+    // action as an unresolved live commitment.
+    expect(seed).not.toContain('pending assistant action · Let me verify the QR code.');
+    expect(seed).not.toContain('pending action source · id=qr-open');
   });
 
   test('keeps the latest 15 genuine users and 15 assistants across a 5,000-row tool-heavy trace', () => {

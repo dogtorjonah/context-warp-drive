@@ -471,7 +471,7 @@ describe('Rebirth Package v6', () => {
     });
     expect(value.executionState.facts).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'runtime', text: 'working' }),
-      expect.objectContaining({ kind: 'next_action', text: 'Run the canonical adapter regression.' }),
+      expect.objectContaining({ kind: 'next_action', text: 'Use the typed receipt as the only adapter contract.' }),
       expect.objectContaining({ kind: 'claim', text: 'src/claim.ts' }),
       expect.objectContaining({ kind: 'validation', text: 'canonical adapter regression passed' }),
       expect.objectContaining({ kind: 'blocker', text: 'receipt hazard survives' }),
@@ -483,6 +483,57 @@ describe('Rebirth Package v6', () => {
     expect(value.activeEditDelta.files).toEqual([
       expect.objectContaining({ filePath: 'src/edit.ts', baselineQuality: 'baseline_unknown' }),
     ]);
+  });
+
+  it('adapts an unresolved assistant action ahead of an older rail action', () => {
+    const continuityReceipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      capturedAt: '2026-08-02T18:00:00.000Z',
+      captureSourceId: 'capture-pending',
+      pendingAssistantAction: {
+        status: 'unresolved',
+        text: 'Check whether the QR code works before changing the brochure.',
+        basis: 'assistant-commitment',
+        source: {
+          unit: 'message',
+          index: 17,
+          id: 'message:assistant-17',
+          timestamp: '2026-08-02T17:59:55.000Z',
+        },
+      },
+      rail: {
+        railId: 'rail-older',
+        title: 'Older brochure work',
+        state: 'active',
+        activeStep: {
+          id: 'step-older',
+          title: 'Resume layout edits',
+          status: 'active',
+          instruction: 'Resume the older brochure layout.',
+        },
+      },
+    });
+
+    const value = adaptLegacyRebirthPackageToV6({ continuityReceipt });
+
+    expect(value.boundaryAndActiveTask.lastMaterialAssistant).toMatchObject({
+      text: 'Check whether the QR code works before changing the brochure.',
+      source: {
+        provenanceId: 'message:assistant-17',
+        sourceAt: '2026-08-02T17:59:55.000Z',
+        status: 'exact',
+      },
+    });
+    expect(value.executionState.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'pending_assistant_action',
+        text: 'Check whether the QR code works before changing the brochure.',
+      }),
+    ]));
+    expect(value.executionState.facts).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'next_action', text: 'Resume the older brochure layout.' }),
+    ]));
   });
 
   it('preserves the newest known conversation rows when the section budget overflows', () => {

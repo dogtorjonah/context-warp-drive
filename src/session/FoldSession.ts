@@ -62,6 +62,11 @@ import {
   renderTailEpochProvenance,
   selectPairingSafeRawTailStart,
 } from '../chronologicalProvenance.ts';
+import { renderEpochContinuityCapsule } from '../epochContinuityCapsule.ts';
+import {
+  readPendingAssistantContinuityFromTrustedMessages,
+  reducePendingAssistantContinuity,
+} from '../pendingAssistantAction.ts';
 // microRebirthSeed import removed — tail epochs now use vault + cognitive block only
 import { computeOpenBurst } from '../foldEpisodeCapture.ts';
 import {
@@ -1441,7 +1446,45 @@ export class FoldSession {
         previous: 'frozen-prefix',
         liveObjective,
       });
-      const tailWithProvenance = appendDedicatedChronologicalMessage(enrichedTail, provenance);
+      let trajectory: string | null = null;
+      for (let index = tail.length - 1; index >= 0; index -= 1) {
+        const candidate = extractAssistantText([tail[index]]).trim();
+        if (!candidate) continue;
+        trajectory = candidate;
+        break;
+      }
+      const priorPendingAssistantState = readPendingAssistantContinuityFromTrustedMessages(
+        this.freezeState.frozenView ?? [],
+      );
+      const pendingAssistantState = reducePendingAssistantContinuity(
+        priorPendingAssistantState,
+        tail,
+        {
+          syntheticContext: this.syntheticContext,
+          sourceUnit: 'message',
+          sourceIndexOffset: frozenCount,
+        },
+      );
+      const continuityCapsule = renderEpochContinuityCapsule({
+        objective: liveObjective
+          ? { text: liveObjective, provenance: 'live', source: 'operator-message' }
+          : null,
+        trajectory,
+        pendingAssistantState,
+        source: {
+          unit: 'message',
+          sourceStart: frozenCount,
+          sourceEndExclusive: frozenCount + tail.length,
+          rawResumeIndex: hasKeptRaw ? frozenCount + keptRawSplitIndex : frozenCount + tail.length,
+          frameId: `standalone:tail-epoch#${upcomingEpoch}:pre-fold`,
+          frameRowStart: frozenCount,
+          frameRowEndInclusive: Math.max(frozenCount, frozenCount + tail.length - 1),
+        },
+      });
+      const tailWithProvenance = appendDedicatedChronologicalMessage(
+        enrichedTail,
+        [provenance, continuityCapsule].filter(Boolean).join('\n\n'),
+      );
       // When we kept a raw working set, pass truncated history so
       // frozenRawCount advances only to the fold boundary.
       const commitMessages = hasKeptRaw

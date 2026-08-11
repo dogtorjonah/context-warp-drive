@@ -25,6 +25,12 @@ export interface FoldMessage {
    * lack one leave it absent and downstream artifacts mark source as unknown. */
   sourceIdentity?: string;
   /**
+   * Authority of `sourceIdentity`. Host-supplied legacy identities default to
+   * exact; annotator-generated prefix/index fallbacks are synthetic positions
+   * and must never be rendered as persisted provider ids.
+   */
+  sourceIdentityAuthority?: 'exact' | 'synthetic-position';
+  /**
    * All exact persisted source-row identities represented by this message.
    * Internal-only metadata: provider adapters must strip it from outbound
    * payloads. Unlike symbol/non-enumerable metadata, this survives the
@@ -136,11 +142,21 @@ export function annotateFoldMessageSourceIdentities<T extends FoldMessage>(
         ? [fallback]
         : []),
     ]);
-    const primary = message.sourceIdentity?.trim()
+    const suppliedPrimary = message.sourceIdentity?.trim();
+    const primary = suppliedPrimary
       || (hasAssistantText && fallback ? fallback : undefined)
       || (structured.length === 1 ? structured[0] : undefined)
       || (identities.length === 1 ? identities[0] : undefined);
-    return attachFoldMessageSourceIdentities(message, identities, primary);
+    const annotated = attachFoldMessageSourceIdentities(message, identities, primary);
+    if (!primary) return annotated;
+    return {
+      ...annotated,
+      sourceIdentityAuthority: suppliedPrimary
+        ? message.sourceIdentityAuthority ?? 'exact'
+        : primary === fallback
+          ? 'synthetic-position'
+          : 'exact',
+    };
   });
 }
 
@@ -1541,7 +1557,11 @@ export function extractAssistantText(turnMessages: FoldMessage[]): string {
       texts.push(msg.content);
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
-        if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        if (
+          (block?.type === 'text' || block?.type === 'output_text')
+          && typeof block.text === 'string'
+          && block.text.trim()
+        ) {
           texts.push(block.text);
         }
       }
@@ -1579,7 +1599,11 @@ export function extractUserText(
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content as any[]) {
         // Only genuine text blocks — tool_result blocks are tool output.
-        if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        if (
+          (block?.type === 'text' || block?.type === 'input_text')
+          && typeof block.text === 'string'
+          && block.text.trim()
+        ) {
           const cleaned = stripSyntheticUserContextBlocks(block.text, syntheticContext).trim();
           if (cleaned) texts.push(cleaned);
         }

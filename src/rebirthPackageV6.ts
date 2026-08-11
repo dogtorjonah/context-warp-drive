@@ -137,6 +137,7 @@ export interface RebirthPackageV6ExecutionFact {
   readonly status: RebirthPackageV6SourceStatus;
   readonly kind:
     | 'rail'
+    | 'pending_assistant_action'
     | 'next_action'
     | 'blocker'
     | 'claim'
@@ -903,7 +904,11 @@ export function adaptLegacyRebirthPackageToV6(
       ?? receipt?.liveState?.request.value?.text
       ?? legacy.triggeringUserMessage,
   );
-  const assistantText = extractLegacyAssistant(legacy.lastUserAiMessages);
+  const pendingAssistantAction = receipt?.pendingAssistantAction?.status === 'unresolved'
+    ? receipt.pendingAssistantAction
+    : undefined;
+  const assistantText = pendingAssistantAction?.text
+    ?? extractLegacyAssistant(legacy.lastUserAiMessages);
   const requestSource = receipt?.liveState?.request?.source;
   const activeEditDelta = options.activeEditDelta ?? (nonEmpty(legacy.activeEditDelta)
     ? {
@@ -941,6 +946,17 @@ export function adaptLegacyRebirthPackageToV6(
       }
     : adaptReceiptEditDelta(receipt));
   const executionFacts: RebirthPackageV6ExecutionFact[] = [];
+  if (pendingAssistantAction) {
+    executionFacts.push({
+      kind: 'pending_assistant_action',
+      text: pendingAssistantAction.text,
+      ...receiptFactSource(
+        'pending_assistant_action',
+        pendingAssistantAction.text,
+        receipt?.liveState?.assistantAction?.source,
+      ),
+    });
+  }
   if (receipt?.rail) {
     const railSource = receipt.liveState?.rail.source;
     executionFacts.push({
@@ -954,7 +970,7 @@ export function adaptLegacyRebirthPackageToV6(
       ...receiptFactSource('rail', receipt.rail.railId, railSource),
     });
     const nextAction = nonEmpty(receipt.nextAction ?? receipt.rail.queuedStepTitle);
-    if (nextAction) {
+    if (nextAction && nextAction !== pendingAssistantAction?.text) {
       executionFacts.push({
         kind: 'next_action',
         text: nextAction,
@@ -1076,9 +1092,16 @@ export function adaptLegacyRebirthPackageToV6(
         text: assistantText,
         chars: assistantText.length,
         source: {
-          provenanceId: stableTextIdentity('last-assistant', assistantText),
-          sourceAt: null,
-          status: 'partial',
+          provenanceId: receipt?.liveState?.assistantAction?.source.id
+            ?? pendingAssistantAction?.source.id
+            ?? stableTextIdentity('last-assistant', assistantText),
+          sourceAt: knownSourceTime(
+            receipt?.liveState?.assistantAction?.source.sourceTimestamp
+              ?? pendingAssistantAction?.source.timestamp,
+          ),
+          status: receipt?.liveState?.assistantAction?.source.id || pendingAssistantAction?.source.id
+            ? 'exact'
+            : 'partial',
         },
       } : null,
     },

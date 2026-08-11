@@ -54,6 +54,12 @@ const ALLOWLIST: readonly AllowlistEntry[] = [
     max: 3,
     why: 'legacy-compat reader: pre-rename persisted snapshots carry the lastFullRecomputeReason key; deserializeFoldFreezeState still accepts it',
   },
+  {
+    file: 'src/foldFreeze.d.ts',
+    allow: /lastFullRecomputeReason/,
+    max: 1,
+    why: 'generated declaration mirror of the single legacy-compat snapshot field accepted by src/foldFreeze.ts',
+  },
 ];
 
 function collectSourceFiles(dir: string, out: string[]): void {

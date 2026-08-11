@@ -56,6 +56,10 @@ import {
   renderRebirthPackageV6,
   type RebirthPackageV6Model,
 } from './rebirthPackageV6.ts';
+import {
+  pendingAssistantActionFromState,
+  reducePendingAssistantContinuityTimeline,
+} from './pendingAssistantAction.ts';
 
 /**
  * Build a portable lineage glyph log from the message trace: scan assistant
@@ -3172,6 +3176,11 @@ export function buildRawRebirthSeedFromMessages(
         runtimeStatus: options.predecessorStatus ?? 'unknown',
       },
       rail: legacyReceipt.rail,
+      pendingAssistantAction: pendingAssistantActionFromState(
+        reducePendingAssistantContinuityTimeline(messages.slice(0, traceEnd), {
+          sourceUnit: 'message',
+        }),
+      ) ?? undefined,
       nextAction: legacyReceipt.nextAction,
       activeRequestText,
       activeRequestSourceId: suppliedRequestSource?.sourceId?.trim() || 'unknown',

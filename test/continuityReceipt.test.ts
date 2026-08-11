@@ -24,7 +24,8 @@ const AUTHORITY_ADJACENCIES: readonly (readonly [
   keyof ContinuityAuthorityLattice<string>,
   ContinuityAuthorityRank,
 ])[] = [
-  ['laterUnansweredOperatorMessage', 'later-unanswered-operator-message', 'liveTaskRail', 'live-task-rail'],
+  ['laterUnansweredOperatorMessage', 'later-unanswered-operator-message', 'pendingAssistantAction', 'pending-assistant-action'],
+  ['pendingAssistantAction', 'pending-assistant-action', 'liveTaskRail', 'live-task-rail'],
   ['liveTaskRail', 'live-task-rail', 'newestTailBand', 'newest-tail-band'],
   ['newestTailBand', 'newest-tail-band', 'frozenControlSnapshot', 'frozen-control-snapshot'],
   ['frozenControlSnapshot', 'frozen-control-snapshot', 'activeEditDelta', 'active-edit-delta'],
@@ -59,6 +60,7 @@ describe('continuity authority lattice', () => {
       frozenControlSnapshot: { sourceId: 'frozen-control', value: 'frozen instruction' },
       newestTailBand: { sourceId: 'tail-band', value: 'newest band' },
       liveTaskRail: { sourceId: 'locked-rail', value: 'locked=true: keep old task' },
+      pendingAssistantAction: { sourceId: 'assistant-message-98', value: 'check the QR target' },
       laterUnansweredOperatorMessage: { sourceId: 'operator-message-99', value: 'redirect now' },
     });
 
@@ -68,6 +70,7 @@ describe('continuity authority lattice', () => {
       value: 'redirect now',
     });
     expect(resolution?.shadowedRanks).toEqual([
+      'pending-assistant-action',
       'live-task-rail',
       'newest-tail-band',
       'frozen-control-snapshot',
@@ -77,7 +80,7 @@ describe('continuity authority lattice', () => {
       'historical-evidence',
     ]);
     expect(renderContinuityAuthorityResolution(resolution!)).toBe(
-      'authority resolution · winner=later-unanswered-operator-message · source="operator-message-99" · outranks=live-task-rail > newest-tail-band > frozen-control-snapshot > active-edit-delta > rail-context > recent-dialogue > historical-evidence',
+      'authority resolution · winner=later-unanswered-operator-message · source="operator-message-99" · outranks=pending-assistant-action > live-task-rail > newest-tail-band > frozen-control-snapshot > active-edit-delta > rail-context > recent-dialogue > historical-evidence',
     );
   });
 
@@ -179,6 +182,37 @@ describe('buildContinuityReceipt (typed assembly)', () => {
       nextAction: 'Run the parity gate.',
     });
     expect(receipt.nextAction).toBe('Run the parity gate.');
+  });
+
+  test('pending assistant action outranks an explicit stale rail next action', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      rail: TYPED_RAIL,
+      nextAction: 'Resume the older tri-fold task.',
+      pendingAssistantAction: {
+        text: 'Okay, let me check whether the QR code works.',
+        status: 'unresolved',
+        basis: 'assistant-commitment',
+        source: {
+          id: 'assistant-row-42',
+          timestamp: '2026-08-10T00:52:45.000Z',
+          unit: 'message',
+          index: 42,
+        },
+      },
+    });
+
+    expect(receipt.nextAction).toBe('Okay, let me check whether the QR code works.');
+    expect(receipt.liveState?.assistantAction).toMatchObject({
+      status: 'current',
+      source: {
+        kind: 'assistant-message',
+        id: 'assistant-row-42',
+        coordinate: 'message#42',
+        sourceTimestamp: '2026-08-10T00:52:45.000Z',
+      },
+    });
   });
 
   test('captures active request text with true totalChars', () => {
@@ -431,6 +465,53 @@ describe('renderContinuityReceiptControl (canonical renderer)', () => {
     expect(block).not.toContain('rail:');
     expect(block).not.toContain('active request');
     expect(block).not.toContain('validation=');
+  });
+
+  test('renders pending assistant action before the stale rail with explicit precedence', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      sourceStatus: 'working',
+      rail: TYPED_RAIL,
+      pendingAssistantAction: {
+        text: 'Okay, let me check whether the QR code works.',
+        status: 'unresolved',
+        basis: 'assistant-commitment',
+        source: {
+          id: 'assistant-row-42',
+          timestamp: '2026-08-10T00:52:45.000Z',
+          unit: 'message',
+          index: 42,
+        },
+      },
+    });
+    const block = renderContinuityReceiptControl(receipt);
+
+    expect(block.indexOf('pending assistant action')).toBeLessThan(block.indexOf('current task-rail step'));
+    expect(block).toContain('status=unresolved · outranks=live-task-rail');
+    expect(block).toContain('winner=pending-assistant-action');
+    expect(block).toContain('source="assistant-row-42"');
+  });
+
+  test('later unanswered operator request outranks pending action and rail', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      rail: TYPED_RAIL,
+      activeRequestText: 'Show me the current continuity state.',
+      activeRequestSourceId: 'operator-newer',
+      pendingAssistantAction: {
+        text: 'Okay, let me check whether the QR code works.',
+        status: 'unresolved',
+        basis: 'assistant-commitment',
+        source: { id: 'assistant-older', timestamp: null, unit: 'message', index: 42 },
+      },
+    });
+
+    expect(receipt.nextAction).toBe('Show me the current continuity state.');
+    expect(renderContinuityReceiptControl(receipt)).toContain(
+      'winner=later-unanswered-operator-message',
+    );
   });
 
   test('keeps rail and active-step source timestamps distinct in typed live state', () => {

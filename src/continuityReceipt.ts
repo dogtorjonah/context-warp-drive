@@ -29,6 +29,11 @@
  * Pure module: no I/O, no timers, no environment access. GOD RULE 2 safe.
  */
 
+import {
+  isPendingAssistantAction as isCanonicalPendingAssistantAction,
+  type PendingAssistantAction,
+} from './pendingAssistantAction.ts';
+
 export const CONTINUITY_RECEIPT_VERSION = 1 as const;
 
 export type ContinuityReceiptBoundary =
@@ -159,6 +164,8 @@ export interface ContinuityReceiptLiveState {
   readonly capturedAt: string;
   readonly instance: ContinuityLiveField<ContinuityLiveInstance>;
   readonly request: ContinuityLiveField<{ readonly text: string; readonly totalChars: number }>;
+  /** Newest assistant-created executable open loop, when one is still unresolved. */
+  readonly assistantAction?: ContinuityLiveField<PendingAssistantAction>;
   readonly rail: ContinuityLiveField<ContinuityReceiptRail>;
   readonly step: ContinuityLiveField<ContinuityReceiptRailStep>;
   readonly claims: ContinuityLiveField<readonly string[]>;
@@ -181,9 +188,11 @@ export interface ContinuityReceipt {
   readonly captureSourceId?: string;
   readonly sourceStatus?: string;
   readonly rail?: ContinuityReceiptRail;
+  /** Newer unresolved assistant commitment/progress that outranks a stale rail. */
+  readonly pendingAssistantAction?: PendingAssistantAction;
   /**
-   * Immediate next action as resolved at assembly. Defaults to the active
-   * rail step's instruction when omitted here.
+   * Immediate next action as resolved at assembly: current operator request,
+   * then pending assistant action, then explicit/rail fallback.
    */
   readonly nextAction?: string;
   readonly activeRequest?: { readonly text: string; readonly totalChars: number };
@@ -205,6 +214,7 @@ export interface ContinuityReceipt {
  */
 export const CONTINUITY_AUTHORITY_ORDER = [
   'later-unanswered-operator-message',
+  'pending-assistant-action',
   'live-task-rail',
   'newest-tail-band',
   'frozen-control-snapshot',
@@ -225,6 +235,7 @@ export interface ContinuityAuthoritySource<T> {
 /** Named fields prevent callers from inventing or silently reordering ranks. */
 export interface ContinuityAuthorityLattice<T> {
   readonly laterUnansweredOperatorMessage?: ContinuityAuthoritySource<T>;
+  readonly pendingAssistantAction?: ContinuityAuthoritySource<T>;
   readonly liveTaskRail?: ContinuityAuthoritySource<T>;
   readonly newestTailBand?: ContinuityAuthoritySource<T>;
   readonly frozenControlSnapshot?: ContinuityAuthoritySource<T>;
@@ -242,6 +253,7 @@ export interface ContinuityAuthorityResolution<T> {
 
 const CONTINUITY_AUTHORITY_FIELDS = [
   ['later-unanswered-operator-message', 'laterUnansweredOperatorMessage'],
+  ['pending-assistant-action', 'pendingAssistantAction'],
   ['live-task-rail', 'liveTaskRail'],
   ['newest-tail-band', 'newestTailBand'],
   ['frozen-control-snapshot', 'frozenControlSnapshot'],
@@ -297,6 +309,21 @@ export function resolveContinuityReceiptAuthority(
   const currentRail = live !== undefined
     && ((live.step.status === 'current' && live.step.value !== undefined)
       || (live.rail.status === 'current' && live.rail.value !== undefined));
+  const livePendingAssistantAction = live?.assistantAction?.status === 'current'
+    && live.assistantAction.value?.status === 'unresolved'
+    ? live.assistantAction
+    : undefined;
+  const receiptPendingAssistantAction = receipt.pendingAssistantAction?.status === 'unresolved'
+    ? receipt.pendingAssistantAction
+    : undefined;
+  const pendingAssistantActionPresent = Boolean(
+    livePendingAssistantAction || receiptPendingAssistantAction,
+  );
+  const pendingAssistantActionSourceId = livePendingAssistantAction?.source.id
+    ?? receiptPendingAssistantAction?.source.id
+    ?? (receiptPendingAssistantAction
+      ? `${receiptPendingAssistantAction.source.unit}#${receiptPendingAssistantAction.source.index ?? 'unknown'}`
+      : undefined);
   const currentTail = live?.rawTailFrontier.status === 'current'
     && (live.rawTailFrontier.value?.exactCount ?? 0) > 0
     ? live.rawTailFrontier
@@ -310,6 +337,12 @@ export function resolveContinuityReceiptAuthority(
       : !live && receipt.activeRequest?.text.trim()
         ? { sourceId: 'continuity-receipt.active-request', value: true }
         : undefined,
+    pendingAssistantAction: pendingAssistantActionPresent && pendingAssistantActionSourceId
+      ? {
+          sourceId: pendingAssistantActionSourceId,
+          value: true,
+        }
+      : undefined,
     liveTaskRail: currentRail
       ? { sourceId: 'continuity-receipt.live-state', value: true }
       : undefined,
@@ -372,7 +405,8 @@ export interface ContinuityReceiptParts {
   readonly sourceStatus?: string;
   readonly capturedAt?: string;
   readonly rail?: ContinuityReceiptRail;
-  /** Defaults to rail.activeStep.instruction when omitted. */
+  readonly pendingAssistantAction?: PendingAssistantAction;
+  /** Resolved after operator request and pending assistant action, before rail fallback. */
   readonly nextAction?: string;
   readonly activeRequestText?: string;
   readonly activeRequestSourceTimestamp?: string;
@@ -463,6 +497,7 @@ function buildReceiptLiveState(args: {
     ? parts.activeRequestSourceId?.trim() || `${captureId}:embedded-active-request`
     : 'none';
   const rail = parts.rail;
+  const pendingAssistantAction = parts.pendingAssistantAction;
   const railSource = rail
     ? captureSource('task-rail', rail.railId || 'legacy-rail', {
         ...(rail.revision !== undefined ? { coordinate: `revision:${rail.revision}` } : {}),
@@ -528,6 +563,25 @@ function buildReceiptLiveState(args: {
       ...(activeRequest ? { value: activeRequest } : {}),
       ...(!activeRequest ? { note: 'no unanswered operator request bundled' } : {}),
     },
+    ...(pendingAssistantAction ? {
+      assistantAction: {
+        status: 'current' as const,
+        source: captureSource(
+          'assistant-message',
+          pendingAssistantAction.source.id ?? `${captureId}:pending-assistant-action`,
+          {
+            ...(pendingAssistantAction.source.index !== null
+              ? { coordinate: `${pendingAssistantAction.source.unit}#${pendingAssistantAction.source.index}` }
+              : {}),
+            ...(pendingAssistantAction.source.timestamp
+              ? { sourceTimestamp: pendingAssistantAction.source.timestamp }
+              : {}),
+          },
+        ),
+        value: pendingAssistantAction,
+        note: 'unresolved assistant commitment/progress outranks older task-rail work',
+      },
+    } : {}),
     rail: {
       status: rail ? 'current' : 'unknown',
       source: railSource,
@@ -674,7 +728,11 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
     captureSourceId,
     sourceStatus: parts.sourceStatus?.trim() || undefined,
     rail: parts.rail,
-    nextAction: parts.nextAction ?? parts.rail?.activeStep?.instruction,
+    pendingAssistantAction: parts.pendingAssistantAction,
+    nextAction: activeRequestText
+      ?? parts.pendingAssistantAction?.text
+      ?? parts.nextAction
+      ?? parts.rail?.activeStep?.instruction,
     activeRequest,
     editClaim: {
       supplied: parts.hasActiveEditDelta ?? (claims.length > 0 || editEvidenceFiles.length > 0),
@@ -893,6 +951,10 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
 }
 
+function isPendingAssistantAction(value: unknown): value is PendingAssistantAction {
+  return isCanonicalPendingAssistantAction(value);
+}
+
 const CONTINUITY_LIVE_FIELD_STATUSES: readonly ContinuityLiveFieldStatus[] = [
   'current',
   'stale',
@@ -912,7 +974,7 @@ function isContinuityLiveField(value: unknown): value is ContinuityLiveField<unk
 
 function isContinuityReceiptLiveState(value: unknown): value is ContinuityReceiptLiveState {
   if (!isRecord(value) || typeof value.capturedAt !== 'string') return false;
-  return [
+  const requiredFieldsValid = [
     'instance',
     'request',
     'rail',
@@ -926,6 +988,11 @@ function isContinuityReceiptLiveState(value: unknown): value is ContinuityReceip
     'subscriptions',
     'rawTailFrontier',
   ].every((key) => isContinuityLiveField(value[key]));
+  return requiredFieldsValid
+    && (value.assistantAction === undefined
+      || (isContinuityLiveField(value.assistantAction)
+        && (value.assistantAction.value === undefined
+          || isPendingAssistantAction(value.assistantAction.value))));
 }
 
 /** Structural check for the typed render path. Unknown/newer versions fail so older runtimes degrade to prose synthesis instead of misrendering. */
@@ -938,6 +1005,8 @@ export function isContinuityReceipt(value: unknown): value is ContinuityReceipt 
   if (!isRecord(value.editClaim) || !isStringArray(value.editClaim.claims) || !isStringArray(value.editClaim.editEvidenceFiles)) return false;
   if (!isRecord(value.validation)) return false;
   if (!isStringArray(value.hazards) || !isStringArray(value.disagreements)) return false;
+  if (value.pendingAssistantAction !== undefined
+    && !isPendingAssistantAction(value.pendingAssistantAction)) return false;
   if (value.liveState !== undefined && !isContinuityReceiptLiveState(value.liveState)) return false;
   return true;
 }
@@ -1265,11 +1334,21 @@ function renderContinuityLiveState(
     liveState.step.value,
     liveState.step.source.sourceTimestamp,
   );
+  const pendingAssistantAction = liveState.assistantAction?.status === 'current'
+    ? liveState.assistantAction.value
+    : receipt.pendingAssistantAction;
+  const pendingAssistantActionLines = pendingAssistantAction?.status === 'unresolved'
+    ? [
+        `pending assistant action · ${truncateContinuity(pendingAssistantAction.text, 360)}`,
+        `pending action source · id=${pendingAssistantAction.source.id ?? 'unknown'} · coordinate=${pendingAssistantAction.source.unit}#${pendingAssistantAction.source.index ?? 'unknown'} · source-time=${pendingAssistantAction.source.timestamp ?? 'unknown'} · status=unresolved · outranks=live-task-rail`,
+      ]
+    : [];
 
   return [
     LIVE_CONTINUITY_STATE_HEADER,
     `boundary=${receipt.boundary} · identity=${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)} · runtime=${runtimeStatus}`,
     `captured=${liveState.capturedAt} · frontier=${renderLiveFrontier(liveState.rawTailFrontier.value)}`,
+    ...pendingAssistantActionLines,
     ...activeStepLines,
     `active files · claims=${renderLiveList(liveState.claims.value)} · recent edits=${renderRecentEditsField(renderLiveList(liveState.edits.value), receipt.editClaim.supplied || receipt.editClaim.editEvidenceFiles.length > 0)}`,
     ...(validation ? [`validation=${validation}`] : []),
@@ -1311,10 +1390,17 @@ export function renderContinuityReceiptControl(
     receipt.rail?.activeStep?.updatedAt,
     receipt.rail?.activeStepRawLine,
   );
+  const pendingAssistantActionLines = receipt.pendingAssistantAction?.status === 'unresolved'
+    ? [
+        `pending assistant action · ${truncateContinuity(receipt.pendingAssistantAction.text, 360)}`,
+        `pending action source · id=${receipt.pendingAssistantAction.source.id ?? 'unknown'} · coordinate=${receipt.pendingAssistantAction.source.unit}#${receipt.pendingAssistantAction.source.index ?? 'unknown'} · source-time=${receipt.pendingAssistantAction.source.timestamp ?? 'unknown'} · status=unresolved · outranks=live-task-rail`,
+      ]
+    : [];
   return [
     LIVE_CONTINUITY_STATE_HEADER,
     `boundary=${receipt.boundary} · identity=${formatContinuityIdentity(receipt.boundary, receipt.predecessorName)} · runtime=${receipt.sourceStatus ?? 'unknown'}`,
     `frontier=${canonical}`,
+    ...pendingAssistantActionLines,
     ...activeStepLines,
     `active files · claims=${receipt.editClaim.claims.join(', ') || 'none'} · recent edits=${renderRecentEditsField(receipt.editClaim.editEvidenceFiles.join(', ') || 'none', receipt.editClaim.supplied)}`,
     receipt.validation.fact !== undefined

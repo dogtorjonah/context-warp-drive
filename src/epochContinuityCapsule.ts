@@ -7,8 +7,19 @@ import type {
   LiveObjectiveProvenance,
   LiveObjectiveSource,
 } from './chronologicalProvenance.ts';
+import {
+  classifyPendingAssistantActionText,
+  isPendingAssistantContinuityState,
+  PENDING_ASSISTANT_ACTION_CAPSULE_HEADER,
+  PENDING_ASSISTANT_ACTION_STATE_PREFIX,
+  settledPendingAssistantContinuityState,
+  unknownPendingAssistantContinuityState,
+  unresolvedPendingAssistantContinuityState,
+  type PendingAssistantAction,
+  type PendingAssistantContinuityState,
+} from './pendingAssistantAction.ts';
 
-export const EPOCH_CONTINUITY_CAPSULE_HEADER = '[Epoch Continuity Capsule]';
+export const EPOCH_CONTINUITY_CAPSULE_HEADER = PENDING_ASSISTANT_ACTION_CAPSULE_HEADER;
 export const EPOCH_CONTINUITY_POINTERS_PREFIX = 'pointers: ';
 
 export const EPOCH_CONTINUITY_OBJECTIVE_MAX_CHARS = 800;
@@ -35,6 +46,10 @@ export interface EpochContinuityCapsuleSource {
 export interface RenderEpochContinuityCapsuleInput {
   readonly objective?: EpochContinuityCapsuleObjective | null;
   readonly trajectory?: string | null;
+  /** Full tri-state transport. Hosts should always supply this at epoch boundaries. */
+  readonly pendingAssistantState?: PendingAssistantContinuityState;
+  /** @deprecated Compatibility input. Explicit null means an authoritative clear. */
+  readonly pendingAssistantAction?: PendingAssistantAction | null;
   readonly validation?: string | null;
   readonly liveState?: string | null;
   readonly source: EpochContinuityCapsuleSource;
@@ -644,6 +659,48 @@ export function renderEpochContinuityCapsule(
         EPOCH_CONTINUITY_TRAJECTORY_MAX_CHARS,
       )
     : null;
+  const hasStateInput = Object.prototype.hasOwnProperty.call(input, 'pendingAssistantState');
+  const hasActionInput = Object.prototype.hasOwnProperty.call(input, 'pendingAssistantAction');
+  const hasExplicitContinuityInput = hasStateInput || hasActionInput;
+  const inferredPendingBasis = !hasExplicitContinuityInput && trajectory
+    ? classifyPendingAssistantActionText(trajectory)
+    : null;
+  let pendingAssistantState: PendingAssistantContinuityState;
+  if (hasStateInput && isPendingAssistantContinuityState(input.pendingAssistantState)) {
+    pendingAssistantState = input.pendingAssistantState;
+  } else if (hasActionInput) {
+    pendingAssistantState = input.pendingAssistantAction
+      ? unresolvedPendingAssistantContinuityState(input.pendingAssistantAction)
+      : settledPendingAssistantContinuityState(null);
+  } else if (inferredPendingBasis && trajectory) {
+    const inferredIndex = typeof input.source.frameRowEndInclusive === 'number'
+      ? input.source.frameRowEndInclusive
+      : typeof input.source.sourceEndExclusive === 'number'
+        ? Math.max(0, input.source.sourceEndExclusive - 1)
+        : null;
+    pendingAssistantState = unresolvedPendingAssistantContinuityState({
+      text: trajectory,
+      status: 'unresolved',
+      basis: inferredPendingBasis,
+      source: {
+        id: null,
+        timestamp: null,
+        unit: input.source.unit,
+        index: inferredIndex,
+      },
+    });
+  } else {
+    pendingAssistantState = unknownPendingAssistantContinuityState();
+  }
+  const pendingAssistantAction = pendingAssistantState.state === 'unresolved'
+    ? pendingAssistantState.action
+    : null;
+  const pendingAssistantActionText = pendingAssistantAction
+    ? boundEpochContinuityText(
+        pendingAssistantAction.text,
+        EPOCH_CONTINUITY_TRAJECTORY_MAX_CHARS,
+      )
+    : null;
   const validation = input.validation === undefined
     ? (trajectory ? deriveEpochContinuityValidation(trajectory) : null)
     : input.validation
@@ -675,13 +732,21 @@ export function renderEpochContinuityCapsule(
   );
   const provenance = input.objective?.provenance?.trim() || 'unknown';
   const objectiveSource = input.objective?.source?.trim() || 'none';
+  const stateJson = JSON.stringify(pendingAssistantState);
+  const renderLegacyTrajectory = !hasExplicitContinuityInput && !pendingAssistantAction && trajectory;
+  const pendingSource = pendingAssistantAction?.source;
 
   return [
     EPOCH_CONTINUITY_CAPSULE_HEADER,
     objectiveText
       ? `objective: ${objectiveText} [provenance=${provenance} source=${objectiveSource}]`
       : 'objective: unknown [provenance=unknown source=none]',
-    trajectory ? `trajectory: ${trajectory}` : '',
+    pendingAssistantActionText
+      ? `pending_assistant_action: ${pendingAssistantActionText} [status=unresolved basis=${pendingAssistantAction?.basis ?? 'unknown'} source-id=${pendingSource?.id ?? 'unknown'} source-coordinate=${pendingSource?.unit ?? input.source.unit}#${pendingSource?.index ?? 'unknown'} source-time=${pendingSource?.timestamp ?? 'unknown'} outranks=live-task-rail]`
+      : renderLegacyTrajectory
+        ? `trajectory: ${trajectory}`
+        : '',
+    `${PENDING_ASSISTANT_ACTION_STATE_PREFIX}${stateJson}`,
     validation ? `validation: ${validation}` : '',
     liveState ? `live_state:\n${liveState}` : '',
     renderEpochContinuityPointers(),

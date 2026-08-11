@@ -185,8 +185,18 @@ describe('live source identity annotation', () => {
     const annotated = annotateFoldMessageSourceIdentities(raw, 'claude-api');
 
     expect(annotated).toEqual([
-      { ...raw[0], sourceIdentity: 'claude-api-0', sourceIdentities: ['claude-api-0'] },
-      { ...raw[1], sourceIdentity: 'claude-api-1', sourceIdentities: ['claude-api-1'] },
+      {
+        ...raw[0],
+        sourceIdentity: 'claude-api-0',
+        sourceIdentityAuthority: 'synthetic-position',
+        sourceIdentities: ['claude-api-0'],
+      },
+      {
+        ...raw[1],
+        sourceIdentity: 'claude-api-1',
+        sourceIdentityAuthority: 'synthetic-position',
+        sourceIdentities: ['claude-api-1'],
+      },
     ]);
     expect(annotated).toHaveLength(raw.length);
     expect(annotated.map((message) => message.role)).toEqual(raw.map((message) => message.role));
@@ -206,14 +216,17 @@ describe('live source identity annotation', () => {
 
     expect(annotated[0]).toMatchObject({
       sourceIdentity: 'origin:event#4',
+      sourceIdentityAuthority: 'exact',
       sourceIdentities: ['origin:event#4', 'claude-api-0'],
     });
     expect(annotated[1]).toMatchObject({
       sourceIdentity: 'toolu_exact',
+      sourceIdentityAuthority: 'exact',
       sourceIdentities: ['toolu_exact'],
     });
     expect(annotated[2]).toMatchObject({
       sourceIdentity: 'gemini-call-7',
+      sourceIdentityAuthority: 'exact',
       sourceIdentities: ['gemini-call-7'],
     });
   });
@@ -228,6 +241,7 @@ describe('live source identity annotation', () => {
     }], 'provider-snapshot');
 
     expect(mixed.sourceIdentity).toBe('provider-snapshot-0');
+    expect(mixed.sourceIdentityAuthority).toBe('synthetic-position');
     expect(mixed.sourceIdentities).toEqual(['call-tap-star', 'provider-snapshot-0']);
   });
 });

@@ -979,13 +979,17 @@ export function foldMessageTimestampBounds(messages: readonly FoldMessage[]): {
   };
 }
 
-/** Append a dedicated relay-internal user message; never mutates source arrays. */
+/** Append a trusted dedicated Context Warp message; never mutates source arrays. */
 export function appendDedicatedChronologicalMessage<T extends FoldMessage>(
   view: readonly T[],
   provenance: string | null,
 ): T[] {
   if (!provenance) return view.slice();
-  return view.concat({ role: 'user', content: provenance } as T);
+  return view.concat({
+    role: 'user',
+    content: provenance,
+    contextWarpSynthetic: 'folded-context',
+  } as T);
 }
 
 interface ToolCoordinate {
