@@ -1,5 +1,5 @@
 /**
- * capture-contract/v3 — authoritative capture boundary contract (relay-agnostic).
+ * capture-contract/v4 — authoritative capture boundary contract (relay-agnostic).
  *
  * This module is the canonical home for the intention/rail/step/status lifecycle
  * vocabulary that episode capture, canonical transport, and persistence joins
@@ -8,7 +8,7 @@
  * modules; relay and shared/src adapt DOWNWARD from here. Dependency direction
  * is one-way: this file imports nothing outside the package.
  *
- * Freeze seam: `capture-contract/v3`. Mutation path: version bump + squad
+ * Freeze seam: `capture-contract/v4`. Mutation path: version bump + squad
  * invalidation broadcast only. Consumers import or alias these exports; local
  * duplicates of the literals or predicates are freeze violations.
  *
@@ -18,7 +18,7 @@
  */
 
 /** Durable identity of this freeze, for receipts and consumer gating. */
-export const CAPTURE_CONTRACT_VERSION = 'capture-contract/v3' as const;
+export const CAPTURE_CONTRACT_VERSION = 'capture-contract/v4' as const;
 
 // ── Production seal-reason vocabulary ────────────────────────────────────────
 //
@@ -149,24 +149,38 @@ export interface CaptureStatusUpdatePayload {
 //
 // The single canonical export for deciding whether an idle transition is a
 // GENUINE idle (agent finished and willingly went quiet) versus a deferred or
-// passthrough idle (queued input waiting, cleanup deferred). Relay status
-// transitions already compute the inputs exactly once per transition; this
-// predicate is pure so capture, transport, and persistence all evaluate the
-// same rule from the same evidence instead of re-implementing it.
+// lifecycle-generated idle. Empty input alone is not proof of completion:
+// folds, rebirths, operator interrupts, and transient provider idles can all
+// publish an empty-queue `idle` while the original turn remains alive. Relay
+// status transitions compute the complete evidence exactly once; this pure
+// predicate lets capture, transport, persistence, and idle-triggered mechanics
+// consume one decision instead of hand-rolling weaker local guards.
 
 export interface GenuineIdleTransitionInput {
+  /** Status being exited; a voluntary completion must finish real work. */
+  fromStatus: string;
   /** Status being entered. */
   toStatus: string;
   /** Queued user messages at the transition. */
   inputQueueDepth: number;
   /** Whether true-idle cleanup was deferred at the transition. */
   idleCleanupDeferred: boolean;
+  /** True for relay-known interrupts, folds, rebirths, or abnormal termination. */
+  lifecycleSuppressed: boolean;
+  /** True while initial, rebirth, resume, or other continuation work is pending. */
+  continuationPending: boolean;
+  /** Provider/session authority says the original turn remains in flight. */
+  turnStillInFlight: boolean;
 }
 
 export function isGenuineIdleTransition(input: GenuineIdleTransitionInput): boolean {
-  return input.toStatus === 'idle'
+  return input.fromStatus === 'working'
+    && input.toStatus === 'idle'
     && !input.idleCleanupDeferred
-    && input.inputQueueDepth === 0;
+    && input.inputQueueDepth === 0
+    && !input.lifecycleSuppressed
+    && !input.continuationPending
+    && !input.turnStillInFlight;
 }
 
 // ── Interrupt-artifact quarantine ────────────────────────────────────────────

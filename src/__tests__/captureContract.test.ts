@@ -13,9 +13,9 @@ import {
   type EpisodeCaptureOutcome,
 } from '../captureContract.ts';
 
-describe('capture-contract/v3 freeze identity', () => {
+describe('capture-contract/v4 freeze identity', () => {
   it('exposes the durable freeze version', () => {
-    expect(CAPTURE_CONTRACT_VERSION).toBe('capture-contract/v3');
+    expect(CAPTURE_CONTRACT_VERSION).toBe('capture-contract/v4');
   });
 });
 
@@ -103,21 +103,48 @@ describe('plural episode transport DTOs', () => {
 });
 
 describe('isGenuineIdleTransition', () => {
-  it('is genuine only when entering idle with no queue and no deferral', () => {
-    expect(isGenuineIdleTransition({ toStatus: 'idle', inputQueueDepth: 0, idleCleanupDeferred: false })).toBe(true);
+  function genuineIdleInput(
+    overrides: Partial<Parameters<typeof isGenuineIdleTransition>[0]> = {},
+  ): Parameters<typeof isGenuineIdleTransition>[0] {
+    return {
+      fromStatus: 'working',
+      toStatus: 'idle',
+      inputQueueDepth: 0,
+      idleCleanupDeferred: false,
+      lifecycleSuppressed: false,
+      continuationPending: false,
+      turnStillInFlight: false,
+      ...overrides,
+    };
+  }
+
+  it('is genuine only after a completed unsuppressed working window', () => {
+    expect(isGenuineIdleTransition(genuineIdleInput())).toBe(true);
   });
 
   it('rejects deferred idle (queued input keeps cleanup deferred)', () => {
-    expect(isGenuineIdleTransition({ toStatus: 'idle', inputQueueDepth: 2, idleCleanupDeferred: true })).toBe(false);
+    expect(isGenuineIdleTransition(genuineIdleInput({ inputQueueDepth: 2, idleCleanupDeferred: true }))).toBe(false);
   });
 
   it('rejects idle with queued input even if the deferral flag was not set', () => {
-    expect(isGenuineIdleTransition({ toStatus: 'idle', inputQueueDepth: 1, idleCleanupDeferred: false })).toBe(false);
+    expect(isGenuineIdleTransition(genuineIdleInput({ inputQueueDepth: 1 }))).toBe(false);
+  });
+
+  it('rejects lifecycle, continuation, and in-flight provider idles', () => {
+    expect(isGenuineIdleTransition(genuineIdleInput({ lifecycleSuppressed: true }))).toBe(false);
+    expect(isGenuineIdleTransition(genuineIdleInput({ continuationPending: true }))).toBe(false);
+    expect(isGenuineIdleTransition(genuineIdleInput({ turnStillInFlight: true }))).toBe(false);
+  });
+
+  it('rejects idle that did not complete a working window', () => {
+    for (const fromStatus of ['idle', 'compacting', 'stopped', 'error', 'hibernated']) {
+      expect(isGenuineIdleTransition(genuineIdleInput({ fromStatus }))).toBe(false);
+    }
   });
 
   it('rejects non-idle targets', () => {
     for (const toStatus of ['working', 'compacting', 'stopped', 'error', 'hibernated']) {
-      expect(isGenuineIdleTransition({ toStatus, inputQueueDepth: 0, idleCleanupDeferred: false })).toBe(false);
+      expect(isGenuineIdleTransition(genuineIdleInput({ toStatus }))).toBe(false);
     }
   });
 });
