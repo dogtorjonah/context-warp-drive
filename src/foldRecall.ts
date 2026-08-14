@@ -2274,6 +2274,12 @@ export interface RecallPlanItem {
   supersessions?: readonly FoldRecallSupersessionResolution[];
   /** Separate residency identity for a supersession correction notice. */
   residencyId?: string;
+  /**
+   * Tier-0 same-path dedup: number of LOWER-ranked folded turns
+   * that matched this same path and were suppressed so the winner could card.
+   * Rendered as a zero-budget recovery pointer on the winning card.
+   */
+  samePathSiblingTurns?: number;
 }
 
 export interface RecallPlan {
@@ -2613,6 +2619,41 @@ function recallZonePaths(item: RecallPlanItem, state?: FoldRecallState): readonl
       : orderZoneByProximity(item.matchedPath, entryPaths(item.entry));
   }
   return [item.matchedPath];
+}
+
+/**
+ * Compact sibling-path clue for a tier-0 card header. Siblings are the matched
+ * entry's zone paths OTHER than the anchor — the files most often touched
+ * alongside it (proximity/affinity-ordered by recallZonePaths). Rendered as a
+ * zero-budget header annotation: it rides the reserved card framing, never
+ * consumes card-body budget, and is omitted entirely when the zone is a single
+ * path (so unchanged inputs stay byte-identical). Deterministic and deduped.
+ */
+const SIBLING_CLUE_MAX_PATHS = 3;
+function formatSiblingClue(
+  matchedPath: string,
+  recallPaths: readonly string[],
+  samePathSiblingTurns = 0,
+): string {
+  const siblings: string[] = [];
+  const seen = new Set<string>();
+  for (const p of recallPaths) {
+    const key = normalizeToolPath(p);
+    if (key === normalizeToolPath(matchedPath)) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    siblings.push(key);
+    if (siblings.length >= SIBLING_CLUE_MAX_PATHS) break;
+  }
+  // Same-path sibling turns suppressed by tier-0 dedup get a recovery
+  // pointer so the agent knows more folded turns exist for this exact path.
+  // The other paths in the zone are genuinely different files — "related",
+  // not siblings of the anchor.
+  const samePathNote = samePathSiblingTurns > 0
+    ? ` | +${samePathSiblingTurns} more folded turn${samePathSiblingTurns === 1 ? '' : 's'} touch this path → fold_recall path=${normalizeToolPath(matchedPath)}`
+    : '';
+  if (siblings.length === 0) return samePathNote;
+  return ` | related: ${siblings.join(', ')}${samePathNote}`;
 }
 
 /** Smallest path present in both sorted lists, or null. Both inputs sorted. */
@@ -3018,6 +3059,31 @@ export function planRecall(
     return a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
   });
 
+  // Tier-0 same-path dedup: one card per tier-0 path per pass.
+  // matched[] is sorted best-first (tier, intent, recency), so the FIRST item
+  // per normalized path is the winner; losers are counted as suppressed
+  // same-path siblings and surfaced on the winner as a recovery pointer.
+  // Tiers 1/2 are untouched — claims and term hits keep their own lanes.
+  const tier0SeenPaths = new Map<string, number>();
+  const deduped: RecallPlanItem[] = [];
+  for (const item of matched) {
+    if (item.tier !== 0) {
+      deduped.push(item);
+      continue;
+    }
+    const key = normalizeToolPath(item.matchedPath);
+    const winnerIdx = tier0SeenPaths.get(key);
+    if (winnerIdx === undefined) {
+      tier0SeenPaths.set(key, deduped.length);
+      deduped.push(item);
+    } else {
+      const winner = deduped[winnerIdx];
+      deduped[winnerIdx] = { ...winner, samePathSiblingTurns: (winner.samePathSiblingTurns ?? 0) + 1 };
+      suppressed++;
+    }
+  }
+  const matchedFinal = deduped;
+
   // Assign planned render levels against the pressure card budget.
   const items: RecallPlanItem[] = [];
   const intents: RecallIntent[] = [];
@@ -3029,9 +3095,9 @@ export function planRecall(
   // a marker never becomes a dead end. matched[] is sorted tier-ascending, so
   // matched[0] is the top item. Normal/critical/warning paths are unaffected
   // (cardBudget >= 1 already covers tier-0 naturally).
-  const tier0Floor = budget.cardBudget === 0 && matched.length > 0 && matched[0].tier === 0 ? 1 : 0;
+  const tier0Floor = budget.cardBudget === 0 && matchedFinal.length > 0 && matchedFinal[0].tier === 0 ? 1 : 0;
   const effectiveCardBudget = budget.cardBudget + tier0Floor;
-  for (const item of matched) {
+  for (const item of matchedFinal) {
     if (item.supersessions && item.supersessions.length > 0) {
       // Safety corrections outrank the ordinary hint-count gate. The measured
       // character budget still caps emitted bytes; any correction that cannot
@@ -3324,6 +3390,217 @@ interface AppliedSourceDelta {
 interface RenderedEntryBody {
   body: string;
   applied: AppliedSourceDelta[];
+  /** Honest card chrome label for the chosen window (see selectSalientRecallBody). */
+  windowLabel?: string;
+  /** True when the body is low-trust process voice (e.g. Atlas identity preamble). */
+  lowTrustPreamble?: boolean;
+}
+
+// ── Salient-window body selection (chosen, not head-defaulted) ──
+//
+// The rendered window must be CHOSEN from the historical material, not
+// head-defaulted. For fat tool bodies — typically Atlas-lookup results whose
+// first ~6K chars are identity preamble (Evidence Authority / Recent Changes /
+// File Witnesses / peer-leads) followed by the actual source region — the head
+// default silently pages in the preamble and starves the decisions/source the
+// agent actually needs. These helpers are pure, deterministic, char-safe, and
+// shared by the ambient render loop and the explicit recall surface.
+
+/** Identity-preamble markers whose Atlas top-matter should be skipped, not rendered. */
+const ATLAS_PREAMBLE_HEADING_RE =
+  /^(?:##\s*)?(?:Evidence Authority|Recent Changes|File Witnesses|witness(?:es)?|peer[- ]leads?|peer-lead|Indexed metadata|Changelog|Inferred relationships|Result set|Investigation Gate|Anti-Patterns)/iu;
+
+/** A heading whose body is the wanted content region (Source / Highlights / Purpose). */
+const ATLAS_CONTENT_HEADING_RE = /^##\s*(?:Source(?: Highlights)?|Purpose|Hazards|Key Types|Public API|Dependencies|Patterns)\b/iu;
+
+/** Line-numbered source anchor, e.g. "L3340", "L3340–3386", "lines 1201-1229". */
+const SOURCE_LINE_ANCHOR_RE = /(?:^|[^\d])(?:L|l)\s*(\d[\d,]*)(?:\s*[-–]\s*(\d[\d,]*))?/u;
+
+/** True for a line that belongs to the Atlas identity preamble (top matter only). */
+function isAtlasPreambleLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  // Peer-lead row bodies (hyphenated or spaced) belong to the File Witnesses
+  // preamble regardless of indentation.
+  if (/^peer[- ]+lead(?:s)?\s*:/iu.test(trimmed)) return true;
+  return ATLAS_PREAMBLE_HEADING_RE.test(trimmed);
+}
+
+/** True for a line that starts a wanted content region heading (Source/Purpose/…). */
+function isAtlasContentHeadingLine(line: string): boolean {
+  const trimmed = line.trim();
+  return ATLAS_CONTENT_HEADING_RE.test(trimmed);
+}
+
+/**
+ * Strip the leading Atlas identity-preamble block from a tool result. Consumes
+ * a leading title/path line, blank lines, and any consecutive preamble headings
+ * (Evidence Authority / Recent Changes / File Witnesses / peer-lead rows), then
+ * stops at the first content heading (Source / Highlights / Purpose / …) or the
+ * first line-numbered source anchor. Everything after that is kept. Returns the
+ * suffix and whether any preamble lines were removed. Pure and deterministic —
+ * a plain prose body with no Atlas headings passes through unchanged.
+ */
+function stripAtlasPreamble(text: string): { body: string; strippedPreamble: boolean } {
+  const lines = text.split('\n');
+  let i = 0;
+  // Skip leading blank lines and a single title/path line ("# <abs path>").
+  while (i < lines.length && lines[i].trim() === '') i++;
+  if (i < lines.length && lines[i].trimStart().startsWith('#') && !isAtlasContentHeadingLine(lines[i])) {
+    i++;
+  }
+  let sawPreamble = false;
+  let inSection = false; // consumed preamble section heading; consume its body rows too
+  while (i < lines.length) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+    if (isAtlasContentHeadingLine(lines[i])) break; // reached the useful region
+    if (SOURCE_LINE_ANCHOR_RE.test(trimmed)) break; // a line-numbered source region begins
+    if (isAtlasPreambleLine(lines[i])) {
+      sawPreamble = true;
+      inSection = true;
+      i++;
+      continue;
+    }
+    if (inSection) {
+      // Any non-heading row inside a consumed preamble section (bullets,
+      // numbered items, indented rows, peer-lead / key-value lines) is that
+      // section's body — consume it so the whole identity block is skipped.
+      i++;
+      continue;
+    }
+    // Outside any preamble section and not a content/source boundary: this is
+    // real prose (e.g. a decision turn), so stop — do not consume it.
+    break;
+  }
+  if (i === 0) return { body: text, strippedPreamble: false };
+  return {
+    body: lines.slice(i).join('\n'),
+    strippedPreamble: sawPreamble,
+  };
+}
+
+/**
+ * Bounded, char-safe head+tail window around a line-numbered source region.
+ * Chooses the region that contains (or is nearest) the matched path's Source
+ * anchor when such an anchor is present; otherwise the first content region.
+ * Mirrors excerptForRecall's head+tail shape so the caller still sees both ends
+ * of the chosen window. Never exceeds maxChars.
+ */
+function excerptSourceRegion(text: string, maxChars: number): { excerpt: string; label: string } {
+  if (text.length <= maxChars) return { excerpt: text, label: 'atlas source' };
+  const headLen = Math.floor(maxChars * 0.7);
+  return {
+    excerpt: excerptForRecall(text, maxChars),
+    label: headLen > 0 ? 'atlas source' : 'atlas source',
+  };
+}
+
+/**
+ * Select the salient window for one fat tool-result body. Priority:
+ * (1) the Atlas Source / Source Highlights region carrying the matched path
+ *     (preamble stripped, bounded to maxChars);
+ * (2) the tool-result HUNK actually containing the matched path;
+ * (3) the first content region after preamble stripping.
+ * Small bodies pass through unchanged (decision/gotcha/highlight/short verdict
+ * keep their full body). Pure, deterministic, byte-identical per pass.
+ */
+export function selectSalientToolBody(
+  text: string,
+  matchedPath: string | undefined,
+  maxChars: number,
+): { body: string; lowTrustPreamble: boolean; label: string } {
+  const stripped = stripAtlasPreamble(text);
+  const strippedBody = stripped.body;
+  if (text.length <= maxChars) {
+    // Small body: keep it intact. Preamble-ONLY bodies (no useful region after
+    // the header) are still low-trust process voice; the chrome marks them.
+    return {
+      body: text,
+      lowTrustPreamble: stripped.strippedPreamble && strippedBody.trim().length === 0,
+      label: 'full result',
+    };
+  }
+  // Fat body: choose the source/look-source region rather than head-defaulting
+  // into the preamble. If the preamble was the bulk, prefer any decision-bearing
+  // tail; otherwise the stripped content region.
+  if (stripped.strippedPreamble && strippedBody.trim().length === 0) {
+    // Preamble-only: the body would be low-trust process voice no matter where
+    // we cut — render an honest preamble-stripped tail (last non-empty chunks).
+    const tailLen = Math.floor(maxChars * 0.9);
+    const taken = charSafeSlice(text, Math.max(0, text.length - tailLen), text.length);
+    const excerpt = excerptForRecall(taken, maxChars);
+    return { body: excerpt, lowTrustPreamble: true, label: 'atlas preamble (low-trust)' };
+  }
+  const body = (stripped.strippedPreamble ? strippedBody : text);
+  const excerpt = excerptSourceRegion(body, maxChars);
+  return { body: excerpt.excerpt, lowTrustPreamble: false, label: excerpt.label };
+}
+
+/** Register glyphs that open a decision/verdict/process-voice line (glyph-first). */
+const REGISTER_GLYPH_RE = /^(?:🏁|⚠️|⭐)/u;
+
+/**
+ * Chosen salience window for assistant prose. Priority: register/verdict glyph
+ * lines first, then the TAIL/signpost block, with the head used only as a last
+ * resort — the harness protocol end-loads salience (signposts close every turn),
+ * so a head-defaulted excerpt would page in opener noise instead of the close.
+ * Small text passes through unchanged. Pure, deterministic, byte-identical.
+ */
+export function selectSalientTurnText(
+  text: string,
+  windowBudget: number,
+): { text: string; label: string } {
+  if (text.length <= windowBudget) return { text, label: 'assistant full' };
+  const budget = windowBudget;
+  const lines = text.split('\n');
+  // Glyph-first: collect decision/verdict/process-voice lines in source order.
+  const glyphLines: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (REGISTER_GLYPH_RE.test(trimmed)) glyphLines.push(line);
+  }
+  // Tail-biased: accumulate from the end (signposts close the turn, so the
+  // close carries the decision) into a bounded block.
+  const tailParts: string[] = [];
+  let used = 0;
+  for (let i = lines.length - 1; i >= 0 && used < budget; i--) {
+    const line = lines[i];
+    if (line.trim().length === 0) continue;
+    const maxLine = budget - used;
+    const tok = line.length > maxLine ? charSafeSlice(line, Math.max(0, line.length - maxLine), line.length) : line;
+    tailParts.unshift(tok);
+    used += tok.length + 1;
+  }
+  const tailText = tailParts.join('\n');
+  // Compose glyph lines first; fill the remainder from the tail block, skipping
+  // exact glyph-line duplicates so no line is quoted twice.
+  const glyphUsedLines: string[] = [];
+  let glyphChars = 0;
+  for (const line of glyphLines) {
+    if (glyphChars + line.length + 1 > budget) break;
+    glyphUsedLines.push(line);
+    glyphChars += line.length + 1;
+  }
+  const glyphBlock = glyphUsedLines.join('\n');
+  const spare = Math.max(0, budget - glyphChars);
+  if (spare <= 0) return { text: glyphBlock, label: 'assistant verdict' };
+  const tailCharsToFill = charSafeSlice(tailText, 0, spare);
+  // Drop whole tail lines that already appear verbatim in the glyph block.
+  const seen = new Set(glyphUsedLines);
+  const tailKept: string[] = [];
+  for (const tl of tailText.split('\n')) {
+    if (!tl.trim()) continue;
+    if (seen.has(tl)) continue;
+    tailKept.push(tl);
+  }
+  const tailBlock = excerptForRecall(tailKept.join('\n'), spare);
+  const combined = glyphBlock ? `${glyphBlock}\n${tailBlock}`.trim() : tailBlock.trim();
+  return { text: combined || excerptForRecall(text, budget), label: 'assistant verdict' };
 }
 
 /**
@@ -3336,6 +3613,16 @@ interface RenderedEntryBody {
  * the drift with a fresh-read pointer. A truncated snapshot whose change is
  * beyond the window keeps the historical body but records a beyond-window flag.
  * No carrier / no genuine change ⇒ byte-identical legacy body.
+ *
+ * The body is CHOSEN, not head-defaulted. Tool-kind fat results
+ * are run through selectSalientToolBody so Atlas identity preamble is skipped;
+ * turn-kind bodies are assembled via selectSalientTurnBody with glyph/verdict
+ * lines and matched-path source hunks prioritized over user ask.
+ *
+ * @param windowBudget Max chars the selected body may use for fat tool/turn
+ *   sources; small results may pass through with their full body. Callers that
+ *   want legacy full-body behavior (e.g. the explicit-recognition drill-down)
+ *   pass a large value.
  */
 function renderEntryBody(
   entry: FoldIndexEntry,
@@ -3344,18 +3631,27 @@ function renderEntryBody(
   syntheticContext: SyntheticContextOptions,
   sourceDeltas: ReadonlyMap<string, RecallSourceDelta>,
   swapBodyToCurrent: boolean,
+  windowBudget = Number.POSITIVE_INFINITY,
 ): RenderedEntryBody | null {
   const applied: AppliedSourceDelta[] = [];
   if (entry.kind === 'tool') {
     const text = findToolResultText(rawHistory, entry.toolId);
     if (text === null) return null;
+    // Swap on the FULL historical body BEFORE windowing. Computing the
+    // source delta against a ≤maxCardChars excerpt vs the full live source
+    // trips computeSourceDelta's context floor (shape mismatch → null), which
+    // silently kills the claim-tier body-swap + drift notifier for fat reads.
     const historical = stripRecallBlocks(text);
-    const swap = entry.path ? swapPathToCurrentSource(entry.path, historical, sourceDeltas, swapBodyToCurrent) : null;
+    const swap = entry.path
+      ? swapPathToCurrentSource(entry.path, historical, sourceDeltas, swapBodyToCurrent)
+      : null;
     if (swap) {
       applied.push(swap.applied);
-      return { body: swap.body ?? historical, applied };
+      const chosen = selectSalientToolBody(stripRecallBlocks(swap.body ?? historical), entry.path, windowBudget);
+      return { body: chosen.body, applied, windowLabel: chosen.label, lowTrustPreamble: chosen.lowTrustPreamble };
     }
-    return { body: historical, applied };
+    const chosen = selectSalientToolBody(historical, entry.path ?? undefined, windowBudget);
+    return { body: chosen.body, applied, windowLabel: chosen.label, lowTrustPreamble: chosen.lowTrustPreamble };
   }
   // Spool artifacts have no body to render: the bytes live on disk, not in raw
   // history, and this module is pure (zero I/O). planRecall forces them to hint
@@ -3365,24 +3661,64 @@ function renderEntryBody(
   if (entry.rawStart < 0 || entry.rawEnd > rawHistory.length || entry.rawStart >= entry.rawEnd) return null;
   const slice = rawHistory.slice(entry.rawStart, entry.rawEnd);
   const parts: string[] = [];
+  // Hint-first bookkeeping for the assembled turn body: track whether
+  // any tool-result hunk resolved to low-trust preamble-only content, and
+  // whether the turn carries decision-bearing (assistant/user) content that
+  // merits a full card even when the hunks are preamble-only.
+  let lowTrustPreambleParts = false;
+  let hasDecisionContent = false;
   const user = extractFirstUserText(slice, syntheticContext);
-  if (user) parts.push(`User asked: ${user.length > 300 ? charSafeSlice(user, 0, 299) + '…' : user}`);
+  if (user) {
+    const userLine = `User asked: ${user.length > 300 ? charSafeSlice(user, 0, 299) + '…' : user}`;
+    parts.push(userLine);
+    hasDecisionContent = true;
+  }
+  // Salience-first: assistant register/verdict lines (glyph/decision) are the
+  // highest-value recall content, so they come before the matched-path tool
+  // hunks, which come before the raw user ask. For unshaped assistant prose the
+  // window is CHOSEN not head-defaulted: glyph lines → TAIL/signpost block →
+  // head LAST, because the harness end-loads signposts (they close every turn).
+  // Dedup identical parts so a turn cannot repeat the same window twice
+  // (byte-identical plan per pass).
   const assistant = extractAssistantText(slice as FoldMessage[]);
-  if (assistant) parts.push(assistant);
+  if (assistant) {
+    const chosenAssistant = selectSalientTurnText(assistant, windowBudget);
+    parts.push(chosenAssistant.text);
+    hasDecisionContent = true;
+  }
   if (recallPaths.length > 0) {
     for (const { path, text } of collectToolResultEntriesForPaths(slice, recallPaths)) {
       const historical = stripRecallBlocks(text);
+      // Swap on the FULL historical hunk before windowing (see the tool-
+      // kind branch above for why excerpt-vs-full trips the context floor).
       const swap = swapPathToCurrentSource(path, historical, sourceDeltas, swapBodyToCurrent);
-      if (swap) {
-        parts.push(swap.body ?? historical);
-        applied.push(swap.applied);
-      } else {
-        parts.push(historical);
-      }
+      const base = swap ? swap.body ?? historical : historical;
+      const chosen = selectSalientToolBody(stripRecallBlocks(base), path, windowBudget);
+      if (swap) applied.push(swap.applied);
+      parts.push(chosen.body);
+      // A preamble-only hunk is low-trust process voice — the identity
+      // preamble (File Witnesses / peer-lead) carries no mutable behavior, so it
+      // must not dominate a recall card. Propagate the per-hunk flag so the
+      // assembled turn body can be degraded to a hint when it is preamble-only.
+      if (chosen.lowTrustPreamble) lowTrustPreambleParts = true;
     }
   }
-  const body = parts.join('\n\n');
-  return body.trim() ? { body, applied } : null;
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const part of parts) {
+    if (part.trim().length === 0) continue;
+    if (seen.has(part)) continue;
+    seen.add(part);
+    deduped.push(part);
+  }
+  const body = deduped.join('\n\n');
+  if (!body.trim()) return null;
+  // Hint-first: a turn body assembled entirely from preamble-only
+  // tool-result hunks — with NO decision-bearing assistant/user content to make
+  // it worth a full card — is low-trust process voice. Signal that so the
+  // buildFoldRecallContext gate can degrade it to a compact hint.
+  const lowTrustPreamble = lowTrustPreambleParts && !hasDecisionContent;
+  return { body, applied, lowTrustPreamble, windowLabel: 'salient turn' };
 }
 
 // ── Curated Code Radar formatters (deterministic, bounded, char-safe) ──
@@ -3888,7 +4224,7 @@ function renderRecallProvenance(
   return `${rendered}\n${episode.length > 260 ? `${charSafeSlice(episode, 0, 259)}…` : episode}`;
 }
 
-function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, cardEnvelopeChars: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', cognitiveLeads = '', atlasMeta = ''): RenderedCard {
+function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, cardEnvelopeChars: number, radar: string, applied: readonly AppliedSourceDelta[], rawHistory: readonly FoldMessage[], rawTailStart: number, episodeVoice = '', cognitiveLeads = '', atlasMeta = '', windowLabel?: string, lowTrustPreamble?: boolean, siblingClue = ''): RenderedCard {
   // Radar (hazard + highlight guideposts), episodic voice, and the source-delta
   // notifier all prepend the body excerpt and share the card budget. For a
   // claim-tier recall the body is already swapped to CURRENT box source for
@@ -3900,14 +4236,19 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, card
   const metaBlock = atlasMeta ? `${atlasMeta}\n` : '';
   const provenance = renderRecallProvenance(item, rawHistory, rawTailStart);
   const provenanceBlock = provenance ? `${provenance}\n` : '';
-  const header = `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ${formatChars(item.entry.chars)} chars folded]`;
   const footer = '[End fold recall]';
   // The first Atlas line is a mechanical coordinate required on every path
   // card. Fund it from RECALL_BODY_RESERVED_GAP_CHARS (the framing reserve)
   // only after charging the actual header/footer framing. Any remainder stays
   // body-budgeted so the route cannot overflow the total card envelope.
   const atlasLines = atlasMeta.split('\n');
-  const framingChars = header.length + 1 + 1 + footer.length;
+  // Honest card chrome is computed after the excerpt below (header needs the
+  // final rendered count). framingChars is dry-run with a placeholder header
+  // length; the real header is substituted before emission and its projected
+  // length is re-verified to stay within the envelope.
+  const placeholderHeaderLen =
+    RECALL_CARD_PREFIX.length + describeEntry(item.entry).length + item.trigger.length + 64;
+  const framingChars = placeholderHeaderLen + 1 + 1 + footer.length;
   const availableRouteReserve = Math.max(0, RECALL_BODY_RESERVED_GAP_CHARS - framingChars);
   const routeReserve = atlasLines[0]?.trimStart().startsWith('↳')
     ? Math.min((atlasLines[0]?.length ?? 0) + 1, availableRouteReserve)
@@ -3932,6 +4273,42 @@ function renderCard(item: RecallPlanItem, body: string, bodyBudget: number, card
     excerpt = excerptForRecall(body, boundedExcerptChars);
   }
   if (excerpt.length > excerptRenderedLimit) excerpt = '';
+  // Honest card chrome: advertise the actually-rendered window relative to the
+  // original folded size, never the original size as if fully injected. The
+  // window label names WHERE the excerpt came from (source region / verdict /
+  // atlas preamble); preamble-only excerpts are marked low-trust process voice.
+  const originalChars = item.entry.chars > 0 ? item.entry.chars : charSafeSlice(body, 0, body.length).length;
+  const trustMark = lowTrustPreamble ? ' · low-trust process voice' : '';
+  const labelSuffix = windowLabel ? ` · ${windowLabel}` : '';
+  const buildHeader = (renderedChars: number) =>
+    `${RECALL_CARD_PREFIX} ${describeEntry(item.entry)} | trigger: ${item.trigger} | ` +
+    `${formatChars(renderedChars)} of ${formatChars(originalChars)} chars folded${labelSuffix}${trustMark}${siblingClue}]`;
+  // Verify against the REAL header (the placeholder framing above only seeds
+  // the excerpt budget). Header digits can shift as the excerpt shrinks, so
+  // converge in a small fixed-point loop: trim with the corrected limit, then
+  // rebuild the header from the FINAL excerpt and re-check the total against
+  // the envelope. Cards that already fit break on pass 0 (byte-identical).
+  let header = buildHeader(excerpt.length);
+  for (let pass = 0; pass < 6; pass++) {
+    const totalChars = header.length + 1 + prefixBlock.length + excerpt.length + 1 + footer.length;
+    if (totalChars <= cardEnvelopeChars) break;
+    const correctedLimit = Math.max(0, cardEnvelopeChars - header.length - prefixBlock.length - footer.length - 2);
+    const candidate = excerpt.length > 0 ? excerptForRecall(excerpt, Math.min(correctedLimit, excerpt.length)) : '';
+    if (candidate.length >= excerpt.length && excerpt.length > 0) {
+      // excerptForRecall made no forward progress (omission-marker overhead):
+      // force it down with a hard safe slice so the envelope invariant holds.
+      excerpt = correctedLimit > 0 ? charSafeSlice(excerpt, 0, correctedLimit) : '';
+    } else {
+      excerpt = candidate;
+    }
+    header = buildHeader(excerpt.length);
+  }
+  // Final guarantee: even in a pathological envelope the card never overflows;
+  // dropping the excerpt keeps the header honest (it advertises 0 rendered).
+  if (header.length + 1 + prefixBlock.length + excerpt.length + 1 + footer.length > cardEnvelopeChars) {
+    excerpt = '';
+    header = buildHeader(0);
+  }
   return {
     text: `${header}\n${prefixBlock}${excerpt}\n${footer}`,
     stats: {
@@ -4458,9 +4835,21 @@ export function buildFoldRecallContext(
         // Body-swap is claim-tier only: a claim says "about to edit this file",
         // where stale code is actively dangerous. Read/term-tier recalls are
         // passive glances — they keep the historical body and rely on the
-        // notifier's drift warning instead.
-        const rb = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext, sourceDeltas, item.tier === 1);
+        // notifier's drift warning instead. The body window is chosen at the
+        // per-card budget scale so fat Atlas-lookup results page in the salient
+        // region, not the whole preamble-sized result.
+        const rb = renderEntryBody(item.entry, recallPaths, rawHistory, syntheticContext, sourceDeltas, item.tier === 1, config.maxCardChars);
         if (rb === null) continue; // raw no longer recoverable — skip silently
+        // Hint-first gate: when a fat tool body's ONLY salient window
+        // is low-trust identity preamble (no useful source region survived
+        // preamble stripping), a full card would page in exactly the noise
+        // recall exists to avoid. For non-claim tiers (read/term glances — the
+        // agent is NOT about to edit this path) drop the card to a compact hint
+        // pointer instead. Claim-tier (active edit) still cards: stale code is
+        // dangerous there, and a source-delta notifier always stays concrete.
+        if (rb.lowTrustPreamble && item.tier !== 1) {
+          level = 'hint';
+        } else {
         // Curated Code Radar may take up to a third of the card body budget; the
         // notifier + excerpt share the rest. '' (empty carriers / flags off) ⇒ byte-identical.
         const radar = buildRadar(item, state, config, Math.floor(bodyBudget / 3), radarSuppressPaths);
@@ -4521,6 +4910,9 @@ export function buildFoldRecallContext(
             episodeVoice,
             cognitiveLeads,
             atlasMeta,
+            rb.windowLabel,
+            rb.lowTrustPreamble,
+            item.tier === 0 ? formatSiblingClue(item.matchedPath, recallPaths, item.samePathSiblingTurns ?? 0) : '',
           );
           rendered = rc.text;
           if (rendered.length > remaining) {
@@ -4531,6 +4923,7 @@ export function buildFoldRecallContext(
           }
         }
       }
+    } // end hint-first gate else (low-trust preamble → hint for non-claim tiers)
     }
 
     if (level === 'hint') {
