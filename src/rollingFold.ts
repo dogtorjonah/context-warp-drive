@@ -226,6 +226,26 @@ export interface FoldConfig {
 }
 
 /**
+ * Honest fold-block header chrome: the header must say what the compressed
+ * artifact IS, not just its compression ratio. `diagnosis` reports whether a
+ * conserved belief-changing sentence (trust=diagnosis lane) survived into
+ * this body — `none` stops a successor from mistaking receipt aggregates for
+ * understanding. `pending` is the fold-scope commitment state as of this
+ * folded span's frontier: `none` is a measured quiet window (every message
+ * walked, no commitment opened) or an explicit-null tombstone, never a guess;
+ * the live tail's Epoch Continuity Capsule remains authoritative for current
+ * state. Absent chrome renders a byte-identical legacy header (provider-cache
+ * invariant for frozen bands and non-artifact callers). Declared before its
+ * first use so single-pass dts bundlers resolve it without a forward trace.
+ */
+export interface FoldArtifactChrome {
+  /** Body composition label, e.g. 'receipts+waypoints'. */
+  readonly artifact: string;
+  readonly diagnosis: 'kept' | 'none';
+  readonly pending: 'live' | 'settled' | 'operator-superseded' | 'none';
+}
+
+/**
  * Builds the artifact-mode fold-block body from the surviving fold-window
  * messages. Returns the body lines and their total char count for block
  * accounting/eviction. Must be pure and deterministic (provider-cache
@@ -233,7 +253,7 @@ export interface FoldConfig {
  */
 export type ArtifactModeBodyBuilder = (
   windowMessages: readonly FoldMessage[],
-) => { bodyLines: string[]; blockChars: number };
+) => { bodyLines: string[]; blockChars: number; chrome?: FoldArtifactChrome };
 
 export interface FoldedTurn {
   timestamp: string;
@@ -335,11 +355,12 @@ export const DEFAULT_FOLD_CONFIG: FoldConfig = {
 };
 
 /**
- * Always-on inter-turn fold config — compresses every turn past the active
- * window into a skeleton on every call, regardless of char/turn thresholds, so
- * historical context stays lean from the moment the conversation grows past
- * activeWindowTurns. Used when an instance's rollingFold mode is 'on' (or
- * 'dry-run' for preview). This is the inter-turn sibling of
+ * Pressure-epoch inter-turn fold config — once provider/relay measured token
+ * pressure authorizes a fold, compress every turn past the active window into
+ * a skeleton regardless of char/turn thresholds. `continuous` controls the
+ * extent of an authorized fold; it is not permission to fold. Automatic hosts
+ * must gate this config behind measured pressure. Explicit fold previews and
+ * one-shot/manual callers own their own authorization. This is the inter-turn sibling of
  * ALWAYS_ON_INTRA_FOLD_CONFIG: intra-turn slims consumed tool results inside the
  * working set; this slims the narrative history behind it.
  *
@@ -359,9 +380,9 @@ export const DEFAULT_FOLD_CONFIG: FoldConfig = {
  *   - the fold is recoverable, not destructive — foldContext returns a new array
  *     and never mutates the raw JSONL, so any folded turn is one self-tap away.
  *
- * Continuous mode can fold even a single detected turn; when that folds the whole
- * view, the newest user text is retained inside the folded block and the output
- * ends on the folded user message.
+ * During an authorized pressure epoch, continuous mode can fold even a single
+ * detected turn; when that folds the whole view, the newest user text is
+ * retained inside the folded block and the output ends on the folded user message.
  */
 export const ALWAYS_ON_FOLD_CONFIG: FoldConfig = {
   ...DEFAULT_FOLD_CONFIG,
@@ -2776,9 +2797,16 @@ function renderFoldedBlock(
   counterStamp?: string,
   preamble: string = FOLD_BLOCK_PREAMBLE,
   bodyLines?: readonly string[],
+  chrome?: FoldArtifactChrome,
 ): string {
+  // Honest chrome: composition + diagnosis + pending state ride the header so
+  // a successor knows whether this block holds a finished thought before
+  // reading a line of it. Absent chrome → byte-identical legacy header.
+  const chromeStamp = chrome
+    ? ` · artifact=${chrome.artifact} · diagnosis=${chrome.diagnosis} · pending=${chrome.pending}`
+    : '';
   const lines: string[] = [
-    `[Conversation Context — ${stats.turnsFolded} turns folded, ${Math.round(stats.origChars / 1000)}K → ${Math.round(stats.blockChars / 1000)}K chars${counterStamp ? ` · ${counterStamp}` : ''}]`,
+    `[Conversation Context — ${stats.turnsFolded} turns folded, ${Math.round(stats.origChars / 1000)}K → ${Math.round(stats.blockChars / 1000)}K chars${counterStamp ? ` · ${counterStamp}` : ''}${chromeStamp}]`,
     '',
     preamble,
     HISTORICAL_PAYLOAD_CONTROL_NOTE,
@@ -3262,7 +3290,14 @@ export function foldContext(
       const blockChars = artifactChars
         + foldBlockPreamble.length
         + tombstoneLines.reduce((s, line) => s + line.length, 0);
-      return { collapsed, closetLine: undefined, blockChars, tombstoneLines, bodyLines };
+      return {
+        collapsed,
+        closetLine: undefined,
+        blockChars,
+        tombstoneLines,
+        bodyLines,
+        chrome: artifactBody.chrome,
+      };
     }
 
     const bodyCorpus = collapsed
@@ -3395,7 +3430,7 @@ export function foldContext(
       (closetLine?.length ?? 0) +
       foldBlockPreamble.length +
       tombstoneLines.reduce((s, line) => s + line.length, 0);
-    return { collapsed: renderedCollapsed, closetLine, blockChars, tombstoneLines, bodyLines: undefined };
+    return { collapsed: renderedCollapsed, closetLine, blockChars, tombstoneLines, bodyLines: undefined, chrome: undefined };
   };
 
   // ── E10 eviction.
@@ -3469,7 +3504,7 @@ export function foldContext(
     turnsFolded: actualFoldCount,
     origChars: countChars(foldZone) - countChars(systemInFoldZone),
     blockChars: block.blockChars,
-  }, block.closetLine, block.tombstoneLines, counterStamp, foldBlockPreamble, block.bodyLines);
+  }, block.closetLine, block.tombstoneLines, counterStamp, foldBlockPreamble, block.bodyLines, block.chrome);
 
   const foldedMessage: FoldMessage = {
     role: 'user',

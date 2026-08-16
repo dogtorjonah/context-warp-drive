@@ -8,7 +8,6 @@ import type {
   LiveObjectiveSource,
 } from './chronologicalProvenance.ts';
 import {
-  classifyPendingAssistantActionText,
   isPendingAssistantContinuityState,
   PENDING_ASSISTANT_ACTION_CAPSULE_HEADER,
   PENDING_ASSISTANT_ACTION_STATE_PREFIX,
@@ -662,9 +661,6 @@ export function renderEpochContinuityCapsule(
   const hasStateInput = Object.prototype.hasOwnProperty.call(input, 'pendingAssistantState');
   const hasActionInput = Object.prototype.hasOwnProperty.call(input, 'pendingAssistantAction');
   const hasExplicitContinuityInput = hasStateInput || hasActionInput;
-  const inferredPendingBasis = !hasExplicitContinuityInput && trajectory
-    ? classifyPendingAssistantActionText(trajectory)
-    : null;
   let pendingAssistantState: PendingAssistantContinuityState;
   if (hasStateInput && isPendingAssistantContinuityState(input.pendingAssistantState)) {
     pendingAssistantState = input.pendingAssistantState;
@@ -672,24 +668,13 @@ export function renderEpochContinuityCapsule(
     pendingAssistantState = input.pendingAssistantAction
       ? unresolvedPendingAssistantContinuityState(input.pendingAssistantAction)
       : settledPendingAssistantContinuityState(null);
-  } else if (inferredPendingBasis && trajectory) {
-    const inferredIndex = typeof input.source.frameRowEndInclusive === 'number'
-      ? input.source.frameRowEndInclusive
-      : typeof input.source.sourceEndExclusive === 'number'
-        ? Math.max(0, input.source.sourceEndExclusive - 1)
-        : null;
-    pendingAssistantState = unresolvedPendingAssistantContinuityState({
-      text: trajectory,
-      status: 'unresolved',
-      basis: inferredPendingBasis,
-      source: {
-        id: null,
-        timestamp: null,
-        unit: input.source.unit,
-        index: inferredIndex,
-      },
-    });
   } else {
+    // No explicit continuity input: the state stays honestly unknown. Never
+    // manufacture unresolved state from trajectory prose — a null-id/null-time
+    // action serialized into the state row below becomes trusted carried state
+    // at the next fold, which authenticates a guess as freshness. Every
+    // production host supplies pendingAssistantState; a stateless caller still
+    // gets the low-authority legacy `trajectory:` line rendered further down.
     pendingAssistantState = unknownPendingAssistantContinuityState();
   }
   const pendingAssistantAction = pendingAssistantState.state === 'unresolved'
@@ -743,9 +728,16 @@ export function renderEpochContinuityCapsule(
       : 'objective: unknown [provenance=unknown source=none]',
     pendingAssistantActionText
       ? `pending_assistant_action: ${pendingAssistantActionText} [status=unresolved basis=${pendingAssistantAction?.basis ?? 'unknown'} source-id=${pendingSource?.id ?? 'unknown'} source-coordinate=${pendingSource?.unit ?? input.source.unit}#${pendingSource?.index ?? 'unknown'} source-time=${pendingSource?.timestamp ?? 'unknown'} outranks=live-task-rail]`
-      : renderLegacyTrajectory
-        ? `trajectory: ${trajectory}`
-        : '',
+      // A real settlement is rendered visibly, not only inside the state JSON:
+      // a successor must see WHO closed the commitment (operator supersession,
+      // cancellation, or assistant verdict) without structural parsing. An
+      // explicit-null tombstone (settledBy=null) and unknown state stay
+      // line-free — absence of evidence is not rendered as a settlement.
+      : pendingAssistantState.state === 'none' && pendingAssistantState.settledBy
+        ? `pending_assistant_action: none [settled-by=${pendingAssistantState.settledBy.reason} source-id=${pendingAssistantState.settledBy.source.id ?? 'unknown'} source-coordinate=${pendingAssistantState.settledBy.source.unit}#${pendingAssistantState.settledBy.source.index ?? 'unknown'} source-time=${pendingAssistantState.settledBy.source.timestamp ?? 'unknown'}]`
+        : renderLegacyTrajectory
+          ? `trajectory: ${trajectory}`
+          : '',
     `${PENDING_ASSISTANT_ACTION_STATE_PREFIX}${stateJson}`,
     validation ? `validation: ${validation}` : '',
     liveState ? `live_state:\n${liveState}` : '',

@@ -19,6 +19,7 @@ import {
   type RebirthPackageV7LineageSection,
   type RebirthPackageV7LineageUnit,
 } from '../rebirthPackageV6.ts';
+import { renderRawRebirthSeed, renderRawRebirthSeedWithReport } from '../rawRebirthSeed.ts';
 
 /**
  * A lineage unit whose verbatim body is large enough that a handful of them
@@ -103,6 +104,29 @@ function sectionText(value: RebirthPackageV6Model, id: string, options = {}): st
   return found ? found.text : null;
 }
 
+describe('raw hard-epoch v7 report boundary', () => {
+  it('returns the shipped text, canonical collapse report, and rebirth ledger rows in one render', () => {
+    const value = model({ operatorVault: lineage(3) });
+    const input = { predecessorName: 'worker-a', rebirthV6: value };
+    const rendered = renderRawRebirthSeedWithReport(input);
+
+    expect(rendered.text).toBe(renderRawRebirthSeed(input));
+    expect(rendered.collapse?.sections.some((section) => section.sectionId === 'operatorVault')).toBe(true);
+    expect(rendered.continuityLedger).toMatchObject({
+      lifecycle: 'rebirth',
+      ownerInstanceId: 'instance-a',
+      captureId: 'capture-v7',
+      sourceStartIndex: null,
+      sourceEndIndexExclusive: null,
+    });
+    expect(rendered.continuityLedger?.units).toHaveLength(3);
+    for (const unit of rendered.continuityLedger?.units ?? []) {
+      expect(unit.sourceIdentityAuthority).toBe('exact');
+      expect(unit.sha256).toBe(createHash('sha256').update(unit.verbatim, 'utf8').digest('hex'));
+    }
+  });
+});
+
 describe('Rebirth Package v7 — lineage sections', () => {
   it('declares the three lineage sections in the fixed order, after recentConversation', () => {
     expect(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS).toEqual([
@@ -139,6 +163,12 @@ describe('Rebirth Package v7 — lineage sections', () => {
       expect(text).not.toContain('No lineage units captured');
     }
     expect(sectionText(value, 'operatorVault')).toContain('jonah said something durable.');
+  });
+
+  it('renders standalone lineage units newest-first', () => {
+    const value = model({ operatorVault: lineage(3) });
+    const text = sectionText(value, 'operatorVault')!;
+    expect(text.indexOf('source=message:2')).toBeLessThan(text.indexOf('source=message:0'));
   });
 
   it('renders byte-identical output for the same model and options', () => {
@@ -279,7 +309,10 @@ describe('Rebirth Package v7 — lineage sections', () => {
   });
 
   it('orders adaptive backfill so operator memory is funded before lower-priority lineage', () => {
-    expect(REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY[0]).toBe('operatorVault');
+    expect(REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY.slice(0, 2)).toEqual([
+      'operatorVault',
+      'cognitiveArtifacts',
+    ]);
     expect([...REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY]).not.toContain('boundaryAndActiveTask');
     expect([...REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY]).not.toContain('recoveryIndex');
   });

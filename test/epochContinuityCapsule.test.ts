@@ -11,7 +11,7 @@ describe('epoch continuity pending assistant action', () => {
     frameRowEndInclusive: 13,
   };
 
-  it('promotes a commitment trajectory into unresolved executable state', () => {
+  it('keeps state honestly unknown instead of promoting trajectory prose', () => {
     const capsule = renderEpochContinuityCapsule({
       objective: { text: 'Are these cards good enough?', provenance: 'live', source: 'operator-message' },
       trajectory: 'Okay, let me check whether the QR code works.',
@@ -19,12 +19,14 @@ describe('epoch continuity pending assistant action', () => {
       source,
     });
 
-    expect(capsule).toContain(
-      'pending_assistant_action: Okay, let me check whether the QR code works.',
-    );
-    expect(capsule).toContain('status=unresolved');
-    expect(capsule).toContain('outranks=live-task-rail');
-    expect(capsule).not.toContain('trajectory: Okay, let me check');
+    // Without explicit continuity input the renderer must not manufacture
+    // unresolved state from trajectory prose: a null-id/null-time action
+    // serialized into pending_assistant_state would be re-ingested as trusted
+    // carried state at the next fold. The prose survives as the low-authority
+    // legacy trajectory line instead.
+    expect(capsule).not.toContain('pending_assistant_action: ');
+    expect(capsule).toContain('trajectory: Okay, let me check whether the QR code works.');
+    expect(capsule).toContain('pending_assistant_state: {"version":1,"state":"unknown"}');
   });
 
   it('keeps settled assistant text as non-executable trajectory', () => {
@@ -56,6 +58,33 @@ describe('epoch continuity pending assistant action', () => {
     expect(capsule).toContain('source-id=assistant-row-12');
     expect(capsule).toContain('source-coordinate=message#12');
     expect(capsule).toContain('source-time=2026-08-10T00:52:45.000Z');
+  });
+
+  it('renders a visible settlement tombstone when a real settledBy exists', () => {
+    const capsule = renderEpochContinuityCapsule({
+      trajectory: 'Okay, let me check whether the QR code works.',
+      pendingAssistantState: {
+        version: 1,
+        state: 'none',
+        settledBy: {
+          reason: 'operator-superseded',
+          source: {
+            id: 'operator-pivot',
+            timestamp: '2026-08-14T17:36:55.276Z',
+            unit: 'message',
+            index: 30,
+          },
+        },
+      },
+      source,
+    });
+
+    expect(capsule).toContain(
+      'pending_assistant_action: none [settled-by=operator-superseded source-id=operator-pivot source-coordinate=message#30 source-time=2026-08-14T17:36:55.276Z]',
+    );
+    expect(capsule).not.toContain('outranks=live-task-rail');
+    expect(capsule).not.toContain('trajectory:');
+    expect(capsule).toContain('"state":"none"');
   });
 
   it('treats explicit null as a tombstone and never reopens from trajectory', () => {

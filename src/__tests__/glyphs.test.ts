@@ -112,6 +112,23 @@ describe('register glyph grammar', () => {
       final: false,
     });
   });
+
+  it('classifies active-request transitions as directive cognition, not a verdict', () => {
+    expect(parseRegisterGlyph('🧭 Active request: preserve chronological authority')).toMatchObject({
+      ok: true,
+      register: 'active_request',
+      glyph: '🧭',
+      body: ' Active request: preserve chronological authority',
+      classification: {
+        register: 'active_request',
+        trust: 'directive',
+        durable: false,
+        final: false,
+      },
+    });
+    expect(parseRegisterGlyph('[request] preserve chronology', { asciiAliases: true }))
+      .toMatchObject({ ok: true, register: 'active_request', glyph: '🧭' });
+  });
 });
 
 describe('emit contract (REGISTER_GLYPH_PROMPT_SNIPPET)', () => {
@@ -120,6 +137,7 @@ describe('emit contract (REGISTER_GLYPH_PROMPT_SNIPPET)', () => {
     // collide with register glyphs, so split-count is exact.
     const count = (glyph: string) => REGISTER_GLYPH_PROMPT_SNIPPET.split(glyph).length - 1;
     expect(count(REGISTER_GLYPHS.executing), 'executing ▶: list + self-exclude').toBe(2);
+    expect(count(REGISTER_GLYPHS.active_request), 'active request 🧭: list + exact form + authority + harvest guidance').toBe(4);
     expect(count(REGISTER_GLYPHS.verdict), 'verdict 🏁: list + harvest guidance + micro-🏁 blessing ×2').toBe(4);
     expect(count(REGISTER_GLYPHS.hazard), 'hazard ⚠️: list + harvest guidance').toBe(2);
     expect(count(REGISTER_GLYPHS.blocked), 'blocked ❓: list + self-exclude').toBe(2);
@@ -137,6 +155,7 @@ describe('emit contract (REGISTER_GLYPH_PROMPT_SNIPPET)', () => {
     const custom = buildRegisterGlyphPromptSnippet({
       in_progress: 'a',
       executing: 'b',
+      active_request: 'directive',
       verdict: 'c',
       hazard: 'd',
       blocked: 'e',

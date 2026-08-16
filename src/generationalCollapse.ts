@@ -89,6 +89,8 @@ export interface CollapseUnit {
 export interface CollapseOptions {
   readonly units: readonly CollapseUnit[];
   readonly maxChars: number;
+  /** Display known-time units newest-first without changing oldest-first demotion. */
+  readonly renderOrder?: 'oldest_first' | 'newest_first';
   /** Range recovery command used by T4 rollups; falls back to the unit's own. */
   readonly rangeRecover?: string | null;
   /** Emitted when even the floor representation cannot fit. */
@@ -205,7 +207,10 @@ function previousTier(tier: CollapseTier): CollapseTier | null {
 }
 
 interface RenderState {
+  /** Provider-visible order for known-time units. */
   readonly known: readonly CollapseUnit[];
+  /** Oldest-first order used exclusively for tier demotion. */
+  readonly demotionKnown: readonly CollapseUnit[];
   readonly unknown: readonly CollapseUnit[];
   readonly tiers: Map<string, CollapseTier>;
 }
@@ -290,7 +295,7 @@ function nextDemotionCandidate(state: RenderState): CollapseUnit | null {
     const tier = state.tiers.get(unit.id) ?? 't0';
     if (tier !== floorTier(unit)) return unit;
   }
-  for (const unit of state.known) {
+  for (const unit of state.demotionKnown) {
     const tier = state.tiers.get(unit.id) ?? 't0';
     if (tier !== floorTier(unit)) return unit;
   }
@@ -300,10 +305,13 @@ function nextDemotionCandidate(state: RenderState): CollapseUnit | null {
 export function collapseUnits(options: CollapseOptions): CollapseResult {
   const maxChars = Math.max(0, Math.floor(options.maxChars));
   const sorted = [...options.units].sort(compareUnits);
-  const known = sorted.filter((unit) => unit.sourceAt);
+  const demotionKnown = sorted.filter((unit) => unit.sourceAt);
+  const known = options.renderOrder === 'newest_first'
+    ? [...demotionKnown].reverse()
+    : demotionKnown;
   const unknown = sorted.filter((unit) => !unit.sourceAt);
   const tiers = new Map<string, CollapseTier>(sorted.map((unit) => [unit.id, 't0' as CollapseTier]));
-  const state: RenderState = { known, unknown, tiers };
+  const state: RenderState = { known, demotionKnown, unknown, tiers };
 
   if (sorted.length === 0) {
     return {

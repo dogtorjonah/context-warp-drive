@@ -1607,6 +1607,24 @@ export function commitFoldFreeze(
 }
 
 /**
+ * Install or refresh an unfurled provider-visible foundation without recording
+ * a fold epoch. This is the cache baseline used while measured pressure has not
+ * authorized compression: the bytes may be frozen for reuse, but no history was
+ * folded and fold telemetry must remain at zero.
+ */
+export function commitFoldFreezeFoundation(
+  state: FoldFreezeState,
+  history: FoldMessage[],
+  view: FoldMessage[],
+  context: FoldFreezeContext,
+  now: number,
+  cause: FoldFreezeHardEpochCause = 'first-call',
+): void {
+  initializeFoldFreezeBase(state, history, view, context, now, HARD_EPOCH_MATERIALIZATION);
+  state.lastTransitionReason = cause;
+}
+
+/**
  * Append a freshly folded tail band without re-rendering the existing frozen
  * view. This is the cache-preserving tail-epoch transition: the old frozen
  * message objects remain the byte-identical prefix, and only the newly folded

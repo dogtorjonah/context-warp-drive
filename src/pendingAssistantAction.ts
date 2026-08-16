@@ -3,14 +3,17 @@
  *
  * Assistant promises/progress are executable state. The state is reduced from
  * raw speech, serialized into authenticated epoch capsules, and carried until
- * later explicit completion/cancellation evidence emits a tombstone. Silence,
- * unrelated narration, tool rows, malformed capsules, and quoted capsule text
- * never mutate it.
+ * later completion/cancellation evidence — or a substantive genuine operator
+ * message, which supersedes the commitment (authority order: later operator >
+ * pending action) — emits a tombstone. Silence, tool rows, continuation
+ * nudges ("continue", "ok"), non-genuine user rows (chatroom deliveries,
+ * digest frames), malformed capsules, and quoted capsule text never mutate it.
  *
  * Pure CPU, deterministic, zero I/O.
  */
 
 import { parseRegisterGlyph } from './glyphs.ts';
+import { isPortableGenuineOperatorMessage } from './rebirthDialogue.ts';
 import {
   extractAssistantText,
   extractUserText,
@@ -26,7 +29,11 @@ export const PENDING_ASSISTANT_ACTION_STATE_PREFIX = 'pending_assistant_state: '
 
 export type PendingAssistantActionBasis = 'assistant-register' | 'assistant-commitment';
 export type PendingAssistantActionSourceUnit = 'event' | 'message';
-export type PendingAssistantSettlementReason = 'assistant-final' | 'assistant-cancelled' | 'operator-cancelled';
+export type PendingAssistantSettlementReason =
+  | 'assistant-final'
+  | 'assistant-cancelled'
+  | 'operator-cancelled'
+  | 'operator-superseded';
 
 export interface PendingAssistantActionSource {
   /** Exact provider/persisted identity only. Synthetic positions stay null. */
@@ -127,6 +134,7 @@ function isPendingAssistantSettlement(value: unknown): value is PendingAssistant
     value.reason === 'assistant-final'
     || value.reason === 'assistant-cancelled'
     || value.reason === 'operator-cancelled'
+    || value.reason === 'operator-superseded'
   ) && isPendingAssistantActionSource(value.source);
 }
 
@@ -162,6 +170,30 @@ const OPERATOR_CANCELLATION_CUES = [
   /^\s*(?:stop|cancel that|never\s*mind|skip that)(?:\b|[.!])/iu,
   /\b(?:do not|don['’]t)\s+(?:continue|proceed|resume|check|verify|inspect|test|run|fix|patch|update|change|edit|build|implement|work on)\b/iu,
 ] as const;
+
+/**
+ * Whole-message continuation endorsements. A nudge ratifies the open
+ * commitment instead of superseding it, so matching is deliberately exact
+ * over a closed list (after trimming and dropping terminal punctuation):
+ * operator text carrying anything beyond one of these forms is a genuine
+ * redirect and settles the register as operator-superseded.
+ */
+const OPERATOR_CONTINUATION_NUDGES: ReadonlySet<string> = new Set([
+  'continue', 'please continue', 'continue please', 'keep going', 'keep at it',
+  'carry on', 'go', 'go on', 'go ahead', 'proceed', 'do it', 'do that',
+  'yes', 'y', 'yes please', 'yeah', 'yep', 'ya', 'sure', 'sure thing',
+  'ok', 'okay', 'k', 'kk', 'ok continue', 'okay continue', 'ok keep going',
+  'sounds good', 'good', 'nice', 'great', 'perfect', 'cool', 'love it',
+  'thanks', 'thank you', 'ty', 'thx', 'lgtm', 'approved', '👍',
+]);
+
+function operatorContinuationNudge(text: string): boolean {
+  const normalized = text
+    .trim()
+    .toLowerCase()
+    .replace(/[\s.!…]+$/u, '');
+  return OPERATOR_CONTINUATION_NUDGES.has(normalized);
+}
 
 function lastMatchIndex(text: string, patterns: readonly RegExp[]): number {
   let latest = -1;
@@ -267,6 +299,28 @@ export function derivePendingAssistantActionTransition(
           kind: 'settled',
           settlement: {
             reason: 'operator-cancelled',
+            source: canonicalSource(message, index, options),
+          },
+        };
+      } else if (
+        userText
+        && !userText.includes(PENDING_ASSISTANT_ACTION_CAPSULE_HEADER)
+        && isPortableGenuineOperatorMessage(userText)
+        && !operatorContinuationNudge(userText)
+      ) {
+        // A substantive genuine operator message outranks any earlier open
+        // commitment (authority order: later operator > pending action).
+        // Settling here is what stops a finished conversation from re-issuing
+        // a stale chore after the next fold; the successor takes direction
+        // from the operator line itself, which continuity carries separately
+        // (active request / operator vault). Continuation nudges ratify the
+        // commitment; non-genuine user rows (chatroom deliveries, digest
+        // frames) stay inert; capsule-quoting text stays inert too, keeping
+        // the module's anti-echo invariant intact for raw user rows.
+        transition = {
+          kind: 'settled',
+          settlement: {
+            reason: 'operator-superseded',
             source: canonicalSource(message, index, options),
           },
         };

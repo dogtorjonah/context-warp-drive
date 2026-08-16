@@ -49,6 +49,9 @@ function makeSession(readBurstGuard: boolean): FoldSession {
     foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
     freeze: { enabled: true, ttlMs: 0, maxTailChars: 1_000_000 },
     eviction: false,
+    pressureCeiling: DEFAULT_FOLD_PRESSURE_CEILING_TOKENS,
+    singleCeilingMode: false,
+    tailEpochRunway: { foldTriggerTokens: 100 },
     readBurstGuard,
     now: () => {
       now += 1_000;
@@ -61,15 +64,25 @@ describe('FoldSession read-burst guard', () => {
   // One continuous, still-open read-burst of 6 turns (no >gapEvents pause).
   const burst = Array.from({ length: 6 }, (_, i) => readTurn(i, `/repo/src/mod${i}.ts`)).flat();
 
-  test('guard OFF (default behavior): folds the leading turns of the burst', () => {
-    const off = makeSession(false).prepare(burst);
+  test('a fresh oversized first turn stays raw without measured pressure', () => {
+    const marker = 'FRESH_OVERSIZED_NOTICE_PAYLOAD';
+    const fresh = [userMsg(`${marker}\n${'x'.repeat(200_000)}`)];
+    const outcome = makeSession(false).prepare(fresh);
+
+    expect(outcome.stats.turnsFolded ?? 0).toBe(0);
+    expect(extractFoldBlock(outcome.messages)).toBe('');
+    expect(JSON.stringify(outcome.messages)).toContain(marker);
+  });
+
+  test('guard OFF: folds the leading turns once measured pressure reaches the trigger', () => {
+    const off = makeSession(false).prepare(burst, { measuredInputTokens: 100 });
     expect(off.stats.turnsFolded ?? 0).toBeGreaterThan(0);
     expect(extractFoldBlock(off.messages)).toContain(FIRST_PATH);
   });
 
   test('guard ON: defers the whole open burst — nothing folds, earliest read stays verbatim', () => {
-    const off = makeSession(false).prepare(burst);
-    const on = makeSession(true).prepare(burst);
+    const off = makeSession(false).prepare(burst, { measuredInputTokens: 100 });
+    const on = makeSession(true).prepare(burst, { measuredInputTokens: 100 });
     // The entire history is one open burst whose first touch is in turn 0, so the
     // floor is 0 turns: the guard caps turnsToFold to 0.
     expect(on.stats.turnsFolded ?? 0).toBe(0);
@@ -79,7 +92,7 @@ describe('FoldSession read-burst guard', () => {
   });
 
   test('pressure ceiling OVERRIDES the guard floor (measured tokens only)', () => {
-    const off = makeSession(false).prepare(burst);
+    const off = makeSession(false).prepare(burst, { measuredInputTokens: 100 });
     const onPressure = makeSession(true).prepare(burst, {
       measuredInputTokens: DEFAULT_FOLD_PRESSURE_CEILING_TOKENS + 1,
     });
@@ -98,7 +111,7 @@ describe('FoldSession read-burst guard', () => {
       // >gapEvents non-touch messages -> the open burst settles -> guard yields.
       ...Array.from({ length: 26 }, (_, k) => assistantMsg(`idle ${k}`)),
     ];
-    const on = makeSession(true).prepare(settled);
+    const on = makeSession(true).prepare(settled, { measuredInputTokens: 100 });
     expect(on.stats.turnsFolded ?? 0).toBeGreaterThan(0);
     expect(extractFoldBlock(on.messages)).toContain(FIRST_PATH);
   });

@@ -50,6 +50,17 @@ describe('generational collapse', () => {
     expect(result.complete).toBe(false);
   });
 
+  it('renders newest-first without changing oldest-first demotion', () => {
+    const units = lineage(10);
+    const full = collapseUnits({ units, maxChars: 100_000, renderOrder: 'newest_first' });
+    expect(full.text.indexOf(units[9]!.verbatim)).toBeLessThan(full.text.indexOf(units[0]!.verbatim));
+
+    const pressured = collapseUnits({ units, maxChars: 700, renderOrder: 'newest_first' });
+    const placements = new Map(pressured.placements.map((placement) => [placement.id, placement.tier]));
+    expect(placements.get('u000')).not.toBe('t0');
+    expect(placements.get('u009')).toBe('t0');
+  });
+
   it('is deterministic: same units and budget produce byte-identical output', () => {
     const units = lineage(24);
     const a = collapseUnits({ units, maxChars: 1_500 });

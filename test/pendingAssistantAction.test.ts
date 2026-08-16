@@ -236,3 +236,89 @@ describe('trusted tri-state capsule continuity', () => {
     });
   });
 });
+
+describe('operator supersession', () => {
+  const unresolved = unresolvedPendingAssistantContinuityState(ORIGINAL_ACTION);
+
+  it('settles an open commitment when a substantive operator message follows', () => {
+    const next = reducePendingAssistantContinuity(unresolved, [{
+      role: 'user',
+      content: 'what about the critique u gave on the folding aspect? not just recall?',
+      sourceIdentity: 'operator-pivot',
+      sourceIdentityAuthority: 'exact',
+      tsMs: Date.parse('2026-08-14T17:36:55.276Z'),
+    }], { sourceUnit: 'message', sourceIndexOffset: 30 });
+
+    expect(next).toEqual(settledPendingAssistantContinuityState({
+      reason: 'operator-superseded',
+      source: {
+        id: 'operator-pivot',
+        timestamp: '2026-08-14T17:36:55.276Z',
+        unit: 'message',
+        index: 30,
+      },
+    }));
+  });
+
+  it('keeps the commitment open on continuation nudges', () => {
+    for (const nudge of ['continue', 'ok!', 'keep going', 'yes please', 'sounds good.', '👍']) {
+      const next = reducePendingAssistantContinuity(unresolved, [
+        { role: 'user', content: nudge },
+      ]);
+      expect(next, `nudge: ${nudge}`).toEqual(unresolved);
+    }
+  });
+
+  it('keeps non-genuine user rows inert (chatroom deliveries, digest frames, pings)', () => {
+    const rows: FoldMessage[] = [
+      { role: 'user', content: '[Chat Room "fold-recall-exec"] peer: status update arrived' },
+      { role: 'user', content: '[DIGEST DELTA seq 1-2]\n[SQUAD BOARD]\nrows\n[END DIGEST DELTA]' },
+      { role: 'user', content: '@peer-name quick ack' },
+    ];
+    for (const row of rows) {
+      expect(reducePendingAssistantContinuity(unresolved, [row])).toEqual(unresolved);
+    }
+  });
+
+  it('explicit cancellation cues still outrank supersession', () => {
+    const next = reducePendingAssistantContinuity(unresolved, [{
+      role: 'user',
+      content: 'stop. that lane belongs to fold-bug-hunt now.',
+    }]);
+    expect(next).toMatchObject({
+      state: 'none',
+      settledBy: { reason: 'operator-cancelled' },
+    });
+  });
+
+  it('a later verdict register settles an earlier commitment without done-words', () => {
+    const next = reducePendingAssistantContinuityTimeline([
+      { role: 'assistant', content: '🔍 I am tracing the harvest drop next.' },
+      { role: 'assistant', content: '🏁 The 8/12 cutover is the prime break.' },
+    ], { sourceUnit: 'message' });
+    expect(next).toMatchObject({
+      state: 'none',
+      settledBy: { reason: 'assistant-final' },
+    });
+  });
+
+  it('a carried unresolved capsule dies to a later genuine operator row', () => {
+    const carried = capsule(unresolved);
+    const settled = reducePendingAssistantContinuityTimeline([
+      { role: 'user', content: carried, contextWarpSynthetic: 'folded-context' },
+      {
+        role: 'user',
+        content: 'its ok fold bug hunt is on it.',
+        sourceIdentity: 'operator-supersede',
+        sourceIdentityAuthority: 'exact',
+      },
+    ], { sourceUnit: 'message', sourceIndexOffset: 50 });
+    expect(settled).toMatchObject({
+      state: 'none',
+      settledBy: {
+        reason: 'operator-superseded',
+        source: { id: 'operator-supersede', unit: 'message', index: 51 },
+      },
+    });
+  });
+});

@@ -456,6 +456,17 @@ describe('compileFoldReceipts — receipt classes', () => {
     expect(totalitySum(c.counts)).toBe(c.counts.totalToolCalls);
   });
 
+  it('keeps retired fork_sidequest calls classified as historical spawn receipts', () => {
+    const c = compileFoldReceipts([
+      toolUse('legacy-sidequest', 'fork_sidequest', { name: 'legacy-scout', engine: 'deepseek' }),
+      toolResult('legacy-sidequest', 'spawned'),
+    ]);
+    expect(c.counts.spawns).toBe(1);
+    expect(c.receipts).toHaveLength(1);
+    expect(c.receipts[0]).toMatchObject({ recordType: 'action', kind: 'spawn' });
+    expect(totalitySum(c.counts)).toBe(c.counts.totalToolCalls);
+  });
+
   it('counts prose turns separately from tool-call totality', () => {
     const window: FoldMessage[] = [
       assistantText('The fix is the classifier ordering because errors must win.'),

@@ -370,6 +370,71 @@ function resolveToolResult(
   return {};
 }
 
+const CHATROOM_COMMIT_RECEIPT_PREFIX = '[chatroom-commit] ';
+
+function committedChatVoice(
+  content: unknown,
+  explicitError: boolean,
+): EpisodeAnnotation | null {
+  const head = resultTextHead(content);
+  if (explicitError || headLooksLikeError(head)) return null;
+  const receiptLine = head.split(/\r?\n/)
+    .find((line) => line.startsWith(CHATROOM_COMMIT_RECEIPT_PREFIX));
+  if (!receiptLine) return null;
+  let receipt: Record<string, unknown> | null = null;
+  try {
+    receipt = asRecord(JSON.parse(receiptLine.slice(CHATROOM_COMMIT_RECEIPT_PREFIX.length)));
+  } catch {
+    return null;
+  }
+  if (!receipt) return null;
+  const roomId = typeof receipt.roomId === 'string' ? receipt.roomId.trim() : '';
+  const messageId = typeof receipt.messageId === 'string' ? receipt.messageId.trim() : '';
+  const firstLine = typeof receipt.firstLine === 'string' ? receipt.firstLine.trim() : '';
+  const tags = Array.isArray(receipt.tags)
+    ? receipt.tags.filter((tag): tag is string => typeof tag === 'string')
+    : [];
+  if (!roomId || !messageId || !firstLine
+    || !tags.some((tag) => CHAT_VOICE_TAGS.includes(`#${tag}`))) return null;
+  const artifact = createCognitiveArtifactEnvelope({
+    source: {
+      family: 'chat',
+      roomId,
+      messageId,
+      sourceTime: receipt.sourceTime as string | number | null | undefined,
+    },
+    authorityClass: 'pointer',
+  });
+  if (!artifact) return null;
+  return {
+    ts: artifact.sourceTime,
+    kind: 'chat',
+    text: truncateVerbatim(firstLine, VOICE_TEXT_CAP_CHARS),
+    artifact,
+  };
+}
+
+function resolveCommittedChatVoice(
+  messages: readonly FoldMessage[],
+  call: ToolCallView,
+): EpisodeAnnotation | null {
+  if (call.input.action !== 'commit' || !call.id) return null;
+  const end = Math.min(messages.length, call.eventIndex + 1 + RESULT_SCAN_AHEAD_MESSAGES);
+  for (let i = call.eventIndex + 1; i < end; i++) {
+    const message = messages[i];
+    if (message.role === 'tool' && message.tool_call_id === call.id) {
+      return committedChatVoice(message.content, false);
+    }
+    if (!Array.isArray(message.content)) continue;
+    for (const rawBlock of message.content) {
+      const block = asRecord(rawBlock);
+      if (!block || block.type !== 'tool_result' || block.tool_use_id !== call.id) continue;
+      return committedChatVoice(block.content, block.is_error === true);
+    }
+  }
+  return null;
+}
+
 function isEpistemicClaimAnnotation(annotation: EpisodeAnnotation): boolean {
   return annotation.kind === 'narration:verdict'
     || annotation.kind === 'narration:hazard'
@@ -501,7 +566,10 @@ function extractTouchPaths(input: Record<string, unknown>, canon?: CanonContext)
   }
 }
 
-function mineVoice(call: ToolCallView): EpisodeAnnotation | null {
+function mineVoice(
+  call: ToolCallView,
+  messages: readonly FoldMessage[],
+): EpisodeAnnotation | null {
   const shortName = shortToolName(call.name).toLowerCase();
   if (shortName === 'atlas_commit') {
     const entry = call.input.changelog_entry;
@@ -530,14 +598,7 @@ function mineVoice(call: ToolCallView): EpisodeAnnotation | null {
     return null;
   }
   if (shortName === 'chatroom') {
-    const message = call.input.message;
-    if (call.input.action === 'send' && typeof message === 'string') {
-      const firstLine = message.split('\n')[0].trim();
-      if (CHAT_VOICE_TAGS.some((tag) => firstLine.startsWith(tag))) {
-        return { ts: '', kind: 'chat', text: truncateVerbatim(firstLine, VOICE_TEXT_CAP_CHARS) };
-      }
-    }
-    return null;
+    return resolveCommittedChatVoice(messages, call);
   }
   if (shortName === 'task_rail') {
     // Rail ACK notes are deliberate, contemporaneous agent voice — the "what I
@@ -1197,9 +1258,11 @@ export function deriveEpisodesFromMessages(
       touches.push({ eventIndex: call.eventIndex, path: p, kind, ...(ts !== undefined ? { ts } : {}) });
     }
 
-    const voice = mineVoice(call);
+    const voice = mineVoice(call, messages);
     if (voice) {
-      const stamped: EpisodeAnnotation = { ...voice, ...(ts !== undefined ? { ts } : {}) };
+      const stamped: EpisodeAnnotation = voice.artifact
+        ? voice
+        : { ...voice, ...(ts !== undefined ? { ts } : {}) };
       annotated.push({ eventIndex: call.eventIndex, annotation: stamped });
       if (stamped.kind === 'star:pivot') pivots.push({ eventIndex: call.eventIndex });
       steps.push({ eventIndex: call.eventIndex, step: { tool: shortToolName(call.name), voice: stamped } });
@@ -1497,7 +1560,7 @@ export function computeOpenBurst(
     for (const p of touched) {
       touches.push({ eventIndex: call.eventIndex, path: p, kind, ...(ts !== undefined ? { ts } : {}) });
     }
-    const voice = mineVoice(call);
+    const voice = mineVoice(call, messages);
     if (voice) {
       annotated.push({ eventIndex: call.eventIndex, annotation: voice });
       if (voice.kind === 'star:pivot') pivots.push({ eventIndex: call.eventIndex });

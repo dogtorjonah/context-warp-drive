@@ -114,6 +114,7 @@ export type MeasuredEpochEligibilityReason =
   | 'telemetry-unavailable'
   | 'pressure-disabled'
   | 'below-single-ceiling'
+  | 'below-fold-trigger'
   | 'no-tail-epoch'
   | 'append-disabled'
   | 'governor-pressure'
@@ -207,11 +208,10 @@ export function resolveMeasuredEpochEligibility(
   } as const;
 
   if (ceiling === null) {
-    const append = input.tailEpochRequested && appendEnabled;
     return {
       ...base,
-      decision: append ? 'append' : 'reuse',
-      reason: append ? 'pressure-disabled' : 'no-tail-epoch',
+      decision: 'reuse',
+      reason: 'pressure-disabled',
       runwayBasis: 'disabled',
       postAppendRunwayTokens: null,
       tailEpochRunwayWouldHold: true,
@@ -249,6 +249,23 @@ export function resolveMeasuredEpochEligibility(
       tailEpochRunwayWouldHold: false,
     };
   }
+  const trigger = typeof input.foldTriggerTokens === 'number'
+    && Number.isFinite(input.foldTriggerTokens)
+    && input.foldTriggerTokens > 0
+      ? Math.floor(input.foldTriggerTokens)
+      : null;
+  if (!singleCeilingMode
+    && input.tailEpochRequested
+    && (trigger === null || measured < trigger)) {
+    return {
+      ...base,
+      decision: 'reuse',
+      reason: 'below-fold-trigger',
+      runwayBasis: 'measured',
+      postAppendRunwayTokens: ceiling - measured,
+      tailEpochRunwayWouldHold: true,
+    };
+  }
   if (!input.tailEpochRequested || !appendEnabled) {
     const hardAtSingleCeiling = singleCeilingMode && pressureCeilingTriggered;
     return {
@@ -265,11 +282,6 @@ export function resolveMeasuredEpochEligibility(
     && Number.isFinite(input.postFoldFloorTokens)
     && input.postFoldFloorTokens > 0
       ? Math.floor(input.postFoldFloorTokens)
-      : null;
-  const trigger = typeof input.foldTriggerTokens === 'number'
-    && Number.isFinite(input.foldTriggerTokens)
-    && input.foldTriggerTokens > 0
-      ? Math.floor(input.foldTriggerTokens)
       : null;
   const floorGateArmed = (input.appendEpochsSinceHardReset ?? 0) >= 1;
   let runwayBasis: MeasuredEpochEligibility['runwayBasis'] = 'measured';

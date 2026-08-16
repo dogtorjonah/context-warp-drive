@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto';
 
 import type { ContinuityLiveFieldSource, ContinuityReceipt } from './continuityReceipt.ts';
+import type { FoldMessage } from './rollingFold.ts';
 import {
   collapseUnits,
   type CollapseResult,
@@ -97,6 +98,19 @@ export interface RebirthPackageV6ExactMessage {
   readonly source: RebirthPackageV6SourceRef;
 }
 
+export type RebirthPackageV6ActiveRequestClaimStatus =
+  | 'current'
+  | 'expired_by_newer_operator'
+  | 'fallback_operator_frontier_unknown';
+
+export interface RebirthPackageV6ActiveRequestClaims {
+  /** Newest known-time agent interpretation. Never operator authority. */
+  readonly latest: RebirthPackageV6ExactMessage;
+  readonly latestStatus: RebirthPackageV6ActiveRequestClaimStatus;
+  /** Immediately preceding known-time interpretation, always expired. */
+  readonly previous: RebirthPackageV6ExactMessage | null;
+}
+
 export interface RebirthPackageV6BoundaryAndActiveTask {
   readonly lifecycle: RebirthPackageV6Lifecycle;
   readonly lifecycleMeaning: string;
@@ -111,6 +125,7 @@ export interface RebirthPackageV6BoundaryAndActiveTask {
   readonly cwd: string | null;
   readonly runtimeChange: string | null;
   readonly activeRequest: RebirthPackageV6ExactMessage | null;
+  readonly activeRequestClaims?: RebirthPackageV6ActiveRequestClaims;
   readonly lastMaterialAssistant: RebirthPackageV6ExactMessage | null;
   /**
    * Optional durable fork identity carried into the v6 Boundary. Distinct from
@@ -146,6 +161,15 @@ export interface RebirthPackageV6ExecutionFact {
     | 'runtime'
     | 'coordination';
   readonly text: string;
+  /**
+   * Measured chronology flag: present only when this fact's source time and
+   * the active request's source time are BOTH known and this row is strictly
+   * older. The capsule authority order (a later genuine operator message
+   * outranks live rail direction) is why renderExecution surfaces it; the
+   * model records the measurement, never the judgment. Absent covers every
+   * unknown-time case — absence of evidence is not "current" (God Rule 8).
+   */
+  readonly predatesActiveRequest?: true;
 }
 
 export interface RebirthPackageV6ExecutionState {
@@ -212,6 +236,17 @@ export interface RebirthPackageV6CognitiveArtifact {
   readonly supersededBy: string | null;
 }
 
+export interface RebirthPackageV6CognitiveArtifactCapture {
+  /** Completeness of the indexed projection, not of the underlying stores. */
+  readonly status: 'complete' | 'partial' | 'unavailable';
+  /** Capture/ingestion time; never used as artifact chronology. */
+  readonly capturedAt: string | null;
+  readonly totalMatched: number | null;
+  readonly overlayCount: number | null;
+  readonly missingFamilies: readonly string[];
+  readonly warnings: readonly string[];
+}
+
 export interface RebirthPackageV6ConversationRow {
   readonly provenanceId: string;
   readonly sourceAt: string | null;
@@ -261,6 +296,8 @@ export interface RebirthPackageV6Model {
   readonly executionState: RebirthPackageV6ExecutionState;
   readonly activeEditDelta: RebirthPackageV6ActiveEditDelta;
   readonly cognitiveArtifacts: readonly RebirthPackageV6CognitiveArtifact[];
+  /** Optional for persisted packages produced before indexed cognition delivery. */
+  readonly cognitiveArtifactCapture?: RebirthPackageV6CognitiveArtifactCapture;
   readonly recentConversation: readonly RebirthPackageV6ConversationRow[];
   // Lineage sections are optional on the model because `isRebirthPackageV6Model`
   // accepts persisted v6 packages that predate them. `buildRebirthPackageV6Model`
@@ -280,6 +317,7 @@ export interface BuildRebirthPackageV6ModelInput {
   readonly executionState?: RebirthPackageV6ExecutionState;
   readonly activeEditDelta?: RebirthPackageV6ActiveEditDelta;
   readonly cognitiveArtifacts?: readonly RebirthPackageV6CognitiveArtifact[];
+  readonly cognitiveArtifactCapture?: RebirthPackageV6CognitiveArtifactCapture;
   readonly recentConversation?: readonly RebirthPackageV6ConversationRow[];
   readonly operatorVault?: RebirthPackageV7LineageSection;
   readonly episodeChapterIndex?: RebirthPackageV7LineageSection;
@@ -424,10 +462,10 @@ export const REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS = 5_000;
  */
 export const REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY = [
   'operatorVault',
-  'episodeChapterIndex',
-  'recentConversation',
-  'lifeLedger',
   'cognitiveArtifacts',
+  'recentConversation',
+  'episodeChapterIndex',
+  'lifeLedger',
 ] as const satisfies readonly RebirthPackageV6SectionId[];
 
 const V6_SECTION_OPEN_PREFIX = '[REBIRTH-V6-SECTION';
@@ -611,6 +649,13 @@ export function buildRebirthPackageV6Model(
       reasons: ['no immutable Atlas edit capture was supplied'],
     },
     cognitiveArtifacts: normalizeCognitiveRows(input.cognitiveArtifacts ?? []),
+    ...(input.cognitiveArtifactCapture ? {
+      cognitiveArtifactCapture: {
+        ...input.cognitiveArtifactCapture,
+        missingFamilies: [...input.cognitiveArtifactCapture.missingFamilies],
+        warnings: [...input.cognitiveArtifactCapture.warnings],
+      },
+    } : {}),
     recentConversation: normalizeConversationRows(
       input.recentConversation ?? [],
       activeRequest,
@@ -635,6 +680,22 @@ export function isRebirthPackageV6Model(value: unknown): value is RebirthPackage
     && Boolean(candidate.executionState)
     && Boolean(candidate.activeEditDelta)
     && Array.isArray(candidate.cognitiveArtifacts)
+    && (candidate.cognitiveArtifactCapture === undefined
+      || (typeof candidate.cognitiveArtifactCapture === 'object'
+        && candidate.cognitiveArtifactCapture !== null
+        && ['complete', 'partial', 'unavailable'].includes(candidate.cognitiveArtifactCapture.status)
+        && (candidate.cognitiveArtifactCapture.capturedAt === null
+          || typeof candidate.cognitiveArtifactCapture.capturedAt === 'string')
+        && (candidate.cognitiveArtifactCapture.totalMatched === null
+          || (Number.isSafeInteger(candidate.cognitiveArtifactCapture.totalMatched)
+            && candidate.cognitiveArtifactCapture.totalMatched >= 0))
+        && (candidate.cognitiveArtifactCapture.overlayCount === null
+          || (Number.isSafeInteger(candidate.cognitiveArtifactCapture.overlayCount)
+            && candidate.cognitiveArtifactCapture.overlayCount >= 0))
+        && Array.isArray(candidate.cognitiveArtifactCapture.missingFamilies)
+        && candidate.cognitiveArtifactCapture.missingFamilies.every((family) => typeof family === 'string')
+        && Array.isArray(candidate.cognitiveArtifactCapture.warnings)
+        && candidate.cognitiveArtifactCapture.warnings.every((warning) => typeof warning === 'string')))
     && Array.isArray(candidate.recentConversation)
     && Array.isArray(candidate.recoveryIndex);
 }
@@ -946,6 +1007,27 @@ export function adaptLegacyRebirthPackageToV6(
       }
     : adaptReceiptEditDelta(receipt));
   const executionFacts: RebirthPackageV6ExecutionFact[] = [];
+  // Capsule authority order: a later genuine operator message outranks live
+  // rail direction. The package cannot judge whether rail text AGREES with the
+  // operator's latest line, but it can measure order: a rail/next_action row
+  // whose known source time strictly predates the known active-request time is
+  // flagged so renderExecution marks it for reconciliation instead of
+  // presenting stale direction as current command (the rail-58fc5e71 failure:
+  // a 17:11 rail row rendered as commanding after 17:18/17:22 operator
+  // pivots). pending_assistant_action is deliberately NOT flagged here — the
+  // slice-1 reducer settles superseded commitments upstream with an
+  // operator-superseded tombstone. Either time unknown → no flag: absence of
+  // evidence is never a staleness verdict (God Rule 8).
+  const activeRequestSourceAt = knownSourceTime(requestSource?.sourceTimestamp);
+  const activeRequestSourceMs = activeRequestSourceAt
+    ? Date.parse(activeRequestSourceAt)
+    : Number.NaN;
+  const predatesActiveRequest = (source: ContinuityLiveFieldSource | undefined): boolean => {
+    const rowAt = knownSourceTime(source?.sourceTimestamp);
+    return rowAt !== null
+      && Number.isFinite(activeRequestSourceMs)
+      && Date.parse(rowAt) < activeRequestSourceMs;
+  };
   if (pendingAssistantAction) {
     executionFacts.push({
       kind: 'pending_assistant_action',
@@ -968,13 +1050,23 @@ export function adaptLegacyRebirthPackageToV6(
         receipt.rail.activeStep?.title,
       ].filter(Boolean).join(' · '),
       ...receiptFactSource('rail', receipt.rail.railId, railSource),
+      ...(predatesActiveRequest(railSource) ? { predatesActiveRequest: true as const } : {}),
     });
     const nextAction = nonEmpty(receipt.nextAction ?? receipt.rail.queuedStepTitle);
     if (nextAction && nextAction !== pendingAssistantAction?.text) {
+      // buildContinuityReceipt mirrors the active request into nextAction.
+      // Attribute that fact to the operator row itself; borrowing the older
+      // rail-step source makes current operator text look stale relative to
+      // its own timestamp. A genuinely rail-derived next action still uses
+      // step/rail provenance and remains eligible for the chronology marker.
+      const nextActionSource = nextAction === activeRequestText
+        ? requestSource
+        : receipt.liveState?.step.source ?? railSource;
       executionFacts.push({
         kind: 'next_action',
         text: nextAction,
-        ...receiptFactSource('next_action', nextAction, receipt.liveState?.step.source ?? railSource),
+        ...receiptFactSource('next_action', nextAction, nextActionSource),
+        ...(predatesActiveRequest(nextActionSource) ? { predatesActiveRequest: true as const } : {}),
       });
     }
   } else if (nonEmpty(legacy.resumePoint ?? legacy.taskRailContext)) {
@@ -1174,6 +1266,28 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
   } else {
     lines.push('', 'active-request=unknown or unavailable at capture');
   }
+  if (boundary.activeRequestClaims) {
+    const claims = boundary.activeRequestClaims;
+    const latestStatus = claims.latestStatus === 'current'
+      ? 'CURRENT · non-authoritative · exact raw operator chronology wins'
+      : claims.latestStatus === 'expired_by_newer_operator'
+        ? 'EXPIRED BY NEWER RAW OPERATOR REQUEST · do not execute'
+        : 'FALLBACK ONLY · operator frontier unknown · do not treat as instruction';
+    lines.push(
+      '',
+      `[AGENT ACTIVE-REQUEST INTERPRETATION · ${latestStatus} · ${formatSource(claims.latest.source)}]`,
+      claims.latest.text,
+      '[/AGENT ACTIVE-REQUEST INTERPRETATION]',
+    );
+    if (claims.previous) {
+      lines.push(
+        '',
+        `[PREVIOUS AGENT ACTIVE-REQUEST INTERPRETATION · EXPIRED BY ${claims.latest.source.provenanceId} · fallback context only · do not execute · ${formatSource(claims.previous.source)}]`,
+        claims.previous.text,
+        '[/PREVIOUS AGENT ACTIVE-REQUEST INTERPRETATION]',
+      );
+    }
+  }
   if (boundary.lastMaterialAssistant) {
     const recovery = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
     const assistantBudget = Math.max(512, maxChars - lines.join('\n').length - 320);
@@ -1197,7 +1311,7 @@ function renderExecution(model: RebirthPackageV6Model, maxChars: number): { text
   const known = model.executionState.facts.filter((fact) => fact.sourceAt);
   const unknown = model.executionState.facts.filter((fact) => !fact.sourceAt);
   const lines = known.map((fact) => (
-    `- ${fact.kind} · ${fact.text} · source=${fact.provenanceId} · source-time=${fact.sourceAt} · status=${fact.status}`
+    `- ${fact.kind} · ${fact.text} · source=${fact.provenanceId} · source-time=${fact.sourceAt} · status=${fact.status}${fact.predatesActiveRequest ? ' · authority=predates-active-request' : ''}`
   ));
   for (const reason of model.executionState.unknownReasons) lines.push(`- unknown: ${reason}`);
   if (unknown.length > 0) {
@@ -1362,15 +1476,46 @@ function compactCognitionSource(provenanceId: string, noteText: string): string 
 }
 
 function renderCognition(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
-  const known = model.cognitiveArtifacts.filter((row) => row.sourceAt);
+  const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'cognition')?.handle ?? null;
+  const recovery = recoveryHandle ? `recover=${recoveryHandle}` : 'exact recovery unavailable';
+  const capture = model.cognitiveArtifactCapture;
+  const known = model.cognitiveArtifacts
+    .filter((row) => row.sourceAt)
+    .sort((left, right) => right.sourceAt!.localeCompare(left.sourceAt!)
+      || right.provenanceId.localeCompare(left.provenanceId));
   const unknown = model.cognitiveArtifacts.filter((row) => !row.sourceAt);
   const lines = known.map((row) => `${row.sourceAt} · ${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · authority=${row.authority}`);
   if (unknown.length > 0) {
     lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
     for (const row of unknown) lines.push(`- ${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · authority=${row.authority}`);
   }
-  if (lines.length === 0) lines.push('No relevant current cognitive artifacts captured.');
-  return boundedText(lines.join('\n'), maxChars, model.recoveryIndex.find((entry) => entry.id === 'cognition')?.handle ?? null);
+  if (lines.length === 0) {
+    if (!capture) {
+      lines.push(`Cognitive projection status is unknown for this persisted package; zero rendered rows do not prove artifact absence. ${recovery}`);
+    } else if (capture.status === 'complete' && (capture.totalMatched ?? 0) === 0) {
+      lines.push(`The bounded indexed cognitive projection returned zero current rows; this does not prove the underlying cognitive stores are empty. ${recovery}`);
+    } else if (capture.status === 'complete') {
+      lines.push(`The indexed cognitive projection matched ${capture.totalMatched} root(s), but no rows reached this section after selection or budgeting. ${recovery}`);
+    } else {
+      lines.push(`The indexed cognitive projection is ${capture.status}; zero rendered rows are not evidence that no current cognitive artifacts exist. ${recovery}`);
+    }
+  }
+  if (capture) {
+    lines.push('', [
+      `Capture receipt: status=${capture.status}`,
+      `captured-at=${capture.capturedAt ?? 'unknown'}`,
+      `total-matched=${capture.totalMatched ?? 'unknown'}`,
+      `overlay=${capture.overlayCount ?? 'unknown'}`,
+    ].join(' · '));
+    if (capture.missingFamilies.length > 0) {
+      lines.push(`Missing indexed families: ${capture.missingFamilies.join(', ')}`);
+    }
+    if (capture.warnings.length > 0) {
+      lines.push('Capture warnings:');
+      for (const warning of capture.warnings) lines.push(`- ${warning}`);
+    }
+  }
+  return boundedText(lines.join('\n'), maxChars, recoveryHandle);
 }
 
 function conversationRowText(row: RebirthPackageV6ConversationRow): string {
@@ -1617,12 +1762,14 @@ function collapseWithReceipt(
   units: readonly CollapseUnit[],
   budget: number,
   recover: string | null,
+  renderOrder: 'oldest_first' | 'newest_first' = 'oldest_first',
 ): { text: string; collapse: CollapseResult; complete: boolean } {
   const collapse = (chars: number) => collapseUnits({
     units,
     maxChars: Math.max(0, chars),
     rangeRecover: recover,
     floorRecover: recover,
+    renderOrder,
   });
   const tierReceipt = (result: CollapseResult): string => (
     `\n[COLLAPSE units=${units.length} t0=${result.tierCounts.t0}`
@@ -1651,7 +1798,12 @@ function renderLineage(
   }
   const headerText = header.length > 0 ? `${header.join('\n')}\n` : '';
   const recover = section.rangeRecover ?? fallbackRecover;
-  const body = collapseWithReceipt(section.units, maxChars - headerText.length, recover);
+  const body = collapseWithReceipt(
+    section.units,
+    maxChars - headerText.length,
+    recover,
+    'newest_first',
+  );
   return {
     text: `${headerText}${body.text}`,
     complete: body.complete && !section.partialReason,
@@ -2279,7 +2431,23 @@ export type ContinuityLedgerTierBasis =
   | 'cap-overflow'
   | 'section-elision'
   | 'tier-demotion'
-  | 'rendered';
+  | 'rendered'
+  | 'tail-epoch-fold'
+  | 'tail-epoch-retained'
+  | 'hard-epoch-seed'
+  | 'hard-epoch-live';
+
+export type ContinuityLedgerLifecycle = 'rebirth' | 'tail-epoch' | 'hard-epoch';
+export type ContinuityLedgerPlacement = 'rendered' | 'folded' | 'elided';
+export type ContinuityLedgerCaptureSectionId =
+  | RebirthPackageV7CollapseSectionId
+  | 'tailEpoch'
+  | 'hardEpoch';
+
+/** One hash function for every Rebirth/tail/hard continuity-ledger row. */
+export function sha256ContinuityLedgerVerbatim(verbatim: string): string {
+  return createHash('sha256').update(verbatim, 'utf8').digest('hex');
+}
 
 /**
  * One persistable continuity-ledger row assembled from an actual render.
@@ -2290,13 +2458,18 @@ export type ContinuityLedgerTierBasis =
 export interface ContinuityLedgerCaptureUnit {
   readonly unitId: string;
   readonly kind: string;
-  readonly sectionId: RebirthPackageV7CollapseSectionId;
+  readonly sectionId: ContinuityLedgerCaptureSectionId;
+  /** Stable source-row identity, or a declared capture-relative coordinate. */
+  readonly sourceProvenanceId: string;
+  readonly sourceIdentityAuthority: 'exact' | 'synthetic-position';
+  readonly sourceIndex: number | null;
   readonly sourceInstanceId: string | null;
   readonly sourceTime: string | null;
   readonly sourceEndTime: string | null;
   readonly eraKey: string | null;
   readonly tier: string;
   readonly tierBasis: ContinuityLedgerTierBasis;
+  readonly placement: ContinuityLedgerPlacement;
   readonly claim: string;
   readonly verbatim: string;
   readonly sha256: string;
@@ -2309,6 +2482,11 @@ export interface ContinuityLedgerCaptureRecord {
   readonly ownerInstanceId: string;
   readonly captureId: string;
   readonly workspace: string | null;
+  readonly lifecycle: ContinuityLedgerLifecycle;
+  readonly sourceStartIndex: number | null;
+  readonly sourceEndIndexExclusive: number | null;
+  readonly sourceFirstTime: string | null;
+  readonly sourceLastTime: string | null;
   readonly units: readonly ContinuityLedgerCaptureUnit[];
 }
 
@@ -2362,15 +2540,23 @@ export function buildContinuityLedgerCaptureFromV6Render(
         unitId: unit.id,
         kind: unit.kind,
         sectionId: sectionReport.sectionId,
+        sourceProvenanceId: unit.id,
+        sourceIdentityAuthority: 'exact',
+        sourceIndex: null,
         sourceInstanceId: unit.sourceInstanceId ?? null,
         sourceTime: unit.sourceAt ?? null,
         sourceEndTime: unit.sourceEndAt ?? null,
         eraKey: unit.eraKey ?? null,
         tier: placement.tier,
         tierBasis,
+        placement: sectionReport.sectionElided
+          ? 'elided'
+          : placement.tier === 't0'
+            ? 'rendered'
+            : 'folded',
         claim: unit.claim,
         verbatim: unit.verbatim,
-        sha256: createHash('sha256').update(unit.verbatim, 'utf8').digest('hex'),
+        sha256: sha256ContinuityLedgerVerbatim(unit.verbatim),
         origin: unit.origin ?? null,
         recover: unit.recover,
         workspace,
@@ -2378,7 +2564,145 @@ export function buildContinuityLedgerCaptureFromV6Render(
     }
   }
   if (units.length === 0) return null;
-  return { ownerInstanceId, captureId, workspace, units };
+  const sourceTimes = units
+    .flatMap((unit) => [unit.sourceTime, unit.sourceEndTime])
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  return {
+    ownerInstanceId,
+    captureId,
+    workspace,
+    lifecycle: 'rebirth',
+    sourceStartIndex: null,
+    sourceEndIndexExclusive: null,
+    sourceFirstTime: sourceTimes[0] ?? null,
+    sourceLastTime: sourceTimes.at(-1) ?? null,
+    units,
+  };
+}
+
+export interface ContinuityLedgerFoldEpochCaptureInput {
+  readonly lifecycle: 'tail-epoch' | 'hard-epoch';
+  readonly ownerInstanceId: string;
+  readonly captureId: string;
+  readonly workspace?: string | null;
+  readonly messages: readonly FoldMessage[];
+  readonly sourceStartIndex: number;
+  /** Exact source ordinal per message when filtering left gaps in the capture. */
+  readonly sourceIndexes?: readonly number[];
+  /** One exact placement per source message; defaults to folded. */
+  readonly placements?: readonly ContinuityLedgerPlacement[];
+  readonly recover?: (sourceIndex: number, message: FoldMessage) => string;
+}
+
+function foldMessageVerbatim(message: FoldMessage): string {
+  // Fixed property order makes the canonical unit independent of host object
+  // insertion order while preserving every FoldMessage field that can affect
+  // provider-visible trace meaning.
+  return JSON.stringify({
+    role: message.role,
+    content: message.content,
+    ...(message.reasoning_content !== undefined ? { reasoning_content: message.reasoning_content } : {}),
+    ...(message.tool_calls !== undefined ? { tool_calls: message.tool_calls } : {}),
+    ...(message.tool_call_id !== undefined ? { tool_call_id: message.tool_call_id } : {}),
+    ...(message.name !== undefined ? { name: message.name } : {}),
+  });
+}
+
+function foldMessageSourceTime(message: FoldMessage): string | null {
+  if (typeof message.tsMs !== 'number' || !Number.isFinite(message.tsMs)) return null;
+  const date = new Date(message.tsMs);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function foldMessageProvenance(
+  message: FoldMessage,
+  captureId: string,
+  sourceIndex: number,
+): { id: string; authority: 'exact' | 'synthetic-position' } {
+  const primary = message.sourceIdentityAuthority !== 'synthetic-position'
+    ? message.sourceIdentity?.trim()
+    : undefined;
+  if (primary) return { id: primary, authority: 'exact' };
+  const identities = [...new Set((message.sourceIdentities ?? []).map((value) => value.trim()).filter(Boolean))]
+    .sort();
+  if (identities.length === 1) return { id: identities[0]!, authority: 'exact' };
+  if (identities.length > 1) {
+    return {
+      id: `source-set:${sha256ContinuityLedgerVerbatim(identities.join('\n'))}`,
+      authority: 'exact',
+    };
+  }
+  return { id: `${captureId}:message#${sourceIndex}`, authority: 'synthetic-position' };
+}
+
+/**
+ * Build storage-neutral per-message rows for a committed FoldSession epoch.
+ * The ledger callback is owned by FoldSession; this pure builder performs no
+ * writes and is equally usable by relay and standalone hosts.
+ */
+export function buildContinuityLedgerCaptureFromFoldEpoch(
+  input: ContinuityLedgerFoldEpochCaptureInput,
+): ContinuityLedgerCaptureRecord | null {
+  const ownerInstanceId = input.ownerInstanceId.trim();
+  const captureId = input.captureId.trim();
+  if (!ownerInstanceId || !captureId || input.messages.length === 0) return null;
+  const workspace = input.workspace?.trim() || null;
+  const sectionId: ContinuityLedgerCaptureSectionId = input.lifecycle === 'tail-epoch'
+    ? 'tailEpoch'
+    : 'hardEpoch';
+  const units: ContinuityLedgerCaptureUnit[] = input.messages.map((message, offset) => {
+    const explicitSourceIndex = input.sourceIndexes?.[offset];
+    const sourceIndex = Number.isSafeInteger(explicitSourceIndex) && explicitSourceIndex! >= 0
+      ? explicitSourceIndex!
+      : input.sourceStartIndex + offset;
+    const provenance = foldMessageProvenance(message, captureId, sourceIndex);
+    const placement = input.placements?.[offset] ?? 'folded';
+    const verbatim = foldMessageVerbatim(message);
+    const sourceTime = foldMessageSourceTime(message);
+    const tierBasis: ContinuityLedgerTierBasis = input.lifecycle === 'tail-epoch'
+      ? placement === 'rendered' ? 'tail-epoch-retained' : 'tail-epoch-fold'
+      : placement === 'rendered' ? 'hard-epoch-live' : 'hard-epoch-seed';
+    return {
+      unitId: provenance.id,
+      kind: `message:${message.role}`,
+      sectionId,
+      sourceProvenanceId: provenance.id,
+      sourceIdentityAuthority: provenance.authority,
+      sourceIndex,
+      sourceInstanceId: ownerInstanceId,
+      sourceTime,
+      sourceEndTime: null,
+      eraKey: sourceTime?.slice(0, 10) ?? null,
+      tier: placement === 'rendered' ? 't0' : placement === 'folded' ? 't2' : 't3',
+      tierBasis,
+      placement,
+      claim: `${input.lifecycle} ${message.role} message ${provenance.id}`,
+      verbatim,
+      sha256: sha256ContinuityLedgerVerbatim(verbatim),
+      origin: null,
+      recover: input.recover?.(sourceIndex, message)
+        ?? `fold_recall op="range" start_event=${sourceIndex} end_event_exclusive=${sourceIndex + 1}`,
+      workspace,
+    };
+  });
+  const sourceTimes = units.map((unit) => unit.sourceTime).filter((value): value is string => Boolean(value)).sort();
+  const sourceIndexes = units.map((unit) => unit.sourceIndex).filter((value): value is number => value !== null);
+  const sourceStartIndex = sourceIndexes.length > 0 ? Math.min(...sourceIndexes) : input.sourceStartIndex;
+  const sourceEndIndexExclusive = sourceIndexes.length > 0
+    ? Math.max(...sourceIndexes) + 1
+    : input.sourceStartIndex + input.messages.length;
+  return {
+    ownerInstanceId,
+    captureId,
+    workspace,
+    lifecycle: input.lifecycle,
+    sourceStartIndex,
+    sourceEndIndexExclusive,
+    sourceFirstTime: sourceTimes[0] ?? null,
+    sourceLastTime: sourceTimes.at(-1) ?? null,
+    units,
+  };
 }
 
 /**

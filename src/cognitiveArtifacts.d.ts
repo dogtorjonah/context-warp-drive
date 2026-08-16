@@ -54,7 +54,7 @@ export interface CognitiveArtifact {
      * 'transient' artifacts are unverified mid-flow narration conserved for
      * continuity only. Renderers must keep the distinction visible.
      */
-    trust: 'durable' | 'transient';
+    trust: 'durable' | 'transient' | 'diagnosis';
 }
 /** Options for extractCognitiveArtifacts / enrichFoldedBandBody. */
 export interface ExtractCognitiveArtifactsOptions {

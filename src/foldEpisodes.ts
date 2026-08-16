@@ -676,7 +676,12 @@ export function extractProcessNarrationLines(
   cap = PROCESS_MAX_LINES,
 ): ProcessNarrationLine[] {
   if (!text || toolStepCount < PROCESS_MIN_TOOL_STEPS || cap <= 0) return [];
-  if (messageMode === 'blocked' || messageMode === 'verdict' || messageMode === 'hazard') return [];
+  if (
+    messageMode === 'active_request'
+    || messageMode === 'blocked'
+    || messageMode === 'verdict'
+    || messageMode === 'hazard'
+  ) return [];
 
   const out: ProcessNarrationLine[] = [];
   const seenKinds = new Set<ProcessNarrationLine['kind']>();
@@ -687,7 +692,12 @@ export function extractProcessNarrationLines(
     if (trimmed.startsWith('```')) { inCodeBlock = !inCodeBlock; continue; }
     if (inCodeBlock || trimmed.length === 0) continue;
     const lineMode = classifyMessageGlyph(trimmed) ?? messageMode;
-    if (lineMode === 'blocked' || lineMode === 'verdict' || lineMode === 'hazard') continue;
+    if (
+      lineMode === 'active_request'
+      || lineMode === 'blocked'
+      || lineMode === 'verdict'
+      || lineMode === 'hazard'
+    ) continue;
     if (isSyntheticLine(trimmed) || NARRATION_QUOTED_VOICE_RE.test(trimmed)) continue;
     const stripped = trimmed
       .replace(/^(?:🔍|▶️?)\s*/u, '')
@@ -741,7 +751,13 @@ const NARRATION_NONVERDICT_LINE_RE = /^[🔍▶❓❔]/u;
 // ── Message glyph grammar (register tags) ────────────────────────────────
 
 /** Register an agent declares by opening a message with one SOP glyph. */
-export type MessageGlyphMode = 'working' | 'executing' | 'verdict' | 'hazard' | 'blocked';
+export type MessageGlyphMode =
+  | 'working'
+  | 'executing'
+  | 'active_request'
+  | 'verdict'
+  | 'hazard'
+  | 'blocked';
 
 // SOP taxonomy (sop/master.md P23): 🔍 in-progress · ▶ executing ·
 // 🏁 verified verdict · ⚠️ hazard/gotcha · ❓ blocked. Bare ▶/⚠/❔
@@ -751,6 +767,7 @@ const MESSAGE_GLYPHS: readonly (readonly [string, MessageGlyphMode])[] = [
   ['🔍', 'working'],
   ['▶️', 'executing'],
   ['▶', 'executing'],
+  ['🧭', 'active_request'],
   ['🏁', 'verdict'],
   ['⚠️', 'hazard'],
   ['⚠', 'hazard'],
@@ -785,7 +802,10 @@ export function classifyMessageGlyph(text: string | undefined): MessageGlyphMode
  * glyph as the deliberate trust signal.
  */
 export function isNarrationEligibleGlyph(mode: MessageGlyphMode | undefined): boolean {
-  return mode !== 'working' && mode !== 'executing' && mode !== 'blocked';
+  return mode !== 'working'
+    && mode !== 'executing'
+    && mode !== 'active_request'
+    && mode !== 'blocked';
 }
 
 /**
@@ -1934,6 +1954,37 @@ function fitCardToBudget(header: string, body: readonly string[], pointer: strin
  * after the hot chapter. The card ALWAYS ends with the pointer line into full
  * verbatim; budget enforcement never sacrifices it.
  */
+/**
+ * Revision verdict for an OWN-lineage recall card: how the episode's observed
+ * git revision relates to the caller's current revision. Peer cards keep the
+ * stricter peer-evidence boundary (resolvePeerEvidenceDisposition); this line
+ * closes the own-lineage asymmetry so a historical card of mine stops reading
+ * as automatically current after HEAD moves. Unknown means either side carries
+ * no revision — absence is reported, never inferred.
+ */
+export function resolveOwnLineageRevisionDisposition(
+  episode: Episode,
+  opts: Pick<ChainCardOptions, 'currentRevision'>,
+): 'current' | 'stale' | 'unknown' {
+  const observed = nonEmptyScalar(episode.gitHead);
+  const current = nonEmptyScalar(opts.currentRevision);
+  if (!observed || !current) return 'unknown';
+  return observed === current ? 'current' : 'stale';
+}
+
+/** Render the own-lineage revision verdict; null when neither side carries a revision. */
+export function formatOwnLineageRevisionLine(
+  episode: Episode,
+  opts: Pick<ChainCardOptions, 'currentRevision'>,
+): string | null {
+  const observed = nonEmptyScalar(episode.gitHead);
+  const current = nonEmptyScalar(opts.currentRevision);
+  if (!observed && !current) return null;
+  return renderHistoricalClaim(derivedHistoricalClaim(
+    `  ↞ own rev: ${resolveOwnLineageRevisionDisposition(episode, opts)} (observed=${observed || 'unknown'} current=${current || 'unknown'})`,
+  ));
+}
+
 export function formatChainCard(
   chapters: readonly Episode[],
   targetPath: string,
@@ -1960,11 +2011,16 @@ export function formatChainCard(
   const header = renderHistoricalClaim(derivedHistoricalClaim(
     `[Episode recall ${targetPath} — ${formatEpisodeDate(hot.endedAt)}, "${truncateVerbatim(hot.summary, HEADER_SUMMARY_CAP_CHARS)}"]`,
   ));
-  const peerBoundary = isForeignChapter(hot, opts)
+  const foreignHot = isForeignChapter(hot, opts);
+  const peerBoundary = foreignHot
     ? formatPeerEvidenceBoundary(hot, targetPath, opts)
     : undefined;
+  const ownRevisionLine = foreignHot
+    ? undefined
+    : formatOwnLineageRevisionLine(hot, opts);
   const body = [
     ...(peerBoundary ? [peerBoundary] : []),
+    ...(ownRevisionLine ? [ownRevisionLine] : []),
     ...renderChapterBody(hot, sinceDeltas, maxVoice, hotLabel),
   ];
 
@@ -2808,14 +2864,21 @@ export function episodicCardAlreadyInPov(card: EpisodicRecallCardLike, providerP
  * Suppress information-resident cards before noteEpisodicInjection mutates
  * served/walk state. Header replay is handled separately; this catches the
  * first circular injection when the source narration is already visible.
+ * suppressedOut (optional) receives the dropped cards so callers can render
+ * a bounded one-line audit of what the selector rejected at this boundary.
  */
 export function suppressEpisodicCardsAlreadyInPov(
   state: EpisodicInjectionState,
   cards: readonly EpisodicRecallCardLike[] | null,
   providerPovText: string,
+  suppressedOut?: EpisodicRecallCardLike[],
 ): EpisodicRecallCardLike[] | null {
   if (!cards || cards.length === 0 || !providerPovText) return cards ? [...cards] : null;
-  const kept = cards.filter((card) => !episodicCardAlreadyInPov(card, providerPovText));
+  const kept: EpisodicRecallCardLike[] = [];
+  for (const card of cards) {
+    if (episodicCardAlreadyInPov(card, providerPovText)) suppressedOut?.push(card);
+    else kept.push(card);
+  }
   const suppressed = cards.length - kept.length;
   state.episodicSuppressed += suppressed;
   state.episodicPovSuppressed += suppressed;
@@ -2850,13 +2913,60 @@ export function filterEpisodicCardsServedThisEpoch(
   state: EpisodicInjectionState,
   cards: readonly EpisodicRecallCardLike[] | null,
   epoch: number,
+  suppressedOut?: EpisodicRecallCardLike[],
 ): EpisodicRecallCardLike[] | null {
   if (!cards || cards.length === 0) return cards ? [...cards] : null;
-  const kept = cards.filter((card) => {
+  const kept: EpisodicRecallCardLike[] = [];
+  for (const card of cards) {
     const served = state.servedPathCardSignatures.get(card.targetPath);
-    return !(served && served.epoch === epoch && served.signature === episodicCardSignature(card));
-  });
+    if (served && served.epoch === epoch && served.signature === episodicCardSignature(card)) {
+      suppressedOut?.push(card);
+    } else {
+      kept.push(card);
+    }
+  }
   return kept.length > 0 ? kept : null;
+}
+
+/** Upper bound on one-line titles rendered for cards suppressed at a boundary. */
+export const EPISODIC_SUPPRESSED_TITLES_MAX = 8;
+/** Per-title character clamp (truncation appends a single ellipsis). */
+export const EPISODIC_SUPPRESSED_TITLE_MAX_CHARS = 96;
+
+/**
+ * Compact audit trail for recall candidates suppressed at THIS boundary: up to
+ * EPISODIC_SUPPRESSED_TITLES_MAX one-line header titles, deduplicated, so the
+ * selector's rejects stay inspectable without re-inflating the window. The
+ * lifetime counters remain numbers; this block is the bounded "what exactly"
+ * companion. Returns null when nothing was suppressed. Pure string formatting;
+ * rides the synthetic block footer and is never mined as agent voice.
+ */
+export function formatEpisodicSuppressedTitlesBlock(
+  suppressed: readonly EpisodicRecallCardLike[],
+  maxTitles: number = EPISODIC_SUPPRESSED_TITLES_MAX,
+): string | null {
+  if (suppressed.length === 0) return null;
+  const cap = Math.max(0, Math.floor(maxTitles));
+  if (cap === 0) return null;
+  const seen = new Set<string>();
+  const titles: string[] = [];
+  for (const card of suppressed) {
+    if (titles.length >= cap) break;
+    const raw = episodicCardHeaderLine(card);
+    if (!raw) continue;
+    const title = raw.length > EPISODIC_SUPPRESSED_TITLE_MAX_CHARS
+      ? `${raw.slice(0, EPISODIC_SUPPRESSED_TITLE_MAX_CHARS - 1)}…`
+      : raw;
+    if (seen.has(title)) continue;
+    seen.add(title);
+    titles.push(title);
+  }
+  if (titles.length === 0) return null;
+  const more = suppressed.length > titles.length ? ` (+${suppressed.length - titles.length} more)` : '';
+  return [
+    `[suppressed at boundary: ${suppressed.length} candidate${suppressed.length === 1 ? '' : 's'}${more}]`,
+    ...titles.map((title) => `  · ${title}`),
+  ].join('\n');
 }
 
 export function noteEpisodicInjection(
@@ -3296,6 +3406,11 @@ export const EPISODIC_NARRATION_REMINDER =
  * mention-extraction self-excitation guard stays intact. Pure string formatting;
  * rides inside the synthetic block so it is never mined as agent voice. Stable per
  * card (no timestamps/counters) so it never churns the injection cache.
+ *
+ * Confidence is tier-derived, not score-derived, for the same cache-stability
+ * contract: path/rail/mention matches are exact-anchor tiers (high), continuity
+ * ledger matches are identity-indexed (mid), and term matches are the fuzziest
+ * lane by construction (low). A score number would churn every boundary.
  */
 export function formatEpisodicCardProvenance(card: EpisodicRecallCardLike): string {
   const ids = card.chapterIds ?? [];
@@ -3308,6 +3423,7 @@ export function formatEpisodicCardProvenance(card: EpisodicRecallCardLike): stri
     ? ` · gate:${card.debug.annotationBoostKind.replace(/^star:/, '')}`
     : '';
   let why: string;
+  let confidence: 'high' | 'mid' | 'low';
   switch (card.kind) {
     case 'term': {
       const colon = card.targetPath.indexOf(':');
@@ -3315,21 +3431,26 @@ export function formatEpisodicCardProvenance(card: EpisodicRecallCardLike): stri
         ? card.targetPath.slice(colon + 1).split('+').join(', ')
         : card.targetPath;
       why = `term-match (${terms})`;
+      confidence = 'low';
       break;
     }
     case 'rail':
       why = 'rail-match';
+      confidence = 'high';
       break;
     case 'mention':
       why = 'mention-match';
+      confidence = 'high';
       break;
     case 'ledger':
       why = 'ledger-match';
+      confidence = 'mid';
       break;
     default:
       why = 'path-match';
+      confidence = 'high';
   }
-  return `↞ why: ${why} · ${source}${gate}`;
+  return `↞ why: ${why} · conf:${confidence} · ${source}${gate}`;
 }
 
 /**

@@ -130,3 +130,69 @@ describe('cognitive artifact transient supersession', () => {
     expect(block).toContain(TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER);
   });
 });
+
+describe('conserved diagnosis lane', () => {
+  const longDiagnosis =
+    '🔍 I walked the ledger end to end and compared the observe path against the sidecar assembler while the grinder kept running in the background of this fold window, checking every persisted row twice. Ledger has the stars — observe is not the miss. Next I will chase the queryCurrent read and see whether the empty projection comes from the harvest drop instead of the persist path.';
+
+  it('conserves the newest belief-changing sentence from a long gated narration', () => {
+    expect(longDiagnosis.length).toBeGreaterThan(240);
+    const artifacts = extractCognitiveArtifacts([assistant(longDiagnosis)]);
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0]).toMatchObject({
+      trust: 'diagnosis',
+      glyph: 'Δ',
+      register: 'in_progress',
+      headline: 'Ledger has the stars — observe is not the miss.',
+      authorityClass: 'historical_observation',
+      completionSupport: 'insufficient_alone',
+    });
+  });
+
+  it('keeps exactly one diagnosis per window — the newest candidate wins', () => {
+    const older =
+      '🔍 First pass over the selector and the ranking pipeline with every guard disabled so the raw ordering shows through, which took several reads of the same section to untangle properly before anything was clear. The stale entry id turns out to be harmless here. I will keep going and read the residency map next to see who pages this window back in.';
+    expect(older.length).toBeGreaterThan(240);
+    const artifacts = extractCognitiveArtifacts([assistant(older), assistant(longDiagnosis)]);
+    const diagnoses = artifacts.filter((a) => a.trust === 'diagnosis');
+    expect(diagnoses).toHaveLength(1);
+    expect(diagnoses[0].messageIndex).toBe(1);
+    expect(diagnoses[0].headline).toBe('Ledger has the stars — observe is not the miss.');
+  });
+
+  it('leaves long chatter without belief-change cues fully gated', () => {
+    const chatter =
+      '🔍 Reading through the module again and taking notes on the structure while the checks run in the background, then I will look at the renderer and the provenance lines and the disclaimer stack before deciding anything, and after that I want to compare the two copies of the file for drift and check the imports one more time to be sure.';
+    expect(chatter.length).toBeGreaterThan(240);
+    expect(extractCognitiveArtifacts([assistant(chatter)])).toHaveLength(0);
+  });
+
+  it('short narrations still ride the transient lane, never the diagnosis lane', () => {
+    const artifacts = extractCognitiveArtifacts([
+      assistant('🔍 The cache is the culprit maybe — checking now.'),
+    ]);
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0].trust).toBe('transient');
+  });
+
+  it('a later durable verdict supersedes the conserved diagnosis', () => {
+    const artifacts = extractCognitiveArtifacts([
+      assistant(longDiagnosis),
+      assistant('🏁 Confirmed: harvest drop reproduced and fixed.'),
+    ]);
+    const diagnosis = artifacts.find((a) => a.trust === 'diagnosis');
+    expect(diagnosis?.currentStatus).toBe('superseded');
+    expect(diagnosis?.supersededByMessageIndex).toBe(1);
+  });
+
+  it('renders the Δ disclaimer without granting durable authority', () => {
+    const artifacts = extractCognitiveArtifacts([assistant(longDiagnosis)]);
+    const block = renderCognitiveBlock(artifacts, { supersedesElderTransientNotes: true });
+    expect(block).toContain('Δ lines are conserved diagnoses');
+    expect(block).toContain('Δ Ledger has the stars — observe is not the miss.');
+    // A diagnosis is not a durable waypoint: it cannot trigger elder-band
+    // supersession, and a diagnosis-only block carries no transient disclaimer.
+    expect(block).not.toContain('supersede transient flow notes frozen in elder band(s)');
+    expect(block).not.toContain(TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER);
+  });
+});

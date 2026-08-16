@@ -241,6 +241,80 @@ describe('artifact-mode band body — flag on', () => {
   });
 });
 
+describe('honest fold chrome — header composition stamp', () => {
+  const artifactConfig: FoldConfig = { ...TEST_FOLD_CONFIG, artifactModeBody: buildArtifactModeBody };
+
+  function header(messages: FoldMessage[]): string {
+    return foldBlockText(messages, artifactConfig, 3).split('\n')[0]!;
+  }
+
+  it('declares diagnosis=kept and pending=live for a conserved verdict plus an open commitment', () => {
+    // The diagnosis lane harvests only from LONG clean narration (a short 🏁
+    // becomes a durable waypoint instead), so the belief-changer rides a
+    // >240-char 🔍 investigation message — the exact shape the 240-gate used
+    // to destroy.
+    const longDiagnosis = '🔍 Walked the harvest path end to end: the observe pass reads every ledger row, '
+      + 'the star census matches the persisted counts, and the projection cursor moves exactly as documented '
+      + 'across all three windows I replayed, each time with identical rowcounts and no skipped batches. '
+      + 'Ledger has the stars — observe is not the miss.';
+    const h = header([
+      { role: 'user', content: 'why is the ledger empty?', tsMs: T1 },
+      toolUse('r1', 'Read', { file_path: '/home/jonah/repo/src/observe.ts' }, T1),
+      toolResult('r1', 'observe source contents', T1),
+      { role: 'assistant', content: longDiagnosis, tsMs: T2 },
+      { role: 'user', content: 'keep digging into the cursor', tsMs: T2 },
+      { role: 'assistant', content: "▶ I'll check the harvest cursor next.", tsMs: T3 },
+    ]);
+    expect(h).toContain('artifact=receipts+waypoints');
+    expect(h).toContain('diagnosis=kept');
+    expect(h).toContain('pending=live');
+  });
+
+  it('declares pending=operator-superseded when a genuine operator message kills an open commitment', () => {
+    const h = header([
+      { role: 'user', content: 'chase the empty artifacts bug', tsMs: T1 },
+      { role: 'assistant', content: "▶ I'll trace the extraction path and post the packet.", tsMs: T1 },
+      { role: 'user', content: 'its ok fold bug hunt is on it.', tsMs: T2 },
+      { role: 'assistant', content: 'Standing by on that lane.', tsMs: T2 },
+    ]);
+    expect(h).toContain('diagnosis=none');
+    expect(h).toContain('pending=operator-superseded');
+  });
+
+  it('declares pending=settled when the assistant closes its own commitment', () => {
+    const h = header([
+      { role: 'user', content: 'run the suite for the fold slice', tsMs: T1 },
+      { role: 'assistant', content: "▶ I'll run the suite now.", tsMs: T1 },
+      { role: 'user', content: 'continue', tsMs: T2 },
+      { role: 'assistant', content: '🏁 Verified: suite green, twelve passed.', tsMs: T3 },
+    ]);
+    expect(h).toContain('pending=settled');
+  });
+
+  it('declares the measured pending=none for a quiet grinder window — a genuine operator message with no open commitment never invents a supersession', () => {
+    const h = header([
+      { role: 'user', content: 'scan the repo for stale selectors', tsMs: T1 },
+      toolUse('r1', 'Read', { file_path: '/home/jonah/repo/src/selectors.ts' }, T1),
+      toolResult('r1', 'selector table contents', T1),
+      { role: 'assistant', content: 'Scan output attached above.', tsMs: T2 },
+    ]);
+    expect(h).toContain('diagnosis=none');
+    expect(h).toContain('pending=none');
+    expect(h).not.toContain('operator-superseded');
+  });
+
+  it('renders a byte-identical legacy header when no artifact builder is injected', () => {
+    const fixture: FoldMessage[] = [
+      { role: 'user', content: 'fix the classifier in src/a.ts', tsMs: T1 },
+      { role: 'assistant', content: '🏁 Ledger has the stars — observe is not the miss.', tsMs: T2 },
+    ];
+    const legacyHeader = foldBlockText(fixture, TEST_FOLD_CONFIG, 3).split('\n')[0]!;
+    expect(legacyHeader).not.toContain('artifact=');
+    expect(legacyHeader).not.toContain('diagnosis=');
+    expect(legacyHeader).not.toContain('pending=');
+  });
+});
+
 describe('FoldSession env integration', () => {
   const fixtureHistory = (): FoldMessage[] => [
     { role: 'user', content: 'question one', tsMs: T1 },

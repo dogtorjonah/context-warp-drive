@@ -43,6 +43,15 @@ describe('rebirth dialogue control-message classification', () => {
     expect(isGenuineRebirthOperatorMessage(operator)).toBe(true);
   });
 
+  it('keeps retired sidequest-cleanup rows synthetic in historical transcripts', () => {
+    expect(isGenuineRebirthOperatorMessage(
+      '[sidequest-cleanup] reviewer-1 completed; parent may collect the result.',
+    )).toBe(false);
+    expect(isGenuineRebirthOperatorMessage(
+      'Why did [sidequest-cleanup] appear as a genuine operator message?',
+    )).toBe(true);
+  });
+
   it('keeps the fork-point genuine user in quota when a later wave directive has user role', () => {
     const messages = [
       { id: 'u1', type: 'user', text: 'The genuine fork-point request.', created_at: '2026-01-01T00:00:00.000Z' },

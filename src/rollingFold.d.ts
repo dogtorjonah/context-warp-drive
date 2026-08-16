@@ -682,4 +682,15 @@ export declare function extractToolPathSet(messages: readonly FoldMessage[]): Se
  * self-tap to recover any folded result.
  */
 export declare function intraTurnFold(messages: FoldMessage[], config?: IntraTurnFoldConfig, syntheticContext?: SyntheticContextOptions): IntraTurnFoldResult;
+/**
+ * Honest fold-block header chrome: composition + conserved-diagnosis presence
+ * + fold-scope pending-commitment state riding the fold header. Absent chrome
+ * renders a byte-identical legacy header (provider-cache invariant).
+ */
+export interface FoldArtifactChrome {
+    /** Body composition label, e.g. 'receipts+waypoints'. */
+    readonly artifact: string;
+    readonly diagnosis: 'kept' | 'none';
+    readonly pending: 'live' | 'settled' | 'operator-superseded' | 'none';
+}
 export {};

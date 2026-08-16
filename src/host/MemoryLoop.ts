@@ -63,6 +63,7 @@ import {
   buildLineageGlyphLogFromMessages,
 } from '../rawRebirthSeed.ts';
 import { buildRawHardEpochSeed, DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS } from '../foldFreeze.ts';
+import { StandaloneContinuityLedgerStore } from './continuityLedgerStore.ts';
 
 export interface MemoryLoopOptions {
   /** A configured FoldSession (fold + freeze orchestrator). */
@@ -83,6 +84,12 @@ export interface MemoryLoopOptions {
   readonly syntheticContext?: SyntheticContextOptions;
   /** Root directory for live-source resolution (default: process.cwd()). */
   readonly rootDir?: string;
+  /** Optional async content-free ledger + exact source store. */
+  readonly continuityLedgerStore?: StandaloneContinuityLedgerStore;
+  /** Ledger owner identity (default: sessionId, then 'default'). */
+  readonly continuityOwnerInstanceId?: string;
+  /** Optional workspace attached to automatically-addressed epoch records. */
+  readonly continuityWorkspace?: string | null;
 }
 
 export interface MemoryLoopPrepareContext extends Partial<FoldPrepareContext> {
@@ -137,6 +144,11 @@ export class MemoryLoop {
   private readonly fileMetaProvider: FileMetaProvider | null;
   private readonly syntheticContext: SyntheticContextOptions;
   private readonly rootDir: string;
+  private readonly continuityLedgerStore: StandaloneContinuityLedgerStore | null;
+  private readonly continuityOwnerInstanceId: string;
+  private readonly continuityWorkspace: string | null;
+  private continuityCaptureSequence = 0;
+  private readonly pendingContinuityWrites = new Set<Promise<unknown>>();
 
   // Touch-set accumulator for affinity (one entry per tool boundary).
   private readonly touchHistory: Array<ReadonlySet<string>> = [];
@@ -162,6 +174,11 @@ export class MemoryLoop {
     this.fileMetaProvider = options.fileMetaProvider ?? null;
     this.syntheticContext = options.syntheticContext ?? {};
     this.rootDir = options.rootDir ?? process.cwd();
+    this.continuityLedgerStore = options.continuityLedgerStore ?? null;
+    this.continuityOwnerInstanceId = options.continuityOwnerInstanceId?.trim()
+      || options.sessionId?.trim()
+      || 'default';
+    this.continuityWorkspace = options.continuityWorkspace?.trim() || null;
   }
 
   /**
@@ -188,6 +205,27 @@ export class MemoryLoop {
       && (context.hardEpoch === true
         || session.willTriggerPressureCeiling(context.measuredInputTokens));
 
+    const requestedLedger = context.continuityLedger;
+    const ledgerAddress = requestedLedger ?? (this.continuityLedgerStore
+      ? {
+          ownerInstanceId: this.continuityOwnerInstanceId,
+          captureId: `${this.continuityOwnerInstanceId}:memory-loop-epoch#${this.continuityCaptureSequence + 1}`,
+          workspace: this.continuityWorkspace,
+        }
+      : undefined);
+    const continuityLedger = ledgerAddress && this.continuityLedgerStore
+      ? {
+          ...ledgerAddress,
+          recover: ledgerAddress.recover ?? ((sourceIndex: number) => (
+            this.continuityLedgerStore!.renderRecoveryHandle(
+              ledgerAddress.ownerInstanceId,
+              ledgerAddress.captureId,
+              sourceIndex,
+            )
+          )),
+        }
+      : ledgerAddress;
+
     const foldOutcome = session.prepare(rawHistory, {
       measuredInputTokens: context.measuredInputTokens,
       fidelity: context.fidelity,
@@ -202,7 +240,20 @@ export class MemoryLoop {
       hardEpochSeed: needsPortableSeed
         ? this.buildPortableHardEpochSeed(rawHistory, this.episodeRuntime, this.recallState.index, context)
         : context.hardEpochSeed,
+      continuityLedger,
     });
+
+    if (foldOutcome.continuityLedger && this.continuityLedgerStore) {
+      this.continuityCaptureSequence += 1;
+      const write = this.continuityLedgerStore.record(foldOutcome.continuityLedger);
+      this.pendingContinuityWrites.add(write);
+      void write
+        .catch(() => {
+          // Provider-visible continuity already committed; persistence is
+          // deliberately fail-open and can be retried by the host.
+        })
+        .finally(() => this.pendingContinuityWrites.delete(write));
+    }
 
     const isEpoch = !foldOutcome.cacheHot;
 
@@ -424,5 +475,11 @@ export class MemoryLoop {
    */
   getEpisodeRuntime(): EpisodeRuntime | null {
     return this.episodeRuntime;
+  }
+
+  /** Wait for all fire-and-forget epoch ledger writes queued by prepare(). */
+  async flushContinuityLedger(): Promise<void> {
+    await Promise.allSettled([...this.pendingContinuityWrites]);
+    await this.continuityLedgerStore?.flush();
   }
 }

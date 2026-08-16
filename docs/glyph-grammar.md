@@ -2,7 +2,7 @@
 
 A one-character convention that turns ordinary assistant messages into a machine-readable trust signal — the substrate that lets episodic recall harvest **durable** memory from a stream of in-progress chatter without an LLM judging each line.
 
-## The five registers
+## The six registers
 
 Every assistant message opens with exactly one register glyph:
 
@@ -10,11 +10,14 @@ Every assistant message opens with exactly one register glyph:
 |---|---|---|---|
 | 🔍 | `in_progress` | investigating, building, partial findings, hypotheses | transient (not final) |
 | ▶ | `executing` | tool, edit, test, or batch execution is actively underway | transient (not final) |
+| 🧭 | `active_request` | the agent's interpreted active request materially changed | directive cognition; non-final and non-authoritative |
 | 🏁 | `verdict` | a verified outcome or settled conclusion | **durable**, final |
 | ⚠️ | `hazard` | a trap, gotcha, or invariant others must know | **durable**, final |
 | ❓ | `blocked` | needs a decision or input to proceed | final, not durable |
 
 When in doubt, a message is `in_progress` (🔍). Tag what the message **is**, not what you hope it becomes.
+
+`🧭` is deliberately sparse. Emit exactly `🧭 Active request: <concise request>` only on a material intent transition, never as routine status. Its persisted source identity and source time make it a durable Cognitive Artifact, but it remains an agent-authored historical observation: raw operator chronology always wins. A later genuine operator message expires an older claim; rebirth may show the latest claim and one explicitly expired predecessor as fallback context.
 
 ## Tap stars — an independent salience axis
 
@@ -42,7 +45,7 @@ Strict, deterministic, first-character parse:
 
 Episodic capture mines an agent's burst-final prose into durable memory. Without a register signal, a confident-sounding **mid-investigation hypothesis** (which is often wrong) looks identical to a **verified conclusion** — and gets harvested as fact. The glyph is a coarse trust gate ahead of the shape filter:
 
-- 🔍 / ▶ / ❓ messages **self-exclude** from harvest — in-progress, executing, and blocked work can never masquerade as a verdict.
+- 🔍 / ▶ / 🧭 / ❓ messages **self-exclude** from episode narration harvest — in-progress work, intent claims, and blockers can never masquerade as a verdict. The separate Cognitive Artifact path durably harvests 🧭.
 - 🏁 / ⚠️ messages are eligible, and their register sets the harvested line's **trust tier**: 🏁 → `narration:verdict`, ⚠️ → `narration:hazard`, both promoted into the high-priority ranking tier so a declared conclusion can outrank a routine log line.
 - Untagged prose stays a priority-last backstop — behavior is byte-identical at 0% glyph compliance and strictly less noisy above it.
 
@@ -52,7 +55,7 @@ In short: the grammar is what makes the high-frequency commentary channel a *pri
 
 Parsing is only half the grammar: a host that never *instructs* its model to open messages with a register glyph gets 0% compliance and the entire trust ladder runs on the untagged backstop. The engine therefore exports the emit contract alongside the parser:
 
-- **`REGISTER_GLYPH_PROMPT_SNIPPET`** — a canonical one-paragraph system-prompt instruction, derived at module load from `REGISTER_GLYPHS` + `REGISTER_DESCRIPTIONS` so the emit wording can never drift from what `parseRegisterGlyph` accepts. Inject it into any system prompt that drives a model through this engine.
+- **`REGISTER_GLYPH_PROMPT_SNIPPET`** — a canonical one-paragraph system-prompt instruction, derived at module load from `REGISTER_GLYPHS` + `REGISTER_DESCRIPTIONS` so the emit wording can never drift from what `parseRegisterGlyph` accepts, including 🧭's non-authoritative transition rule. Inject it into any system prompt that drives a model through this engine.
 - **`buildRegisterGlyphPromptSnippet(descriptions?)`** — same derivation with a replaceable description table (localization / house-style wording); the glyph set always comes from `REGISTER_GLYPHS`.
 - **`CARD_GLYPHS`** — the quoted-memory glyphs (✎ ⭐ 💬 🗣 ⌖ Δ ↞ ↠) that must never open fresh speech; the snippet names them as forbidden openers to prevent echo contamination (replayed memory re-harvested as a fresh verdict).
 

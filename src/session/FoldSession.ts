@@ -64,6 +64,11 @@ import {
 } from '../chronologicalProvenance.ts';
 import { renderEpochContinuityCapsule } from '../epochContinuityCapsule.ts';
 import {
+  buildContinuityLedgerCaptureFromFoldEpoch,
+  type ContinuityLedgerCaptureRecord,
+  type ContinuityLedgerPlacement,
+} from '../rebirthPackageV6.ts';
+import {
   readPendingAssistantContinuityFromTrustedMessages,
   reducePendingAssistantContinuity,
 } from '../pendingAssistantAction.ts';
@@ -76,6 +81,7 @@ import {
   evaluateFoldFreeze,
   consumeFoldFreezeEvaluationState,
   commitFoldFreeze,
+  commitFoldFreezeFoundation,
   appendFoldFreezeTailEpoch,
   touchFoldFreeze,
   buildHardEpochSeedView,
@@ -245,6 +251,12 @@ export interface FoldSessionOptions {
    * budget.
    */
   readonly rawHardEpochSeedMaxChars?: number;
+  /**
+   * Storage-neutral commit hook. FoldSession calls it only after a tail or hard
+   * epoch has committed its provider-visible output. Hot reuse, skipped append,
+   * and one-shot preview helpers never fire it.
+   */
+  readonly onContinuityLedgerRecord?: (record: ContinuityLedgerCaptureRecord) => void;
 
   /**
    * Read-burst fold guard. When `true`, an epoch-time fold keeps
@@ -341,6 +353,14 @@ export interface FoldPrepareContext extends Partial<FoldFreezeContext> {
    * transcript remains recall backing.
    */
   readonly hardEpochSeed?: string | null;
+  /** Host-owned address for this call's epoch ledger rows. */
+  readonly continuityLedger?: {
+    readonly ownerInstanceId: string;
+    readonly captureId: string;
+    readonly workspace?: string | null;
+    /** Host-owned executable route back to the authoritative source row. */
+    readonly recover?: (sourceIndex: number, message: FoldMessage) => string;
+  };
 }
 
 export interface FoldStats {
@@ -409,6 +429,8 @@ export interface FoldOutcome {
    * the vault is off or self-gated to empty.
    */
   readonly vault?: string;
+  /** Canonical rows for the committed tail/hard epoch represented by this outcome. */
+  readonly continuityLedger?: ContinuityLedgerCaptureRecord;
 }
 
 /**
@@ -460,6 +482,7 @@ export class FoldSession {
    */
   private appendEpochsSinceHardReset = 0;
   private readonly rawHardEpochSeedMaxChars: number;
+  private readonly onContinuityLedgerRecord: ((record: ContinuityLedgerCaptureRecord) => void) | undefined;
   private readonly readBurstGuardEnabled: boolean;
   private readonly valueFidelityInput: FoldFidelityValueInput | undefined;
   private readonly syntheticContext: SyntheticContextOptions;
@@ -495,6 +518,7 @@ export class FoldSession {
       options.rawHardEpochSeedMaxChars,
       DEFAULT_RAW_HARD_EPOCH_SEED_MAX_CHARS,
     );
+    this.onContinuityLedgerRecord = options.onContinuityLedgerRecord;
     if (options.freeze === false) {
       this.freezeEnabled = false;
       this.freezeConfig = DEFAULT_FOLD_FREEZE_CONFIG;
@@ -632,6 +656,23 @@ export class FoldSession {
     const messages = appendUserMessageVaultToView(outcome.messages, block, this.vaultTailWindow);
     if (messages === outcome.messages) return { ...outcome, vault: block };
     return { ...outcome, messages, vault: block };
+  }
+
+  /** Attach and publish rows only after the corresponding epoch commit. */
+  private publishContinuityLedger(
+    outcome: FoldOutcome,
+    record: ContinuityLedgerCaptureRecord | null,
+  ): FoldOutcome {
+    if (!record) return outcome;
+    if (this.onContinuityLedgerRecord) {
+      try {
+        this.onContinuityLedgerRecord(record);
+      } catch {
+        // Persistence is host-owned and fail-open: a ledger callback can never
+        // invalidate provider-visible continuity that already committed.
+      }
+    }
+    return { ...outcome, continuityLedger: record };
   }
 
   /**
@@ -970,6 +1011,17 @@ export class FoldSession {
   }
 
   /**
+   * Automatic folding is pressure-authorized only. Freeze/cache lifecycle
+   * events may rebuild or reseal a provider view, but they cannot independently
+   * authorize turn compression. Explicit fold() and hardEpoch requests remain
+   * caller-owned operations outside this automatic predicate.
+   */
+  private isFoldPressureTriggered(measuredInputTokens: number | undefined): boolean {
+    const eligibility = this.resolvePressureEligibility(measuredInputTokens, true);
+    return eligibility.decision === 'append' || eligibility.decision === 'hard-epoch';
+  }
+
+  /**
    * Public pressure-ceiling probe. Lets hosts short-circuit expensive
    * pressure work when no measured ceiling hit is present. In single-ceiling
    * mode a true result may route to append rather than hard epoch. Mirrors the private check used inside
@@ -1060,6 +1112,7 @@ export class FoldSession {
     const totalTurns = detectTurns(messages, this.syntheticContext).length;
     const durableCursorIndex = context.durableCursorIndex ?? messages.length;
     const pressureCeilingTriggered = this.isPressureCeilingTriggered(context.measuredInputTokens);
+    const foldPressureTriggered = this.isFoldPressureTriggered(context.measuredInputTokens);
     const pressureAppendCandidate = pressureCeilingTriggered
       && this.singleCeilingMode
       && this.freezeEnabled
@@ -1109,7 +1162,9 @@ export class FoldSession {
       const foldConfig = this.effectiveFoldConfig(desiredFidelity);
       const result = foldContext(
         messages,
-        this.guardedTurnsToFold(messages, pressureCeilingTriggered, now),
+        foldPressureTriggered
+          ? this.guardedTurnsToFold(messages, pressureCeilingTriggered, now)
+          : 0,
         foldConfig,
         this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
           allowVaultBackedCoverage: pressureCeilingTriggered,
@@ -1120,7 +1175,9 @@ export class FoldSession {
         this.syntheticContext,
         this.valueFidelityInput,
       );
-      const stepResult = this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig);
+      const stepResult = foldPressureTriggered
+        ? this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig)
+        : null;
       const bookkeepingResult = result.turnsFolded > 0 ? result : stepResult ?? result;
       const preparedMessages = stepResult?.messages ?? result.messages;
       // Artifact mode renders the [cognitive] block into the fold body itself,
@@ -1515,7 +1572,7 @@ export class FoldSession {
         }
         // Live overlay: deferred live row (excluded from the sealed band by
         // selectSealableVaultRows) still renders transiently.
-        return this.applyUnsealedVaultOverlay({
+        const outcome = this.applyUnsealedVaultOverlay({
           messages: appendView,
           cacheHot: false,
           sealedBoundary: appendCommit.sealedPrefixMessageCount,
@@ -1531,6 +1588,29 @@ export class FoldSession {
             appendShrinkRatio: appendCommit.shrinkRatio,
           },
         });
+        const foldTurns = tailStepPlan?.turns ?? detectTurns(tail, this.syntheticContext);
+        const foldedSourceOffsets = new Set<number>();
+        for (const turn of foldTurns.slice(0, tailResult.turnsFolded)) {
+          for (let index = turn.startIndex; index < turn.endIndex; index += 1) {
+            foldedSourceOffsets.add(index);
+          }
+        }
+        const placements: ContinuityLedgerPlacement[] = tail.map((_, index) => (
+          foldedSourceOffsets.has(index) ? 'folded' : 'rendered'
+        ));
+        const ledger = context.continuityLedger
+          ? buildContinuityLedgerCaptureFromFoldEpoch({
+              lifecycle: 'tail-epoch',
+              ownerInstanceId: context.continuityLedger.ownerInstanceId,
+              captureId: context.continuityLedger.captureId,
+              workspace: context.continuityLedger.workspace,
+              recover: context.continuityLedger.recover,
+              messages: tail,
+              sourceStartIndex: frozenCount,
+              placements,
+            })
+          : null;
+        return this.publishContinuityLedger(outcome, ledger);
       }
       if (pressureAppendPromoted) {
         const seedPrompt = context.hardEpochSeed?.trim() || buildRawHardEpochSeed(messages, {
@@ -1590,7 +1670,9 @@ export class FoldSession {
     const foldConfig = this.effectiveFoldConfig(desiredFidelity);
     const result = foldContext(
       messages,
-      this.guardedTurnsToFold(messages, pressureCeilingTriggered, now),
+      foldPressureTriggered
+        ? this.guardedTurnsToFold(messages, pressureCeilingTriggered, now)
+        : 0,
       foldConfig,
       this.buildFoldEvictionInput(messages, durableCursorIndex, upcomingEpoch, now, {
         allowVaultBackedCoverage: pressureCeilingTriggered,
@@ -1601,7 +1683,9 @@ export class FoldSession {
       this.syntheticContext,
       this.valueFidelityInput,
     );
-    const stepResult = this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig);
+    const stepResult = foldPressureTriggered
+      ? this.foldMarathonSteps(result.messages, context.measuredInputTokens, durableCursorIndex, foldConfig)
+      : null;
     const bookkeepingResult = result.turnsFolded > 0 ? result : stepResult ?? result;
     // Whole-view rebuild: render the whole vault and bake it into the frozen view
     // before sealing (resets the sealed set, mirroring commitFoldFreeze clearing
@@ -1620,14 +1704,15 @@ export class FoldSession {
       && !viewCarriesSyntheticCognitiveBlock(sealedBaseView)
       ? mergeBlockIntoViewTail(sealedBaseView, recomputeCognitiveBlock)
       : sealedBaseView;
-    commitFoldFreeze(
-      this.freezeState,
-      messages,
-      sealedView,
-      ctx,
-      now,
-      recomputeReason === 'restore-integrity-failed' ? 'restore-integrity-failed' : 'first-call',
-    );
+    const compressedTurns = bookkeepingResult.turnsFolded > 0;
+    const commitCause = recomputeReason === 'restore-integrity-failed'
+      ? 'restore-integrity-failed'
+      : 'first-call';
+    if (compressedTurns) {
+      commitFoldFreeze(this.freezeState, messages, sealedView, ctx, now, commitCause);
+    } else {
+      commitFoldFreezeFoundation(this.freezeState, messages, sealedView, ctx, now, commitCause);
+    }
     // In-place recompute clears the sealed-band generation, but it does not
     // reset the hard-epoch generation. Keep the runway gate's arming counter:
     // the floor itself PERSISTS, so resetting the counter here would create a
@@ -1635,7 +1720,8 @@ export class FoldSession {
     // high. Only a hard epoch clears both the floor and the counter. Arm
     // post-epoch floor capture so the next measured reading can re-baseline it
     // downward or seed a first floor (GOD RULE 7: provider-measured readings only).
-    if (typeof context.measuredInputTokens === 'number'
+    if (compressedTurns
+      && typeof context.measuredInputTokens === 'number'
       && Number.isFinite(context.measuredInputTokens)
       && context.measuredInputTokens > 0) {
       this.pendingTailEpochPostFoldFloor = { preFoldTokens: Math.floor(context.measuredInputTokens) };
@@ -1742,7 +1828,7 @@ export class FoldSession {
       && context.measuredInputTokens > 0
         ? { preFoldTokens: Math.floor(context.measuredInputTokens) }
         : null;
-    return {
+    const outcome: FoldOutcome = {
       messages: view,
       cacheHot: false,
       sealedBoundary: this.freezeEnabled ? (this.freezeState.lastAppendBoundaryViewCount ?? null) : undefined,
@@ -1753,6 +1839,26 @@ export class FoldSession {
         epochReason,
       },
     };
+    let trailingLiveStart = messages.length;
+    while (trailingLiveStart > 0 && messages[trailingLiveStart - 1]?.role === 'user') {
+      trailingLiveStart -= 1;
+    }
+    const placements: ContinuityLedgerPlacement[] = messages.map((_, index) => (
+      index >= trailingLiveStart ? 'rendered' : 'elided'
+    ));
+    const ledger = context.continuityLedger
+      ? buildContinuityLedgerCaptureFromFoldEpoch({
+          lifecycle: 'hard-epoch',
+          ownerInstanceId: context.continuityLedger.ownerInstanceId,
+          captureId: context.continuityLedger.captureId,
+          workspace: context.continuityLedger.workspace,
+          recover: context.continuityLedger.recover,
+          messages,
+          sourceStartIndex: 0,
+          placements,
+        })
+      : null;
+    return this.publishContinuityLedger(outcome, ledger);
   }
 
   private statsFromResult(

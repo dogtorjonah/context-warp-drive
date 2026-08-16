@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildContinuityReceipt } from '../continuityReceipt.ts';
 import { buildRawHardEpochSeed } from '../foldFreeze.ts';
 import {
+  DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS,
   REBIRTH_PACKAGE_V6_SECTION_IDS,
   REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS,
   adaptLegacyRebirthPackageToV6,
@@ -156,6 +157,51 @@ function model(
 }
 
 describe('Rebirth Package v6', () => {
+  it('renders indexed cognition absence and degradation without claiming the stores are empty', () => {
+    const cognitionText = (value: RebirthPackageV6Model): string => (
+      renderRebirthPackageV6Sections(value)
+        .find((section) => section.id === 'cognitiveArtifacts')?.text ?? ''
+    );
+    const receipt = {
+      status: 'complete' as const,
+      capturedAt: '2026-08-02T18:00:00.000Z',
+      totalMatched: 0,
+      overlayCount: 0,
+      missingFamilies: [] as string[],
+      warnings: [] as string[],
+    };
+
+    const completeEmpty = cognitionText(model({
+      cognitiveArtifacts: [],
+      cognitiveArtifactCapture: receipt,
+    }));
+    expect(completeEmpty).toContain('bounded indexed cognitive projection returned zero current rows');
+    expect(completeEmpty).toContain('Capture receipt: status=complete');
+    expect(completeEmpty).not.toContain('No relevant current cognitive artifacts captured.');
+
+    const partial = cognitionText(model({
+      cognitiveArtifacts: [],
+      cognitiveArtifactCapture: {
+        ...receipt,
+        status: 'partial',
+        missingFamilies: ['star', 'rail'],
+        warnings: ['cognitive ledger: indexed current query unavailable; using bounded overlay only'],
+      },
+    }));
+    expect(partial).toContain('projection is partial; zero rendered rows are not evidence');
+    expect(partial).toContain('Missing indexed families: star, rail');
+    expect(partial).toContain('indexed current query unavailable; using bounded overlay only');
+
+    const unavailable = cognitionText(model({
+      cognitiveArtifacts: [],
+      cognitiveArtifactCapture: { ...receipt, status: 'unavailable', totalMatched: null },
+    }));
+    expect(unavailable).toContain('projection is unavailable; zero rendered rows are not evidence');
+
+    const legacyUnknown = cognitionText(model({ cognitiveArtifacts: [] }));
+    expect(legacyUnknown).toContain('projection status is unknown for this persisted package');
+  });
+
   it('renders the fixed six-section order and de-duplicates promoted dialogue', () => {
     const value = model();
     const sections = renderRebirthPackageV6Sections(value);
@@ -356,6 +402,28 @@ describe('Rebirth Package v6', () => {
     expect(section!.text).not.toContain('end of the long note body');
   });
 
+  it('renders timestamped cognition newest-first and backfills toward the global package cap', () => {
+    const cognitiveArtifacts = Array.from({ length: 240 }, (_, index) => ({
+      provenanceId: `cognition:${index}`,
+      sourceAt: new Date(Date.UTC(2026, 7, 1, 0, index)).toISOString(),
+      kind: 'result' as const,
+      text: `artifact-${index} ${'durable cognition '.repeat(28)}`,
+      authority: 'current' as const,
+      supersededBy: null,
+    }));
+    const value = model({ cognitiveArtifacts });
+    const section = renderRebirthPackageV6Sections(value)
+      .find((candidate) => candidate.id === 'cognitiveArtifacts');
+    const rendered = renderRebirthPackageV6(value);
+
+    expect(section).toBeTruthy();
+    expect(section!.text).toContain('artifact-239');
+    expect(section!.text).not.toContain('artifact-0 ');
+    expect(section!.text.length).toBeGreaterThan(60_000);
+    expect(rendered.length).toBeGreaterThan(90_000);
+    expect(rendered.length).toBeLessThanOrEqual(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
+  });
+
   it('publishes only executable recovery commands and marks unexposed stores unavailable', () => {
     const continuityReceipt = buildContinuityReceipt({
       boundary: 'continuation',
@@ -534,6 +602,137 @@ describe('Rebirth Package v6', () => {
     expect(value.executionState.facts).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'next_action', text: 'Resume the older brochure layout.' }),
     ]));
+  });
+
+  it('flags stale rail direction while sourcing a mirrored next_action from the active request', () => {
+    // Lived fixture: a 17:11 rail row still commanding after the operator
+    // pivoted at 17:18:50. The rail must carry the measured-order flag, while
+    // next_action (which buildContinuityReceipt mirrors from activeRequestText)
+    // must carry the operator row's own provenance and remain unflagged.
+    const continuityReceipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      capturedAt: '2026-08-14T17:30:00.000Z',
+      captureSourceId: 'capture-stale-rail',
+      activeRequestText: 'its ok fold bug hunt is on it.',
+      activeRequestSourceId: 'message:operator-pivot',
+      activeRequestSourceTimestamp: '2026-08-14T17:18:50.158Z',
+      pendingAssistantAction: {
+        status: 'unresolved',
+        text: 'Commit the diagnostics packet to the room.',
+        basis: 'assistant-commitment',
+        source: {
+          unit: 'message',
+          index: 11,
+          id: 'message:assistant-11',
+          timestamp: '2026-08-14T17:11:30.000Z',
+        },
+      },
+      rail: {
+        railId: 'rail-58fc5e71',
+        title: 'Cog-artifacts packet',
+        state: 'active',
+        updatedAt: '2026-08-14T17:11:00.000Z',
+        activeStep: {
+          id: 'step-post-packet',
+          title: 'Post the empty-artifacts packet',
+          status: 'active',
+          updatedAt: '2026-08-14T17:11:10.000Z',
+          instruction: 'Post the packet and wait for ACK.',
+        },
+        queuedStepTitle: 'Await ACK before editing',
+      },
+    });
+
+    const value = adaptLegacyRebirthPackageToV6({ continuityReceipt });
+    const byKind = new Map(value.executionState.facts.map((fact) => [fact.kind, fact]));
+    expect(byKind.get('rail')?.predatesActiveRequest).toBe(true);
+    expect(byKind.get('next_action')).toMatchObject({
+      text: 'its ok fold bug hunt is on it.',
+      sourceAt: '2026-08-14T17:18:50.158Z',
+      status: 'exact',
+    });
+    expect(byKind.get('next_action')?.provenanceId).toMatch(/^message:operator-pivot:/);
+    expect(byKind.get('next_action')?.predatesActiveRequest).toBeUndefined();
+    expect(byKind.get('pending_assistant_action')?.predatesActiveRequest).toBeUndefined();
+
+    const rendered = renderRebirthPackageV6(value);
+    expect(rendered).toMatch(/- rail · rail-58fc5e71[^\n]* · authority=predates-active-request/);
+    expect(rendered).toMatch(/- next_action · its ok fold bug hunt is on it\. · source=message:operator-pivot:[^\n]* · source-time=2026-08-14T17:18:50.158Z · status=exact/);
+    expect(rendered).not.toMatch(/- next_action ·[^\n]*authority=predates-active-request/);
+    expect(rendered).not.toMatch(/- pending_assistant_action ·[^\n]*authority=predates-active-request/);
+
+    // A receipt whose nextAction is genuinely rail-derived still keeps the
+    // older step source and the measured staleness marker.
+    const railDerived = adaptLegacyRebirthPackageToV6({
+      continuityReceipt: {
+        ...continuityReceipt,
+        nextAction: 'Await ACK before editing',
+      },
+    });
+    const railNextAction = railDerived.executionState.facts.find((fact) => fact.kind === 'next_action');
+    expect(railNextAction).toMatchObject({
+      text: 'Await ACK before editing',
+      sourceAt: '2026-08-14T17:11:10.000Z',
+      status: 'exact',
+      predatesActiveRequest: true,
+    });
+    expect(railNextAction?.provenanceId).toMatch(/^rail-58fc5e71:step-post-packet:/);
+  });
+
+  it('never flags rail facts when the rail postdates the request or either time is unknown', () => {
+    const postdating = adaptLegacyRebirthPackageToV6({
+      continuityReceipt: buildContinuityReceipt({
+        boundary: 'continuation',
+        predecessorName: 'worker-a',
+        capturedAt: '2026-08-14T18:00:00.000Z',
+        captureSourceId: 'capture-current-rail',
+        activeRequestText: 'load the rail, take care of the fold side.',
+        activeRequestSourceId: 'message:operator-order',
+        activeRequestSourceTimestamp: '2026-08-14T17:52:44.787Z',
+        rail: {
+          railId: 'rail-current',
+          title: 'Fold-side slices',
+          state: 'active',
+          updatedAt: '2026-08-14T17:53:30.000Z',
+          activeStep: {
+            id: 'step-live',
+            title: 'Slice 1 settlement',
+            status: 'active',
+            updatedAt: '2026-08-14T17:53:40.000Z',
+            instruction: 'Implement operator-superseded settlement.',
+          },
+          queuedStepTitle: 'Slice 2 diagnosis slot',
+        },
+      }),
+    });
+    for (const fact of postdating.executionState.facts) {
+      expect(fact.predatesActiveRequest).toBeUndefined();
+    }
+    expect(renderRebirthPackageV6(postdating)).not.toContain('authority=predates-active-request');
+
+    // Unknown request time: a rail row with a known time must NOT be flagged
+    // against a request whose time is unknown — no side of the comparison is
+    // ever guessed (God Rule 8).
+    const unknownRequestTime = adaptLegacyRebirthPackageToV6({
+      continuityReceipt: buildContinuityReceipt({
+        boundary: 'continuation',
+        predecessorName: 'worker-a',
+        capturedAt: '2026-08-14T18:00:00.000Z',
+        captureSourceId: 'capture-unknown-request',
+        activeRequestText: 'continue',
+        rail: {
+          railId: 'rail-known-time',
+          title: 'Known-time rail',
+          state: 'active',
+          updatedAt: '2026-08-14T17:40:00.000Z',
+        },
+      }),
+    });
+    for (const fact of unknownRequestTime.executionState.facts) {
+      expect(fact.predatesActiveRequest).toBeUndefined();
+    }
+    expect(renderRebirthPackageV6(unknownRequestTime)).not.toContain('authority=predates-active-request');
   });
 
   it('preserves the newest known conversation rows when the section budget overflows', () => {

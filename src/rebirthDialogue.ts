@@ -82,6 +82,8 @@ export function isGenuineRebirthOperatorMessage(text: string | null | undefined)
   if (/^\[(?:DIGEST DELTA|Digest Delta|RELAY DIGEST DELTA|Control Signals|System)\]/u.test(trimmed)) {
     return false;
   }
+  // `sidequest-cleanup` is retired as an active lifecycle surface, but its
+  // persisted user-role rows remain historical synthetic input forever.
   if (/^\[(?:long-horizon-continue|sidequest-cleanup)\b/iu.test(trimmed)) return false;
   // Atlas-debt nudges are relay-authored lifecycle rows persisted with a user
   // role (statusChange.ts buildAtlasDebtNudge, persistUserMessage: true). They
@@ -93,6 +95,27 @@ export function isGenuineRebirthOperatorMessage(text: string | null | undefined)
   }
   if (/^\[Chronological Provenance v\d+\]/u.test(trimmed)) return false;
   if (/^package_version:\s*\d+\s*\n\[CONTEXT REBIRTH\]/u.test(trimmed)) return false;
+  return true;
+}
+
+/**
+ * Genuine-operator filter shared with band-enrichment modules: true when a
+ * user-role message is an actual operator turn rather than a chatroom
+ * delivery, mention ping, digest delta, or ephemeral-only coordination frame.
+ * Canonical home is here beside its base predicate so low-level continuity
+ * reducers can consume it without importing the seed renderer (which itself
+ * imports those reducers); rawRebirthSeed re-exports it for existing callers.
+ */
+export function isPortableGenuineOperatorMessage(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (!isGenuineRebirthOperatorMessage(trimmed)) return false;
+  // Strip known ephemeral coordination markers
+  const stripped = trimmed
+    .replace(/\[DIGEST DELTA[^\]]*\][\s\S]*?\[END DIGEST DELTA\]/g, '')
+    .replace(/\[Control Signals\][\s\S]*?\[\/Control Signals\]/g, '')
+    .trim();
+  if (stripped.length === 0) return false;
   return true;
 }
 

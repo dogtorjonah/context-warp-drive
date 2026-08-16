@@ -94,6 +94,9 @@ function makeSession(options: { thresholdChars: number; eviction?: boolean } = {
     foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
     freeze: { enabled: true, ttlMs: 0, maxTailChars: 1_000_000 },
     eviction: options.eviction === false ? false : { thresholdChars: options.thresholdChars },
+    pressureCeiling: 1_000_000,
+    singleCeilingMode: false,
+    tailEpochRunway: { foldTriggerTokens: 1 },
     now: () => {
       now += 1_000;
       return now;
@@ -111,7 +114,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
       for (let i = 0; i < 3; i++) {
         messages.push(...turn(epoch * 3 + i));
       }
-      prepared = session.prepare(messages).messages;
+      prepared = session.prepare(messages, { measuredInputTokens: 1 }).messages;
     }
 
     const block = extractFoldBlock(prepared);
@@ -132,7 +135,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
       for (let i = 0; i < 3; i++) {
         messages.push(...turn(epoch * 3 + i));
       }
-      prepared = session.prepare(messages, { durableCursorIndex: 0 }).messages;
+      prepared = session.prepare(messages, { durableCursorIndex: 0, measuredInputTokens: 1 }).messages;
     }
 
     const block = extractFoldBlock(prepared);
@@ -228,7 +231,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
       for (let i = 0; i < 3; i++) {
         messages.push(...turn(epoch * 3 + i));
       }
-      prepared = session.prepare(messages).messages;
+      prepared = session.prepare(messages, { measuredInputTokens: 1 }).messages;
     }
 
     const block = extractFoldBlock(prepared);
@@ -264,7 +267,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
     expect(forced.stats.epochReason).toBe('hard-epoch');
     expect(forced.stats.pressureCeilingTokens).toBe(10);
     expect(forced.stats.pressureCeilingTriggered).toBe(true);
-    expect(session.telemetry.epochs).toBe(2);
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   test('the default pressure ceiling is the 240k measured-token guard', () => {
@@ -284,10 +287,11 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const first = turn(0);
-    const epoch = session.prepare(first);
+    const epoch = session.prepare(first, { measuredInputTokens: 1 });
     const appended = session.prepare(appendProfitableTurns(first, 1), { measuredInputTokens: 70_000 });
 
     expect(epoch.cacheHot).toBe(false);
@@ -296,7 +300,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.appendDecision).toBe('committed');
     expect(appended.stats.appendSavedChars).toBeGreaterThan(0);
     expect(appended.sealedBoundary).toBe(epoch.messages.length);
-    expect(session.telemetry.epochs).toBe(2);
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   test('keeps an unresolved tool call and newer operator message raw beyond the char budget', () => {
@@ -305,10 +309,11 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const first: FoldMessage[] = [userMsg('foundation request')];
-    session.prepare(first);
+    session.prepare(first, { measuredInputTokens: 1 });
     const liveObjective = 'FIX THE CONTINUITY THRASHING NOW';
     const grown: FoldMessage[] = [
       ...first,
@@ -329,12 +334,12 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(liveObjectiveIndex).toBeGreaterThanOrEqual(0);
     expect(joined).toContain('[Chronological Provenance v1]');
-    expect(joined).toContain('artifact=tail-epoch#2');
+    expect(joined).toContain('artifact=tail-epoch#1');
     expect(joined).toContain('raw-resumes=?:message#3 @ time unknown (2 exact)');
     expect(appended.messages.slice(-2)).toEqual(grown.slice(-2));
   });
 
-  test('hot-reuses instead of committing an unprofitable append band', () => {
+  test('hard-epochs instead of committing an unprofitable pressure-authorized append band', () => {
     const session = new FoldSession({
       foldConfig: {
         ...ALWAYS_ON_FOLD_CONFIG,
@@ -347,24 +352,23 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const first = turn(0);
-    const epoch = session.prepare(first);
+    const epoch = session.prepare(first, { measuredInputTokens: 1 });
     // The cold append-band profile skeletonizes band bodies, so a full turn(1)
     // now folds profitably. A genuinely unprofitable band needs a tail smaller
     // than the band's fixed skeleton/closet overhead: one tiny exchange.
-    const skipped = session.prepare(
+    const hardEpoch = session.prepare(
       [...first, userMsg('q?'), assistantMsg('ok.')],
       { measuredInputTokens: 70_000 },
     );
 
     expect(epoch.cacheHot).toBe(false);
-    expect(skipped.cacheHot).toBe(true);
-    expect(skipped.stats.appendDecision).toBe('skipped');
-    expect(skipped.stats.appendSkipReason).toBe('not-smaller');
-    expect(skipped.stats.appendRawTailChars).toBeGreaterThan(0);
-    expect(skipped.stats.appendBandChars).toBeGreaterThanOrEqual(skipped.stats.appendRawTailChars ?? 0);
+    expect(hardEpoch.cacheHot).toBe(false);
+    expect(hardEpoch.stats.epochReason).toBe('tail-yield-gate+hard-epoch');
+    expect(hardEpoch.stats.appendDecision).toBeUndefined();
     expect(session.telemetry.epochs).toBe(1);
   });
 
@@ -374,16 +378,17 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const first = turn(0);
-    session.prepare(first);
+    session.prepare(first, { measuredInputTokens: 1 });
     const appended = session.prepare(appendProfitableTurns(first, 1), { measuredInputTokens: 70_000 });
 
     expect(appended.cacheHot).toBe(false);
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(appended.stats.appendDecision).toBe('committed');
-    expect(session.telemetry.epochs).toBe(2);
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   test('accepts an append when measured runway lands exactly on the 10k floor', () => {
@@ -392,10 +397,11 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const first = turn(0);
-    session.prepare(first);
+    session.prepare(first, { measuredInputTokens: 1 });
     const appended = session.prepare(appendProfitableTurns(first, 1), { measuredInputTokens: 81_000 });
 
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
@@ -408,15 +414,16 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const first = turn(0);
-    session.prepare(first);
+    session.prepare(first, { measuredInputTokens: 1 });
     const reused = session.prepare([...first, ...turn(1)]);
 
     expect(reused.cacheHot).toBe(true);
     expect(reused.stats.epochReason).toBeUndefined();
-    expect(session.telemetry.epochs).toBe(1);
+    expect(session.telemetry.epochs).toBe(0);
   });
 
   test('computes a raw hard-epoch seed from local trace when no host seed is supplied', () => {
@@ -456,6 +463,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 111_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const raw: FoldMessage[] = [
@@ -548,6 +556,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const raw = [...turn(0), ...turn(1), ...turn(2)];
@@ -573,6 +582,7 @@ describe('FoldSession tail-epoch runway gate', () => {
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
       singleCeilingMode: false,
+      tailEpochRunway: { foldTriggerTokens: 1 },
       now: () => 1_000,
     });
     const raw = [...turn(0), ...turn(1), ...turn(2)];
@@ -656,6 +666,7 @@ function makeVaultSession(overrides: Record<string, unknown> = {}): FoldSession 
     freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
     vault: true,
     singleCeilingMode: false,
+    tailEpochRunway: { foldTriggerTokens: 1 },
     now: () => 1_000,
     ...overrides,
   });

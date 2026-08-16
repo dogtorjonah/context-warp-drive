@@ -21,6 +21,7 @@ import {
   renderHistoricalPayloadRecord,
   type FoldMessage,
 } from './rollingFold.ts';
+import { buildOpenLoopLedgerSection } from './openLoopLedger.ts';
 // Re-exported so relay callers (rebirthPackageBuilder) share the single
 // kill-switch defined in the rollingFold leaf module.
 export { flatCoordinateClosetEnabled };
@@ -48,13 +49,17 @@ import {
 } from './cognitiveArtifacts.ts';
 import {
   isGenuineRebirthOperatorMessage,
+  isPortableGenuineOperatorMessage,
   selectRoleAwareRebirthDialogueWindow,
 } from './rebirthDialogue.ts';
 import {
   adaptLegacyRebirthPackageToV6,
+  buildContinuityLedgerCaptureFromV6Render,
   isRebirthPackageV6Model,
-  renderRebirthPackageV6,
+  renderRebirthPackageV6WithReport,
+  type ContinuityLedgerCaptureRecord,
   type RebirthPackageV6Model,
+  type RebirthPackageV7CollapseReport,
 } from './rebirthPackageV6.ts';
 import {
   pendingAssistantActionFromState,
@@ -1570,8 +1575,14 @@ function formatRebirthControl(input: RawRebirthSeedInput, boundary: RawRebirthLi
   );
 }
 
-export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
-  if (isRebirthPackageV6Model(input.rebirthV6)) {
+export interface RenderedRawRebirthSeedWithReport {
+  readonly text: string;
+  readonly collapse?: RebirthPackageV7CollapseReport;
+  readonly continuityLedger?: ContinuityLedgerCaptureRecord;
+}
+
+function renderRawRebirthSeedV6WithReport(input: RawRebirthSeedInput): RenderedRawRebirthSeedWithReport {
+  const model = input.rebirthV6 as RebirthPackageV6Model;
     // The v6 hard-epoch raw path must carry the SAME protected boundary
     // envelope the relay rich formatters emit above the six framed sections,
     // so host-unavailable fallback is promotionally consistent with the live
@@ -1605,13 +1616,29 @@ export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
       rawResumeTimestamp: receiptFrontier?.sourceTimestamp ?? input.rawResumeTimestamp,
     }) ?? '';
     const envelopeText = chronology ? `${defaultHeader}\n${chronology}` : defaultHeader;
-    const sections = renderRebirthPackageV6(input.rebirthV6, {
+    const rendered = renderRebirthPackageV6WithReport(model, {
       packageBudget: input.packageBudget,
       // Account for the envelope→sections `\n\n` separator in the allocator's
       // prefix-overhead reservation so the produced total stays in budget.
       envelopeChars: envelopeText.length + 2,
     });
-    return `${envelopeText}\n\n${sections}`;
+    const continuityLedger = buildContinuityLedgerCaptureFromV6Render(model, rendered.collapse);
+    return {
+      text: `${envelopeText}\n\n${rendered.text}`,
+      collapse: rendered.collapse,
+      ...(continuityLedger ? { continuityLedger } : {}),
+    };
+}
+
+/** Pure report-bearing renderer; callers persist only after real delivery. */
+export function renderRawRebirthSeedWithReport(input: RawRebirthSeedInput): RenderedRawRebirthSeedWithReport {
+  if (isRebirthPackageV6Model(input.rebirthV6)) return renderRawRebirthSeedV6WithReport(input);
+  return { text: renderRawRebirthSeed(input) };
+}
+
+export function renderRawRebirthSeed(input: RawRebirthSeedInput): string {
+  if (isRebirthPackageV6Model(input.rebirthV6)) {
+    return renderRawRebirthSeedV6WithReport(input).text;
   }
   const packageBudget = finitePositive(input.packageBudget, DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS);
   const runtimeBlock = input.runtimeModelBlock?.trim()
@@ -2854,26 +2881,10 @@ function buildActivityLogFromMessages(
   return rows.join('\n\n');
 }
 
-// portable genuine-operator filter.
-// Skip system-generated user messages (chatroom deliveries, mention pings,
-// digest deltas, rebirth seeds, ephemeral-only turns).
-/**
- * Genuine-operator filter shared with band-enrichment modules: true when a
- * user-role message is an actual operator turn rather than a chatroom
- * delivery, mention ping, digest delta, or ephemeral-only coordination frame.
- */
-export function isPortableGenuineOperatorMessage(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed) return false;
-  if (!isGenuineRebirthOperatorMessage(trimmed)) return false;
-  // Strip known ephemeral coordination markers
-  const stripped = trimmed
-    .replace(/\[DIGEST DELTA[^\]]*\][\s\S]*?\[END DIGEST DELTA\]/g, '')
-    .replace(/\[Control Signals\][\s\S]*?\[\/Control Signals\]/g, '')
-    .trim();
-  if (stripped.length === 0) return false;
-  return true;
-}
+// Canonical definition moved to rebirthDialogue.ts (beside its base predicate)
+// so low-level continuity reducers can import it cycle-free; re-exported here
+// unchanged for every existing consumer of this module's public surface.
+export { isPortableGenuineOperatorMessage } from './rebirthDialogue.ts';
 
 function isPortableGenuineOperatorFoldMessage(message: FoldMessage): boolean {
   if (message.role !== 'user') return false;
@@ -3063,6 +3074,21 @@ export function buildRawRebirthSeedFromMessages(
       )
     : options.starredMoments;
   let openQuestions = options.openQuestions ?? buildOpenQuestionsFromMessages(visibleMessages);
+  if (options.openQuestions === undefined) {
+    // Consolidated open-loop ledger (heuristic): classify the ❓ trail against
+    // the latest operator directive (pause vs supersede). Tool-result rows are
+    // excluded via tool_call_id so payload text can never trigger a marker.
+    const operatorTexts: string[] = [];
+    for (let i = traceEnd - 1; i >= 0 && operatorTexts.length < 40; i--) {
+      const message = messages[i];
+      if (!message || message.tool_call_id !== undefined) continue;
+      if (message.role !== 'user' && message.role !== 'human') continue;
+      const text = messageValueToText(message.content)?.trim();
+      if (text) operatorTexts.push(text);
+    }
+    const ledger = buildOpenLoopLedgerSection({ operatorTexts, blockedTrailText: openQuestions });
+    if (ledger) openQuestions = openQuestions.trim() ? `${openQuestions.trim()}\n\n${ledger}` : ledger;
+  }
   let thinkingTrail = buildActivityLogFromMessages(
     visibleMessages,
     traceEnd,

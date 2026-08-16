@@ -72,9 +72,13 @@ export interface CognitiveArtifact {
   /**
    * Trust class: 'durable' artifacts are settled verdicts/hazards/blockers;
    * 'transient' artifacts are unverified mid-flow narration conserved for
-   * continuity only. Renderers must keep the distinction visible.
+   * continuity only; 'diagnosis' is the one conserved belief-changing
+   * sentence extracted from long working narration — retained like durable
+   * (never disclaimed as noise) but with no settling authority of its own:
+   * it supersedes nothing, and a later durable waypoint supersedes it.
+   * Renderers must keep the distinction visible.
    */
-  trust: 'durable' | 'transient';
+  trust: 'durable' | 'transient' | 'diagnosis';
   /** Declared category for a durable tap_star waypoint. */
   tapStarCategory?: TapStarCategory;
   /** Authoritative source time copied from FoldMessage.tsMs, when available. */
@@ -138,8 +142,39 @@ const MAX_FLOW_NOTES = 6;
  */
 const MAX_FLOW_NOTE_SOURCE_CHARS = 240;
 
-/** Registers that produce durable artifacts (settled outcomes). */
+/**
+ * Diagnosis conservation for narrations the flow-note gate rejects: a long
+ * 🔍/▶/untagged message stays excluded as a WHOLE (the 240-char gate is the
+ * deterministic noise filter and remains intact), but the single newest
+ * belief-changing sentence inside it is the working desk a successor actually
+ * needs after a fold. One per window, hard-capped, deterministically
+ * cue-matched — never model-summarized.
+ */
+const MAX_DIAGNOSIS_SENTENCE_CHARS = 400;
+
+/**
+ * Deterministic belief-change cues. A sentence qualifies as a diagnosis only
+ * when it asserts or retires a causal conclusion; ordinary progress narration
+ * ("I'm reading the selector next") matches nothing here and stays gated.
+ */
+const DIAGNOSIS_VERDICT_CUES: readonly RegExp[] = [
+  /\b(?:is|are|was|were)\s+(?:not\s+)?the\s+(?:bug|miss|break|cause|culprit|failure|problem|issue|regression|leak|bottleneck)\b/iu,
+  /\b(?:root|actual|real|prime)\s+(?:cause|break|failure|bug|miss|problem)\b/iu,
+  /\b(?:bug|miss|failure|cause|problem|regression|culprit)\s+(?:is|was)\b/iu,
+  /\brul(?:e|es|ed)\s+out\b/iu,
+  /\bturns?\s+out\b/iu,
+];
+
+/** Conserved-diagnosis marker glyph (card glyph: quoted memory, never fresh speech). */
+const DIAGNOSIS_GLYPH = 'Δ';
+
+/**
+ * Registers that produce durable Cognitive Artifacts. The active-request
+ * register is durable here even though its parser classification deliberately
+ * excludes it from episode narration: it records intent, not a task verdict.
+ */
 const DURABLE_REGISTERS: ReadonlySet<AssistantRegister> = new Set([
+  'active_request',
   'verdict',
   'hazard',
   'blocked',
@@ -222,6 +257,7 @@ const SYNTHETIC_NOISE_PREFIXES = ['API Error', '[Request interrupted'] as const;
 
 /** Glyphs by register for rendering. */
 const REGISTER_GLYPHS: Record<AssistantRegister, string> = {
+  active_request: '🧭',
   verdict: '🏁',
   hazard: '⚠️',
   blocked: '❓',
@@ -512,6 +548,27 @@ function extractHeadline(body: string): string {
  * @param messages Raw messages from the fold window (before skeletonization)
  * @param options  Lane control; omit for default durable+flow-note behavior
  */
+/**
+ * Newest sentence in `body` matching a deterministic belief-change cue,
+ * hard-capped for conservation. Pure extraction: the sentence is quoted
+ * verbatim (with cap ellipsis), never paraphrased.
+ */
+function newestDiagnosisSentence(body: string): string | null {
+  const segments = body
+    .split(/(?<=[.!?])\s+|\n+/u)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (segment.startsWith('```') || segment.startsWith('~~~')) continue;
+    if (!DIAGNOSIS_VERDICT_CUES.some((cue) => cue.test(segment))) continue;
+    return segment.length > MAX_DIAGNOSIS_SENTENCE_CHARS
+      ? `${segment.slice(0, MAX_DIAGNOSIS_SENTENCE_CHARS - 1)}…`
+      : segment;
+  }
+  return null;
+}
+
 export function extractCognitiveArtifacts(
   messages: readonly FoldMessage[],
   options: ExtractCognitiveArtifactsOptions = {},
@@ -520,6 +577,7 @@ export function extractCognitiveArtifacts(
   const durable: CognitiveArtifact[] = [];
   const flowNotes: CognitiveArtifact[] = [];
   const thoughtFallbacks: CognitiveArtifact[] = [];
+  let diagnosisCandidate: CognitiveArtifact | null = null;
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -602,7 +660,33 @@ export function extractCognitiveArtifacts(
     }
 
     if (!includeFlowNotes) continue;
-    if (text.length > MAX_FLOW_NOTE_SOURCE_CHARS) continue;
+    if (text.length > MAX_FLOW_NOTE_SOURCE_CHARS) {
+      // The whole message stays gated as speculative, but the newest
+      // belief-changing sentence inside it becomes the window's single
+      // diagnosis candidate (loop order makes the last assignment newest).
+      const isCleanNarration = (parseResult.ok && TRANSIENT_REGISTERS.has(parseResult.register))
+        || (!parseResult.ok
+          && parseResult.reason === 'missing_register'
+          && !CARD_GLYPHS.some((cardGlyph) => text.startsWith(cardGlyph))
+          && !SYNTHETIC_NOISE_PREFIXES.some((prefix) => text.startsWith(prefix)));
+      if (isCleanNarration) {
+        const body = parseResult.ok ? parseResult.body : text;
+        const sentence = newestDiagnosisSentence(body);
+        if (sentence) {
+          diagnosisCandidate = {
+            ...foldArtifactContract(i, 'historical_observation', sourceTimestamp, messageSourceIdentity),
+            register: parseResult.ok ? parseResult.register : 'untagged',
+            glyph: DIAGNOSIS_GLYPH,
+            headline: sentence,
+            messageIndex: i,
+            trust: 'diagnosis',
+            // Standalone divergence: the I/O-free core carries no
+            // mentionedPaths enrichment (pkg-only contract).
+          };
+        }
+      }
+      continue;
+    }
 
     if (parseResult.ok && TRANSIENT_REGISTERS.has(parseResult.register)) {
       const headline = extractHeadline(parseResult.body);
@@ -644,7 +728,11 @@ export function extractCognitiveArtifacts(
   const cappedFlowNotes =
     flowNotes.length > MAX_FLOW_NOTES ? flowNotes.slice(-MAX_FLOW_NOTES) : flowNotes;
 
-  const speechArtifacts = [...cappedDurable, ...cappedFlowNotes].sort(
+  const speechArtifacts = [
+    ...cappedDurable,
+    ...cappedFlowNotes,
+    ...(diagnosisCandidate ? [diagnosisCandidate] : []),
+  ].sort(
     (a, b) => a.messageIndex - b.messageIndex,
   );
   if (speechArtifacts.length > 0) return markSupersededFlowNotes(speechArtifacts);
@@ -811,11 +899,15 @@ export function renderCognitiveBlock(
   ]);
   const hasFlowNotes = artifacts.some((a) => a.trust === 'transient');
   const hasDurable = artifacts.some((a) => a.trust === 'durable');
+  const hasDiagnosis = artifacts.some((a) => a.trust === 'diagnosis');
   return [
     COGNITIVE_BLOCK_HEADER,
     '— authority is per artifact; completion=insufficient_alone for every waypoint —',
     ...(hasFlowNotes
       ? [`— 🔍/▶/·/💭 ${TRANSIENT_FLOW_NOTE_DISCLAIMER_MARKER}: unverified mid-flow narration, not conclusions —`]
+      : []),
+    ...(hasDiagnosis
+      ? ['— Δ lines are conserved diagnoses: the newest belief-changing sentence quoted from long working narration; strongest working evidence, not a verified verdict —']
       : []),
     // Cross-epoch supersession: elder bands are immutable, so the newest band
     // declares their transient narration replaced. Only a genuine durable

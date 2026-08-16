@@ -35,6 +35,17 @@ import {
   type FoldConfig,
   type FoldMessage,
 } from './rollingFold.ts';
+// Separate type-only import: the standalone mirror's tsup dts bundler fails to
+// trace inline `type` specifiers for this forward-declared interface.
+import type { FoldArtifactChrome } from './rollingFold.ts';
+// Fold-scope pending-commitment state for the honest header chrome. DAG-safe:
+// pendingAssistantAction imports only rollingFold/rebirthDialogue/glyphs, so
+// this edge adds no cycle (mirror of the foldRecall note below).
+import {
+  derivePendingAssistantActionTransition,
+  parsePendingAssistantActionCapsule,
+  reducePendingAssistantContinuityTimeline,
+} from './pendingAssistantAction.ts';
 import {
   extractCognitiveArtifacts,
   renderCognitiveBlock,
@@ -92,7 +103,7 @@ export function withArtifactModeConfig(config: FoldConfig): FoldConfig {
  */
 export function buildArtifactModeBody(
   windowMessages: readonly FoldMessage[],
-): { bodyLines: string[]; blockChars: number } {
+): { bodyLines: string[]; blockChars: number; chrome: FoldArtifactChrome } {
   const compile = compileFoldReceipts(windowMessages);
   const receiptLines = renderFoldReceipts(compile);
 
@@ -133,7 +144,44 @@ export function buildArtifactModeBody(
   bodyLines.push(...receiptLines);
 
   const blockChars = bodyLines.reduce((s, line) => s + line.length + 1, 0);
-  return { bodyLines, blockChars };
+
+  // Honest header chrome. diagnosis reflects the SAME artifact rows the body
+  // renders (post decision-dedup filter). pending is the fold-scope commitment
+  // state from walking every window message through the settlement reducer.
+  // A settlement class ('settled'/'operator-superseded') may render ONLY when
+  // the window actually witnessed an open commitment (raw 'opened' transition
+  // or a carried unresolved capsule): the reducer settles on a genuine
+  // operator message even from a blank state, and stamping that as
+  // 'operator-superseded' on a quiet window would invent a killed chore that
+  // never existed. Reducer-'unknown' over a completely walked window and
+  // settlement-without-witnessed-open both render the measured 'none'. The
+  // live tail's capsule remains authoritative for current state — this
+  // describes the folded span only.
+  let sawOpenCommitment = false;
+  for (const message of windowMessages) {
+    if (message.contextWarpSynthetic === 'folded-context' && typeof message.content === 'string') {
+      if (parsePendingAssistantActionCapsule(message.content)?.state === 'unresolved') {
+        sawOpenCommitment = true;
+      }
+      continue;
+    }
+    if (!sawOpenCommitment
+      && derivePendingAssistantActionTransition([message]).kind === 'opened') {
+      sawOpenCommitment = true;
+    }
+  }
+  const pendingState = reducePendingAssistantContinuityTimeline(windowMessages);
+  const pending: FoldArtifactChrome['pending'] = pendingState.state === 'unresolved'
+    ? 'live'
+    : pendingState.state === 'none' && pendingState.settledBy && sawOpenCommitment
+      ? (pendingState.settledBy.reason === 'operator-superseded' ? 'operator-superseded' : 'settled')
+      : 'none';
+  const chrome: FoldArtifactChrome = {
+    artifact: 'receipts+waypoints',
+    diagnosis: artifacts.some((artifact) => artifact.trust === 'diagnosis') ? 'kept' : 'none',
+    pending,
+  };
+  return { bodyLines, blockChars, chrome };
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -414,6 +462,8 @@ export interface FoldReceiptCompileOptions {
 const EDIT_TOOLS = new Set(['Edit', 'NotebookEdit', 'edit_file', 'apply_patch']);
 const WRITE_TOOLS = new Set(['Write', 'write_file']);
 const BASH_TOOLS = new Set(['Bash', 'run_bash']);
+// fork_sidequest is retired from the live tool schema, but old transcripts
+// still need their already-executed forks classified as historical spawns.
 const SPAWN_TOOLS = new Set(['spawn', 'spawn_instance', 'fork_sidequest']);
 const LIFECYCLE_TOOLS = new Set(['kill_instance']);
 const CLAIM_TOOLS = new Set(['partner_claim_file', 'partner_release_file']);

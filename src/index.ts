@@ -58,6 +58,7 @@ export * from './taskRail.ts';
 
 // Host adapters — turnkey standalone wiring of the full memory stack.
 export * from './host/MemoryLoop.ts';
+export * from './host/continuityLedgerStore.ts';
 export * from './host/liveSource.ts';
 export * from './host/affinity.ts';
 export * from './host/fileMetaProvider.ts';

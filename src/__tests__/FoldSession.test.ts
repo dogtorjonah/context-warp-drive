@@ -6,6 +6,8 @@ import {
   USER_MESSAGE_VAULT_LIVE_MARKER,
   dedupeCoordinateClosetText,
   extractCoordinateConservationCorpus,
+  sha256ContinuityLedgerVerbatim,
+  type ContinuityLedgerCaptureRecord,
   type FoldConfig,
   type FoldMessage,
 } from '../index.ts';
@@ -28,6 +30,15 @@ const TEST_FOLD_CONFIG: FoldConfig = {
   },
   verbatimKeepChars: 0,
 };
+
+function createPressureTestSession(
+  options: ConstructorParameters<typeof FoldSession>[0] = {},
+): FoldSession {
+  return new FoldSession({
+    tailEpochRunway: { foldTriggerTokens: 60_000 },
+    ...options,
+  });
+}
 
 function twoTurnHistory(firstAssistantText = 'alpha beta gamma'): FoldMessage[] {
   return [
@@ -68,6 +79,129 @@ function multiTurnHistory(count: number): FoldMessage[] {
   }
   return messages;
 }
+
+describe('FoldSession continuity-ledger epoch reports', () => {
+  it('publishes per-message tail rows only after an append commits', () => {
+    const records: ContinuityLedgerCaptureRecord[] = [];
+    const session = createPressureTestSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
+      pressureCeiling: 150_000,
+      singleCeilingMode: false,
+      now: () => 1_000,
+      onContinuityLedgerRecord: (record) => records.push(record),
+    });
+    const first = twoTurnHistory().map((message, index) => ({
+      ...message,
+      sourceIdentity: `source:first:${index}`,
+      tsMs: Date.parse(`2026-08-11T19:0${index}:00.000Z`),
+    }));
+    session.prepare(first, {
+      continuityLedger: { ownerInstanceId: 'owner-a', captureId: 'preview-not-an-epoch' },
+    });
+    expect(records).toHaveLength(0);
+
+    const full = appendProfitableTail(first, 'ledger tail').map((message, index) => ({
+      ...message,
+      sourceIdentity: message.sourceIdentity ?? `source:tail:${index}`,
+      tsMs: message.tsMs ?? Date.parse(`2026-08-11T20:${String(index).padStart(2, '0')}:00.000Z`),
+    }));
+    const appended = session.prepare(full, {
+      measuredInputTokens: 70_000,
+      continuityLedger: {
+        ownerInstanceId: 'owner-a',
+        captureId: 'tail-capture-1',
+        workspace: 'context-warp',
+      },
+    });
+
+    expect(appended.stats.appendDecision).toBe('committed');
+    expect(records).toHaveLength(1);
+    expect(appended.continuityLedger).toBe(records[0]);
+    expect(records[0]).toMatchObject({
+      lifecycle: 'tail-epoch',
+      ownerInstanceId: 'owner-a',
+      captureId: 'tail-capture-1',
+      workspace: 'context-warp',
+      sourceStartIndex: first.length,
+      sourceEndIndexExclusive: full.length,
+    });
+    expect(records[0]!.units).toHaveLength(full.length - first.length);
+    for (const unit of records[0]!.units) {
+      expect(unit.sourceIdentityAuthority).toBe('exact');
+      expect(unit.sourceTime).toMatch(/^2026-08-11T20:/u);
+      expect(unit.sha256).toBe(sha256ContinuityLedgerVerbatim(unit.verbatim));
+      expect(['folded', 'rendered']).toContain(unit.placement);
+    }
+
+    session.prepare(full, {
+      measuredInputTokens: 70_000,
+      continuityLedger: { ownerInstanceId: 'owner-a', captureId: 'hot-reuse-must-not-fire' },
+    });
+    expect(records).toHaveLength(1);
+  });
+
+  it('publishes hard-epoch elision and live-turn placement with exact or declared identities', () => {
+    const records: ContinuityLedgerCaptureRecord[] = [];
+    const session = createPressureTestSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
+      now: () => 1_000,
+      onContinuityLedgerRecord: (record) => records.push(record),
+    });
+    const messages: FoldMessage[] = [{
+      role: 'user',
+      content: 'historical question',
+      sourceIdentity: 'message:old-user',
+      tsMs: Date.parse('2026-08-11T19:00:00.000Z'),
+    }, {
+      role: 'assistant',
+      content: 'historical answer',
+      sourceIdentity: 'message:old-assistant',
+      tsMs: Date.parse('2026-08-11T19:01:00.000Z'),
+    }, {
+      role: 'user',
+      content: 'live hard-epoch request',
+      tsMs: Date.parse('2026-08-11T19:02:00.000Z'),
+    }];
+    const hard = session.prepare(messages, {
+      hardEpoch: true,
+      hardEpochSeed: 'canonical hard epoch seed',
+      continuityLedger: {
+        ownerInstanceId: 'owner-a',
+        captureId: 'hard-capture-1',
+        workspace: 'context-warp',
+      },
+    });
+
+    expect(records).toHaveLength(1);
+    expect(hard.continuityLedger).toBe(records[0]);
+    expect(records[0]).toMatchObject({
+      lifecycle: 'hard-epoch',
+      sourceStartIndex: 0,
+      sourceEndIndexExclusive: 3,
+      sourceFirstTime: '2026-08-11T19:00:00.000Z',
+      sourceLastTime: '2026-08-11T19:02:00.000Z',
+    });
+    expect(records[0]!.units.map((unit) => unit.placement)).toEqual(['elided', 'elided', 'rendered']);
+    expect(records[0]!.units.map((unit) => unit.tierBasis)).toEqual([
+      'hard-epoch-seed',
+      'hard-epoch-seed',
+      'hard-epoch-live',
+    ]);
+    expect(records[0]!.units[0]).toMatchObject({
+      sourceProvenanceId: 'message:old-user',
+      sourceIdentityAuthority: 'exact',
+    });
+    expect(records[0]!.units[2]).toMatchObject({
+      sourceProvenanceId: 'hard-capture-1:message#2',
+      sourceIdentityAuthority: 'synthetic-position',
+    });
+    for (const unit of records[0]!.units) {
+      expect(unit.sha256).toBe(sha256ContinuityLedgerVerbatim(unit.verbatim));
+    }
+  });
+});
 
 function anthropicToolUse(id: string, path: string): FoldMessage {
   return {
@@ -120,13 +254,22 @@ function appendAssistantLedToolTail(history: FoldMessage[], count: number): Fold
 
 describe('FoldSession fidelity overrides', () => {
   it('applies per-turn fidelity to the epoch fold config', () => {
-    const withoutOverride = new FoldSession({ foldConfig: TEST_FOLD_CONFIG, freeze: false });
-    const defaultOutcome = withoutOverride.prepare(twoTurnHistory());
+    const withoutOverride = createPressureTestSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: false,
+      singleCeilingMode: false,
+    });
+    const defaultOutcome = withoutOverride.prepare(twoTurnHistory(), { measuredInputTokens: 60_000 });
     expect(defaultOutcome.appliedFidelity).toBeNull();
     expect(defaultOutcome.result?.foldSummaries[0]?.retained ?? '').not.toContain('alpha beta gamma');
 
-    const withOverride = new FoldSession({ foldConfig: TEST_FOLD_CONFIG, freeze: false });
+    const withOverride = createPressureTestSession({
+      foldConfig: TEST_FOLD_CONFIG,
+      freeze: false,
+      singleCeilingMode: false,
+    });
     const widenedOutcome = withOverride.prepare(twoTurnHistory(), {
+      measuredInputTokens: 60_000,
       fidelity: {
         fullRetentionFraction: 0.25,
         essenceRetentionFraction: 0,
@@ -141,7 +284,7 @@ describe('FoldSession fidelity overrides', () => {
   });
 
   it('reports the already-applied fidelity during hot reuse without mutating the frozen view', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
       now: () => 1_000,
@@ -177,7 +320,7 @@ describe('FoldSession marathon pressure folding', () => {
     // Asserts the LEGACY flat-closet seed section — restored via the
     // VOXXO_REBIRTH_FLAT_CLOSET kill-switch (default off = inline placement).
     vi.stubEnv('VOXXO_REBIRTH_FLAT_CLOSET', '1');
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: {
         ...TEST_FOLD_CONFIG,
         activeWindowTurns: 1,
@@ -230,7 +373,7 @@ describe('FoldSession marathon pressure folding', () => {
   });
 
   it('full-recomputes repeated over-ceiling calls instead of suppressing pressure epochs', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: {
         ...TEST_FOLD_CONFIG,
         activeWindowTurns: 1,
@@ -253,7 +396,7 @@ describe('FoldSession marathon pressure folding', () => {
   });
 
   it('keeps pressure recomputing when measured growth indicates fresh evictable tail', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: {
         ...TEST_FOLD_CONFIG,
         activeWindowTurns: 1,
@@ -310,7 +453,7 @@ Conserved high-value literals newest-first.
   });
 
   it('hot-reuses instead of appending when measured telemetry is absent', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
@@ -325,11 +468,11 @@ Conserved high-value literals newest-first.
     expect(appended.stats.epochReason).toBeUndefined();
     expect(appended.stats.appendDecision).toBeUndefined();
     expect(appended.messages.slice(0, epoch.messages.length)).toEqual(epoch.messages);
-    expect(session.telemetry.epochs).toBe(1);
+    expect(session.telemetry.epochs).toBe(0);
   });
 
   it('routes a default single-ceiling P hit through the measured append predicate', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
       pressureCeiling: 125_000,
@@ -350,7 +493,7 @@ Conserved high-value literals newest-first.
   it('does not repeat frozen-prefix coordinates in a later appended closet', () => {
     const residentId = '00000000-0000-4000-8000-000000000321';
     const newId = '00000000-0000-4000-8000-000000000654';
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: { ...TEST_FOLD_CONFIG, verbatimKeepChars: 4_000 },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
@@ -363,8 +506,9 @@ Conserved high-value literals newest-first.
       { role: 'user', content: 'finish the first band' },
       { role: 'assistant', content: 'baseline complete' },
     ];
-    const baseline = session.prepare(first);
+    const baseline = session.prepare(first, { measuredInputTokens: 70_000 });
     expect(vaultText(baseline.messages)).toContain(residentId);
+    session.prepare(first, { measuredInputTokens: 50_000 });
 
     const history = [...first];
     for (let index = 0; index < 3; index += 1) {
@@ -386,7 +530,7 @@ Conserved high-value literals newest-first.
   });
 
   it('adds cognitive artifacts to committed tail append views', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
@@ -410,7 +554,7 @@ Conserved high-value literals newest-first.
   });
 
   it('accumulates cognitive artifacts across three consecutive committed tail-append cycles without drift or duplication', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
@@ -431,6 +575,7 @@ Conserved high-value literals newest-first.
     const cycle1 = session.prepare(history, { measuredInputTokens: 70_000 });
     expect(cycle1.stats.appendDecision).toBe('committed');
     expect(cycle1.sealedBoundary).toBe(baseline.messages.length);
+    session.prepare(history, { measuredInputTokens: 50_000 });
 
     history = [
       ...history,
@@ -442,6 +587,7 @@ Conserved high-value literals newest-first.
     // No boundary drift: each cycle's seal point is exactly where the prior
     // cycle's view (prefix + its own baked [cognitive] block) left off.
     expect(cycle2.sealedBoundary).toBe(cycle1.messages.length);
+    session.prepare(history, { measuredInputTokens: 50_000 });
 
     history = [
       ...history,
@@ -496,11 +642,11 @@ Conserved high-value literals newest-first.
     const lastText = typeof lastMessage.content === 'string' ? lastMessage.content : '';
     expect(lastText.startsWith('[cognitive]')).toBe(false);
 
-    expect(session.telemetry.epochs).toBe(4);
+    expect(session.telemetry.epochs).toBe(3);
   });
 
-  it('hot-reuses instead of committing an unprofitable append band', () => {
-    const session = new FoldSession({
+  it('hot-reuses below pressure without attempting an unprofitable append band', () => {
+    const session = createPressureTestSession({
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
@@ -509,19 +655,19 @@ Conserved high-value literals newest-first.
     });
     const first = twoTurnHistory();
     const epoch = session.prepare(first);
-    const skipped = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 70_000 });
+    const skipped = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 50_000 });
 
     expect(epoch.cacheHot).toBe(false);
     expect(skipped.cacheHot).toBe(true);
-    expect(skipped.stats.appendDecision).toBe('skipped');
-    expect(skipped.stats.appendSkipReason).toBe('not-smaller');
-    expect(skipped.stats.appendRawTailChars).toBeGreaterThan(0);
-    expect(skipped.stats.appendBandChars).toBeGreaterThanOrEqual(skipped.stats.appendRawTailChars ?? 0);
-    expect(session.telemetry.epochs).toBe(1);
+    expect(skipped.stats.appendDecision).toBeUndefined();
+    expect(skipped.stats.appendSkipReason).toBeUndefined();
+    expect(skipped.stats.appendRawTailChars).toBeUndefined();
+    expect(skipped.stats.appendBandChars).toBeUndefined();
+    expect(session.telemetry.epochs).toBe(0);
   });
 
   it('does not synthesize cognitive artifacts when an append is skipped by the gate', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
@@ -534,17 +680,17 @@ Conserved high-value literals newest-first.
       ...first,
       { role: 'user', content: 'next tiny tail' },
       { role: 'assistant', content: '🏁 tiny verdict stays raw only' },
-    ], { measuredInputTokens: 70_000 });
+    ], { measuredInputTokens: 50_000 });
 
     const joined = vaultText(skipped.messages);
-    expect(skipped.stats.appendDecision).toBe('skipped');
-    expect(skipped.stats.appendSkipReason).toBe('not-smaller');
+    expect(skipped.stats.appendDecision).toBeUndefined();
+    expect(skipped.stats.appendSkipReason).toBeUndefined();
     expect(joined).toContain('🏁 tiny verdict stays raw only');
     expect(joined).not.toContain('[cognitive]');
   });
 
   it('appends a folded tail epoch when measured runway holds even if fallback modeling would fail', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
@@ -560,7 +706,7 @@ Conserved high-value literals newest-first.
     expect(appended.cacheHot).toBe(false);
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(appended.stats.appendDecision).toBe('committed');
-    expect(session.telemetry.epochs).toBe(2);
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   it('appends a folded tail epoch even when measured input is low (no blind zone)', () => {
@@ -569,7 +715,7 @@ Conserved high-value literals newest-first.
     // sub-floor measured input straight past the pressure ceiling with zero
     // tail epochs (nova-cobra, 2026-07-05). The exact scenario the floor kept
     // hot — over-cap tail at 70K measured — must now seal an append band.
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -586,11 +732,11 @@ Conserved high-value literals newest-first.
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
     expect(appended.stats.appendDecision).toBe('committed');
     expect(appended.sealedBoundary).not.toBeNull();
-    expect(session.telemetry.epochs).toBe(2);
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   it('cold-folds assistant-led orphan tool tails before append commit', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -615,7 +761,7 @@ Conserved high-value literals newest-first.
   });
 
   it('keeps an unresolved tool call raw when a newer operator message crosses the fold seam', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -636,11 +782,11 @@ Conserved high-value literals newest-first.
     expect(appended.stats.appendDecision).toBe('committed');
     expect(joined).toContain('toolu_open_across_seam');
     expect(joined).toContain('steer the live operation while its tool call is still pending');
-    expect(joined).toContain('stack=frozen-prefix>tail-epoch#2');
+    expect(joined).toContain('stack=frozen-prefix>tail-epoch#1');
   });
 
   it('defers the epoch when an unresolved tool call is the entire foldable increment', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -655,12 +801,12 @@ Conserved high-value literals newest-first.
     ], { measuredInputTokens: 70_000 });
 
     expect(deferred.cacheHot).toBe(true);
-    expect(session.telemetry.epochs).toBe(1);
+    expect(session.telemetry.epochs).toBe(0);
     expect(vaultText(deferred.messages)).toContain('toolu_only_pending_increment');
   });
 
   it('defers when a live user anchor collapses the split ahead of a pending call', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -679,12 +825,12 @@ Conserved high-value literals newest-first.
 
     expect(deferred.cacheHot).toBe(true);
     expect(deferred.stats.deferReason).toBe('live-user-anchor');
-    expect(session.telemetry.epochs).toBe(1);
+    expect(session.telemetry.epochs).toBe(0);
     expect(vaultText(deferred.messages)).toContain(openId);
   });
 
   it('lets measured pressure override a permanently pending-call defer', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -703,11 +849,11 @@ Conserved high-value literals newest-first.
     expect(deferred.stats.deferReason).toBe('pending-tool-call');
     expect(escaped.stats.pressureCeilingTriggered).toBe(true);
     expect(escaped.stats.epochReason).toBe('hard-epoch');
-    expect(session.telemetry.epochs).toBe(2);
+    expect(session.telemetry.epochs).toBe(1);
   });
 
   it('keeps a Gemini-parts operator directive in the raw suffix behind a giant tool result', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -741,7 +887,7 @@ Conserved high-value literals newest-first.
   });
 
   it('keeps the latest assistant plan in the raw suffix when the foldable tail has no genuine user text', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 150_000,
@@ -772,7 +918,7 @@ Conserved high-value literals newest-first.
   });
 
   it('accepts an append when measured runway lands exactly on the 10k floor', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
@@ -790,7 +936,7 @@ Conserved high-value literals newest-first.
   });
 
   it('never hard-epochs a telemetryless tail from modeled geometry', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
@@ -804,11 +950,11 @@ Conserved high-value literals newest-first.
     expect(reused.stats.epochReason).toBeUndefined();
     expect(reused.messages.slice(0, epoch.messages.length)).toEqual(epoch.messages);
     expect(vaultText(reused.messages)).toContain('tail one');
-    expect(session.telemetry.epochs).toBe(1);
+    expect(session.telemetry.epochs).toBe(0);
   });
 
   it('appends on the compact seed baseline after a hard epoch when measured runway holds', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
@@ -837,7 +983,7 @@ Conserved high-value literals newest-first.
   });
 
   it('does not let a compact hard-epoch baseline bypass unknown telemetry', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 91_000,
@@ -877,7 +1023,7 @@ Conserved high-value literals newest-first.
     // already encoded by the trigger sitting 30K below the ceiling; the floor gate
     // must not subtract it a second time from healthy staircase bands. A floor at
     // 125K under TRIG150 still has below-trigger raw-tail budget to reclaim.
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
@@ -891,7 +1037,7 @@ Conserved high-value literals newest-first.
     // instant-loop guard keeps the floor gate OFF; the ceiling basis appends
     // and ARMS the post-fold floor with this pre-fold reading (140K).
     const t2 = appendProfitableTail(first, 'tail one');
-    const firstAppend = session.prepare(t2, { measuredInputTokens: 140_000 });
+    const firstAppend = session.prepare(t2, { measuredInputTokens: 150_000 });
     expect(firstAppend.stats.epochReason).toBe('tail-epoch-append');
     expect(firstAppend.stats.appendDecision).toBe('committed');
     // Next tail epoch: the append dropped occupancy to 125K, RE-BASELINING the
@@ -899,7 +1045,8 @@ Conserved high-value literals newest-first.
     // floor is still below the 150K trigger, so the append remains viable. The
     // old trigger-minus-minRunway gate would have hard-epoched here.
     const t3 = appendProfitableTail(t2, 'tail two');
-    const secondAppend = session.prepare(t3, { measuredInputTokens: 125_000 });
+    session.prepare(t2, { measuredInputTokens: 125_000 });
+    const secondAppend = session.prepare(t3, { measuredInputTokens: 150_000 });
     expect(secondAppend.stats.epochReason).toBe('tail-epoch-append');
     expect(secondAppend.stats.appendDecision).toBe('committed');
     expect(secondAppend.messages.length).toBeGreaterThan(1);
@@ -907,7 +1054,7 @@ Conserved high-value literals newest-first.
 
   it('hard-epochs when an armed trigger floor reaches the trigger after a cold full recompute clears sealed bands', () => {
     let now = 1_000;
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
@@ -918,7 +1065,7 @@ Conserved high-value literals newest-first.
     const first = twoTurnHistory();
     session.prepare(first);
     const t2 = appendProfitableTail(first, 'tail one');
-    const firstAppend = session.prepare(t2, { measuredInputTokens: 140_000 });
+    const firstAppend = session.prepare(t2, { measuredInputTokens: 150_000 });
     expect(firstAppend.stats.epochReason).toBe('tail-epoch-append');
     expect(firstAppend.stats.appendDecision).toBe('committed');
 
@@ -938,12 +1085,8 @@ Conserved high-value literals newest-first.
     expect(escalated.messages).toHaveLength(1);
   });
 
-  it('keeps appending on the same occupancy when no trigger is configured (legacy ceiling basis, no floor gate)', () => {
-    // Identical occupancy trace as the floor-gate escalation above, but WITHOUT a
-    // configured foldTriggerTokens: the runway check stays on the ceiling-anchored
-    // measured basis (180K − 125K = 55K ≥ 30K), so the second tail epoch appends.
-    // Isolates the trigger as the sole cause of the escalation.
-    const session = new FoldSession({
+  it('does not authorize automatic folding when no trigger is configured', () => {
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
@@ -955,12 +1098,15 @@ Conserved high-value literals newest-first.
     session.prepare(first);
     const t2 = appendProfitableTail(first, 'tail one');
     const firstAppend = session.prepare(t2, { measuredInputTokens: 140_000 });
-    expect(firstAppend.stats.epochReason).toBe('tail-epoch-append');
+    expect(firstAppend.cacheHot).toBe(true);
+    expect(firstAppend.stats.epochReason).toBeUndefined();
+    expect(firstAppend.stats.appendDecision).toBeUndefined();
     const t3 = appendProfitableTail(t2, 'tail two');
     const secondAppend = session.prepare(t3, { measuredInputTokens: 125_000 });
-    expect(secondAppend.stats.epochReason).toBe('tail-epoch-append');
-    expect(secondAppend.stats.appendDecision).toBe('committed');
-    expect(secondAppend.sealedBoundary).not.toBeNull();
+    expect(secondAppend.cacheHot).toBe(true);
+    expect(secondAppend.stats.epochReason).toBeUndefined();
+    expect(secondAppend.stats.appendDecision).toBeUndefined();
+    expect(secondAppend.sealedBoundary).toBeNull();
   });
 });
 
@@ -971,7 +1117,7 @@ describe('FoldSession per-fold yield gate', () => {
   const YIELD_RUNWAY = { foldTriggerTokens: 100_000, minRunwayTokens: 30_000 } as const;
 
   it('escalates a low-yield fold to a hard epoch when measured occupancy is at/above the trigger', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       // continuous:false → a tiny tail folds to a band no smaller than the raw
       // (shrinkRatio > 0.9, the same 'not-smaller' fold the hot-reuse test uses).
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
@@ -993,7 +1139,7 @@ describe('FoldSession per-fold yield gate', () => {
   });
 
   it('does NOT escalate the same low-yield fold below the trigger when trigger-runway is ample', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
@@ -1004,15 +1150,15 @@ describe('FoldSession per-fold yield gate', () => {
     const first = twoTurnHistory();
     session.prepare(first);
     // Measured 60K < 100K trigger with 40K trigger-runway >= 30K min runway:
-    // the gate stays off and the unprofitable fold hot-reuses.
+    // automatic folding is not authorized, so the yield gate is never entered.
     const reused = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 60_000 });
     expect(reused.cacheHot).toBe(true);
-    expect(reused.stats.appendDecision).toBe('skipped');
-    expect(reused.stats.appendSkipReason).toBe('not-smaller');
+    expect(reused.stats.appendDecision).toBeUndefined();
+    expect(reused.stats.appendSkipReason).toBeUndefined();
   });
 
-  it('escalates a low-yield fold below the trigger when trigger-runway is thin', () => {
-    const session = new FoldSession({
+  it('does not escalate a low-yield tail below the trigger when trigger-runway is thin', () => {
+    const session = createPressureTestSession({
       foldConfig: { ...TEST_FOLD_CONFIG, continuous: false },
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
@@ -1023,15 +1169,16 @@ describe('FoldSession per-fold yield gate', () => {
     const first = twoTurnHistory();
     session.prepare(first);
     // Measured 90K < 100K trigger, but trigger-runway is only 10K < 30K:
-    // appending a zero-yield band would churn, so escalate to the hard seed.
+    // pressure authorization is still absent, so neither folding nor a hard
+    // epoch may be manufactured from the runway geometry alone.
     const escalated = session.prepare(appendTurn(first, 'tiny tail'), { measuredInputTokens: 90_000 });
-    expect(escalated.cacheHot).toBe(false);
-    expect(escalated.stats.epochReason).toBe('tail-yield-gate+hard-epoch');
-    expect(escalated.messages).toHaveLength(1);
+    expect(escalated.cacheHot).toBe(true);
+    expect(escalated.stats.epochReason).toBeUndefined();
+    expect(escalated.stats.appendDecision).toBeUndefined();
   });
 
   it('appends a HIGH-yield fold at pressure (gate is yield-specific, not a blanket at-pressure hard epoch)', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 180_000,
@@ -1056,7 +1203,7 @@ describe('FoldSession restored-overcap full recompute', () => {
     // rebirth-restore one-shot set, the oversized restored tail must instead
     // force a full recompute so the bloated restored prefix is recomputed away
     // rather than sealed and carried forward by an append-only band.
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 1 },
       pressureCeiling: 125_000,
@@ -1078,11 +1225,11 @@ describe('FoldSession restored-overcap full recompute', () => {
     expect(restored.cacheHot).toBe(false);
     expect(restored.stats.epochReason).toBe('restored-overcap');
     expect(restored.sealedBoundary).toBeNull();
-    expect(session.telemetry.epochs).toBe(2);
+    expect(session.telemetry.epochs).toBe(0);
   });
 
   it('still hot-reuses a restored prefix when the tail is within the cap', () => {
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
       now: () => 1_000,
@@ -1096,23 +1243,24 @@ describe('FoldSession restored-overcap full recompute', () => {
     const reused = session.prepare(appendTurn(first, 'small tail'));
 
     expect(reused.cacheHot).toBe(true);
-    expect(session.telemetry.epochs).toBe(1);
+    expect(session.telemetry.epochs).toBe(0);
   });
 });
 
 describe('FoldSession full-recompute eviction invariant', () => {
   it('does not emit eviction telemetry until a safe frontier is available', () => {
     const history = multiTurnHistory(6);
-    const session = new FoldSession({
+    const session = createPressureTestSession({
       foldConfig: TEST_FOLD_CONFIG,
       freeze: false,
       eviction: { thresholdChars: 1_000_000 },
+      singleCeilingMode: false,
       now: () => 1_000,
     });
 
-    session.prepare(history);
-    session.prepare(history);
-    const third = session.prepare(history);
+    session.prepare(history, { measuredInputTokens: 60_000 });
+    session.prepare(history, { measuredInputTokens: 60_000 });
+    const third = session.prepare(history, { measuredInputTokens: 60_000 });
 
     expect(third.cacheHot).toBe(false);
     expect(third.stats.evictionOutcome).toBeUndefined();
@@ -1129,7 +1277,7 @@ function vaultText(messages: FoldMessage[]): string {
 }
 
 function vaultSession(overrides: Record<string, unknown> = {}): FoldSession {
-  return new FoldSession({
+  return createPressureTestSession({
     foldConfig: TEST_FOLD_CONFIG,
     freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
     vault: true,
@@ -1332,7 +1480,7 @@ describe('FoldSession per-band vault sealing', () => {
     session.prepare(first);
 
     const second = appendProfitableTail(first, 'vault tail one');
-    const appended = session.prepare(second, { measuredInputTokens: 140_000 });
+    const appended = session.prepare(second, { measuredInputTokens: 150_000 });
     expect(appended.stats.epochReason).toBe('tail-epoch-append');
 
     const third = appendProfitableTail(second, 'vault tail two');
@@ -1367,6 +1515,7 @@ describe('FoldSession per-band vault sealing', () => {
     const liveFrozenCorpus = vaultText(session.snapshotFoldFreezeState()?.frozenView ?? []);
     expect(liveFrozenCorpus).not.toContain('OPERATOR-THETA live ask');
     expect(liveFrozenCorpus).not.toContain(USER_MESSAGE_VAULT_LIVE_MARKER);
+    session.prepare(second, { measuredInputTokens: 50_000 });
 
     // Once answered, the row seals into the NEXT band — proving it was never
     // sealed while live (a sealed fingerprint would have deduped it out) —

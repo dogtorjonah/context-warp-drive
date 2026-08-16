@@ -309,6 +309,40 @@ describe('resolveContextBudget', () => {
     });
   });
 
+  it('requires measured pressure to reach the legacy fold trigger before authorizing an append', () => {
+    const base = {
+      pressureCeilingTokens: 180_000,
+      foldTriggerTokens: 150_000,
+      appendBandTargetTokens: 5_000,
+      tailEpochMinRunwayTokens: 30_000,
+      tailEpochRequested: true,
+      singleCeilingMode: false,
+    } as const;
+
+    expect(resolveMeasuredEpochEligibility({
+      ...base,
+      measuredInputTokens: 149_999,
+    })).toMatchObject({
+      decision: 'reuse',
+      reason: 'below-fold-trigger',
+    });
+    expect(resolveMeasuredEpochEligibility({
+      ...base,
+      measuredInputTokens: 150_000,
+    })).toMatchObject({
+      decision: 'append',
+      reason: 'runway-holds',
+    });
+    expect(resolveMeasuredEpochEligibility({
+      ...base,
+      pressureCeilingTokens: null,
+      measuredInputTokens: 999_999,
+    })).toMatchObject({
+      decision: 'reuse',
+      reason: 'pressure-disabled',
+    });
+  });
+
   it('keeps legacy TRIG overrides inert in single-ceiling eligibility', () => {
     const normal = resolveContextBudget({ engine: 'codex-api', model: 'gpt-5.5' });
     const legacyOverride = resolveContextBudget({

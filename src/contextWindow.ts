@@ -92,6 +92,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'gemini-3-pro-preview': 1_048_576,
   'gemini-3-flash-preview': 1_048_576,
   'gemini-3-pro-image-preview': 65_536,
+  'gemini-3.7-flash': 1_048_576,
   'gemini-3.6-flash': 1_048_576,
   'gemini-3.5-flash-lite': 1_048_576,
   'gemini-2.5-pro': 1_048_576,
@@ -120,6 +121,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'mistral-small-latest': 128_000,
 
   // ── Grok (xAI) models ──
+  'grok-4.6': 500_000,
   'grok-4.3': 1_000_000,
   'grok-4-1-fast-reasoning': 2_000_000,
   'grok-4-1-fast-non-reasoning': 2_000_000,

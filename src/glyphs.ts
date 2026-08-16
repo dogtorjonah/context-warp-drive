@@ -1,6 +1,7 @@
 export const REGISTER_GLYPHS = {
   in_progress: '🔍',
   executing: '▶',
+  active_request: '🧭',
   verdict: '🏁',
   hazard: '⚠️',
   blocked: '❓',
@@ -86,6 +87,8 @@ export const ASCII_REGISTER_ALIASES = {
   '[in_progress]': 'in_progress',
   '[executing]': 'executing',
   '[execute]': 'executing',
+  '[active_request]': 'active_request',
+  '[request]': 'active_request',
   '[verdict]': 'verdict',
   '[hazard]': 'hazard',
   '[blocked]': 'blocked',
@@ -94,7 +97,7 @@ export const ASCII_REGISTER_ALIASES = {
 
 export type AssistantRegister = keyof typeof REGISTER_GLYPHS;
 export type AssistantRegisterGlyph = (typeof REGISTER_GLYPHS)[AssistantRegister];
-export type AssistantRegisterTrust = 'transient' | 'durable' | 'blocked' | 'low_trust';
+export type AssistantRegisterTrust = 'transient' | 'directive' | 'durable' | 'blocked' | 'low_trust';
 export type AssistantRegisterParseFailureReason =
   | 'empty'
   | 'leading_whitespace'
@@ -165,6 +168,12 @@ const KNOWN_GLYPH_PREFIXES: readonly PrefixMatch[] = [
     rawPrefix: PLAY_BUTTON,
   },
   {
+    register: 'active_request',
+    glyph: REGISTER_GLYPHS.active_request,
+    source: 'glyph',
+    rawPrefix: REGISTER_GLYPHS.active_request,
+  },
+  {
     register: 'in_progress',
     glyph: REGISTER_GLYPHS.in_progress,
     source: 'glyph',
@@ -213,6 +222,8 @@ export function classifyAssistantRegister(
   register: AssistantRegister | null,
 ): AssistantRegisterClassification {
   switch (register) {
+    case 'active_request':
+      return { register, trust: 'directive', durable: false, final: false };
     case 'verdict':
     case 'hazard':
       return { register, trust: 'durable', durable: true, final: true };
@@ -308,6 +319,7 @@ function failed(reason: AssistantRegisterParseFailureReason, body: string): Assi
 export const REGISTER_DESCRIPTIONS: Readonly<Record<AssistantRegister, string>> = {
   in_progress: 'investigating, building, partial findings, hypotheses',
   executing: 'tool, edit, test, or batch execution actively underway',
+  active_request: 'a source-linked claim that the interpreted active request materially changed',
   verdict: 'a verified outcome or settled conclusion',
   hazard: 'a trap, gotcha, or invariant others must know',
   blocked: 'needs a decision or input to proceed',
@@ -324,6 +336,7 @@ export const CARD_GLYPHS = ['✎', '⭐', '💬', '🗣', '⌖', 'Δ', '↞', '�
 const REGISTER_EMIT_ORDER: readonly AssistantRegister[] = [
   'in_progress',
   'executing',
+  'active_request',
   'verdict',
   'hazard',
   'blocked',
@@ -343,7 +356,8 @@ export function buildRegisterGlyphPromptSnippet(
   return (
     `Open every message with exactly one register glyph as the first character: ${registers}. ` +
     'When in doubt, use 🔍 — tag what the message IS, not what you hope it becomes. ' +
-    'Glyphs drive episodic memory harvest: 🏁/⚠️ are durable and get harvested; 🔍/▶/❓ self-exclude. ' +
+    'Use 🧭 only for `🧭 Active request: …` when your interpretation of the operator\'s active request materially changes; it is an agent-authored continuity claim and never outranks raw operator chronology. ' +
+    'Glyphs drive memory harvest: 🏁/⚠️ enter durable episode memory, 🧭 enters durable active-request cognition, and 🔍/▶/❓ self-exclude. ' +
     'A one-line verified micro-conclusion mid-flow is a legitimate 🏁 — emit micro-🏁s at diagnosis moments instead of burying findings in 🔍 narration. ' +
     `Never open fresh speech with card glyphs ${CARD_GLYPHS.join(' ')} — those mark quoted memory only.`
   );
