@@ -27,6 +27,7 @@ export {
   USER_MESSAGE_VAULT_END,
   USER_MESSAGE_VAULT_LIVE_MARKER,
   USER_MESSAGE_VAULT_MAX_CHARS,
+  USER_MESSAGE_VAULT_REBIRTH_MAX_CHARS,
   USER_MESSAGE_VAULT_MAX_MESSAGES,
   USER_MESSAGE_VAULT_PREFIX,
   VAULT_RECORD_SCHEMA_VERSION,
@@ -119,10 +120,12 @@ const vault = createUserMessageVaultCore({
   envKeys: {
     maxMessages: 'WARP_USER_VAULT_MAX_MESSAGES',
     maxChars: 'WARP_USER_VAULT_MAX_CHARS',
+    maxCharsRebirth: 'WARP_USER_VAULT_REBIRTH_MAX_CHARS',
     assistantMaxMessages: 'WARP_ASSISTANT_VAULT_MAX_MESSAGES',
     minUtilization: 'WARP_USER_VAULT_MIN_UTILIZATION',
     editMaxMessages: 'WARP_EDIT_VAULT_MAX_MESSAGES',
     editSnippetChars: 'WARP_EDIT_VAULT_SNIPPET_CHARS',
+    editSnippetRebirthChars: 'WARP_EDIT_VAULT_SNIPPET_REBIRTH_CHARS',
   },
   classifyMessageGlyph,
   renderSurfaceText: renderPortableSurface,
@@ -158,12 +161,16 @@ const vault = createUserMessageVaultCore({
 
 export const resolveUserMessageVaultMaxMessages = vault.resolveUserMessageVaultMaxMessages;
 export const resolveUserMessageVaultMaxChars = vault.resolveUserMessageVaultMaxChars;
+export const resolveUserMessageVaultRebirthMaxChars =
+  vault.resolveUserMessageVaultRebirthMaxChars;
 export const resolveAssistantGlyphVaultMaxMessages =
   vault.resolveAssistantGlyphVaultMaxMessages;
 export const resolveEditProvenanceVaultMaxMessages =
   vault.resolveEditProvenanceVaultMaxMessages;
 export const resolveEditProvenanceVaultSnippetChars =
   vault.resolveEditProvenanceVaultSnippetChars;
+export const resolveEditProvenanceVaultSnippetRebirthChars =
+  vault.resolveEditProvenanceVaultSnippetRebirthChars;
 export const resolveUserMessageVaultMinUtilization =
   vault.resolveUserMessageVaultMinUtilization;
 export const recordUserMessageVaultEntry = vault.recordUserMessageVaultEntry;

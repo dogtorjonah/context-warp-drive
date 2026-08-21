@@ -12,8 +12,8 @@ import { contextWindowForModel } from './contextWindow.ts';
 // "one ceiling, more simple" — supersedes the two-trigger layout):
 //   S = 37K static system/tools prefix reserve
 //   M = 40K folded memory after a hard epoch
-//   P = THE ceiling — the only fold trigger. Uniform 200K default for every
-//       FC/API and CLI surface (Jonah 2026-07-22). Below P nothing folds: no
+//   P = THE ceiling — the only fold trigger. Uniform 250K default for every
+//       FC/API and CLI surface (Jonah 2026-08-19). Below P nothing folds: no
 //       tail-size char gate, no calm-seal/warning override, no sub-ceiling
 //       deterministic trigger. Sessions hot-reuse the frozen prefix and ride a
 //       raw, full-fidelity live tail all the way up to P.
@@ -323,7 +323,7 @@ export function resolveMeasuredEpochEligibility(
  * In legacy hybrid mode, 150K remains the uniform measured-prompt-token
  * threshold at which every engine folds/reconstructs (FC API, Codex CLI,
  * Claude CLI, and Gemini CLI all resolve to this). Deliberately 150K = 30K
- * BELOW the P=200K pressure ceiling. 150K
+ * BELOW the requested P=250K pressure ceiling. 150K
  * is the LARGEST value that still sits under every engine's runway clamp
  * (Claude CLI:
  * min(msgCeiling, ceiling)−20K = 160K on 200K windows; Codex CLI:
@@ -331,7 +331,7 @@ export function resolveMeasuredEpochEligibility(
  * or colliding with the ceiling (trigger==ceiling ⇒ 0 tail epochs, measured
  * live 2026-07-04 — never set trigger equal to the ceiling).
  *
- * LEGACY NOTE: this is the hybrid TRIGGER — a DISTINCT knob from the P=200K
+ * LEGACY NOTE: this is the hybrid TRIGGER — a DISTINCT knob from the P=250K
  * pressure ceiling (DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS below). Do
  * not conflate them (recurring regression). Gemini CLI reads this constant
  * directly as its own default; FC/Codex/Claude CLI honor the same value via
@@ -344,15 +344,15 @@ export const DEFAULT_CONTEXT_BUDGET_FOLD_TRIGGER_TOKENS = 150_000;
 export const DEFAULT_CONTEXT_BUDGET_CHARS_PER_TOKEN = 4;
 export const DEFAULT_CONTEXT_BUDGET_BAND_MAX_WINDOW_FRACTION = 0.6;
 /**
- * Pressure ceiling default — P=200K uniformly across FC/API, Codex CLI/API,
- * Claude Code CLI/interactive, Gemini CLI/API, and Fable (Jonah 2026-07-22).
+ * Pressure ceiling default — P=250K uniformly across FC/API, Codex CLI/API,
+ * Claude Code CLI/interactive, Gemini CLI/API, and Fable (Jonah 2026-08-19).
  * There are no shipped per-engine or per-model exceptions. Explicit per-session
  * overrides and the
  * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env still win over every table
  * entry. On 200K windows the resolved default rides at messageCeiling
  * (window − output 16K − emergency 4K = 180K), which always bounds it.
  */
-export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 200_000;
+export const DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS = 250_000;
 /**
  * Back-compat alias for callers that used the old Opus max-context name.
  * It intentionally equals the universal default: no hidden model-specific carve-out.
@@ -365,7 +365,7 @@ export const DEFAULT_CONTEXT_BUDGET_OPUS_MAX_PRESSURE_CEILING_TOKENS =
  * (Jonah, 2026-07-10). defaultPressureCeilingTokensForModelEngine resolves:
  *   1. MODEL_PRESSURE_CEILING_DEFAULTS — exact/longest-prefix model match
  *   2. ENGINE_PRESSURE_CEILING_DEFAULTS — engine match (lowercase keys)
- *   3. DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS — uniform 200K base
+ *   3. DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS — uniform 250K base
  * These are DEFAULTS, not caps: an explicit input.pressureCeilingTokens
  * (spawn param / live per-instance override) or the
  * VOXXO_/WARP_FOLD_PRESSURE_CEILING_TOKENS env var still wins, and every
@@ -388,14 +388,14 @@ export const MODEL_PRESSURE_CEILING_DEFAULTS: Record<string, number> = {};
 // the tail char budget), the relay falls back to an in-place session-swap
 // rebirth ("hard epoch") once provider-MEASURED context tokens cross this
 // ceiling. Kept distinct from the standard pressure ceiling — since 2026-07-10
-// the resolved Claude CLI ceiling normally comes from the shared P=200K
+// the resolved Claude CLI ceiling normally comes from the shared P=250K
 // default. This constant survives strictly as the final
 // fallback when budget resolution cannot produce a ceiling — because fold
 // pressure and out-of-process session-swap saturation can diverge independently.
 // Consumed by relay handleResultEvent (instanceManager/eventHandlers.ts).
 export const DEFAULT_CONTEXT_BUDGET_CLAUDE_CLI_HARD_EPOCH_TOKENS = 200_000;
 // The window-fraction clamp is a fail-safe below the uniform target: a physical
-// 200K window resolves to 180K, while larger listed windows admit P=200K.
+// 200K window resolves to 180K, while sufficiently large windows admit P=250K.
 export const DEFAULT_CONTEXT_BUDGET_PRESSURE_MAX_WINDOW_FRACTION = 0.9;
 export const DEFAULT_CONTEXT_BUDGET_APPEND_ONLY_MAX_WINDOW_FRACTION = 0.9;
 export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_HEADROOM_SAFETY = 0.8;
@@ -403,12 +403,12 @@ export const DEFAULT_CONTEXT_BUDGET_TOOLRESULT_MIN_WINDOW_FRACTION = 0.15;
 export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_BAND_FRACTION = 0.25;
 /**
  * Fallback headroom (tokens) kept between S + M + T and the pressure ceiling
- * when no pressure ceiling is configured. For the standard P200 geometry this
- * is P200 − S37 − M40 − T10 = 113K. (Only consumed when the pressure ceiling is
+ * when no pressure ceiling is configured. For the standard P250 geometry this
+ * is P250 − S37 − M40 − T10 = 163K. (Only consumed when the pressure ceiling is
  * explicitly disabled; with a ceiling present the margin re-derives live as
  * P − S − M − T, which algebraically pins the default tail-epoch cap to T.)
  */
-export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 113_000;
+export const DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_PRESSURE_MARGIN_TOKENS = 163_000;
 /** Absolute floor for the tail-epoch cap so a tight window never collapses to a ~0 tail (fold-every-turn pathology). */
 export const MIN_CONTEXT_BUDGET_TAIL_EPOCH_TOKENS = 4_000;
 

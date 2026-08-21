@@ -27,7 +27,7 @@ import { resolveFoldConfigForBand, ALWAYS_ON_FOLD_CONFIG } from '../rollingFold.
  * Asserts that the resolved default geometry matches the numbers documented in
  * docs/context-warp-geometry.md. If any constant drifts from the documented
  * values, this test fails — making it a structural guard against accidental
- * regression of the P200 single-ceiling geometry.
+ * regression of the P250 single-ceiling geometry.
  */
 describe('context-warp-geometry god-file parity', () => {
   describe('constant defaults match the god file', () => {
@@ -51,8 +51,8 @@ describe('context-warp-geometry god-file parity', () => {
       expect(DEFAULT_CONTEXT_BUDGET_TAIL_EPOCH_MIN_RUNWAY_TOKENS).toBe(30_000);
     });
 
-    it('P (pressure ceiling) = 200K', () => {
-      expect(DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS).toBe(200_000);
+    it('P (pressure ceiling) = 250K', () => {
+      expect(DEFAULT_CONTEXT_BUDGET_PRESSURE_CEILING_TOKENS).toBe(250_000);
     });
 
     it('legacy TRIG constant = 150K', () => {
@@ -136,54 +136,54 @@ describe('context-warp-geometry god-file parity', () => {
   describe('Codex/Gemini CLI single-ceiling trigger regression', () => {
     it('resolves Codex CLI trigger to P, not P-30K', () => {
       const r = resolveContextBudget({ model: 'gpt-5.5', engine: 'codex', env: {} });
-      expect(r.pressureCeilingTokens).toBe(200_000);
-      expect(r.foldTriggerTokens).toBe(200_000);
+      expect(r.pressureCeilingTokens).toBe(232_200);
+      expect(r.foldTriggerTokens).toBe(232_200);
     });
 
     it('resolves Gemini CLI trigger to P, not P-30K', () => {
       const r = resolveContextBudget({ model: 'gemini-2.5-pro', engine: 'gemini', env: {} });
-      expect(r.pressureCeilingTokens).toBe(200_000);
-      expect(r.foldTriggerTokens).toBe(200_000);
+      expect(r.pressureCeilingTokens).toBe(250_000);
+      expect(r.foldTriggerTokens).toBe(250_000);
     });
   });
 
   describe('per-model/engine pressure-ceiling tuning tables', () => {
-    it('ships no per-engine exceptions above or below the 200K base', () => {
+    it('ships no per-engine exceptions above or below the 250K base', () => {
       expect(ENGINE_PRESSURE_CEILING_DEFAULTS).toEqual({});
     });
 
-    it('Codex CLI resolves the uniform 200K default', () => {
+    it('Codex CLI safety-clamps the uniform 250K request to its 258K window', () => {
       const r = resolveContextBudget({ model: 'codex-5.5', engine: 'codex', env: {} });
-      expect(r.pressureCeilingTokens).toBe(200_000);
-      expect(r.foldTriggerTokens).toBe(200_000);
+      expect(r.pressureCeilingTokens).toBe(232_200);
+      expect(r.foldTriggerTokens).toBe(232_200);
     });
 
-    it('Claude Code CLI resolves 200K on modern 1M-window models', () => {
+    it('Claude Code CLI resolves 250K on modern 1M-window models', () => {
       const r = resolveContextBudget({ model: 'claude-sonnet-5', engine: 'claude-cli', env: {} });
-      expect(r.pressureCeilingTokens).toBe(200_000);
-      expect(r.foldTriggerTokens).toBe(200_000);
+      expect(r.pressureCeilingTokens).toBe(250_000);
+      expect(r.foldTriggerTokens).toBe(250_000);
     });
 
-    it('interactive tmux surface resolves 200K on modern 1M-window models', () => {
+    it('interactive tmux surface resolves 250K on modern 1M-window models', () => {
       const r = resolveContextBudget({ model: 'claude-sonnet-5', engine: 'claude-interactive', env: {} });
-      expect(r.pressureCeilingTokens).toBe(200_000);
+      expect(r.pressureCeilingTokens).toBe(250_000);
     });
 
-    it('engine-only CLI surfaces resolve 200K when the window admits it', () => {
+    it('engine-only CLI surfaces resolve 250K when the window admits it', () => {
       for (const engine of ['codex', 'claude-cli', 'claude-interactive'] as const) {
         const r = resolveContextBudget({ engine, contextWindowTokens: 1_000_000, env: {} });
-        expect(r.pressureCeilingTokens).toBe(200_000);
-        expect(r.foldTriggerTokens).toBe(200_000);
+        expect(r.pressureCeilingTokens).toBe(250_000);
+        expect(r.foldTriggerTokens).toBe(250_000);
       }
     });
 
-    it('FC claude engine uses the uniform 200K base on 1M windows', () => {
+    it('FC claude engine uses the uniform 250K base on 1M windows', () => {
       const r = resolveContextBudget({ model: 'claude-sonnet-5', engine: 'claude', env: {} });
-      expect(r.pressureCeilingTokens).toBe(200_000);
-      expect(resolveContextBudget({ engine: 'claude', contextWindowTokens: 1_000_000, env: {} }).pressureCeilingTokens).toBe(200_000);
+      expect(r.pressureCeilingTokens).toBe(250_000);
+      expect(resolveContextBudget({ engine: 'claude', contextWindowTokens: 1_000_000, env: {} }).pressureCeilingTokens).toBe(250_000);
     });
 
-    it('legacy 200K-window Claude CLI self-clamps the 200K target to its 180K messageCeiling', () => {
+    it('legacy 200K-window Claude CLI self-clamps the 250K target to its 180K messageCeiling', () => {
       const r = resolveContextBudget({ model: 'claude-sonnet-4', engine: 'claude-cli', env: {} });
       expect(r.messageCeilingTokens).toBe(180_000);
       expect(r.pressureCeilingTokens).toBe(180_000);

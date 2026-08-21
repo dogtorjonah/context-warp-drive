@@ -421,8 +421,8 @@ const SECTION_TITLES: Readonly<Record<RebirthPackageV6SectionId, string>> = Obje
 
 /**
  * Generational caps (spec §4). These are caps, not guarantees: unspent capacity
- * flows to Adaptive Backfill (§7). This 95k content profile leaves 5k for framing
- * inside the 100k package ceiling. Under pressure, older lineage units collapse
+ * flows to Adaptive Backfill (§7). This 145k content profile leaves 5k for framing
+ * inside the 150k package ceiling. Under pressure, older lineage units collapse
  * through the Continuity Ledger while active-task and recovery sections remain
  * must-push.
  */
@@ -431,7 +431,10 @@ export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
 > = Object.freeze({
   boundaryAndActiveTask: 15_000,
   executionState: 4_000,
-  activeEditDelta: 10_000,
+  // Edit evidence gets the dedicated rebirth-side budget: this section may now
+  // consume the package's +50k increase (100k→150k) so agent edits are carried
+  // at full fidelity instead of clipping to a 10k summary.
+  activeEditDelta: 60_000,
   cognitiveArtifacts: 6_000,
   recentConversation: 20_000,
   operatorVault: 20_000,
@@ -440,7 +443,7 @@ export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
   recoveryIndex: 5_000,
 });
 
-export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 100_000;
+export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 150_000;
 
 /**
  * Smallest cap the push-shrink gear assigns to a collapse citizen. Matches the

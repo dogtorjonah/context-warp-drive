@@ -475,8 +475,8 @@ export const DEFAULT_EPISODE_GROUPING = {
 
 export const BRANCH_TRACE_CAP_CHARS = 450;
 export const SUMMARY_CAP_CHARS = 120;
-export const HEADER_SUMMARY_CAP_CHARS = 60;
 export const VOICE_TEXT_CAP_CHARS = 200;
+export const VERDICT_VOICE_TEXT_CAP_CHARS = 480;
 export const TRACE_VOICE_TEXT_CAP_CHARS = 60;
 export const TRACE_RESULT_TEXT_CAP_CHARS = 96;
 /**
@@ -485,6 +485,13 @@ export const TRACE_RESULT_TEXT_CAP_CHARS = 96;
  * line on the card.
  */
 export const INTENT_TEXT_CAP_CHARS = 200;
+/**
+ * Card headline gist budget. The header quote is the only summary text most
+ * cards ever push; 60 chars truncated real conclusions mid-word ("verdict
+ * CONF…"). 90 keeps typical deriveEpisodeSummary output intact so the card's
+ * standalone value contract starts at the headline.
+ */
+export const HEADER_SUMMARY_CAP_CHARS = 90;
 export const CHAIN_CARD_DEFAULT_BUDGET_CHARS = 1_600;
 
 const TOUCH_KIND_RANK: Record<EpisodeTouchKind, number> = { edit: 2, read: 1, mention: 0 };
@@ -571,6 +578,87 @@ export function truncateVerbatim(text: string, cap: number): string {
   if (text.length <= cap) return text;
   if (cap <= 1) return '…';
   return `${text.slice(0, cap - 1)}…`;
+}
+
+// ── Extractive conclusion gist ────────────────────────────────────────────
+
+const CONCLUSION_SENTENCE_SPLIT_RE = /(?<=[.!?])\s+/gu;
+const CONCLUSION_ENTITY_TOKEN_RE = /[\d/#:%=._]/gu;
+const CONCLUSION_NEGATION_RE = /\b(?:not|no|never|none|nor|barely|only)\b/giu;
+const CONCLUSION_MARKER_RE = /(?:verdict|confirmed|root cause|fix|shipped|closed)/giu;
+const CONCLUSION_LEADING_GLYPH_RE = /^[🏁⚠️]/u;
+const CONCLUSION_GAP_MARKER = ' … ';
+
+/**
+ * Deterministic, purely extractive conclusion gist for the verdict/hazard voice
+ * line. The 2026-08-19 audit measured 21,743 episodes whose narration:verdict
+ * bodies run 10-35K chars; a hard 200-char truncation clipped real 🏁/⚠️
+ * conclusions to ~2 sentences, defeating the "push decisions, not pointers"
+ * directive. This helper keeps the highest-information sentences instead of
+ * blindly keeping the first N chars.
+ *
+ * PURE + byte-deterministic (no model calls, no Date/Math.random, no locale) so
+ * the cache injection key stays stable across runs (#39793). The result is a
+ * concatenation of VERBATIM source sentences — protected tokens (numbers,
+ * paths, `#ids`, percentages, and negation words) are never rewritten or
+ * reordered; omitted spans are marked with " … ".
+ *
+ * Algorithm:
+ *   text.length <= cap → returned verbatim.
+ *   Otherwise split into sentences; score each by entity density, negation
+ *   words, and conclusion markers (leading 🏁/⚠️ counts as a marker); greedily
+ *   select the highest-scoring sentences that fit the cap, emit them in their
+ *   ORIGINAL order, and join non-adjacent spans with " … ". If nothing fits,
+ *   or the result still exceeds the cap, fall back to a plain hard clamp.
+ */
+export function extractiveConclusionGist(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const budget = Math.max(1, Math.floor(cap));
+  const sentences = text.split(CONCLUSION_SENTENCE_SPLIT_RE).filter((s) => s.trim().length > 0);
+  if (sentences.length <= 1) return truncateVerbatim(text, budget);
+
+  const scored = sentences
+    .map((sentence, index) => ({ sentence, index, score: scoreConclusionSentence(sentence) }))
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  // Greedily admit the highest-scoring sentences that still fit; the fitting
+  // cost is recomputed over the ORIGINAL-order join so gap markers are billed.
+  const selected: { sentence: string; index: number }[] = [];
+  for (const candidate of scored) {
+    const trial = [...selected, candidate].sort((a, b) => a.index - b.index);
+    if (joinConclusionSentences(trial).length <= budget) {
+      selected.push(candidate);
+    }
+  }
+  if (selected.length === 0) return truncateVerbatim(text, budget);
+  selected.sort((a, b) => a.index - b.index);
+  const gist = joinConclusionSentences(selected);
+  return gist.length <= budget ? gist : truncateVerbatim(gist, budget);
+}
+
+function scoreConclusionSentence(sentence: string): number {
+  let score = 0;
+  score += (sentence.match(CONCLUSION_ENTITY_TOKEN_RE) ?? []).length;
+  score += (sentence.match(CONCLUSION_NEGATION_RE) ?? []).length * 2;
+  score += (sentence.match(CONCLUSION_MARKER_RE) ?? []).length * 2;
+  if (CONCLUSION_LEADING_GLYPH_RE.test(sentence)) score += 2;
+  return score;
+}
+
+function joinConclusionSentences(selected: readonly { sentence: string; index: number }[]): string {
+  let out = '';
+  let previousIndex = Number.NaN;
+  for (const { sentence, index } of selected) {
+    if (out.length === 0) {
+      out = sentence;
+    } else if (index === previousIndex + 1) {
+      out = `${out} ${sentence}`;
+    } else {
+      out = `${out}${CONCLUSION_GAP_MARKER}${sentence}`;
+    }
+    previousIndex = index;
+  }
+  return out;
 }
 
 // ── Narration (tier-B voice) ─────────────────────────────────────────────
@@ -1590,6 +1678,25 @@ function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
   const withOrigin = (line: string): string => renderHistoricalClaim(synthesizedHistoricalClaim(line));
   if (annotation.kind.startsWith('star:')) return `${withOrigin(`  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}${lifecycle}`)}${evidence}`;
   if (annotation.kind === 'changelog') return `${withOrigin(`  ✎${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
+  // Declared verdict/hazard narration renders with an explicit kind tag — the
+  // card's standalone value contract: the reader sees the CONCLUSION, not just
+  // that someone spoke. Line-leading glyph stays 🗣 (real agent speech may
+  // legitimately open with 🏁/⚠ per the register-glyph protocol, so quoted
+  // memory must not lead with them — that would defeat the self-excitation
+  // guards and cognitive mining's CARD_GLYPHS filter). Same bracket grammar as
+  // process: voice, and cardLinePriority ranks these lines above members/plain
+  // trace so budget pressure evicts receipts before conclusions.
+  if (annotation.kind === 'narration:verdict' || annotation.kind === 'narration:hazard') {
+    const kindTag = annotation.kind === 'narration:verdict' ? 'verdict' : 'hazard';
+    // Per-kind extraction: verdict/hazard conclusions are the card's standalone
+    // value (the 2026-08-19 audit measured 10-35K-char bodies; a fixed 200-char
+    // truncation clipped real 🏁/⚠️ conclusions to ~2 sentences). These lines get
+    // a longer budget AND a sentence-scored extractive gist so the densest
+    // conclusion survives inline; every other voice kind keeps the plain
+    // VOICE_TEXT_CAP_CHARS truncation.
+    const verdictText = extractiveConclusionGist(annotation.text, VERDICT_VOICE_TEXT_CAP_CHARS);
+    return `${withOrigin(`  🗣${who} [${kindTag}]:"${verdictText}"${at}${lifecycle}`)}${evidence}`;
+  }
   if (annotation.kind.startsWith('narration')) return `${withOrigin(`  🗣${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
   if (annotation.kind.startsWith('process:')) {
     const category = annotation.kind.slice('process:'.length);
@@ -1847,9 +1954,16 @@ function fullPreviousChapterLines(
 function cardLinePriority(line: string): number {
   if (line.startsWith('  trace: ') && line.includes(' ⇢ ')) return 100;
   if (line.startsWith('  ⭐gotcha:') || line.startsWith('  ⚠')) return 95;
+  // Declared verdict/hazard voice is the card's standalone value — the
+  // conclusion itself. It outranks origin/ask/members and plain trace so a
+  // tight budget evicts receipts before conclusions (content-first cards),
+  // staying just under gotcha (both say "resurface this") and decisive ⇢-trace
+  // excerpts (#30622/#30637 rationale: payload evidence stays first-class).
+  if (/^  🗣[^\n]* \[(?:verdict|hazard)\]:/.test(line)) return 92;
   if (line.startsWith('  ↞ origin ')) return 90;
   if (line.includes('peer lead from ') || line.includes('peer evidence from ')) return 88;
   if (line.startsWith('  ↳ ask:')) return 85;
+  if (/^  ⭐/u.test(line)) return 87;
   if (line.startsWith('  members:')) return 80;
   if (line.startsWith('  trace: ')) return 75;
   if (/^  (?:⭐|✎|🗣|🛤|💬)/u.test(line)) return 70;

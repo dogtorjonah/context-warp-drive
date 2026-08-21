@@ -64,6 +64,12 @@ export interface UserMessageVaultRenderOptions {
   visibleAssistantTexts?: readonly string[];
   editEntries?: readonly EditProvenanceVaultEntry[];
   /**
+   * Which edit-snippet budget applies to edit rows. 'live-rider' (default) is
+   * the lean per-send budget; 'rebirth' is the fat one-shot budget used by
+   * fold-band/rebirth renders where full-fidelity edit evidence matters most.
+   */
+  editSnippetSurface?: 'live-rider' | 'rebirth';
+  /**
    * True only while the newest operator row has not received a completed
    * assistant reply. Live rows render transiently but are never sealable.
    */
@@ -77,11 +83,20 @@ export interface UserMessageVaultRenderOptions {
 
 export const USER_MESSAGE_VAULT_MAX_MESSAGES = 6;
 export const USER_MESSAGE_VAULT_MAX_CHARS = 8_000;
+/** One-shot fold/rebirth envelope; the every-send live rider stays at 8k. */
+export const USER_MESSAGE_VAULT_REBIRTH_MAX_CHARS = 60_000;
 export const ASSISTANT_GLYPH_VAULT_MAX_MESSAGES = 4;
 export const ASSISTANT_GLYPH_VAULT_BUFFER = 24;
 export const EDIT_PROVENANCE_VAULT_MAX_ENTRIES = 48;
 export const EDIT_PROVENANCE_VAULT_MAX_MESSAGES = 8;
 export const EDIT_PROVENANCE_VAULT_SNIPPET_CHARS = 180;
+/**
+ * Rebirth-surface snippet budget. The per-turn vault rider must stay lean (it
+ * rides EVERY prompt send), but fold-band and rebirth-package renders are
+ * one-shot surfaces where edit evidence is the most causally important
+ * continuity lane — they get fat snippets. Env-overridable like the live cap.
+ */
+export const EDIT_PROVENANCE_VAULT_SNIPPET_REBIRTH_CHARS = 4_000;
 export const EDIT_PROVENANCE_VAULT_GLOBAL_CAP = 500;
 export const DEFAULT_USER_MESSAGE_VAULT_MIN_UTILIZATION = 0.6;
 
@@ -144,14 +159,19 @@ export type VaultSurface =
   | 'fold_vault_assistant_newest'
   | 'fold_vault_assistant_older';
 
+/** Which budget applies to rendered edit-provenance snippets. */
+export type EditSnippetSurface = 'live-rider' | 'rebirth';
+
 export interface UserMessageVaultCoreConfig {
   envKeys: {
     maxMessages: string;
     maxChars: string;
+    maxCharsRebirth: string;
     assistantMaxMessages: string;
     minUtilization: string;
     editMaxMessages: string;
     editSnippetChars: string;
+    editSnippetRebirthChars: string;
   };
   classifyMessageGlyph(text: string): MessageGlyphMode | null | undefined;
   renderSurfaceText(text: string, surface: VaultSurface): string;
@@ -175,9 +195,11 @@ export interface UserMessageVaultCoreConfig {
 export interface UserMessageVaultCore {
   resolveUserMessageVaultMaxMessages(env: NodeJS.ProcessEnv): number;
   resolveUserMessageVaultMaxChars(env: NodeJS.ProcessEnv): number;
+  resolveUserMessageVaultRebirthMaxChars(env: NodeJS.ProcessEnv): number;
   resolveAssistantGlyphVaultMaxMessages(env: NodeJS.ProcessEnv): number;
   resolveEditProvenanceVaultMaxMessages(env: NodeJS.ProcessEnv): number;
   resolveEditProvenanceVaultSnippetChars(env: NodeJS.ProcessEnv): number;
+  resolveEditProvenanceVaultSnippetRebirthChars(env: NodeJS.ProcessEnv): number;
   resolveUserMessageVaultMinUtilization(env: NodeJS.ProcessEnv): number;
   recordUserMessageVaultEntry(
     entries: UserMessageVaultEntry[],
@@ -558,6 +580,11 @@ export function createUserMessageVaultCore(
     resolvePositiveIntEnv(env[config.envKeys.maxMessages], USER_MESSAGE_VAULT_MAX_MESSAGES);
   const resolveUserMessageVaultMaxChars = (env: NodeJS.ProcessEnv): number =>
     resolvePositiveIntEnv(env[config.envKeys.maxChars], USER_MESSAGE_VAULT_MAX_CHARS);
+  const resolveUserMessageVaultRebirthMaxChars = (env: NodeJS.ProcessEnv): number =>
+    resolvePositiveIntEnv(
+      env[config.envKeys.maxCharsRebirth],
+      USER_MESSAGE_VAULT_REBIRTH_MAX_CHARS,
+    );
   const resolveAssistantGlyphVaultMaxMessages = (env: NodeJS.ProcessEnv): number =>
     resolvePositiveIntEnv(
       env[config.envKeys.assistantMaxMessages],
@@ -567,6 +594,11 @@ export function createUserMessageVaultCore(
     resolvePositiveIntEnv(env[config.envKeys.editMaxMessages], EDIT_PROVENANCE_VAULT_MAX_MESSAGES);
   const resolveEditProvenanceVaultSnippetChars = (env: NodeJS.ProcessEnv): number =>
     resolvePositiveIntEnv(env[config.envKeys.editSnippetChars], EDIT_PROVENANCE_VAULT_SNIPPET_CHARS);
+  const resolveEditProvenanceVaultSnippetRebirthChars = (env: NodeJS.ProcessEnv): number =>
+    resolvePositiveIntEnv(
+      env[config.envKeys.editSnippetRebirthChars],
+      EDIT_PROVENANCE_VAULT_SNIPPET_REBIRTH_CHARS,
+    );
   const resolveUserMessageVaultMinUtilization = (env: NodeJS.ProcessEnv): number => {
     const raw = env[config.envKeys.minUtilization];
     if (raw === undefined || raw === '') return DEFAULT_USER_MESSAGE_VAULT_MIN_UTILIZATION;
@@ -656,6 +688,7 @@ export function createUserMessageVaultCore(
     row: VaultRenderRow,
     index: number,
     total: number,
+    compact = resolveUserMessageVaultMaxChars(process.env) < 1_000,
   ): string => {
     const sourceTime = row.sourceTime === null ? 'unknown' : JSON.stringify(row.sourceTime);
     const glyph = row.role === 'assistant' ? ` glyph=${row.glyph ?? 'untagged'}` : '';
@@ -663,7 +696,7 @@ export function createUserMessageVaultCore(
     const historicalAuthority = row.role === 'user' && row.taskScope === 'historical'
       ? ' authority=historical-background'
       : '';
-    if (resolveUserMessageVaultMaxChars(process.env) < 1_000) {
+    if (compact) {
       const role = row.role === 'user' ? 'u' : row.role === 'assistant' ? 'a' : 'x';
       const compactTime = row.sourceTime === null
         ? '?'
@@ -687,8 +720,8 @@ export function createUserMessageVaultCore(
   const renderVaultBlockProvenance = (
     rows: ReadonlyArray<{ sourceTime: string | null }>,
     mode: 'operator-only' | 'full' | 'delta',
+    compact = resolveUserMessageVaultMaxChars(process.env) < 1_000,
   ): string => {
-    const compact = resolveUserMessageVaultMaxChars(process.env) < 1_000;
     const firstTimestamp = compact
       ? undefined
       : rows.find((row) => row.sourceTime !== null)?.sourceTime ?? undefined;
@@ -715,8 +748,13 @@ export function createUserMessageVaultCore(
     }) ?? '';
   };
 
-  const renderEditVaultText = (entry: EditProvenanceVaultEntry): string => {
-    const maxSnippet = resolveEditProvenanceVaultSnippetChars(process.env);
+  const renderEditVaultText = (
+    entry: EditProvenanceVaultEntry,
+    surface: EditSnippetSurface = 'live-rider',
+  ): string => {
+    const maxSnippet = surface === 'rebirth'
+      ? resolveEditProvenanceVaultSnippetRebirthChars(process.env)
+      : resolveEditProvenanceVaultSnippetChars(process.env);
     const lines = [
       `Edit(${entry.filePath}) via ${entry.toolName}${entry.replaceAll ? ' replaceAll' : ''}`
         + ` hash=${editProvenanceVaultFingerprint(entry)}`,
@@ -741,8 +779,9 @@ export function createUserMessageVaultCore(
     index: number,
     total: number,
     body = renderVaultRowBody(row, index === total - 1),
+    compact = resolveUserMessageVaultMaxChars(process.env) < 1_000,
   ): string => {
-    const header = renderVaultRecordHeader(row, index, total);
+    const header = renderVaultRecordHeader(row, index, total, compact);
     const payload = renderHistoricalPayloadRecord('vault-row', body);
     if (row.role !== 'user') return `${header}\n${payload}`;
     const rendered = `${header}\n${payload}`;
@@ -751,28 +790,34 @@ export function createUserMessageVaultCore(
       : rendered;
   };
 
-  const renderVaultRowsBlock = (
+  const renderVaultRowsBlockWithMaxChars = (
     rows: readonly VaultRenderRow[],
     mode: 'full' | 'delta' = 'full',
+    maxChars = resolveUserMessageVaultMaxChars(process.env),
   ): string => {
     if (rows.length === 0) return '';
-    const compact = resolveUserMessageVaultMaxChars(process.env) < 1_000;
+    const compact = maxChars < 1_000;
     const hasEdits = rows.some((row) => row.role === 'edit');
     const header = compact
       ? config.headers.minimal
       : mode === 'delta'
         ? hasEdits ? config.headers.deltaWithEdits ?? config.headers.delta : config.headers.delta
         : hasEdits ? config.headers.fullWithEdits ?? config.headers.full : config.headers.full;
-    const provenance = renderVaultBlockProvenance(rows, mode);
+    const provenance = renderVaultBlockProvenance(rows, mode, compact);
     const bodies = rows.map((row, index) => renderVaultRowBody(row, index === rows.length - 1));
     const assemble = (rowBodies: readonly string[]): string => {
       const body = rows
-        .map((row, index) => renderVaultRow(row, index, rows.length, rowBodies[index] ?? ''))
+        .map((row, index) => renderVaultRow(
+          row,
+          index,
+          rows.length,
+          rowBodies[index] ?? '',
+          compact,
+        ))
         .join('\n\n');
       return `${header}\n${provenance}\n\n${body}\n${USER_MESSAGE_VAULT_END}`;
     };
     const full = assemble(bodies);
-    const maxChars = resolveUserMessageVaultMaxChars(process.env);
     if (maxChars >= 1_000 || full.length <= maxChars) return full;
 
     const fixedChars = assemble(bodies.map(() => '')).length;
@@ -794,6 +839,15 @@ export function createUserMessageVaultCore(
     return assemble(bodies.map((body, index) => clipVaultRowBody(body, allocations[index])));
   };
 
+  const renderVaultRowsBlock = (
+    rows: readonly VaultRenderRow[],
+    mode: 'full' | 'delta' = 'full',
+  ): string => renderVaultRowsBlockWithMaxChars(
+    rows,
+    mode,
+    resolveUserMessageVaultMaxChars(process.env),
+  );
+
   const selectVaultRows = (
     userEntries: readonly UserMessageVaultEntry[],
     assistantEntries: readonly AssistantGlyphVaultEntry[],
@@ -802,7 +856,9 @@ export function createUserMessageVaultCore(
     env: NodeJS.ProcessEnv = process.env,
   ): VaultRenderRow[] => {
     const maxMessages = resolveUserMessageVaultMaxMessages(env);
-    const maxChars = resolveUserMessageVaultMaxChars(env);
+    const maxChars = options?.editSnippetSurface === 'rebirth'
+      ? resolveUserMessageVaultRebirthMaxChars(env)
+      : resolveUserMessageVaultMaxChars(env);
     const assistantMax = resolveAssistantGlyphVaultMaxMessages(env);
     const visibleUserTexts = normalizedVisibleTexts(options, 'user');
     const visibleAssistantTexts = normalizedVisibleTexts(options, 'assistant');
@@ -851,7 +907,7 @@ export function createUserMessageVaultCore(
       .map((entry) => ({
         kind: 'evidence' as const,
         role: 'edit' as const,
-        text: renderEditVaultText(entry),
+        text: renderEditVaultText(entry, options?.editSnippetSurface ?? 'live-rider'),
         sourceTime: entry.createdAt ?? null,
         liveness: 'not-applicable' as const,
         authorization: 'not-applicable' as const,
@@ -957,18 +1013,24 @@ export function createUserMessageVaultCore(
     if (assistantEntries.length === 0 && editEntries.length === 0) {
       return renderOperatorOnlyVault(entries, options);
     }
-    return renderVaultRowsBlock(
+    const maxChars = options?.editSnippetSurface === 'rebirth'
+      ? resolveUserMessageVaultRebirthMaxChars(process.env)
+      : resolveUserMessageVaultMaxChars(process.env);
+    return renderVaultRowsBlockWithMaxChars(
       selectVaultRows(entries, assistantEntries, editEntries, options),
       'full',
+      maxChars,
     );
   };
 
   return {
     resolveUserMessageVaultMaxMessages,
     resolveUserMessageVaultMaxChars,
+    resolveUserMessageVaultRebirthMaxChars,
     resolveAssistantGlyphVaultMaxMessages,
     resolveEditProvenanceVaultMaxMessages,
     resolveEditProvenanceVaultSnippetChars,
+    resolveEditProvenanceVaultSnippetRebirthChars,
     resolveUserMessageVaultMinUtilization,
     recordUserMessageVaultEntry,
     recordAssistantGlyphVaultEntry,
