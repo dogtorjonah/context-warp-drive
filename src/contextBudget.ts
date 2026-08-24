@@ -658,10 +658,16 @@ function classifyLimitSource(model: string, engine: string, explicitWindow: bool
   return 'conservative-fallback';
 }
 
+// Codex reports this effective input-window family as either 258K (the static
+// model table) or 258.4K (live provider telemetry). Keep both representations
+// on the same reserve tier so a reporting detail cannot remove 13K+ of usable
+// pressure headroom.
+const SMALL_CONTEXT_WINDOW_MAX_TOKENS = 258_400;
+
 function classifyTier(windowTokens: number, source: ContextLimitSource): ContextBudgetTier {
   if (source === 'conservative-fallback') return 'unknown-conservative';
   if (windowTokens <= 128_000) return 'tiny-window';
-  if (windowTokens <= 258_000) return 'small-200k';
+  if (windowTokens <= SMALL_CONTEXT_WINDOW_MAX_TOKENS) return 'small-200k';
   if (windowTokens <= 512_000) return 'mid-400k';
   if (windowTokens <= 1_048_576) return 'large-1m';
   return 'huge-2m';
@@ -678,7 +684,7 @@ function compressionProfileForTier(tier: ContextBudgetTier): ContextBudgetCompre
 
 function defaultOutputReserveTokens(windowTokens: number): number {
   if (windowTokens <= 128_000) return 8_000;
-  if (windowTokens <= 258_000) return 16_000;
+  if (windowTokens <= SMALL_CONTEXT_WINDOW_MAX_TOKENS) return 16_000;
   if (windowTokens <= 512_000) return 32_000;
   return 64_000;
 }
@@ -688,11 +694,16 @@ function defaultSystemToolsReserveTokens(windowTokens: number): number {
 }
 
 function defaultEmergencyMarginTokens(windowTokens: number): number {
-  // The ≤258K tier uses 0.02 (200K window → 4K) so messageCeiling =
+  // The small-window tier uses 0.02 (200K window → 4K) so messageCeiling =
   // window − output(16K) − emergency leaves a safe 180K message ceiling on a
   // physical 200K window. Wider windows keep the roomier 0.03 margin.
   // Runtime consumers: messageCeiling here + status display only (verified).
-  return reserveFloor(windowTokens, windowTokens <= 258_000 ? 0.02 : 0.03, 4_000, 48_000);
+  return reserveFloor(
+    windowTokens,
+    windowTokens <= SMALL_CONTEXT_WINDOW_MAX_TOKENS ? 0.02 : 0.03,
+    4_000,
+    48_000,
+  );
 }
 
 function defaultTailEpochPressureMarginTokens(windowTokens: number): number {

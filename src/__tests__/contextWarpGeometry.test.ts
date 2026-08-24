@@ -140,6 +140,19 @@ describe('context-warp-geometry god-file parity', () => {
       expect(r.foldTriggerTokens).toBe(232_200);
     });
 
+    it('preserves Codex CLI pressure geometry when the provider reports 258.4K', () => {
+      const r = resolveContextBudget({
+        model: 'gpt-5.5',
+        engine: 'codex',
+        contextWindowTokens: 258_400,
+        env: {},
+      });
+      expect(r.outputReserveTokens).toBe(16_000);
+      expect(r.emergencyMarginTokens).toBe(5_168);
+      expect(r.pressureCeilingTokens).toBe(232_560);
+      expect(r.foldTriggerTokens).toBe(232_560);
+    });
+
     it('resolves Gemini CLI trigger to P, not P-30K', () => {
       const r = resolveContextBudget({ model: 'gemini-2.5-pro', engine: 'gemini', env: {} });
       expect(r.pressureCeilingTokens).toBe(250_000);

@@ -187,6 +187,21 @@ describe('resolveContextBudget', () => {
     expect(api.foldTriggerTokens).toBe(250_000);
   });
 
+  it('keeps the provider-reported 258.4K Codex window on the 258K reserve tier', () => {
+    const budget = resolveContextBudget({
+      engine: 'codex',
+      model: 'gpt-5.5',
+      contextWindowTokens: 258_400,
+    });
+
+    expect(budget.budgetTier).toBe('small-200k');
+    expect(budget.outputReserveTokens).toBe(16_000);
+    expect(budget.emergencyMarginTokens).toBe(5_168);
+    expect(budget.messageCeilingTokens).toBe(237_232);
+    expect(budget.pressureCeilingTokens).toBe(232_560);
+    expect(budget.foldTriggerTokens).toBe(232_560);
+  });
+
   it('treats GLM 5.2 as a 1M flagship window instead of the older GLM fallback', () => {
     const budget = resolveContextBudget({ engine: 'glm', model: 'glm-5.2' });
 
