@@ -22,6 +22,7 @@ import {
   type TraceStep,
 } from '../src/foldEpisodes.ts';
 import { deriveEpisodesFromMessages, type EpisodeCaptureIdentity } from '../src/foldEpisodeCapture.ts';
+import { createCognitiveArtifactEnvelope } from '../src/cognitiveArtifactEnvelope.ts';
 import type { FoldMessage } from '../src/rollingFold.ts';
 
 function annotation(ts: string, kind: EpisodeAnnotation['kind'], text: string): EpisodeAnnotation {
@@ -415,7 +416,7 @@ describe('episodic card richness', () => {
       ],
     });
 
-    const chain = formatChainCard([episode], longPath('a'), []);
+    const chain = formatChainCard([episode], longPath('a'), [], { charBudget: 1_600 });
     expect(chain.length).toBeLessThanOrEqual(1_600);
     expect(chain).toContain('⇢');
     expect(chain.split('\n').at(-1)).toMatch(/^  ⌖ verbatim:/);
@@ -721,5 +722,33 @@ Make your fixes`;
     const cardWithout = formatChainCard([makeEpisode(base)], 'src/a.ts', []);
     expect(cardWithout.split('\n')[1]).toBe('  members: src/a.ts*×3, src/b.ts [origin=derived]');
     expect(cardWithout).not.toContain('↳ ask');
+  });
+
+  it('keeps a selected Cognitive Artifact atomic under card budget pressure', () => {
+    const sourceTime = '2026-08-26T06:00:00.000Z';
+    const artifact = createCognitiveArtifactEnvelope({
+      source: { family: 'glyph', messageId: 'standalone-lossless-card', sourceTime },
+      authorityClass: 'historical_observation',
+    });
+    if (!artifact) throw new Error('valid standalone artifact fixture required');
+    const exactBody = `🏁 STANDALONE-EXACT-BEGIN\n${'preserve the selected artifact as one unit '.repeat(120)}\nSTANDALONE-EXACT-END`;
+    const episode = makeEpisode({
+      endedAt: sourceTime,
+      annotations: [{
+        ts: sourceTime,
+        kind: 'narration:verdict',
+        text: exactBody,
+        artifact,
+        artifactTextStatus: 'complete',
+      }],
+    });
+
+    const roomy = formatChainCard([episode], 'src/a.ts', [], { charBudget: 12_000 });
+    expect(roomy).toContain(exactBody);
+    const tight = formatChainCard([episode], 'src/a.ts', [], { charBudget: 700 });
+    expect(tight).not.toContain('STANDALONE-EXACT-BEGIN');
+    expect(tight).not.toContain('[cognitive-artifact-body=');
+    expect(tight).toContain(`source=${artifact.sourceIdentity}`);
+    expect(tight).toContain(`[cognitive-artifact-receipt=${artifact.artifactId}]`);
   });
 });

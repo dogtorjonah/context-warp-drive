@@ -1527,7 +1527,7 @@ function pushSection(
 function resolveLifecycleBoundary(input: RawRebirthSeedInput): RawRebirthLifecycleBoundary {
   return resolveContinuityBoundary({
     lifecycleBoundary: input.lifecycleBoundary,
-    isFreshFork: input.forkContext ? input.forkContext.isFreshFork !== false : undefined,
+    isFreshFork: input.forkContext?.isFreshFork,
     mergedLineageCount: input.mergedFromLineages?.length ?? 0,
   });
 }

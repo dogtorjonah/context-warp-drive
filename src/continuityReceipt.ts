@@ -43,6 +43,9 @@ export type ContinuityReceiptBoundary =
   | 'resurrection'
   | 'brain_merge';
 
+/** Authoritative event that delivered this package into the receiving lifecycle. */
+export type ContinuityDeliveryKind = 'session-rebirth' | 'fork-birth';
+
 const CONTINUITY_RECEIPT_BOUNDARIES: readonly ContinuityReceiptBoundary[] = [
   'same_instance_hard_epoch',
   'continuation',
@@ -100,6 +103,12 @@ export interface ContinuityReceiptEditClaim {
 export interface ContinuityReceiptValidation {
   /** Stripped fact text (label removed); undefined when none was bundled. */
   readonly fact?: string;
+}
+
+export interface ContinuityReceiptValidationSource {
+  readonly text: string;
+  /** Authoritative source time of the text carrying the fact, when known. */
+  readonly sourceTimestamp?: string;
 }
 
 /** Canonical event range of the predecessor trace at package creation. */
@@ -173,6 +182,7 @@ export interface ContinuityReceiptLiveState {
   readonly validation: ContinuityLiveField<{ readonly fact: string }>;
   readonly review: ContinuityLiveField<{ readonly state: string }>;
   readonly blockers: ContinuityLiveField<readonly string[]>;
+  /** Membership snapshot at capture time; not room activity history or squad membership. */
   readonly rooms: ContinuityLiveField<readonly string[]>;
   readonly subscriptions: ContinuityLiveField<readonly string[]>;
   readonly rawTailFrontier: ContinuityLiveField<ContinuityLiveRawTailFrontier>;
@@ -372,12 +382,19 @@ export function resolveContinuityReceiptAuthority(
  */
 export function resolveContinuityBoundary(input: {
   readonly lifecycleBoundary?: ContinuityReceiptBoundary;
+  /** Authoritative delivery event. Undefined is reserved for legacy packages/builders. */
+  readonly deliveryKind?: ContinuityDeliveryKind;
   /** Pass undefined when no fork context exists (legacy callers/tests). */
   readonly isFreshFork?: boolean;
   readonly mergedLineageCount?: number;
 }): ContinuityReceiptBoundary {
   if (input.lifecycleBoundary) return input.lifecycleBoundary;
-  if (input.isFreshFork !== undefined && input.isFreshFork !== false) return 'fresh_fork';
+  if (input.deliveryKind === 'fork-birth') return 'fresh_fork';
+  if (input.deliveryKind === 'session-rebirth') {
+    return (input.mergedLineageCount ?? 0) > 0 ? 'brain_merge' : 'continuation';
+  }
+  // Legacy-only fallback: missing/unknown fork evidence is never birth proof.
+  if (input.isFreshFork === true) return 'fresh_fork';
   if ((input.mergedLineageCount ?? 0) > 0) return 'brain_merge';
   return 'continuation';
 }
@@ -421,14 +438,18 @@ export interface ContinuityReceiptParts {
   readonly hasActiveEditDelta?: boolean;
   /** Explicit validation fact (already scanned). Wins over validationSources. */
   readonly validationFact?: string;
+  /** Authoritative source time of validationFact, when the caller has it. */
+  readonly validationFactSourceTimestamp?: string;
   /** Prose blobs scanned for the latest explicit validation/verification line. */
-  readonly validationSources?: readonly string[];
+  readonly validationSources?: readonly (string | ContinuityReceiptValidationSource)[];
   /** Extra hazard descriptors beyond auto-detection. */
   readonly hazards?: readonly string[];
   /** Text blocks scanned for unresolved provider/runtime error markers. */
   readonly hazardSources?: readonly string[];
   readonly canonicalRange?: ContinuityReceiptCanonicalRange;
   readonly chatroomMembership?: string;
+  /** Latest authoritative join time among the caller's current room memberships. */
+  readonly chatroomMembershipSourceTimestamp?: string;
   /** Direct-mention or other notification subscriptions, when the relay contract exposes them. */
   readonly subscriptions?: readonly string[];
   readonly subscriptionsKnown?: boolean;
@@ -470,6 +491,7 @@ function buildReceiptLiveState(args: {
   parts: ContinuityReceiptParts;
   activeRequest?: { readonly text: string; readonly totalChars: number };
   validationFact?: string;
+  validationSourceTimestamp?: string;
   disagreements: readonly string[];
   claims: readonly string[];
   editEvidenceFiles: readonly string[];
@@ -480,6 +502,7 @@ function buildReceiptLiveState(args: {
     parts,
     activeRequest,
     validationFact,
+    validationSourceTimestamp,
     disagreements,
     claims,
     editEvidenceFiles,
@@ -609,7 +632,10 @@ function buildReceiptLiveState(args: {
     },
     validation: {
       status: validationFact ? 'current' : 'unknown',
-      source: captureSource('explicit-validation-scan', captureId, { coordinate: 'latest-explicit-fact' }),
+      source: captureSource('explicit-validation-scan', captureId, {
+        coordinate: 'latest-explicit-fact',
+        ...(validationSourceTimestamp ? { sourceTimestamp: validationSourceTimestamp } : {}),
+      }),
       ...(validationFact ? { value: { fact: validationFact } } : {}),
       ...(!validationFact ? { note: 'step status alone is not validation evidence' } : {}),
     },
@@ -627,7 +653,11 @@ function buildReceiptLiveState(args: {
     },
     rooms: {
       status: parts.chatroomMembership !== undefined ? 'current' : 'unknown',
-      source: captureSource('chatroom-membership-registry', instanceId),
+      source: captureSource('chatroom-membership-registry', instanceId, {
+        ...(parts.chatroomMembershipSourceTimestamp
+          ? { sourceTimestamp: parts.chatroomMembershipSourceTimestamp }
+          : {}),
+      }),
       value: rooms,
       ...(parts.chatroomMembership === undefined ? { note: 'room membership snapshot not supplied' } : {}),
     },
@@ -677,18 +707,70 @@ export function detectContinuityHazards(sources: readonly string[]): string[] {
 const VALIDATION_FACT_PATTERN = /^(?:validation|verification)(?:\s+(?:passed|state|fact|facts))?\s*:/iu;
 
 /**
- * Latest explicit validation/verification fact across prose blobs, latest line
- * wins. Returns the fact text with its label stripped (untruncated; the
- * renderer bounds display). This is THE scan — both the receipt assembler and
- * any legacy surface share it, so validation state cannot diverge.
+ * Latest explicit validation/verification fact across prose blobs. Structured
+ * sources sort by authoritative source time; input order is only a deterministic
+ * tie-break, and unknown-time prose cannot supersede a timestamped outcome.
+ * Returns the fact text with its label stripped (untruncated; the renderer
+ * bounds display). This is THE scan — both the receipt assembler and any legacy
+ * surface share it, so validation state cannot diverge.
  */
 export function findLatestValidationFact(texts: readonly string[]): string | undefined {
-  const explicitLines = texts
-    .flatMap((text) => text.split('\n'))
-    .map((line) => line.trim())
-    .filter((line) => VALIDATION_FACT_PATTERN.test(line));
-  const latest = explicitLines.at(-1);
-  return latest ? latest.replace(/^[^:]+:\s*/u, '') : undefined;
+  return findLatestValidationFactWithSource(texts)?.fact;
+}
+
+interface ContinuityValidationFactMatch {
+  readonly fact: string;
+  readonly sourceTimestamp?: string;
+}
+
+function findLatestValidationFactWithSource(
+  sources: readonly (string | ContinuityReceiptValidationSource)[],
+): ContinuityValidationFactMatch | undefined {
+  let latest: (ContinuityValidationFactMatch & {
+    readonly sourceTimeMs?: number;
+    readonly sourceOrder: number;
+    readonly lineOrder: number;
+  }) | undefined;
+  for (const [sourceOrder, source] of sources.entries()) {
+    const text = typeof source === 'string' ? source : source.text;
+    const sourceTimestamp = typeof source === 'string' ? undefined : source.sourceTimestamp;
+    const parsedSourceTime = sourceTimestamp ? Date.parse(sourceTimestamp) : Number.NaN;
+    for (const [lineOrder, line] of text.split('\n').entries()) {
+      const trimmed = line.trim();
+      if (!VALIDATION_FACT_PATTERN.test(trimmed)) continue;
+      const candidate = {
+        fact: trimmed.replace(/^[^:]+:\s*/u, ''),
+        ...(sourceTimestamp ? { sourceTimestamp } : {}),
+        ...(Number.isFinite(parsedSourceTime) ? { sourceTimeMs: parsedSourceTime } : {}),
+        sourceOrder,
+        lineOrder,
+      };
+      if (!latest) {
+        latest = candidate;
+        continue;
+      }
+      const candidateKnown = candidate.sourceTimeMs !== undefined;
+      const latestKnown = latest.sourceTimeMs !== undefined;
+      if (candidateKnown !== latestKnown) {
+        if (candidateKnown) latest = candidate;
+        continue;
+      }
+      if (candidateKnown && latestKnown && candidate.sourceTimeMs !== latest.sourceTimeMs) {
+        if (candidate.sourceTimeMs! > latest.sourceTimeMs!) latest = candidate;
+        continue;
+      }
+      if (candidate.sourceOrder > latest.sourceOrder
+        || (candidate.sourceOrder === latest.sourceOrder && candidate.lineOrder > latest.lineOrder)) {
+        latest = candidate;
+      }
+    }
+  }
+  return latest
+    ? {
+        fact: latest.fact,
+        ...(latest.sourceTimestamp ? { sourceTimestamp: latest.sourceTimestamp } : {}),
+      }
+    : undefined;
 }
 
 function railIsExecutable(rail: ContinuityReceiptRail | undefined): boolean {
@@ -719,7 +801,15 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
   const activeRequest = activeRequestText
     ? { text: activeRequestText, totalChars: activeRequestText.length }
     : undefined;
-  const validationFact = parts.validationFact ?? findLatestValidationFact(parts.validationSources ?? []);
+  const validationMatch = parts.validationFact
+    ? {
+        fact: parts.validationFact,
+        ...(parts.validationFactSourceTimestamp
+          ? { sourceTimestamp: parts.validationFactSourceTimestamp }
+          : {}),
+      }
+    : findLatestValidationFactWithSource(parts.validationSources ?? []);
+  const validationFact = validationMatch?.fact;
   return {
     version: CONTINUITY_RECEIPT_VERSION,
     boundary: parts.boundary,
@@ -751,6 +841,7 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
       parts,
       activeRequest,
       validationFact,
+      validationSourceTimestamp: validationMatch?.sourceTimestamp,
       disagreements,
       claims,
       editEvidenceFiles,

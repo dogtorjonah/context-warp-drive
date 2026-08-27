@@ -19,8 +19,9 @@
  * - NO-NARRATOR RULE: traces and cards contain only structural tokens (tools,
  *   targets, outcomes, order, counts) plus VERBATIM agent-authored text.
  *   Nothing retrospective, nothing paraphrased, no voice that wasn't there.
- *   Truncation of verbatim text (with a trailing ellipsis) is permitted;
- *   rewording is not. Narration annotations stay inside this rule: they are
+ *   Truncation of ordinary verbatim text (with a trailing ellipsis) is permitted;
+ *   rewording is not. Hydrated Cognitive Artifact bodies are the exception:
+ *   they render whole or are omitted whole with a source receipt. Narration annotations stay inside this rule: they are
  *   the agent's own contemporaneous words, selected by a deterministic shape
  *   gate (never an LLM), provenance-marked as kind 'narration' (🗣), and
  *   ranked below every deliberate voice channel unless promoted by a declared
@@ -119,13 +120,22 @@ export interface EpisodeAnnotation {
    * immutable artifactId/sourceIdentity pair.
    */
   artifact?: CognitiveArtifactEnvelope;
+  /**
+   * Query-time body hydration status for a linked Cognitive Artifact. This is
+   * never inferred from the denormalized episode text: only an exact persisted
+   * source row can mark the body complete.
+   */
+  artifactTextStatus?: 'complete' | 'unavailable';
 }
 
 /** Bounded query-time lifecycle row supplied by a host-owned artifact index. */
 export type EpisodeArtifactLifecycleState = Pick<
   CognitiveArtifactEnvelope,
   'artifactId' | 'sourceIdentity' | 'sourceTime' | 'authorityClass' | 'currentStatus' | 'supersededBy' | 'driftStatus'
->;
+> & {
+  /** Exact persisted source body, when the host index can supply it. */
+  text?: string;
+};
 
 export type EpisodeEvidenceRef =
   | {
@@ -492,7 +502,7 @@ export const INTENT_TEXT_CAP_CHARS = 200;
  * standalone value contract starts at the headline.
  */
 export const HEADER_SUMMARY_CAP_CHARS = 90;
-export const CHAIN_CARD_DEFAULT_BUDGET_CHARS = 1_600;
+export const CHAIN_CARD_DEFAULT_BUDGET_CHARS = 12_000;
 
 const TOUCH_KIND_RANK: Record<EpisodeTouchKind, number> = { edit: 2, read: 1, mention: 0 };
 
@@ -1283,7 +1293,7 @@ export function resolveEpisodeArtifactLifecycles(
   episode: Episode,
   lifecycleRows: readonly EpisodeArtifactLifecycleState[],
 ): Episode {
-  if (episode.annotations.length === 0 || lifecycleRows.length === 0) return episode;
+  if (episode.annotations.length === 0) return episode;
   const byArtifactId = new Map<string, EpisodeArtifactLifecycleState>();
   const start = Math.max(0, lifecycleRows.length - EPISODE_ARTIFACT_LIFECYCLE_LIMIT);
   for (let index = start; index < lifecycleRows.length; index++) {
@@ -1299,16 +1309,17 @@ export function resolveEpisodeArtifactLifecycles(
       !current
       || current.sourceIdentity !== artifact.sourceIdentity
       || current.sourceTime !== artifact.sourceTime
-    ) return annotation;
-    if (
-      artifact.authorityClass === current.authorityClass
-      && artifact.currentStatus === current.currentStatus
-      && artifact.supersededBy === current.supersededBy
-      && artifact.driftStatus === current.driftStatus
-    ) return annotation;
+    ) {
+      if (annotation.artifactTextStatus === 'unavailable') return annotation;
+      changed = true;
+      return { ...annotation, artifactTextStatus: 'unavailable' as const };
+    }
     changed = true;
     return {
       ...annotation,
+      ...(typeof current.text === 'string'
+        ? { text: current.text, artifactTextStatus: 'complete' as const }
+        : { artifactTextStatus: 'unavailable' as const }),
       artifact: {
         ...artifact,
         authorityClass: current.authorityClass,
@@ -1331,6 +1342,11 @@ function artifactLifecycleSuffix(annotation: EpisodeAnnotation): string {
 }
 
 function renderVoiceInline(annotation: EpisodeAnnotation): string {
+  if (annotation.artifact) {
+    // Structural traces are deliberately compact. Never squeeze a Cognitive
+    // Artifact body into that tiny lane; carry only its exact durable identity.
+    return `artifact:${annotation.artifact.artifactId}`;
+  }
   const text = truncateVerbatim(annotation.text, TRACE_VOICE_TEXT_CAP_CHARS);
   const lifecycle = artifactLifecycleSuffix(annotation);
   if (annotation.kind.startsWith('star:')) return `⭐${annotation.kind.slice(5)}:"${text}"${lifecycle}`;
@@ -1670,14 +1686,20 @@ function filterSelfLineageChapters(
 }
 
 function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
-  const text = truncateVerbatim(annotation.text, VOICE_TEXT_CAP_CHARS);
+  if (annotation.artifact && annotation.artifactTextStatus !== 'complete') return '';
+  const text = annotation.artifact
+    ? annotation.text
+    : truncateVerbatim(annotation.text, VOICE_TEXT_CAP_CHARS);
   const at = voiceTimeSuffix(annotation);
   const lifecycle = artifactLifecycleSuffix(annotation);
   const who = label ? ` ${label}` : '';
   const evidence = evidenceRefSuffix(annotation);
   const withOrigin = (line: string): string => renderHistoricalClaim(synthesizedHistoricalClaim(line));
-  if (annotation.kind.startsWith('star:')) return `${withOrigin(`  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}${lifecycle}`)}${evidence}`;
-  if (annotation.kind === 'changelog') return `${withOrigin(`  ✎${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
+  const artifactMarker = annotation.artifact
+    ? ` [cognitive-artifact-body=${annotation.artifact.artifactId}]`
+    : '';
+  if (annotation.kind.startsWith('star:')) return `${withOrigin(`  ⭐${who}${who ? ' ' : ''}${annotation.kind.slice(5)}:"${text}"${at}${lifecycle}${artifactMarker}`)}${evidence}`;
+  if (annotation.kind === 'changelog') return `${withOrigin(`  ✎${who}:"${text}"${at}${lifecycle}${artifactMarker}`)}${evidence}`;
   // Declared verdict/hazard narration renders with an explicit kind tag — the
   // card's standalone value contract: the reader sees the CONCLUSION, not just
   // that someone spoke. Line-leading glyph stays 🗣 (real agent speech may
@@ -1694,16 +1716,31 @@ function renderVoiceLine(annotation: EpisodeAnnotation, label: string): string {
     // a longer budget AND a sentence-scored extractive gist so the densest
     // conclusion survives inline; every other voice kind keeps the plain
     // VOICE_TEXT_CAP_CHARS truncation.
-    const verdictText = extractiveConclusionGist(annotation.text, VERDICT_VOICE_TEXT_CAP_CHARS);
-    return `${withOrigin(`  🗣${who} [${kindTag}]:"${verdictText}"${at}${lifecycle}`)}${evidence}`;
+    const verdictText = annotation.artifact
+      ? annotation.text
+      : extractiveConclusionGist(annotation.text, VERDICT_VOICE_TEXT_CAP_CHARS);
+    return `${withOrigin(`  🗣${who} [${kindTag}]:"${verdictText}"${at}${lifecycle}${artifactMarker}`)}${evidence}`;
   }
-  if (annotation.kind.startsWith('narration')) return `${withOrigin(`  🗣${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
+  if (annotation.kind.startsWith('narration')) return `${withOrigin(`  🗣${who}:"${text}"${at}${lifecycle}${artifactMarker}`)}${evidence}`;
   if (annotation.kind.startsWith('process:')) {
     const category = annotation.kind.slice('process:'.length);
-    return `${withOrigin(`  🗣${who} [${category}]:"${text}"${at}${lifecycle}`)}${evidence}`;
+    return `${withOrigin(`  🗣${who} [${category}]:"${text}"${at}${lifecycle}${artifactMarker}`)}${evidence}`;
   }
-  if (annotation.kind === 'rail') return `${withOrigin(`  🛤${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
-  return `${withOrigin(`  💬${who}:"${text}"${at}${lifecycle}`)}${evidence}`;
+  if (annotation.kind === 'rail') return `${withOrigin(`  🛤${who}:"${text}"${at}${lifecycle}${artifactMarker}`)}${evidence}`;
+  return `${withOrigin(`  💬${who}:"${text}"${at}${lifecycle}${artifactMarker}`)}${evidence}`;
+}
+
+function renderCognitiveArtifactReceipt(annotation: EpisodeAnnotation): string | null {
+  const artifact = annotation.artifact;
+  if (!artifact) return null;
+  const disposition = annotation.artifactTextStatus === 'complete'
+    ? 'body included intact when budget permits'
+    : 'body unavailable; denormalized projection withheld';
+  return renderHistoricalClaim(witnessedHistoricalClaim(
+    `  ↞ cognitive artifact ${artifact.artifactId} — ${disposition}; source=${artifact.sourceIdentity}`
+      + ` [cognitive-artifact-receipt=${artifact.artifactId}]`,
+    { sourceIdentity: artifact.sourceIdentity, sourceTimestamp: artifact.sourceTime },
+  ));
 }
 
 function evidenceRefSuffix(annotation: EpisodeAnnotation): string {
@@ -1739,9 +1776,13 @@ export function renderEpisodeVoiceLines(
   maxLines = 2,
 ): { voiceLines: string[]; intent: string | null } {
   const voiceLabel = episodeAuthorLabel(episode, opts);
-  const voiceLines = selectVoiceInlays(episode.annotations, maxLines).map((inlay) =>
-    renderVoiceLine(inlay, voiceLabel),
-  );
+  const voiceLines: string[] = [];
+  for (const inlay of selectVoiceInlays(episode.annotations, maxLines)) {
+    const renderedVoice = renderVoiceLine(inlay, voiceLabel);
+    if (renderedVoice) voiceLines.push(renderedVoice);
+    const artifactReceipt = renderCognitiveArtifactReceipt(inlay);
+    if (artifactReceipt) voiceLines.push(artifactReceipt);
+  }
   const intent = episode.intent ?? null;
   return { voiceLines, intent };
 }
@@ -1912,7 +1953,10 @@ function renderChapterBody(
     lines.push(renderHistoricalClaim(derivedHistoricalClaim(`  trace: ${episode.trace}`)));
   }
   for (const inlay of selectVoiceInlays(episode.annotations, maxVoiceInlays)) {
-    lines.push(renderVoiceLine(inlay, voiceLabel));
+    const renderedVoice = renderVoiceLine(inlay, voiceLabel);
+    if (renderedVoice) lines.push(renderedVoice);
+    const artifactReceipt = renderCognitiveArtifactReceipt(inlay);
+    if (artifactReceipt) lines.push(artifactReceipt);
   }
   for (const delta of sinceDeltas) {
     lines.push(renderHistoricalClaim(derivedHistoricalClaim(`  Δ ${delta}`)));
@@ -1952,6 +1996,8 @@ function fullPreviousChapterLines(
 }
 
 function cardLinePriority(line: string): number {
+  if (line.includes('[cognitive-artifact-receipt=')) return 99;
+  if (line.includes('[cognitive-artifact-body=')) return 98;
   if (line.startsWith('  trace: ') && line.includes(' ⇢ ')) return 100;
   if (line.startsWith('  ⭐gotcha:') || line.startsWith('  ⚠')) return 95;
   // Declared verdict/hazard voice is the card's standalone value — the
@@ -2045,6 +2091,11 @@ function fitCardToBudget(header: string, body: readonly string[], pointer: strin
       remaining -= fullCost;
       continue;
     }
+    // Cognitive Artifact bodies are atomic continuity units. If the exact body
+    // cannot fit, omit it whole; its separately-rendered receipt remains
+    // eligible and carries the durable source coordinate.
+    if (candidate.line.includes('[cognitive-artifact-body=')
+      || candidate.line.includes('[cognitive-artifact-receipt=')) continue;
     const lineRoom = remaining - 1;
     if (lineRoom < 8) continue;
     const fitted = truncateCardLine(candidate.line, lineRoom);
@@ -2368,13 +2419,13 @@ export const EPISODIC_ZONE_TTL_BOUNDARIES = 8;
 /** Hard process-memory bound for the once-per-epoch automatic-serve registry. */
 export const EPISODIC_SERVED_SIGNATURE_MAX_ENTRIES = 4_096;
 /** Default per-boundary char budget for the episodic block (one breath). */
-export const EPISODIC_DEFAULT_CHAR_BUDGET = 2000;
+export const EPISODIC_DEFAULT_CHAR_BUDGET = 12_000;
 /** Default max distinct chains served per boundary. */
 export const EPISODIC_DEFAULT_MAX_CHAINS = 2;
 /** Default max active hot cards re-pinned while a zone is still being walked. */
 export const EPISODIC_ACTIVE_PIN_DEFAULT_MAX_CARDS = 2;
 /** Default active-path pin budget; small enough to stay as working memory. */
-export const EPISODIC_ACTIVE_PIN_DEFAULT_CHAR_BUDGET = 1200;
+export const EPISODIC_ACTIVE_PIN_DEFAULT_CHAR_BUDGET = 12_000;
 
 /** Mirror of the worker's FoldEpisodesRecallCard (kept structural — this module imports nothing). */
 export interface EpisodicRecallCardDebugLike {
@@ -3451,16 +3502,24 @@ export function selectActiveEpisodicPathCards(
   return { cards: out, decisions, enabled, repinInactive, repinValueFloor, maxCards };
 }
 
-function compactActivePathCard(card: EpisodicRecallCardLike, budget: number): string | null {
+function fitActivePathCardWhole(card: EpisodicRecallCardLike, budget: number): string | null {
   if (budget <= 0) return null;
-  if (card.renderedCard.length <= budget) return card.renderedCard;
-  const lines = card.renderedCard.split('\n');
-  const header = lines[0] ?? '';
-  const members = lines.find((line) => line.startsWith('  members: '));
-  const pointer = lines.find((line) => line.startsWith('  ⌖ verbatim: '));
-  const compact = [header, members, pointer].filter((line): line is string => typeof line === 'string' && line.length > 0).join('\n');
-  if (compact.length === 0) return null;
-  return compact.length <= budget ? compact : truncateVerbatim(compact, budget);
+  return card.renderedCard.length <= budget ? card.renderedCard : null;
+}
+
+function fitActivePathArtifactReceipts(card: EpisodicRecallCardLike, budget: number): string | null {
+  if (budget <= 0) return null;
+  const receipts = [...new Set(
+    card.renderedCard
+      .split('\n')
+      .filter((line) => line.includes('[cognitive-artifact-receipt=')),
+  )];
+  if (receipts.length === 0) return null;
+  const fallback = [
+    '[active path card omitted whole; selected Cognitive Artifact body withheld]',
+    ...receipts,
+  ].join('\n');
+  return fallback.length <= budget ? fallback : null;
 }
 
 export interface ActiveEpisodicPathBlockOptions {
@@ -3485,10 +3544,12 @@ export function renderActiveEpisodicPathBlock(
   const renderedCards: string[] = [];
   for (const card of cards) {
     const separatorCost = 2; // the \n\n between header/cards
-    const compact = compactActivePathCard(card, budgetLeft - separatorCost);
-    if (!compact) continue;
-    renderedCards.push(compact);
-    budgetLeft -= separatorCost + compact.length;
+    const cardBudget = budgetLeft - separatorCost;
+    const rendered = fitActivePathCardWhole(card, cardBudget)
+      ?? fitActivePathArtifactReceipts(card, cardBudget);
+    if (!rendered) continue;
+    renderedCards.push(rendered);
+    budgetLeft -= separatorCost + rendered.length;
     if (budgetLeft <= 0) break;
   }
   if (renderedCards.length === 0) return null;

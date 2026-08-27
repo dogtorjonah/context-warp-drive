@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_BRAIN_MERGE_REBIRTH_PACKAGE_BUDGET_CHARS,
   DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS,
   DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS,
   REBIRTH_PACKAGE_V6_SECTION_IDS,
@@ -142,11 +143,44 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(order[order.length - 1]).toBe('recoveryIndex');
   });
 
-  it('keeps the declared caps plus the framing reserve exactly at the package budget', () => {
-    const capSum = Object.values(DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS)
+  it('keeps the ordinary profile at budget and treats Brain Merge as a conditional protected cap', () => {
+    const ordinaryCapSum = Object.entries(DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS)
+      .filter(([id]) => id !== 'brainMergeSynthesis')
+      .map(([, cap]) => cap)
       .reduce((total, cap) => total + cap, 0);
-    expect(capSum + REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS)
+    expect(ordinaryCapSum + REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS)
       .toBe(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
+    expect(DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS.brainMergeSynthesis).toBe(30_000);
+    expect(DEFAULT_BRAIN_MERGE_REBIRTH_PACKAGE_BUDGET_CHARS).toBe(300_000);
+  });
+
+  it('water-fills Brain Merge to 300k without enlarging ordinary rebirths', () => {
+    const baseline = model();
+    const synthesis = `${'donor synthesis evidence '.repeat(9_000)}END_OF_MERGE_SYNTHESIS`;
+    const ordinary = model({ brainMergeSynthesis: synthesis });
+    const brainMerge = model({
+      boundaryAndActiveTask: {
+        ...baseline.boundaryAndActiveTask,
+        lifecycle: 'brain_merge',
+        lifecycleMeaning: 'same identity; donor lineages absorbed at this boundary',
+      },
+      brainMergeSynthesis: synthesis,
+    });
+
+    const ordinaryText = renderRebirthPackageV6(ordinary);
+    const brainMergeText = renderRebirthPackageV6(brainMerge);
+
+    expect(ordinaryText.length).toBeLessThanOrEqual(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
+    expect(ordinaryText).not.toContain('END_OF_MERGE_SYNTHESIS');
+    expect(brainMergeText.length).toBeGreaterThan(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
+    expect(brainMergeText.length).toBeLessThanOrEqual(
+      DEFAULT_BRAIN_MERGE_REBIRTH_PACKAGE_BUDGET_CHARS,
+    );
+    expect(brainMergeText).toContain('END_OF_MERGE_SYNTHESIS');
+
+    const explicitLowerBudget = renderRebirthPackageV6(brainMerge, { packageBudget: 120_000 });
+    expect(explicitLowerBudget.length).toBeLessThanOrEqual(120_000);
+    expect(explicitLowerBudget).not.toContain('END_OF_MERGE_SYNTHESIS');
   });
 
   it('renders every populated lineage section with its framed title and units', () => {
@@ -204,17 +238,75 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(text).toMatch(/recover=tap_instance_messages/);
   });
 
-  it('keeps the whole package inside the declared budget with a saturated vault', () => {
+  it('ships all available thin-lifecycle truth without truncation or padding', () => {
+    const cognitionBody = `${'full cognition body '.repeat(70)}END_OF_AVAILABLE_TRUTH`;
     const value = model({
+      cognitiveArtifacts: [{
+        provenanceId: 'star:thin',
+        sourceAt: '2026-08-07T18:59:00.000Z',
+        kind: 'result',
+        text: cognitionBody,
+        authority: 'current',
+        supersededBy: null,
+      }],
+      operatorVault: lineage(2),
+    });
+    const unrestrictedDemand = renderRebirthPackageV6Sections(value, {
+      adaptiveBackfill: false,
+      sectionMaxChars: Object.fromEntries(
+        REBIRTH_PACKAGE_V6_SECTION_IDS.map((id) => [
+          id,
+          DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS,
+        ]),
+      ),
+    }).map((section) => section.text).join('\n\n');
+    const { text, collapse } = renderRebirthPackageV6WithReport(value);
+
+    // Abundance is byte-exact demand: dynamic defaults cannot project or omit
+    // anything that the same renderer can supply inside the fixed envelope.
+    expect(text).toBe(unrestrictedDemand);
+    expect(text).toContain(cognitionBody);
+    expect(collapse.omittedSectionIds).toEqual([]);
+    expect(collapse.telemetry.unitsDemoted).toBe(0);
+    expect(collapse.telemetry.sectionsElided).toBe(0);
+    // No padding: a young lifecycle stops at its available truth rather than
+    // manufacturing bytes merely to approach 150k.
+    expect(text.length).toBeLessThan(20_000);
+    expect(collapse.telemetry.finalTotalChars).toBe(text.length);
+  });
+
+  it('keeps the whole package inside the declared budget with a saturated vault', () => {
+    const saturated = {
       operatorVault: lineage(600),
       episodeChapterIndex: lineage(300),
       lifeLedger: lineage(120),
+    };
+    const value = model(saturated);
+    const baseline = model();
+    const brainMerge = model({
+      ...saturated,
+      boundaryAndActiveTask: {
+        ...baseline.boundaryAndActiveTask,
+        lifecycle: 'brain_merge',
+        lifecycleMeaning: 'same identity; donor lineages absorbed at this boundary',
+      },
     });
     const rendered = renderRebirthPackageV6(value);
     expect(rendered.length).toBeLessThanOrEqual(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
     // The point of v7: a rich lineage must actually consume the headroom rather
     // than rendering a thin package beside an unspent budget.
-    expect(rendered.length).toBeGreaterThan(80_000);
+    expect(rendered.length).toBeGreaterThan(
+      DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS - REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS,
+    );
+
+    const merged = renderRebirthPackageV6(brainMerge);
+    expect(merged.length).toBeLessThanOrEqual(
+      DEFAULT_BRAIN_MERGE_REBIRTH_PACKAGE_BUDGET_CHARS,
+    );
+    expect(merged.length).toBeGreaterThan(
+      DEFAULT_BRAIN_MERGE_REBIRTH_PACKAGE_BUDGET_CHARS
+        - REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS,
+    );
   });
 
   it('reserves envelope chars from the section budget rather than overflowing', () => {
@@ -308,13 +400,25 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(() => renderRebirthPackageV6(stripped as unknown as RebirthPackageV6Model)).not.toThrow();
   });
 
-  it('orders adaptive backfill so operator memory is funded before lower-priority lineage', () => {
-    expect(REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY.slice(0, 2)).toEqual([
+  it('extends adaptive backfill eligibility to every admitted section in the frozen drink order', () => {
+    // Dynamic fill (operator directive 2026-08-26): every admitted,
+    // non-explicit, incomplete section is backfill-eligible so the loop
+    // converges to demand-first water-fill. The order preserves the
+    // re-derivability ranking under scarcity — operator memory and cognition
+    // first (they die with the context that held them), pure recovery handles
+    // last (cheap to regenerate, expansion adds the least).
+    expect([...REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY]).toEqual([
       'operatorVault',
       'cognitiveArtifacts',
+      'recentConversation',
+      'episodeChapterIndex',
+      'lifeLedger',
+      'activeEditDelta',
+      'boundaryAndActiveTask',
+      'brainMergeSynthesis',
+      'executionState',
+      'recoveryIndex',
     ]);
-    expect([...REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY]).not.toContain('boundaryAndActiveTask');
-    expect([...REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY]).not.toContain('recoveryIndex');
   });
 
   it('funds the vault beyond its declared cap only when backfill is enabled', () => {
@@ -363,7 +467,10 @@ describe('Rebirth Package v7 — eviction envelopes and edit citizenship', () =>
       packageBudget: evictionBudget(value),
     });
     expect(text).toContain(`[EVICTED section=operatorVault units=40 span=2026-07-`);
-    expect(text).toContain(` ledger=${CONTINUITY_LEDGER_HANDLE}]`);
+    expect(text).toContain(
+      'recover=continuity_ledger action="fetch" owner="instance-a" capture_id="capture-v7"'
+      + ' section_id="operatorVault" omitted_only=true include_unknown_source_time=true limit=200]',
+    );
     expect(text).toContain('· era=');
     expect(text).not.toContain('ledger unreachable');
     expect(collapse.omittedSectionIds).toContain('operatorVault');

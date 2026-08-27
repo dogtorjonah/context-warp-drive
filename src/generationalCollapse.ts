@@ -39,6 +39,7 @@ export type CollapseUnitKind =
   | 'era'
   | 'package'
   | 'star'
+  | 'cognitive'
   | 'conversation'
   | 'edit';
 
@@ -84,6 +85,25 @@ export interface CollapseUnit {
    * find rows sourced from a purged identity. Null/absent = unknown source.
    */
   readonly sourceInstanceId?: string | null;
+  /**
+   * Projection declaration. Present only when `verbatim` is a head-clamped or
+   * otherwise projected prefix of a longer source body the `recover` handle
+   * still addresses. Presence is what lets a receipt name the artifact as a
+   * projection instead of claiming full-fidelity proof: `storedChars`/
+   * `storedBytes` describe `verbatim`; `sourceChars`/`sourceBytes` describe
+   * what `recover` resolves. No source hash is carried here — where the source
+   * bytes survive (e.g. the cognitive lane), the feeder must mint `sha256`
+   * against them; a projection unit must never mint a hash it cannot verify.
+   */
+  readonly projection?: {
+    readonly mode: 'truncated';
+    readonly algorithm: 'head-clamp';
+    readonly version: number;
+    readonly storedChars: number;
+    readonly storedBytes: number;
+    readonly sourceChars: number;
+    readonly sourceBytes: number;
+  } | null;
 }
 
 export interface CollapseOptions {
@@ -139,8 +159,15 @@ function oneLine(value: string, maxChars = 180): string {
 /** Exact T3 receipt line (spec §6). Minted only for verified, hashed targets. */
 export function formatCollapseReceipt(unit: CollapseUnit): string {
   const sha = (unit.sha256 ?? '').slice(0, 12) || 'unknown';
+  // A projection unit's `sha256` (when present) attests the STORED prefix only;
+  // the source dimensions here prevent the receipt from reading as full-proof.
+  const projection = unit.projection
+    ? ` projection=${unit.projection.mode}/v${unit.projection.version}`
+      + ` stored-chars=${unit.projection.storedChars} source-chars=${unit.projection.sourceChars}`
+      + ` stored-bytes=${unit.projection.storedBytes} source-bytes=${unit.projection.sourceBytes}`
+    : '';
   return `[RECEIPT kind=${unit.kind} id=${unit.id} span=${unitSpan(unit)}`
-    + ` sha256=${sha} chars=${unit.verbatim.length}`
+    + ` sha256=${sha} chars=${unit.verbatim.length}${projection}`
     + ` claim="${oneLine(unit.claim, 160).replace(/"/gu, "'")}" recover=${unit.recover}]`;
 }
 

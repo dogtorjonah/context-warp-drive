@@ -126,7 +126,7 @@ describe('raw rebirth seed renderer', () => {
     expect(seed.startsWith('[CONTEXT REBIRTH] Lifecycle boundary: continuation for "source-agent"')).toBe(true);
     expect(seed).toContain('artifact=rebirth-package#continuation class=reconstructed-state authority=current-as-of-frontier');
     expect(seed).toContain(
-      'source=source-agent:event#0..source-agent:event#42 n=42 @ 2026-07-28T21:00:00.000Z..2026-07-28T21:41:00.000Z',
+      'source[canonical-epoch-tail]=source-agent:event#0..source-agent:event#41 n=42 @ 2026-07-28T21:00:00.000Z..2026-07-28T21:41:00.000Z',
     );
     expect(seed).toContain('created=source-agent:event#42 @ 2026-07-28T21:42:00.000Z');
     expect(seed).toContain('topology=raw-history>artifact>seam>none host=continuity-package');
@@ -1078,7 +1078,7 @@ describe('raw rebirth seed renderer', () => {
     });
     const seed = buildRawRebirthSeedFromMessages([
       { role: 'user', content: capsule, contextWarpSynthetic: 'folded-context' },
-      { role: 'user', content: 'Keep the current card visible.' },
+      { role: 'user', content: 'Continue.' },
       { role: 'assistant', content: 'The inventory has three rows.' },
     ], {
       predecessorName: 'standalone-pending-action-agent',

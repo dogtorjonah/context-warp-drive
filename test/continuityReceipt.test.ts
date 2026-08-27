@@ -146,19 +146,27 @@ describe('resolveContinuityBoundary', () => {
   test('lifecycle boundary wins over every other signal', () => {
     expect(resolveContinuityBoundary({
       lifecycleBoundary: 'same_instance_hard_epoch',
+      deliveryKind: 'fork-birth',
       isFreshFork: true,
       mergedLineageCount: 2,
     })).toBe('same_instance_hard_epoch');
   });
 
-  test('fresh fork beats brain merge; brain merge beats continuation', () => {
+  test('authoritative fork birth beats brain merge; session merge stays brain_merge', () => {
+    expect(resolveContinuityBoundary({ deliveryKind: 'fork-birth', mergedLineageCount: 3 })).toBe('fresh_fork');
+    expect(resolveContinuityBoundary({ deliveryKind: 'session-rebirth', mergedLineageCount: 1 })).toBe('brain_merge');
+    expect(resolveContinuityBoundary({ deliveryKind: 'session-rebirth', isFreshFork: true })).toBe('continuation');
+  });
+
+  test('legacy freshness remains available only when explicitly proven', () => {
     expect(resolveContinuityBoundary({ isFreshFork: true, mergedLineageCount: 3 })).toBe('fresh_fork');
     expect(resolveContinuityBoundary({ isFreshFork: false, mergedLineageCount: 1 })).toBe('brain_merge');
     expect(resolveContinuityBoundary({ mergedLineageCount: 2 })).toBe('brain_merge');
   });
 
-  test('defaults to continuation when no signal exists', () => {
+  test('defaults missing or unknown freshness to continuation', () => {
     expect(resolveContinuityBoundary({})).toBe('continuation');
+    expect(resolveContinuityBoundary({ isFreshFork: undefined })).toBe('continuation');
     expect(resolveContinuityBoundary({ isFreshFork: false, mergedLineageCount: 0 })).toBe('continuation');
   });
 });
@@ -278,19 +286,44 @@ describe('buildContinuityReceipt (typed assembly)', () => {
       boundary: 'continuation',
       predecessorName: 'agent',
       validationFact: 'shipped',
+      validationFactSourceTimestamp: '2026-07-20T02:00:00.000Z',
       validationSources: ['validation state: stale'],
     });
     expect(explicit.validation.fact).toBe('shipped');
+    expect(explicit.liveState?.validation.source.sourceTimestamp).toBe('2026-07-20T02:00:00.000Z');
 
     const scanned = buildContinuityReceipt({
       boundary: 'continuation',
       predecessorName: 'agent',
       validationSources: [
-        'validation state: first fact\nnoise',
-        'some line\nVerification: second fact wins',
+        {
+          text: 'some line\nVerification: later terminal receipt wins',
+          sourceTimestamp: '2026-07-20T02:02:00.000Z',
+        },
+        {
+          text: 'validation state: no terminal receipt surfaced\nnoise',
+          sourceTimestamp: '2026-07-20T02:01:00.000Z',
+        },
+        'Verification: unknown-time prose cannot supersede known chronology',
       ],
     });
-    expect(scanned.validation.fact).toBe('second fact wins');
+    expect(scanned.validation.fact).toBe('later terminal receipt wins');
+    expect(scanned.liveState?.validation.source.sourceTimestamp).toBe('2026-07-20T02:02:00.000Z');
+  });
+
+  test('room membership keeps the registry join time separate from capture time', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      capturedAt: '2026-07-20T03:00:00.000Z',
+      chatroomMembership: '[CHATROOM MEMBERSHIP]\nroom-a — you\n[END CHATROOM MEMBERSHIP]',
+      chatroomMembershipSourceTimestamp: '2026-07-20T02:30:00.000Z',
+    });
+
+    expect(receipt.liveState?.rooms.source).toMatchObject({
+      sourceTimestamp: '2026-07-20T02:30:00.000Z',
+      capturedAt: '2026-07-20T03:00:00.000Z',
+    });
   });
 
   test('hazards combine marker detection with explicit extras', () => {

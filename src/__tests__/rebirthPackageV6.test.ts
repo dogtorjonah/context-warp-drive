@@ -3,15 +3,20 @@ import { buildContinuityReceipt } from '../continuityReceipt.ts';
 import { buildRawHardEpochSeed } from '../foldFreeze.ts';
 import {
   DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS,
+  REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS,
   REBIRTH_PACKAGE_V6_SECTION_IDS,
   REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS,
   adaptLegacyRebirthPackageToV6,
   adaptRebirthPackageV6SectionsToLegacyKeys,
+  buildContinuityLedgerCaptureFromV6Render,
   buildRebirthPackageV6Model,
   isRebirthPackageV6Model,
   renderRebirthPackageV6,
   renderRebirthPackageV6Sections,
+  renderRebirthPackageV6WithReport,
+  sha256ContinuityLedgerVerbatim,
   type RebirthPackageV6ActiveEditDelta,
+  type RebirthPackageV6CognitiveArtifact,
   type RebirthPackageV6Model,
 } from '../rebirthPackageV6.ts';
 
@@ -151,6 +156,13 @@ function model(
       status: 'available',
       count: null,
       frontier: 'capture-1',
+    }, {
+      id: 'continuity-ledger',
+      label: 'continuity ledger',
+      handle: 'continuity_ledger action="index" owner="instance-a"',
+      status: 'available',
+      count: null,
+      frontier: 'capture-1',
     }],
     ...overrides,
   });
@@ -202,6 +214,362 @@ describe('Rebirth Package v6', () => {
     expect(legacyUnknown).toContain('projection status is unknown for this persisted package');
   });
 
+  describe('cognition render discipline', () => {
+    const artifact = (
+      overrides: Partial<RebirthPackageV6CognitiveArtifact> & { provenanceId: string },
+    ): RebirthPackageV6CognitiveArtifact => ({
+      sourceAt: '2026-08-02T17:00:00.000Z',
+      kind: 'discovery',
+      text: 'a finding',
+      authority: 'evidence',
+      supersededBy: null,
+      ...overrides,
+    });
+
+    /**
+     * The section BODY, with the `[REBIRTH-V6-SECTION …]` frame stripped. The
+     * frame is protected envelope charged above the section cap, so asserting
+     * the cap against framed text would measure the wrong string.
+     */
+    const cognition = (
+      value: RebirthPackageV6Model,
+      maxChars?: number,
+    ): string => {
+      const framed = renderRebirthPackageV6Sections(
+        value,
+        maxChars === undefined
+          ? {}
+          : { adaptiveBackfill: false, sectionMaxChars: { cognitiveArtifacts: maxChars } },
+      ).find((section) => section.id === 'cognitiveArtifacts')?.text ?? '';
+      // Frame is four lines: title, `[REBIRTH-V6-SECTION …]`, body, close.
+      const openLine = framed.indexOf('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
+      const bodyStart = openLine < 0 ? -1 : framed.indexOf('\n', openLine) + 1;
+      const close = framed.lastIndexOf('\n[/REBIRTH-V6-SECTION]');
+      return bodyStart > 0 && close >= bodyStart ? framed.slice(bodyStart, close) : framed;
+    };
+
+    const receipt = {
+      status: 'complete' as const,
+      capturedAt: '2026-08-02T18:00:00.000Z',
+      totalMatched: 6,
+      selectedCount: 1,
+      overlayCount: 0,
+      missingFamilies: [] as string[],
+      warnings: [] as string[],
+      relaySuppression: {
+        duplicate: 2,
+        rootDuplicate: 1,
+        superseded: 1,
+        frontier: 3,
+        crossSection: 1,
+        unknownSourceTime: 1,
+        overBudget: 1,
+        unattributed: 0,
+      },
+    };
+
+    it('keeps relay selection suppression visible and arithmetically separate from upstream rejections', () => {
+      const value = model({
+        cognitiveArtifacts: [artifact({ provenanceId: 'star:kept', text: 'kept result' })],
+        cognitiveArtifactCapture: receipt,
+      });
+
+      const rendered = cognition(value);
+      expect(rendered).toContain('rendered=1 captured=1 matched=6');
+      expect(rendered).toContain(
+        'relay-drops{root:1,superseded:1,thread:1,unknown-time:1,budget:1,other:0}',
+      );
+      expect(rendered).toContain('upstream-rejects{duplicate:2,frontier:3}');
+    });
+
+    it('ships an oversized entry whole while room remains and projects it only under contention', () => {
+      const body = `${'x'.repeat(1200)} tail`;
+      const value = model({
+        cognitiveArtifacts: [artifact({ provenanceId: 'star:huge', text: body })],
+        cognitiveArtifactCapture: receipt,
+      });
+
+      // Dynamic fill: normalize preserves the FULL body. The per-entry cap is
+      // a scarcity floor and the ledger's storage economy, never a normalize
+      // mutation — projecting at normalize time would make the abundance
+      // render unable to ship the body it still has room for.
+      const [row] = value.cognitiveArtifacts;
+      expect(row.projection).toBeUndefined();
+      expect(row.text).toBe(body);
+
+      // Abundance: the body ships whole, byte-exact, with no projection.
+      const full = cognition(value);
+      expect(full).toContain(body);
+      expect(full).not.toContain('projected{truncated');
+
+      // Contention (cap below full assembled demand): the declared per-entry
+      // projection uses the same exact byte prefix as the ledger's stored copy.
+      // The cap fits the raw body but not the body plus its protected capture
+      // and accounting receipts, so the demand probe must fall back to the
+      // scarcity projection without dropping the row wholesale.
+      const contended = cognition(value, 1400);
+      expect(contended).toContain(`projection=truncated stored=${REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS}/${body.length} chars`);
+      expect(contended).toContain('projected{truncated:1}');
+      // No rendered artifact body may exceed the per-entry cap under pressure.
+      expect(contended).not.toContain('x'.repeat(REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS + 1));
+    });
+
+    it('keeps full bodies through normalize and passes persisted projected rows through untouched', () => {
+      const body = `${'y'.repeat(1500)} end`;
+      const once = model({
+        cognitiveArtifacts: [artifact({ provenanceId: 'star:huge', text: body })],
+      }).cognitiveArtifacts;
+      // Normalize is a filter/dedupe pass, not a projection pass: the full
+      // body survives so the render can ship it whole under abundance.
+      expect(once[0].text).toBe(body);
+      expect(once[0].projection).toBeUndefined();
+      const twice = model({ cognitiveArtifacts: once }).cognitiveArtifacts;
+      expect(twice).toEqual(once);
+
+      // A persisted, already-projected row (from a pre-dynamic package) passes
+      // through byte-identically: re-normalizing can never truncate twice or
+      // lose the original sourceChars.
+      const persisted = artifact({
+        provenanceId: 'star:persisted',
+        text: body.slice(0, REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS),
+        projection: 'truncated',
+        storedChars: REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS,
+        storedBytes: REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS,
+        sourceChars: body.length,
+        sourceBytes: body.length,
+      });
+      const rehydrated = model({ cognitiveArtifacts: [persisted] }).cognitiveArtifacts;
+      expect(rehydrated).toEqual([persisted]);
+      expect(rehydrated[0].sourceChars).toBe(body.length);
+    });
+
+    it('stores the declared per-entry projection in the ledger even when the render ships the body whole', () => {
+      const body = `${'Q'.repeat(1_200)} tail`;
+      const value = model({
+        cognitiveArtifacts: [artifact({ provenanceId: 'star:economy', text: body })],
+        cognitiveArtifactCapture: { ...receipt, totalMatched: 1 },
+      });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
+      // Abundance: the shipped section carries the whole body.
+      expect(text).toContain(body);
+
+      const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
+      const unit = record.units.find((entry) => entry.unitId === 'star:economy')!;
+      // Storage economy: the persisted ledger copy is the declared byte-exact
+      // PREFIX of the shipped body, and sha256 attests exactly those stored
+      // bytes — never undeclared full-body bytes the store would then discard.
+      expect(unit.projection?.mode).toBe('truncated');
+      expect(unit.projection?.storedChars).toBe(REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS);
+      expect(unit.projection?.sourceChars).toBe(body.length);
+      expect(unit.verbatim).toContain(body.slice(0, REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS));
+      expect(unit.verbatim).not.toContain(body);
+      expect(unit.sha256).toBe(sha256ContinuityLedgerVerbatim(unit.verbatim));
+    });
+
+    it('drops whole units by lowest priority under pressure and declares the suppression', () => {
+      const rows = [
+        artifact({ provenanceId: 'a:flow', kind: 'flow', text: 'F'.repeat(300), sourceAt: '2026-08-02T17:05:00.000Z' }),
+        artifact({ provenanceId: 'b:discovery', kind: 'discovery', text: 'D'.repeat(300), sourceAt: '2026-08-02T17:04:00.000Z' }),
+        artifact({ provenanceId: 'c:result', kind: 'result', text: 'R'.repeat(300), sourceAt: '2026-08-02T17:03:00.000Z' }),
+        artifact({ provenanceId: 'd:question', kind: 'question', text: 'Q'.repeat(300), sourceAt: '2026-08-02T17:01:00.000Z' }),
+      ];
+      const value = model({ cognitiveArtifacts: rows, cognitiveArtifactCapture: receipt });
+      const text = cognition(value, 1400);
+
+      expect(text.length).toBeLessThanOrEqual(1400);
+      // Unresolved open loop survives; transient process voice goes first.
+      expect(text).toContain('Q'.repeat(300));
+      expect(text).not.toContain('F'.repeat(300));
+      expect(text).toMatch(/cognition: rendered=\d+ captured=4 matched=6 · omitted-units=\d+ · suppressed\{/u);
+      expect(text).toContain('dropped-whole by lowest budget priority');
+      // The capture receipt is protected: it survives pressure that rows do not.
+      expect(text).toContain('Capture receipt: status=complete');
+    });
+
+    it('never slices a row mid-body: every surviving row ships its exact model bytes', () => {
+      const rows = Array.from({ length: 12 }, (_, index) => artifact({
+        provenanceId: `row:${index}`,
+        kind: 'discovery',
+        text: `${String.fromCharCode(65 + index).repeat(240)}`,
+        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+      }));
+      const value = model({ cognitiveArtifacts: rows, cognitiveArtifactCapture: receipt });
+      const text = cognition(value, 1800);
+
+      expect(text.length).toBeLessThanOrEqual(1800);
+      // Byte coherence: a row is present in full or absent entirely. A partial
+      // body would mean the ledger's sha256 attests bytes nobody was shown.
+      let shown = 0;
+      for (const row of value.cognitiveArtifacts) {
+        if (!text.includes(`· ${row.kind} · ${row.text} ·`)) {
+          expect(text).not.toContain(row.text.slice(0, 40));
+          continue;
+        }
+        shown += 1;
+      }
+      expect(shown).toBeGreaterThan(0);
+      expect(shown).toBeLessThan(rows.length);
+      expect(text).toContain(`cognition: rendered=${shown} captured=${rows.length} matched=6`);
+    });
+
+    it('publishes one capture-scoped command whose ledger rows equal the declared omitted count', () => {
+      const rows = Array.from({ length: 8 }, (_, index) => artifact({
+        provenanceId: `omission:${index}`,
+        kind: index === 0 ? 'question' : 'decision',
+        text: index === 7 ? 'P'.repeat(1_200) : String(index).repeat(260),
+        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+      }));
+      const value = model({
+        cognitiveArtifacts: rows,
+        cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
+      });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, {
+        adaptiveBackfill: false,
+        sectionMaxChars: { cognitiveArtifacts: 1_500 },
+      });
+      const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
+      const omitted = record.units.filter((unit) => (
+        unit.sectionId === 'cognitiveArtifacts'
+        && (unit.placement !== 'rendered' || unit.projection?.mode === 'truncated')
+      ));
+      const declared = text.match(/cognition: rendered=\d+ captured=8 matched=8 · omitted-units=(\d+)/u);
+      expect(declared).not.toBeNull();
+      expect(omitted).toHaveLength(Number(declared![1]));
+      const command = 'continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1" section_id="cognitiveArtifacts" omitted_only=true include_unknown_source_time=true limit=200';
+      expect(text.match(new RegExp(command.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'gu'))).toHaveLength(1);
+      expect(text).not.toContain('unit_ids=');
+    });
+
+    it('ledgers selector budget evictions as explicit cap-overflow elisions', () => {
+      const dropped = [
+        artifact({ provenanceId: 'selector-drop:1', text: 'first selector omission' }),
+        artifact({ provenanceId: 'selector-drop:2', text: 'second selector omission' }),
+      ];
+      const value = model({
+        cognitiveArtifacts: [artifact({ provenanceId: 'selector-kept', text: 'visible cognition' })],
+        cognitiveArtifactCapture: {
+          ...receipt,
+          totalMatched: 3,
+          selectedCount: 1,
+          droppedByBudget: dropped,
+          relaySuppression: {
+            ...receipt.relaySuppression,
+            overBudget: 2,
+          },
+        },
+      });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
+      const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
+      const droppedRows = record.units.filter((unit) => unit.unitId.startsWith('selector-drop:'));
+
+      expect(text).toContain('relay-drops{root:1,superseded:1,thread:1,unknown-time:1,budget:2,other:0}');
+      expect(text).not.toContain('first selector omission');
+      expect(text).not.toContain('second selector omission');
+      expect(droppedRows.map((unit) => unit.unitId).sort())
+        .toEqual(['selector-drop:1', 'selector-drop:2']);
+      expect(droppedRows.every((unit) => (
+        unit.placement === 'elided'
+        && unit.tier === 't4'
+        && unit.tierBasis === 'cap-overflow'
+      ))).toBe(true);
+    });
+
+    it('keeps every cognitive unit addressable when the package omits the whole section', () => {
+      const rows = Array.from({ length: 3 }, (_, index) => artifact({
+        provenanceId: `whole-section:${index}`,
+        kind: index === 0 ? 'question' : 'decision',
+        text: index === 2 ? 'P'.repeat(1_200) : `artifact-${index}`,
+        sourceAt: `2026-08-02T17:0${index}:00.000Z`,
+      }));
+      const value = model({
+        cognitiveArtifacts: rows,
+        cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
+      });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, {
+        packageBudget: 1,
+      });
+      const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
+      const cognitive = record.units.filter((unit) => unit.sectionId === 'cognitiveArtifacts');
+
+      expect(collapse.omittedSectionIds).toContain('cognitiveArtifacts');
+      expect(collapse.omissionSections).toEqual([{
+        sectionId: 'cognitiveArtifacts',
+        placements: expect.arrayContaining(rows.map((row) => expect.objectContaining({ id: row.provenanceId }))),
+        sectionElided: true,
+      }]);
+      expect(cognitive).toHaveLength(rows.length);
+      expect(cognitive.map((unit) => unit.unitId).sort()).toEqual(rows.map((row) => row.provenanceId).sort());
+      expect(cognitive.every((unit) => unit.placement === 'elided' && unit.tierBasis === 'section-elision')).toBe(true);
+      expect(text).toContain('[EVICTED section=cognitiveArtifacts units=3');
+      expect(text).toContain(
+        'recover=continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1"'
+        + ' section_id="cognitiveArtifacts" omitted_only=true include_unknown_source_time=true limit=200]',
+      );
+    });
+
+    it('covers every one of the five ledger families when the count formula assumes them', () => {
+      // Review F1 left side: the capture writer must persist one row for every
+      // unit of every family the assembler's count formula sums (activeEditDelta
+      // files, cognitiveArtifacts, operatorVault, episodeChapterIndex, lifeLedger).
+      // If a family is added to the formula without being fed to the writer (or
+      // vice versa), the relay-side count===rows invariant fails; this test pins
+      // the writer's family coverage directly.
+      const lineageRow = (
+        id: string,
+        sourceAt: string,
+        kind: 'operator' | 'episode' | 'life',
+        verbatim: string,
+        claim: string,
+      ) => ({
+        id,
+        sourceAt,
+        sourceEndAt: null,
+        kind,
+        verbatim,
+        digest: claim,
+        claim,
+        recover: 'continuity_ledger action="fetch" owner="instance-a"',
+        origin: kind === 'operator' ? 'declared' as const : undefined,
+      });
+      const value = model({
+        activeEditDelta: exactDelta({ files: [exactDelta().files[0]] }),
+        cognitiveArtifacts: model().cognitiveArtifacts,
+        cognitiveArtifactCapture: { ...receipt, totalMatched: model().cognitiveArtifacts.length },
+        operatorVault: { units: [lineageRow('vault:1', '2026-08-02T17:55:00.000Z', 'operator', 'operator vault note', 'operator: note')], rangeRecover: null },
+        episodeChapterIndex: { units: [lineageRow('ep:1', '2026-08-02T17:54:00.000Z', 'episode', 'episode chapter', 'episode: chapter')], rangeRecover: null },
+        lifeLedger: { units: [lineageRow('life:1', '2026-08-02T17:53:00.000Z', 'life', 'life ledger row', 'life: row')], rangeRecover: null },
+      });
+      const { collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
+      const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
+      const expectedIds = new Set([
+        'edit-file:one',
+        ...value.cognitiveArtifacts.map((entry) => entry.provenanceId),
+        'vault:1',
+        'ep:1',
+        'life:1',
+      ]);
+      expect(record.units.map((unit) => unit.unitId).sort()).toEqual([...expectedIds].sort());
+      expect(new Set(record.units.map((unit) => unit.sectionId)))
+        .toEqual(new Set(['activeEditDelta', 'cognitiveArtifacts', 'operatorVault', 'episodeChapterIndex', 'lifeLedger']));
+    });
+
+    it('selects deterministically and preserves newest-first chronology with quarantine last', () => {
+      const rows = [
+        artifact({ provenanceId: 'z:old', kind: 'decision', text: 'oldest decision', sourceAt: '2026-08-02T17:01:00.000Z' }),
+        artifact({ provenanceId: 'a:new', kind: 'decision', text: 'newest decision', sourceAt: '2026-08-02T17:09:00.000Z' }),
+        artifact({ provenanceId: 'm:none', kind: 'decision', text: 'undated decision', sourceAt: null }),
+      ];
+      const first = cognition(model({ cognitiveArtifacts: rows, cognitiveArtifactCapture: receipt }));
+      const second = cognition(model({ cognitiveArtifacts: [...rows].reverse(), cognitiveArtifactCapture: receipt }));
+
+      expect(first).toBe(second);
+      expect(first.indexOf('newest decision')).toBeLessThan(first.indexOf('oldest decision'));
+      // Unknown source time never interleaves into the chronology (GOD RULE 8).
+      expect(first.indexOf('oldest decision')).toBeLessThan(first.indexOf('undated decision'));
+      expect(first).toContain('Unknown source time (quarantined; not part of the chronology):');
+    });
+  });
+
   it('renders the fixed six-section order and de-duplicates promoted dialogue', () => {
     const value = model();
     const sections = renderRebirthPackageV6Sections(value);
@@ -209,7 +577,8 @@ describe('Rebirth Package v6', () => {
     // reason, so a lineage-free model renders the original v6 six in order.
     expect(sections.map((section) => section.id)).toEqual(
       REBIRTH_PACKAGE_V6_SECTION_IDS.filter(
-        (id) => !(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id),
+        (id) => id !== 'brainMergeSynthesis'
+          && !(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id),
       ),
     );
 
@@ -221,6 +590,19 @@ describe('Rebirth Package v6', () => {
       expect(rendered.indexOf(sections[index - 1].text))
         .toBeLessThan(rendered.indexOf(sections[index].text));
     }
+  });
+
+  it('suppresses an inapplicable fork-purpose row and renders remaining absent Now-card facts as unknowns', () => {
+    const boundary = renderRebirthPackageV6Sections(model())
+      .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+    const card = boundary.split('[FACTUAL NOW CARD · descriptive boundary facts]')[1]
+      ?.split('[/FACTUAL NOW CARD]')[0] ?? '';
+
+    expect(card).not.toContain('fork-purpose=');
+    expect(card).toContain('parent-identity=unknown · checkpoint=unknown');
+    expect(card).toContain('parent-status=unknown');
+    expect(card).toContain('current-rail=unknown · state=unknown');
+    expect(card).not.toMatch(/\b(?:should|must|recommend|safe-action|next-action)\b/iu);
   });
 
   it('renders a persisted v6 package that predates the lineage sections', () => {
@@ -236,23 +618,91 @@ describe('Rebirth Package v6', () => {
     const sections = renderRebirthPackageV6Sections(legacy);
     expect(sections.map((section) => section.id)).toEqual(
       REBIRTH_PACKAGE_V6_SECTION_IDS.filter(
-        (id) => !(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id),
+        (id) => id !== 'brainMergeSynthesis'
+          && !(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id),
       ),
     );
     expect(renderRebirthPackageV6(legacy)).toContain('contract=rebirth-package-v6/v1');
   });
 
-  it('omits Recent Conversation when every row was promoted', () => {
+  it('rejects a malformed persisted Brain Merge section before rendering', () => {
+    const persisted = JSON.parse(JSON.stringify(model())) as Record<string, unknown>;
+    persisted.brainMergeSynthesis = 17;
+    expect(isRebirthPackageV6Model(persisted)).toBe(false);
+  });
+
+  it('keeps a relocation receipt when every conversation row was promoted', () => {
     const value = model({
       recentConversation: [{
         provenanceId: 'message:user-1',
-        sourceAt: null,
+        sourceAt: '2026-08-02T17:58:00.000Z',
         role: 'user',
         text: 'Implement the frozen v6 contract.',
+      }, {
+        provenanceId: 'message:assistant-1',
+        sourceAt: '2026-08-02T17:58:30.000Z',
+        role: 'assistant',
+        text: 'I will implement it now.',
       }],
     });
-    expect(renderRebirthPackageV6Sections(value).map((section) => section.id))
-      .not.toContain('recentConversation');
+    expect(value.recentConversation).toHaveLength(0);
+
+    const section = renderRebirthPackageV6Sections(value)
+      .find((entry) => entry.id === 'recentConversation');
+    expect(section?.text).toContain('Endpoint relocation receipt');
+    expect(section?.text).toContain('rendered-as=EXACT ACTIVE REQUEST');
+    expect(section?.text).toContain('rendered-as=LAST MATERIAL ASSISTANT');
+    expect(section?.text).toContain('Additional recent-dialogue rows retained here: 0.');
+    expect(section?.text).not.toContain('Implement the frozen v6 contract.');
+    expect(section?.text).not.toContain('I will implement it now.');
+
+    const rendered = renderRebirthPackageV6(value);
+    expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
+    expect(rendered.match(/I will implement it now\./gu)).toHaveLength(1);
+  });
+
+  it('keeps non-promoted dialogue beside the endpoint relocation receipt', () => {
+    const value = model();
+    expect(value.recentConversation.map((row) => row.provenanceId))
+      .toEqual(['message:user-older']);
+
+    const section = renderRebirthPackageV6Sections(value)
+      .find((entry) => entry.id === 'recentConversation');
+    expect(section?.text).toContain('Endpoint relocation receipt');
+    expect(section?.text).toContain('Additional recent-dialogue rows retained here: 1.');
+    expect(section?.text).toContain('Keep Atlas semantics stable.');
+  });
+
+  it('keeps the endpoint relocation receipt when admitted dialogue consumes the section cap', () => {
+    const value = model({
+      recentConversation: [{
+        provenanceId: 'message:user-1',
+        sourceAt: '2026-08-02T17:58:00.000Z',
+        role: 'user',
+        text: 'Implement the frozen v6 contract.',
+      }, {
+        provenanceId: 'message:assistant-1',
+        sourceAt: '2026-08-02T17:58:30.000Z',
+        role: 'assistant',
+        text: 'I will implement it now.',
+      }, ...Array.from({ length: 8 }, (_, index) => ({
+        provenanceId: `message:retained-${index}`,
+        sourceAt: `2026-08-02T17:59:0${index}.000Z`,
+        role: 'assistant' as const,
+        text: `retained dialogue ${index} ${'x'.repeat(180)}`,
+      }))],
+    });
+
+    const rendered = renderRebirthPackageV6(value, {
+      packageBudget: 200_000,
+      sectionMaxChars: { recentConversation: 700 },
+    });
+    const section = rendered.split('[REBIRTH-V6-SECTION id=recentConversation')[1]
+      ?.split('[REBIRTH-V6-SECTION-END id=recentConversation]')[0] ?? '';
+
+    expect(section).toContain('Endpoint relocation receipt');
+    expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
+    expect(rendered.match(/I will implement it now\./gu)).toHaveLength(1);
   });
 
   it('de-duplicates promoted dialogue wrapped by the legacy transcript renderer', () => {
@@ -424,7 +874,7 @@ describe('Rebirth Package v6', () => {
     expect(rendered.length).toBeLessThanOrEqual(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
   });
 
-  it('publishes only executable recovery commands and marks unexposed stores unavailable', () => {
+  it('publishes only executable recovery commands and marks bounded store recovery partial', () => {
     const continuityReceipt = buildContinuityReceipt({
       boundary: 'continuation',
       predecessorName: 'worker-a',
@@ -434,6 +884,27 @@ describe('Rebirth Package v6', () => {
         instanceId: 'instance-a',
         instanceName: 'worker-a',
         runtimeStatus: 'working',
+      },
+      rail: {
+        railId: 'rail-recovery',
+        title: 'Recovery census',
+        state: 'active',
+        totalSteps: 4,
+        updatedAt: '2026-08-02T17:59:00.000Z',
+      },
+      canonicalRange: {
+        traceId: 'trace-a',
+        eventCount: 12,
+        lastEventId: 'event-12',
+        lastEventTimestamp: '2026-08-02T17:59:30.000Z',
+      },
+      rawTailFrontier: {
+        traceId: 'trace-a',
+        unit: 'event',
+        index: 12,
+        id: 'event-12',
+        exactCount: 3,
+        sourceTimestamp: '2026-08-02T17:59:30.000Z',
       },
     });
     const value = adaptLegacyRebirthPackageToV6({
@@ -461,9 +932,15 @@ describe('Rebirth Package v6', () => {
     expect(handles.get('rebirth-package')?.handle)
       .toBe('tap_instance_messages action="rebirth" target_instance_id="instance-a" search="capture-1"');
     expect(handles.get('context-warp-stores')).toMatchObject({
-      status: 'unavailable',
-      handle: '',
+      status: 'partial',
+      handle: 'fold_recall op="range" start_event=0',
     });
+    expect(handles.get('transcript')).toMatchObject({ count: 12, frontier: 'event-12' });
+    expect(handles.get('current-continuity-pov')).toMatchObject({ count: 3, frontier: 'event-12' });
+    expect(handles.get('task-rail')).toMatchObject({ count: 4 });
+    expect(handles.get('atlas-edit-capture')).toMatchObject({ count: 1 });
+    expect(handles.get('rebirth-package')).toMatchObject({ count: 1, frontier: 'capture-1' });
+    expect(handles.get('identity')).toMatchObject({ count: 1 });
   });
 
   it('adapts the canonical continuity receipt without stale field aliases', () => {
@@ -765,6 +1242,7 @@ describe('Rebirth Package v6', () => {
     }).find((entry) => entry.id === 'recentConversation');
 
     expect(section?.complete).toBe(false);
+    expect(section?.text).toContain('Endpoint relocation receipt');
     expect(section?.text).toContain('SECOND_NEWEST_TURN_MUST_SURVIVE');
     expect(section?.text).toContain('NEWEST_TURN_MUST_SURVIVE');
     expect(section?.text).not.toContain('OVERSIZED_OLDER_TURN');
@@ -795,6 +1273,7 @@ describe('Rebirth Package v6', () => {
     }).find((entry) => entry.id === 'recentConversation');
 
     expect(section?.complete).toBe(false);
+    expect(section?.text).toContain('Endpoint relocation receipt');
     expect(section?.text).toContain('NEWEST_CANARY');
     expect(section?.text).not.toContain('OLDER_TINY_CAP');
     expect(section?.text).toContain('latest-tail=omitted');
@@ -873,6 +1352,18 @@ describe('Rebirth Package v6', () => {
     expect(rendered).toContain('omitted-files=3');
     expect(rendered).toContain('REBIRTH-V6-PACKAGE-ELISION');
     expect(rendered).toContain('tap_instance_messages action="rebirth" target_instance_id="instance-a" search="capture-1"');
+  });
+
+  it('never elides the Brain Merge synthesis mandate under package pressure', () => {
+    const value = model({
+      brainMergeSynthesis: [
+        'You absorbed Conference Plan (donor-conference-plan).',
+        'Synthesize its exact donor cognition before continuing.',
+      ].join('\n'),
+    });
+    const rendered = renderRebirthPackageV6(value, { packageBudget: 2_500 });
+    expect(rendered).toContain('[REBIRTH-V6-SECTION id=brainMergeSynthesis');
+    expect(rendered).toContain('Conference Plan (donor-conference-plan)');
   });
 
   it('filters superseded cognition and quarantines unknown-time rows', () => {

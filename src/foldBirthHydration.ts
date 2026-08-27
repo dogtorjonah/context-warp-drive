@@ -927,11 +927,12 @@ export function resolveBirthFoldSeedMaxChars(
 export function seedToAnthropicMessage(
   m: BirthFoldSeedMessage,
 ):
-  | { role: 'user'; content: Array<{ type: 'text'; text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[] }
-  | { role: 'assistant'; content: Array<{ type: 'text'; text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[] } {
+  | { role: 'user'; content: Array<{ type: 'text'; text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[]; tsMs?: number }
+  | { role: 'assistant'; content: Array<{ type: 'text'; text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[]; tsMs?: number } {
   const source = {
     ...(m.sourceIdentity ? { sourceIdentity: m.sourceIdentity } : {}),
     ...(m.sourceIdentities ? { sourceIdentities: m.sourceIdentities } : {}),
+    ...(m.tsMs !== undefined ? { tsMs: m.tsMs } : {}),
   };
   return m.role === 'user'
     ? { role: 'user', content: [{ type: 'text', text: m.content }], ...source }
@@ -941,23 +942,25 @@ export function seedToAnthropicMessage(
 /** OpenAI Chat Completions history: plain string content. */
 export function seedToOpenAIChatMessage(
   m: BirthFoldSeedMessage,
-): { role: 'user' | 'assistant'; content: string; sourceIdentity?: string; sourceIdentities?: readonly string[] } {
+): { role: 'user' | 'assistant'; content: string; sourceIdentity?: string; sourceIdentities?: readonly string[]; tsMs?: number } {
   return {
     role: m.role,
     content: m.content,
     ...(m.sourceIdentity ? { sourceIdentity: m.sourceIdentity } : {}),
     ...(m.sourceIdentities ? { sourceIdentities: m.sourceIdentities } : {}),
+    ...(m.tsMs !== undefined ? { tsMs: m.tsMs } : {}),
   };
 }
 
 /** Gemini history: model role + parts array. */
 export function seedToGeminiContent(
   m: BirthFoldSeedMessage,
-): { role: 'user' | 'model'; parts: Array<{ text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[] } {
+): { role: 'user' | 'model'; parts: Array<{ text: string }>; sourceIdentity?: string; sourceIdentities?: readonly string[]; tsMs?: number } {
   return {
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }],
     ...(m.sourceIdentity ? { sourceIdentity: m.sourceIdentity } : {}),
     ...(m.sourceIdentities ? { sourceIdentities: m.sourceIdentities } : {}),
+    ...(m.tsMs !== undefined ? { tsMs: m.tsMs } : {}),
   };
 }

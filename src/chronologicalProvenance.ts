@@ -120,8 +120,12 @@ export const PEER_DISPATCH_BANNER_PREFIXES: readonly { readonly key: string; rea
 /**
  * Relay/runtime control dispatches persisted as user rows: queued-signal
  * digests, fixer-mode batches, watchdog rebirth prompts, fold/redirect
- * interrupt markers, and atlas-debt idle nudges. Runtime machinery authored
- * these, so they are never objective-eligible.
+ * interrupt markers, atlas-debt idle nudges, and review-wave phase
+ * directives. Runtime machinery authored these, so they are never
+ * objective-eligible. The wave directive is the agent's entire task contract
+ * for a launched phase, but it is still relay-authored: classification stays
+ * 'relay-runtime' here so it can never launder into operator intent, and the
+ * dedicated directive lane in the FC session owns fold-time re-injection.
  */
 export const RELAY_RUNTIME_DISPATCH_BANNER_PREFIXES: readonly { readonly key: string; readonly prefix: string }[] = Object.freeze([
   { key: 'queued-signals', prefix: '[Queued Signals' },
@@ -129,6 +133,7 @@ export const RELAY_RUNTIME_DISPATCH_BANNER_PREFIXES: readonly { readonly key: st
   { key: 'watchdog-rebirth', prefix: '[WATCHDOG_REBIRTH]' },
   { key: 'relay-interrupt-marker', prefix: '[relay_interrupt ' },
   { key: 'atlas-debt', prefix: '[atlas-debt]' },
+  { key: 'relay-wave-directive', prefix: '[RELAY WAVE DIRECTIVE' },
 ]);
 
 /**
@@ -373,7 +378,7 @@ export function resolveChronologicalPointToSourceRow<T>(
 
 export interface ChronologicalSpan {
   readonly start: ChronologicalPoint;
-  /** Exclusive when numeric; the renderer prints `[start..end)`. */
+  /** Exclusive when numeric; the renderer shows the final included ordinal. */
   readonly endExclusive?: ChronologicalPoint;
   readonly count?: number;
   readonly lastTimestamp?: string;
@@ -391,6 +396,9 @@ export interface ChronologicalProvenanceEnvelope {
   readonly artifact: string;
   readonly contentClass: ChronologicalContentClass;
   readonly source: ChronologicalSpan;
+  /** Scope of the top-level source range; older evidence may carry its own spans. */
+  readonly sourceScope?: 'canonical-epoch-tail';
+  readonly sourceScopeNote?: 'lineage-sections-carry-older-per-unit-spans';
   readonly transformedAt: ChronologicalPoint;
   readonly rawResumesAt?: ChronologicalPoint;
   readonly authority: 'historical-background' | 'current-as-of-frontier' | 'live';
@@ -465,6 +473,16 @@ export function validateChronologicalProvenance(
   if (envelope.source.count !== undefined
     && (!Number.isInteger(envelope.source.count) || envelope.source.count < 0)) errors.push('source.count');
   if (!validTimestamp(envelope.source.lastTimestamp)) errors.push('source.lastTimestamp');
+  if (envelope.sourceScope !== undefined && envelope.sourceScope !== 'canonical-epoch-tail') {
+    errors.push('sourceScope');
+  }
+  if (envelope.sourceScopeNote !== undefined
+    && envelope.sourceScopeNote !== 'lineage-sections-carry-older-per-unit-spans') {
+    errors.push('sourceScopeNote');
+  }
+  if (envelope.sourceScopeNote !== undefined && envelope.sourceScope === undefined) {
+    errors.push('sourceScope.missing');
+  }
   if (!Number.isInteger(envelope.topology.rawTailCount) || envelope.topology.rawTailCount < 0) {
     errors.push('topology.rawTailCount');
   }
@@ -503,12 +521,29 @@ function pointTimestamp(point: ChronologicalPoint): string {
 
 function sourceText(span: ChronologicalSpan): string {
   const start = pointCoordinate(span.start);
-  const end = span.endExclusive ? pointCoordinate(span.endExclusive) : '?';
+  const endExclusive = span.endExclusive;
+  const numericRange = span.start.index !== undefined
+    && endExclusive?.index !== undefined
+    && span.start.unit === endExclusive.unit
+    && (span.start.traceId ?? '') === (endExclusive.traceId ?? '');
+  const end = numericRange && endExclusive.index! > span.start.index!
+    ? pointCoordinate({ ...endExclusive, index: endExclusive.index! - 1 })
+    : numericRange && endExclusive.index === span.start.index
+      ? `empty@${pointCoordinate(endExclusive)}`
+      : endExclusive ? pointCoordinate(endExclusive) : '?';
   const count = span.count !== undefined ? ` n=${span.count}` : '';
   const firstTime = span.start.timestamp;
   const lastTime = span.lastTimestamp ?? span.endExclusive?.timestamp;
   const time = ` @ ${firstTime ?? 'time unknown'}..${lastTime ?? 'time unknown'}`;
   return `${start}..${end}${count}${time}`;
+}
+
+function sourceFieldName(envelope: ChronologicalProvenanceEnvelope): string {
+  return envelope.sourceScope ? `source[${envelope.sourceScope}]` : 'source';
+}
+
+function sourceScopeNote(envelope: ChronologicalProvenanceEnvelope): string {
+  return envelope.sourceScopeNote ? `source-scope-note=${envelope.sourceScopeNote}` : '';
 }
 
 function supersessionText(envelope: ChronologicalProvenanceEnvelope): string {
@@ -583,7 +618,8 @@ export function renderChronologicalProvenance(
   return [
     CHRONOLOGICAL_PROVENANCE_PREFIX,
     `artifact=${envelope.artifact} class=${envelope.contentClass} authority=${envelope.authority} supersession=${supersession}${chronologicalEnvelopeOriginField(envelope, true)}`,
-    `source=${sourceText(envelope.source)}`,
+    `${sourceFieldName(envelope)}=${sourceText(envelope.source)}`,
+    sourceScopeNote(envelope),
     `created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)}`,
     `topology=${envelope.topology.previous}>artifact>seam>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation}`,
     `raw-resumes=${rawFrontier}`,
@@ -605,7 +641,8 @@ export function renderChronologicalProvenanceCompact(
   const rawFrontier = envelope.rawResumesAt
     ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)}(${envelope.topology.rawTailCount} exact)`
     : 'none';
-  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${envelope.artifact} class=${envelope.contentClass} source=${sourceText(envelope.source)} created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)} authority=${envelope.authority} supersession=${supersessionText(envelope)}${chronologicalEnvelopeOriginField(envelope, true)} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=${rawFrontier}`;
+  const scopeNote = sourceScopeNote(envelope);
+  return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${envelope.artifact} class=${envelope.contentClass} ${sourceFieldName(envelope)}=${sourceText(envelope.source)}${scopeNote ? ` ${scopeNote}` : ''} created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)} authority=${envelope.authority} supersession=${supersessionText(envelope)}${chronologicalEnvelopeOriginField(envelope, true)} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=${rawFrontier}`;
 }
 
 export interface TailEpochProvenanceInput {
@@ -797,6 +834,8 @@ export function renderContinuityPackageProvenance(
       ...(sourceEventCount !== undefined ? { count: sourceEventCount } : {}),
       lastTimestamp: knownTimestamp(input.sourceLastTimestamp),
     },
+    sourceScope: 'canonical-epoch-tail',
+    sourceScopeNote: 'lineage-sections-carry-older-per-unit-spans',
     transformedAt,
     ...(input.rawTailCount > 0 ? { rawResumesAt } : {}),
     authority: 'current-as-of-frontier',
