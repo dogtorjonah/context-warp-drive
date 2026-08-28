@@ -1737,7 +1737,7 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
     `lifecycle=${boundary.lifecycle} · ${boundary.lifecycleMeaning}`,
     `capture-artifact=${boundary.captureId} · captured-at=${boundary.capturedAt ?? 'unknown'} · frontier=${boundary.sourceFrontier ?? 'unknown'}`,
     ...(degradedLanes.length > 0
-      ? [`capture-degraded=${degradedLanes.join(',')} · status=partial · affected lanes remain recoverable below`]
+      ? [`capture-degraded=${degradedLanes.join(',')} · status=partial · per-lane recovery truth renders in each affected section`]
       : []),
     `instance=${boundary.instanceName} (${boundary.instanceId}) · predecessor=${boundary.predecessorName ?? boundary.predecessorInstanceId ?? 'none'}`,
     `workspace=${boundary.workspace} · cwd=${boundary.cwd ?? 'unknown'}`,
@@ -2606,7 +2606,11 @@ function renderLineage(
 ): RenderedV6SectionBody {
   const header: string[] = [];
   if (section.partialReason) {
-    header.push(`partial=${section.partialReason} · omitted-units=unknown · omitted units are ledger-unreachable`);
+    header.push(
+      omissionHandle
+        ? `partial=${section.partialReason} · omitted units are ledger-addressable`
+        : `partial=${section.partialReason} · omitted-units=unknown · omitted units are ledger-unreachable`,
+    );
   }
   const projected = section.units.filter((unit) => unit.projection);
   if (projected.length > 0) {

@@ -216,6 +216,21 @@ describe('capture-degraded boundary header', () => {
     expect(line).toContain('operator-vault');
   });
 
+  it('promises per-lane recovery truth, not a blanket recoverable-below claim', () => {
+    // C4 truth-label: the boundary header must not blanket-assert that every
+    // degraded lane "remains recoverable below" when individual lanes render
+    // their own honest recovery/omission truth per-section (some are
+    // ledger-addressable, others may be ledger-unreachable). The header
+    // points to per-lane truth instead of overpromising uniform recoverability.
+    const rendered = renderRebirthPackageV6(model({
+      operatorVault: { units: [], rangeRecover: null, partialReason: OMISSION_REASON },
+    }));
+    const line = rendered.split('\n').find((row) => row.startsWith('capture-degraded='));
+    expect(line).toBeDefined();
+    expect(line).toContain('per-lane recovery truth renders in each affected section');
+    expect(line).not.toContain('affected lanes remain recoverable below');
+  });
+
   it('lists operator-vault when head-manifest frontier resolution failed', () => {
     const rendered = renderRebirthPackageV6(model({
       operatorVault: { units: [], rangeRecover: null, partialReason: RESOLUTION_FAILURE_REASON },

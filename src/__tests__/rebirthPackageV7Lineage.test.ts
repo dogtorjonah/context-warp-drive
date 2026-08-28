@@ -381,6 +381,45 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(rendered!.complete).toBe(false);
   });
 
+  it('declares omitted lineage units ledger-addressable when the continuity ledger handle exists', () => {
+    // C2 truth-label: a partial section whose units have a continuity-ledger
+    // omission route must say so, not claim "unknown" — the body's own
+    // collapse receipt carries the fetch handle, so the header only needs the
+    // honest availability word, never a duplicated recover= clause.
+    const value = model({
+      operatorVault: lineage(3, { partialReason: 'lineage transcript 2 of 5 unreadable' }),
+      recoveryIndex: [
+        ...model().recoveryIndex,
+        {
+          id: 'continuity-ledger',
+          label: 'continuity ledger: placement + eviction rows for every unit of this build',
+          handle: 'continuity_ledger action="index" owner="instance-a"',
+          status: 'available' as const,
+          count: null,
+          frontier: null,
+        },
+      ],
+    });
+    const rendered = renderRebirthPackageV6Sections(value)
+      .find((s) => s.id === 'operatorVault');
+    expect(rendered!.text).toContain('omitted units are ledger-addressable');
+    expect(rendered!.text).not.toContain('omitted-units=unknown');
+    expect(rendered!.text).not.toContain('ledger-unreachable');
+  });
+
+  it('declares omitted lineage units ledger-unreachable when no ledger handle exists', () => {
+    // C2 truth-label inverse: without a continuity-ledger entry the omitted
+    // units are genuinely unreachable, and the package must say so rather
+    // than implying a fetch route that is not wired.
+    const value = model({
+      operatorVault: lineage(3, { partialReason: 'lineage transcript 2 of 5 unreadable' }),
+    });
+    const rendered = renderRebirthPackageV6Sections(value)
+      .find((s) => s.id === 'operatorVault');
+    expect(rendered!.text).toContain('omitted-units=unknown · omitted units are ledger-unreachable');
+    expect(rendered!.text).not.toContain('ledger-addressable');
+  });
+
   it('renders an empty lineage section as explicitly empty, never as absent evidence', () => {
     const value = model({
       operatorVault: { units: [], rangeRecover: null, partialReason: null },
