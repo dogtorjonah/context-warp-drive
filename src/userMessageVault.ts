@@ -104,16 +104,25 @@ function renderPortableSurface(text: string, surface: VaultSurface): string {
   const trimmed = text.trim();
   const maxChars = resolveSurfaceLimit(surface);
   if (trimmed.length <= maxChars) return trimmed;
-  const headLength = Math.max(1, Math.floor(maxChars * SURFACE_HEAD_RATIO[surface]));
-  const tailLength = Math.max(0, maxChars - headLength);
-  const head = trimmed.slice(0, headLength).trimEnd();
-  const tail = tailLength > 0 ? trimmed.slice(-tailLength).trimStart() : '';
-  const omittedText = trimmed.slice(head.length, trimmed.length - tail.length);
-  const tokens = recallTokens(omittedText);
-  const marker = tokens.length > 0
-    ? `… [${omittedText.length} chars omitted — write any token to recall full text: ${tokens.join(', ')}] …`
-    : `… [${omittedText.length} chars omitted] …`;
-  return tail ? `${head}\n${marker}\n${tail}` : `${head}\n${marker}`;
+  let bodyChars = maxChars;
+  for (let pass = 0; pass < 4; pass += 1) {
+    const headLength = Math.max(1, Math.floor(bodyChars * SURFACE_HEAD_RATIO[surface]));
+    const tailLength = Math.max(0, bodyChars - headLength);
+    const head = trimmed.slice(0, headLength).trimEnd();
+    const tail = tailLength > 0 ? trimmed.slice(-tailLength).trimStart() : '';
+    const omittedText = trimmed.slice(head.length, trimmed.length - tail.length);
+    const tokens = recallTokens(omittedText);
+    const marker = tokens.length > 0
+      ? `… [${omittedText.length} chars omitted — write any token to recall full text: ${tokens.join(', ')}] …`
+      : `… [${omittedText.length} chars omitted] …`;
+    const separatorChars = tail ? 2 : 1;
+    const nextBodyChars = maxChars - marker.length - separatorChars;
+    if (nextBodyChars <= 0) return trimmed.slice(0, maxChars);
+    const candidate = tail ? `${head}\n${marker}\n${tail}` : `${head}\n${marker}`;
+    if (candidate.length <= maxChars) return candidate;
+    bodyChars = nextBodyChars;
+  }
+  return trimmed.slice(0, maxChars);
 }
 
 const vault = createUserMessageVaultCore({
