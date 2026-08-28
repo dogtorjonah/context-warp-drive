@@ -170,6 +170,23 @@ export interface RebirthPackageV6BoundaryAndActiveTask {
     readonly count: number | null;
     readonly pointMessageId: string | null;
   } | null;
+  /**
+   * Identity of the builder process that produced this delivered package: which
+   * build path ran (sidecar inline / sidecar worker pool / relay worker
+   * fallback), where it is hosted, and the exact immutable source-tree identity
+   * (rebirth-builder-source/v1) the process loaded. Optional for retained
+   * models predating the stamp; the sidecar pipeline stamps every delivered
+   * package, and the renderer emits an honest `built-by=unknown` line when the
+   * field is absent so a package can never silently omit its provenance.
+   */
+  readonly builder?: {
+    readonly path: string;
+    readonly endpoint?: string | null;
+    readonly treeSha256: string;
+    readonly fileCount: number;
+    readonly totalBytes: number;
+    readonly builtMs?: number | null;
+  } | null;
 }
 
 export interface RebirthPackageV6ExecutionFact {
@@ -1540,6 +1557,22 @@ function boundedText(
   return { text: `${text.slice(0, keep)}${marker}`, complete: false };
 }
 
+function boundedNewestText(
+  text: string,
+  maxChars: number,
+  authoritativeHistoryHandle: string | null,
+): { readonly text: string; readonly complete: boolean } {
+  if (text.length <= maxChars) return { text, complete: true };
+  const markerFor = (stored: number): string => authoritativeHistoryHandle
+    ? `[… older prefix omitted · stored newest ${stored} of ${text.length} chars · recovery=authoritative-history ${authoritativeHistoryHandle} · byte-exact event replay=unavailable …]\n`
+    : `[… older prefix omitted · stored newest ${stored} of ${text.length} chars · authoritative history recovery=unavailable · byte-exact event replay=unavailable …]\n`;
+  let keep = Math.max(0, maxChars - markerFor(0).length);
+  keep = Math.max(0, maxChars - markerFor(keep).length);
+  keep = Math.max(0, maxChars - markerFor(keep).length);
+  const marker = markerFor(keep);
+  return { text: `${marker}${text.slice(text.length - keep)}`, complete: false };
+}
+
 /**
  * Capture-degradation predicate shared by the boundary renderer below and the
  * rebirth sidecar's build counter (via computeRebirthCaptureDegradedLanesFromPackage).
@@ -1643,6 +1676,33 @@ export function computeRebirthCaptureDegradedLanesFromPackage(pkg: unknown): str
   });
 }
 
+/**
+ * One never-throws line declaring which builder process produced the delivered
+ * package (2026-08-28 package-audit finding A1: a package that cannot say
+ * whether a box-1 sidecar or a remote mirror built it makes dual-path
+ * divergence undiagnosable from the artifact itself). Absent identity renders
+ * an honest unknown — a missing stamp is a fact about provenance, not silence.
+ */
+function formatBuilderIdentityLine(builder: RebirthPackageV6BoundaryAndActiveTask['builder']): string {
+  if (!builder || typeof builder !== 'object') {
+    return 'built-by=unknown · builder identity was not stamped at capture';
+  }
+  const path = typeof builder.path === 'string' && builder.path.trim() ? builder.path.trim() : 'unknown';
+  const endpoint = typeof builder.endpoint === 'string' && builder.endpoint.trim()
+    ? ` @ ${builder.endpoint.trim()}`
+    : '';
+  const treeSha = typeof builder.treeSha256 === 'string' && /^[0-9a-f]{64}$/.test(builder.treeSha256)
+    ? `${builder.treeSha256.slice(0, 12)}…`
+    : 'unknown';
+  const files = Number.isSafeInteger(builder.fileCount) && builder.fileCount >= 0
+    ? String(builder.fileCount)
+    : 'unknown';
+  const builtMs = typeof builder.builtMs === 'number' && Number.isFinite(builder.builtMs) && builder.builtMs >= 0
+    ? ` · built=${Math.round(builder.builtMs)}ms`
+    : '';
+  return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${builtMs}`;
+}
+
 function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
   const boundary = model.boundaryAndActiveTask;
   // One canonical census: the rendered header and the exported helper are the
@@ -1659,6 +1719,7 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
     `workspace=${boundary.workspace} · cwd=${boundary.cwd ?? 'unknown'}`,
   ];
   if (boundary.runtimeChange) lines.push(`runtime-change=${boundary.runtimeChange}`);
+  lines.push(formatBuilderIdentityLine(boundary.builder));
   if (boundary.forkContext) {
     // v6-native fork identity. Deliberately structured (not v4 prose banner):
     // the fact set an agent needs to reason about its lineage without phantom
@@ -1857,6 +1918,7 @@ export function buildActiveEditCollapseUnits(model: RebirthPackageV6Model): read
 function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): RenderedV6SectionBody {
   const delta = model.activeEditDelta;
   const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'atlas-edit-capture')?.handle ?? null;
+  const historyRecoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'atlas-history')?.handle ?? null;
   const omissionHandle = continuityLedgerOmissionHandle(model, 'activeEditDelta');
   // Legacy bounded-edit-log mode: when the immutable Atlas capture was
   // unavailable, the adapter wraps the raw edit log in one synthetic file row
@@ -1870,11 +1932,13 @@ function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): Rend
     : null;
   if (legacyLog) {
     const reason = delta.reasons[0] ?? 'immutable Atlas edit capture unavailable';
-    const legacyLines = [
-      `evidence=bounded edit log; immutable capture unavailable: ${reason}`,
-      ...(legacyLog.preview?.text ? [legacyLog.preview.text] : []),
-    ];
-    return boundedText(legacyLines.join('\n'), maxChars, recoveryHandle);
+    const banner = `evidence=bounded edit log; immutable capture unavailable: ${reason}`;
+    const editLog = legacyLog.preview?.text ?? '';
+    if (!editLog || maxChars <= banner.length + 1) {
+      return boundedText(banner, maxChars, historyRecoveryHandle);
+    }
+    const body = boundedNewestText(editLog, maxChars - banner.length - 1, historyRecoveryHandle);
+    return { text: `${banner}\n${body.text}`, complete: body.complete };
   }
   const lines = [
     `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · source-time=${delta.capturedSourceAt ?? 'unknown'} · observed-at=${delta.completedObservedAt ?? 'unknown'}`,
@@ -2947,6 +3011,8 @@ interface RebirthPackageV7ShrinkOutcome {
   readonly shrinkRenders: number;
   readonly sectionsShrunk: number;
   readonly capReductionChars: number;
+  /** Section caps that produced `sections`, for downstream reduced-cap admission. */
+  readonly limits: Record<RebirthPackageV6SectionId, number>;
 }
 
 /**
@@ -3033,6 +3099,7 @@ function shrinkCollapseSectionsToTarget(args: {
     shrinkRenders,
     sectionsShrunk: shrunk.size,
     capReductionChars,
+    limits,
   };
 }
 
@@ -3072,8 +3139,10 @@ export function renderRebirthPackageV6WithReport(
       shrinkRenders: 0,
       sectionsShrunk: 0,
       capReductionChars: 0,
+      limits: initialLimits,
     };
-  const sections = shrink.sections;
+  let sections = shrink.sections;
+  let sectionLimits = shrink.limits;
   const rendered = shrink.text;
   const finish = (
     text: string,
@@ -3159,6 +3228,7 @@ export function renderRebirthPackageV6WithReport(
   };
 
   const compose = (
+    sectionsArg: readonly RenderedRebirthPackageV6Section[],
     includedOptional: ReadonlySet<RebirthPackageV6SectionId>,
     protectedOverrun = false,
   ): string => {
@@ -3166,7 +3236,7 @@ export function renderRebirthPackageV6WithReport(
       .filter((section) => !includedOptional.has(section.id))
       .map((section) => section.id);
     const blocks: string[] = declaration ? [declaration] : [];
-    for (const section of sections) {
+    for (const section of sectionsArg) {
       if (section.id === 'recoveryIndex' && (omitted.length > 0 || protectedOverrun)) {
         blocks.push(
           `[REBIRTH-V6-PACKAGE-ELISION original-chars=${initialRendered.length} budget=${budget}`
@@ -3215,18 +3285,65 @@ export function renderRebirthPackageV6WithReport(
   };
 
   const included = new Set<RebirthPackageV6SectionId>();
-  const protectedOnly = compose(included);
+  const protectedOnly = compose(sections, included);
   if (protectedOnly.length > sectionBudget) {
-    return finish(compose(included, true), optional.map((section) => section.id));
+    return finish(compose(sections, included, true), optional.map((section) => section.id));
   }
+
+  // Reduced-cap admission (missing middle): a candidate that exceeds the
+  // section budget at its current cap is retried at a bounded sequence of
+  // reduced caps before it is elided wholesale. Cognition and conversation are
+  // non-collapse sections, so the collapse-citizen shrink gear never relieves
+  // them; the old all-or-nothing skip could amputate the only cognitive
+  // carry-over while thousands of chars sat unused (specimen #38: cognition
+  // elided with 36,209 chars of budget left). Every probe re-renders the FULL
+  // section set at the candidate limits, so the compose that fits is the exact
+  // render that ships — report, eviction envelopes, and ledger capture stay
+  // congruent with the emitted bytes.
+  const reducedCapAdmitsContent = (
+    id: RebirthPackageV6SectionId,
+    section: RenderedRebirthPackageV6Section | undefined,
+  ): boolean => {
+    if (!section) return false;
+    if (id === 'cognitiveArtifacts') {
+      return (section.unitPlacements ?? []).some(
+        (placement) => placement.placement === 'rendered' && placement.projected !== true,
+      );
+    }
+    if (id === 'recentConversation') {
+      return (section.unitPlacements ?? []).some((placement) => placement.placement === 'rendered')
+        || section.text.length > frameSection(id, '').length;
+    }
+    return false;
+  };
 
   for (const section of optional) {
     const candidate = new Set(included).add(section.id);
-    if (compose(candidate).length > sectionBudget) continue;
-    included.add(section.id);
+    if (compose(sections, candidate).length <= sectionBudget) {
+      included.add(section.id);
+      continue;
+    }
+    if (section.id !== 'cognitiveArtifacts' && section.id !== 'recentConversation') continue;
+    const remaining = sectionBudget - compose(sections, included).length;
+    if (remaining <= 0) continue;
+    let probeCap = Math.min(sectionLimits[section.id], remaining);
+    for (let attempt = 0; attempt < 4 && probeCap >= 1; attempt += 1) {
+      const candidateLimits = { ...sectionLimits, [section.id]: probeCap };
+      const candidateSections = renderSectionsWithLimits(model, candidateLimits);
+      const candidateSection = candidateSections.find((probe) => probe.id === section.id);
+      const fits = compose(candidateSections, candidate).length <= sectionBudget
+        && reducedCapAdmitsContent(section.id, candidateSection);
+      if (fits) {
+        sections = candidateSections;
+        sectionLimits = candidateLimits;
+        included.add(section.id);
+        break;
+      }
+      probeCap = Math.floor(probeCap / 2);
+    }
   }
   return finish(
-    compose(included),
+    compose(sections, included),
     optional.filter((section) => !included.has(section.id)).map((section) => section.id),
   );
 }

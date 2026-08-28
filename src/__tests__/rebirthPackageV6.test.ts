@@ -515,6 +515,111 @@ describe('Rebirth Package v6', () => {
       );
     });
 
+    it('re-admits cognition at the largest fitting cap when residual capacity survives the protected sections', () => {
+      const rows = Array.from({ length: 60 }, (_, index) => {
+        const newest = index === 59;
+        return artifact({
+          provenanceId: `cog:${index}`,
+          kind: newest ? 'question' : 'decision',
+          text: newest ? 'NEWEST-KEPT-ROW-BODY' : `body-${index}-${'C'.repeat(1_000)}`,
+          sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+        });
+      });
+      const value = model({
+        cognitiveArtifacts: rows,
+        cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
+      });
+      const budget = 40_000;
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
+      const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
+      const cognitive = record.units.filter((unit) => unit.sectionId === 'cognitiveArtifacts');
+      const renderedIds = cognitive.filter((unit) => unit.placement === 'rendered').map((unit) => unit.unitId);
+
+      expect(text.length).toBeLessThanOrEqual(budget);
+      expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
+      expect(text).not.toContain('[EVICTED section=cognitiveArtifacts');
+      expect(text).toContain('NEWEST-KEPT-ROW-BODY');
+      expect(collapse.omittedSectionIds).not.toContain('cognitiveArtifacts');
+      expect(renderedIds.length).toBeGreaterThan(0);
+      expect(renderedIds.length).toBeLessThan(rows.length);
+      expect(cognitive).toHaveLength(rows.length);
+      expect(cognitive.every((unit) => unit.placement === 'rendered' || unit.placement === 'elided')).toBe(true);
+      const report = collapse.omissionSections.find((entry) => entry.sectionId === 'cognitiveArtifacts');
+      expect(report?.sectionElided).toBe(false);
+      expect((report?.placements ?? []).filter((placement) => placement.placement === 'rendered'))
+        .toHaveLength(renderedIds.length);
+    });
+
+    it('keeps the whole-section eviction envelope when no single cognitive unit fits', () => {
+      const rows = Array.from({ length: 8 }, (_, index) => artifact({
+        provenanceId: `unfittable:${index}`,
+        kind: 'decision',
+        text: `${'D'.repeat(1_200)}-${index}`,
+        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+      }));
+      const value = model({
+        cognitiveArtifacts: rows,
+        cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
+      });
+      // Residual capacity below one whole-unit entry (per-entry projection
+      // ≈600 chars + header/tail overhead) must NOT admit projected slivers:
+      // zero whole units is the eviction-envelope boundary.
+      const budget = 10_800;
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
+      const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
+      const cognitive = record.units.filter((unit) => unit.sectionId === 'cognitiveArtifacts');
+
+      expect(text.length).toBeLessThanOrEqual(budget);
+      expect(text).not.toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
+      expect(text).toContain('[EVICTED section=cognitiveArtifacts units=8');
+      expect(collapse.omittedSectionIds).toContain('cognitiveArtifacts');
+      expect(cognitive).toHaveLength(rows.length);
+      expect(cognitive.every((unit) => unit.placement === 'elided' && unit.tierBasis === 'section-elision')).toBe(true);
+    });
+
+    it('re-admits conversation at a reduced cap instead of evicting every dialogue row', () => {
+      const rows = Array.from({ length: 30 }, (_, index) => ({
+        provenanceId: `message:extra-${index}`,
+        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+        role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
+        text: `dialogue-${index}-${'V'.repeat(400)}`,
+      }));
+      const value = model({
+        recentConversation: [...model().recentConversation, ...rows],
+      });
+      const budget = 20_000;
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
+
+      expect(text.length).toBeLessThanOrEqual(budget);
+      expect(text).toContain('[REBIRTH-V6-SECTION id=recentConversation');
+      expect(text).not.toContain('[EVICTED section=recentConversation');
+      expect(collapse.omittedSectionIds).not.toContain('recentConversation');
+      expect(text).toContain('dialogue-29-');
+    });
+
+    it('never exceeds an explicit caller cap even when the reduced-cap retry fires', () => {
+      const rows = Array.from({ length: 60 }, (_, index) => artifact({
+        provenanceId: `explicit-cap:${index}`,
+        kind: 'decision',
+        text: `body-${index}-${'E'.repeat(1_000)}`,
+        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+      }));
+      const value = model({
+        cognitiveArtifacts: rows,
+        cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
+      });
+      const explicitCap = 30_000;
+      const budget = 40_000;
+      const { text } = renderRebirthPackageV6WithReport(value, {
+        packageBudget: budget,
+        sectionMaxChars: { cognitiveArtifacts: explicitCap },
+      });
+      const sectionMatch = text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts chars=(\d+)\]/);
+      expect(sectionMatch).not.toBeNull();
+      expect(Number(sectionMatch![1])).toBeLessThanOrEqual(explicitCap);
+      expect(text.length).toBeLessThanOrEqual(budget);
+    });
+
     it('covers every one of the five ledger families when the count formula assumes them', () => {
       // Review F1 left side: the capture writer must persist one row for every
       // unit of every family the assembler's count formula sums (activeEditDelta
@@ -810,6 +915,36 @@ describe('Rebirth Package v6', () => {
     expect(section!.text).not.toContain('preview partial:');
     expect(section!.text).not.toContain('capture=unknown');
     expect(section!.text).not.toContain('capture-artifact=unknown');
+  });
+
+  it('keeps the newest legacy edit tail and points truncated history at Atlas', () => {
+    const editLog = [
+      '[2026-08-27 08:00 PM UTC] Edit → relay/src/stale-edit.ts',
+      `OLD_EDIT_BODY ${'x'.repeat(900)}`,
+      '[2026-08-28 06:30 AM UTC] Edit → relay/src/newest-edit.ts',
+      'NEWEST_OPERATIONAL_EDIT',
+    ].join('\n');
+    const legacy = adaptLegacyRebirthPackageToV6({
+      predecessorName: 'legacy',
+      currentThread: '',
+      activeEditDelta: editLog,
+    }, {
+      instanceId: 'instance-a',
+      workspace: 'voxxo-swarm',
+    });
+    const section = renderRebirthPackageV6Sections(legacy, {
+      sectionMaxChars: { activeEditDelta: 520 },
+    }).find((candidate) => candidate.id === 'activeEditDelta');
+
+    expect(section?.text).toContain('evidence=bounded edit log; immutable capture unavailable');
+    expect(section?.text).toContain('NEWEST_OPERATIONAL_EDIT');
+    expect(section?.text).not.toContain('OLD_EDIT_BODY');
+    expect(section?.text).toContain('older prefix omitted · stored newest');
+    expect(section?.text).toContain(
+      'recovery=authoritative-history atlas_query action="history" workspace="voxxo-swarm" author_instance_id="instance-a"',
+    );
+    expect(section?.text).toContain('byte-exact event replay=unavailable');
+    expect(section?.text).not.toContain('exact recovery unavailable');
   });
 
   it('compacts provenance ids that embed the artifact note so each note renders once', () => {
