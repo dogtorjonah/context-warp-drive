@@ -779,7 +779,11 @@ export function renderEmbeddedContinuityArtifactProvenance(
       count: input.sourceEndExclusive - input.sourceStart,
       lastTimestamp: input.sourceLastTimestamp,
     },
-    transformedAt: point(input.sourceEndExclusive),
+    // The embedded alias does not own a global committed coordinate — the
+    // enclosing epoch owns the seam. Omit index/timestamp so the compact render
+    // emits the honest `#?` unknown-coordinate form instead of reusing the
+    // source end-ordinal as this artifact's creation coordinate.
+    transformedAt: { traceId: input.traceId, unit: input.unit },
     authority: input.authority,
     supersession: 'later-raw-wins',
     topology: {

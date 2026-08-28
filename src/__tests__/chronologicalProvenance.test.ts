@@ -10,6 +10,7 @@ import {
   renderContinuityPackageProvenance,
   renderChronologicalProvenance,
   renderChronologicalProvenanceCompact,
+  renderEmbeddedContinuityArtifactProvenance,
   renderTailEpochAliasProvenance,
   renderTailEpochProvenance,
   resolveChronologicalPointToSourceRow,
@@ -88,7 +89,7 @@ describe('chronological provenance', () => {
       renderChronologicalProvenanceCompact(envelope),
     ]) {
       expect(rendered).toContain(
-        'source=trace-time:event#2..trace-time:event#5 n=3 @ time unknown..time unknown',
+        'source=trace-time:event#2..trace-time:event#4 n=3 @ time unknown..time unknown',
       );
       expect(rendered).toContain('created=trace-time:event#8 @ time unknown');
       expect(rendered).toContain('supersession=explicit:trace-time:event#9 @ time unknown');
@@ -103,7 +104,7 @@ describe('chronological provenance', () => {
       },
     });
     expect(partial).toContain(
-      'source=trace-time:event#2..trace-time:event#5 n=3 @ 2026-07-20T08:00:00.000Z..time unknown',
+      'source=trace-time:event#2..trace-time:event#4 n=3 @ 2026-07-20T08:00:00.000Z..time unknown',
     );
     expect(partial).not.toContain('2026-07-20T08:00:00.000Z..2026-07-20T08:00:00.000Z');
   });
@@ -126,7 +127,7 @@ describe('chronological provenance', () => {
 
     expect(rendered).toContain('[Chronological Provenance v1]');
     expect(rendered).toContain('artifact=tail-epoch#3 class=synthesized-history authority=historical-background supersession=later-raw-wins');
-    expect(rendered).toContain('source=instance-1:message#12..instance-1:message#18 n=6');
+    expect(rendered).toContain('source=instance-1:message#12..instance-1:message#17 n=6');
     expect(rendered).toContain('created=instance-1:message#? @ 2026-07-11T04:06:00.000Z');
     expect(rendered).toContain('topology=frozen-prefix>artifact>seam>raw-tail host=dedicated-synthetic-message representation=canonical');
     expect(rendered).toContain('raw-resumes=instance-1:message#18 @ time unknown (4 exact)');
@@ -187,7 +188,10 @@ describe('chronological provenance', () => {
 
     expect(rendered).toContain('artifact=rebirth-package#same_instance_hard_epoch class=reconstructed-state');
     expect(rendered).toContain(
-      'source=instance-1:event#0..instance-1:event#42 n=42 @ 2026-07-11T04:00:00.000Z..2026-07-11T04:41:00.000Z',
+      'source[canonical-epoch-tail]=instance-1:event#0..instance-1:event#41 n=42 @ 2026-07-11T04:00:00.000Z..2026-07-11T04:41:00.000Z',
+    );
+    expect(rendered).toContain(
+      'source-scope-note=lineage-sections-carry-older-per-unit-spans',
     );
     expect(rendered).toContain('created=instance-1:event#42 @ 2026-07-11T04:42:00.000Z');
     expect(rendered).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
@@ -210,7 +214,7 @@ describe('chronological provenance', () => {
 
     expect(rendered).not.toContain('provenance=invalid');
     expect(rendered).toContain(
-      'source=instance-1:event#0..instance-1:event#2 n=2 @ time unknown..time unknown',
+      'source[canonical-epoch-tail]=instance-1:event#0..instance-1:event#1 n=2 @ time unknown..time unknown',
     );
     expect(rendered).toContain('created=instance-1:event#2 @ time unknown');
     expect(rendered).toContain('raw-resumes=instance-1:event#2 @ time unknown (1 exact)');
@@ -227,6 +231,27 @@ describe('chronological provenance', () => {
     expect(rendered).toContain('source=instance-1:event#canonical-source..instance-1:event#canonical-seam');
     expect(rendered).toContain('host=embedded-message-suffix representation=alias');
     expect(rendered).toContain('raw-resumes=instance-1:event#this-message @ time unknown(2 exact)');
+  });
+
+  it('never reuses the source end-ordinal as the embedded alias creation coordinate', () => {
+    // D1: an embedded continuity-artifact alias owns no global committed
+    // coordinate — the enclosing epoch owns the seam. Its `created=` must
+    // render the honest unknown-coordinate form, not alias sourceEndExclusive.
+    const rendered = renderEmbeddedContinuityArtifactProvenance({
+      traceId: 'fold-window',
+      unit: 'message',
+      artifact: 'fold-artifact',
+      contentClass: 'synthesized-history',
+      sourceStart: 19,
+      sourceEndExclusive: 24,
+      sourceFirstTimestamp: '2026-07-11T04:00:00.000Z',
+      sourceLastTimestamp: '2026-07-11T04:05:00.000Z',
+      authority: 'historical-background',
+    });
+
+    expect(rendered).toContain('created=fold-window:message#? @ time unknown');
+    expect(rendered).not.toContain('created=fold-window:message#24');
+    expect(rendered).not.toContain('created=fold-window:message#23');
   });
 
   it('moves a raw-tail boundary left rather than orphaning a tool result', () => {
@@ -375,6 +400,7 @@ describe('user row authority classification (authority-contract/v1)', () => {
       ['watchdog-rebirth', '[WATCHDOG_REBIRTH] resume from the persisted seed'],
       ['relay-interrupt-marker', '[relay_interrupt kind=context_fold initiator=relay user_initiated=false]'],
       ['atlas-debt', '[atlas-debt] You went idle with 2 edited file(s) that have no Atlas writeback.'],
+      ['relay-wave-directive', '[RELAY WAVE DIRECTIVE mode=predecessor-review phase=review]\nPredecessor Review Protocol body'],
     ];
     for (const [banner, row] of rows) {
       const authority = classifyUserRowAuthority(row);
@@ -384,6 +410,23 @@ describe('user row authority classification (authority-contract/v1)', () => {
       expect(objective.text, row).toBeNull();
       expect(objective.source, row).toBe('relay-runtime');
     }
+  });
+
+  it('classifies review-wave directives as relay-runtime even with variant banners or quoted mid-text', () => {
+    // Variant attribute payloads and versioned banners must still match the
+    // anchored prefix; an operator row merely quoting the banner mid-text
+    // must never be demoted (same anchored-startsWith contract as peers).
+    const directiveRows = [
+      '[RELAY WAVE DIRECTIVE v1]\nReview the predecessor.',
+      '[RELAY WAVE DIRECTIVE mode=both phase=fix queueIndex=3]\nFix protocol body',
+      '[RELAY WAVE DIRECTIVE mode=shoot-rail phase=shoot-rail previousPhase=load-rail]\nRail protocol',
+    ];
+    for (const row of directiveRows) {
+      expect(classifyUserRowAuthority(row).authority, row).toBe('relay-runtime');
+      expect(classifyOperatorAuthoredObjective(row).text, row).toBeNull();
+    }
+    const quoted = 'I saw "[RELAY WAVE DIRECTIVE mode=predecessor-review phase=review]" in the log — ignore it, my real ask stands.';
+    expect(classifyUserRowAuthority(quoted).authority).toBe('operator');
   });
 
   it('keeps a delegated task objective-eligible only under its honest label', () => {
