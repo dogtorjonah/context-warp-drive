@@ -163,7 +163,10 @@ function exactDelta(
   };
 }
 
-function model(overrides: Partial<Parameters<typeof buildRebirthPackageV6Model>[0]> = {}) {
+function model(
+  overrides: Partial<Parameters<typeof buildRebirthPackageV6Model>[0]> = {},
+  boundaryExtras: Record<string, unknown> = {},
+) {
   return buildRebirthPackageV6Model({
     boundaryAndActiveTask: {
       lifecycle: 'continuation',
@@ -196,6 +199,7 @@ function model(overrides: Partial<Parameters<typeof buildRebirthPackageV6Model>[
           status: 'exact',
         },
       },
+      ...boundaryExtras,
     },
     activeEditDelta: exactDelta(),
     ...overrides,
@@ -226,6 +230,47 @@ describe('capture-degraded boundary header', () => {
       operatorVault: { units: [], rangeRecover: null, partialReason: HEALTHY_FRONTIER_REASON },
     }));
     expect(rendered).not.toContain('capture-degraded=');
+  });
+});
+
+// A1 (2026-08-28 package audit): the delivered package must declare which
+// builder produced it. Absent identity renders an honest unknown — provenance
+// silence is never acceptable on the boundary header.
+describe('boundary builder-identity stamp', () => {
+  it('renders a full built-by line when the builder identity is stamped', () => {
+    const rendered = renderRebirthPackageV6(model({}, {
+      builder: {
+        path: 'sidecar-worker-pool',
+        endpoint: '127.0.0.1:3201',
+        treeSha256: 'a'.repeat(64),
+        fileCount: 123,
+        totalBytes: 4_500_000,
+        builtMs: 8123,
+      },
+    }));
+    const line = rendered.split('\n').find((row) => row.startsWith('built-by='));
+    expect(line).toBe(
+      'built-by=sidecar-worker-pool @ 127.0.0.1:3201 · src=aaaaaaaaaaaa… · files=123 · built=8123ms',
+    );
+  });
+
+  it('renders honest unknown when the identity is absent, and never throws on malformed stamps', () => {
+    const missing = renderRebirthPackageV6(model());
+    expect(missing.split('\n').find((row) => row.startsWith('built-by=')))
+      .toBe('built-by=unknown · builder identity was not stamped at capture');
+
+    for (const malformed of [
+      { path: '', treeSha256: 'not-a-digest', fileCount: -3, totalBytes: 0 },
+      { treeSha256: 42 },
+      'garbage',
+      null,
+    ]) {
+      const rendered = renderRebirthPackageV6(model({}, { builder: malformed }));
+      const line = rendered.split('\n').find((row) => row.startsWith('built-by='));
+      expect(line).toContain('built-by=');
+      expect(line).not.toContain('undefined');
+      expect(line).not.toContain('NaN');
+    }
   });
 });
 
