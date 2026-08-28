@@ -516,6 +516,10 @@ describe('Rebirth Package v6', () => {
     });
 
     it('re-admits cognition at the largest fitting cap when residual capacity survives the protected sections', () => {
+      // Specimen #38 shape: the package is over budget at cognition's current
+      // cap but carries tens of thousands of chars of unused residual capacity.
+      // The inclusion loop must retry at a reduced whole-unit cap instead of
+      // eliding the only cognitive carry-over wholesale.
       const rows = Array.from({ length: 60 }, (_, index) => {
         const newest = index === 59;
         return artifact({
@@ -540,10 +544,13 @@ describe('Rebirth Package v6', () => {
       expect(text).not.toContain('[EVICTED section=cognitiveArtifacts');
       expect(text).toContain('NEWEST-KEPT-ROW-BODY');
       expect(collapse.omittedSectionIds).not.toContain('cognitiveArtifacts');
+      // The retry genuinely reduced the cap: some units survived, some did not.
       expect(renderedIds.length).toBeGreaterThan(0);
       expect(renderedIds.length).toBeLessThan(rows.length);
+      // Every source row stays addressable through the resized render.
       expect(cognitive).toHaveLength(rows.length);
       expect(cognitive.every((unit) => unit.placement === 'rendered' || unit.placement === 'elided')).toBe(true);
+      // Report placements derive from the resized section set, not the full-cap render.
       const report = collapse.omissionSections.find((entry) => entry.sectionId === 'cognitiveArtifacts');
       expect(report?.sectionElided).toBe(false);
       expect((report?.placements ?? []).filter((placement) => placement.placement === 'rendered'))
