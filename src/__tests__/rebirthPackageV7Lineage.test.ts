@@ -199,6 +199,45 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(sectionText(value, 'operatorVault')).toContain('jonah said something durable.');
   });
 
+  it('protects one frame for every admitted section when normal bodies yield under pressure', () => {
+    const value = model({
+      brainMergeSynthesis: 'merge anchor',
+      cognitiveArtifacts: Array.from({ length: 80 }, (_, index) => ({
+        provenanceId: `pressure:cognition:${index}`,
+        sourceAt: `2026-08-07T17:${String(index % 60).padStart(2, '0')}:00.000Z`,
+        kind: 'decision' as const,
+        text: `cognitive-${index}-${'C'.repeat(900)}`,
+        authority: 'current',
+        supersededBy: null,
+      })),
+      recentConversation: Array.from({ length: 40 }, (_, index) => ({
+        provenanceId: `pressure:message:${index}`,
+        sourceAt: `2026-08-07T18:${String(index % 60).padStart(2, '0')}:00.000Z`,
+        role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
+        text: `dialogue-${index}-${'D'.repeat(500)}`,
+      })),
+      operatorVault: lineage(40),
+      episodeChapterIndex: lineage(40),
+      lifeLedger: lineage(40),
+    });
+    const budget = 20_000;
+    const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
+
+    expect(text.length).toBeLessThanOrEqual(budget);
+    expect(collapse.omittedSectionIds.length).toBeGreaterThan(0);
+    expect(text).toContain('elided-section-bodies=');
+    expect(text).toContain('protected-overrun=false');
+    expect(text).not.toContain('omitted-sections=');
+    for (const id of REBIRTH_PACKAGE_V6_SECTION_IDS) {
+      const frames = text.match(new RegExp(`\\[REBIRTH-V6-SECTION id=${id} chars=`, 'gu')) ?? [];
+      expect(frames, `${id} must retain exactly one protected frame`).toHaveLength(1);
+    }
+    for (const id of collapse.omittedSectionIds) {
+      expect(text).toContain(`[REBIRTH-V6-SECTION id=${id}`);
+      expect(text).toContain(`[EVICTED section=${id}`);
+    }
+  });
+
   it('renders standalone lineage units newest-first', () => {
     const value = model({ operatorVault: lineage(3) });
     const text = sectionText(value, 'operatorVault')!;
@@ -512,11 +551,12 @@ describe('Rebirth Package v7 — eviction envelopes and edit citizenship', () =>
     return renderRebirthPackageV6(withoutVault).length + 1500;
   }
 
-  it('renders an eviction envelope with era census and the one ledger handle when a section is omitted', () => {
+  it('renders a framed eviction body with era census and one ledger handle when content yields', () => {
     const value = model({ operatorVault: lineage(40), recoveryIndex: ledgerRecoveryIndex() });
     const { text, collapse } = renderRebirthPackageV6WithReport(value, {
       packageBudget: evictionBudget(value),
     });
+    expect(text).toContain('[REBIRTH-V6-SECTION id=operatorVault');
     expect(text).toContain(`[EVICTED section=operatorVault units=40 span=2026-07-`);
     expect(text).toContain(
       'recover=continuity_ledger action="fetch" owner="instance-a" capture_id="capture-v7"'

@@ -482,7 +482,7 @@ describe('Rebirth Package v6', () => {
       ))).toBe(true);
     });
 
-    it('keeps every cognitive unit addressable when the package omits the whole section', () => {
+    it('keeps every cognitive unit addressable when the normal body yields to a framed receipt', () => {
       const rows = Array.from({ length: 3 }, (_, index) => artifact({
         provenanceId: `whole-section:${index}`,
         kind: index === 0 ? 'question' : 'decision',
@@ -508,6 +508,7 @@ describe('Rebirth Package v6', () => {
       expect(cognitive).toHaveLength(rows.length);
       expect(cognitive.map((unit) => unit.unitId).sort()).toEqual(rows.map((row) => row.provenanceId).sort());
       expect(cognitive.every((unit) => unit.placement === 'elided' && unit.tierBasis === 'section-elision')).toBe(true);
+      expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
       expect(text).toContain('[EVICTED section=cognitiveArtifacts units=3');
       expect(text).toContain(
         'recover=continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1"'
@@ -557,7 +558,7 @@ describe('Rebirth Package v6', () => {
         .toHaveLength(renderedIds.length);
     });
 
-    it('keeps the whole-section eviction envelope when no single cognitive unit fits', () => {
+    it('keeps the cognitive section frame when no single cognitive unit fits', () => {
       const rows = Array.from({ length: 8 }, (_, index) => artifact({
         provenanceId: `unfittable:${index}`,
         kind: 'decision',
@@ -577,7 +578,7 @@ describe('Rebirth Package v6', () => {
       const cognitive = record.units.filter((unit) => unit.sectionId === 'cognitiveArtifacts');
 
       expect(text.length).toBeLessThanOrEqual(budget);
-      expect(text).not.toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
+      expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
       expect(text).toContain('[EVICTED section=cognitiveArtifacts units=8');
       expect(collapse.omittedSectionIds).toContain('cognitiveArtifacts');
       expect(cognitive).toHaveLength(rows.length);

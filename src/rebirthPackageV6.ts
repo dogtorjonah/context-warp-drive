@@ -2910,9 +2910,10 @@ function renderSectionsWithLimits(
 
 /**
  * Per-lineage-section collapse outcome of one actual render: the exact
- * placements behind the shipped text plus whether the whole framed section was
- * omitted by the package-level budget compose. This is the record the
- * continuity ledger persists — computed once by the render, never re-derived.
+ * placements behind the shipped text plus whether the normal section body was
+ * replaced by a framed elision receipt at package compose. The section frame
+ * itself is always retained. This is the record the continuity ledger persists
+ * — computed once by the render, never re-derived.
  */
 /** Sections owning collapse units: the v7 lineage trio plus the Active Edit Delta. */
 export type RebirthPackageV7CollapseSectionId = RebirthPackageV7LineageSectionId | 'activeEditDelta';
@@ -2922,7 +2923,7 @@ export interface RebirthPackageV7SectionCollapseReport {
   readonly placements: readonly CollapseUnitPlacement[];
   readonly demotions: number;
   readonly droppedToFloorRollup: number;
-  /** True when the composed package omitted this section entirely. */
+  /** True when compose replaced the normal body with a framed elision receipt. */
   readonly sectionElided: boolean;
 }
 
@@ -2930,7 +2931,7 @@ export interface RebirthPackageV7CollapseReport {
   readonly sections: readonly RebirthPackageV7SectionCollapseReport[];
   /** Non-collapse sections whose exact source-unit omissions are ledgered. */
   readonly omissionSections: readonly RebirthPackageV6OmissionSectionReport[];
-  /** Every optional section the budget compose omitted (lineage or not). */
+  /** Optional sections whose normal bodies yielded; their frames remain present. */
   readonly omittedSectionIds: readonly RebirthPackageV6SectionId[];
   /** Per-render counters from the graceful push-shrink and final compose. */
   readonly telemetry: RebirthPackageV7EvictionTelemetry;
@@ -3045,11 +3046,12 @@ function buildEvictionEraCensus(units: readonly CollapseUnit[], maxChars: number
 }
 
 /**
- * Eviction envelope for a whole section the package-level budget omitted: unit
- * count, source span, a skeletal era census, and the one continuity-ledger
+ * Eviction body for a section whose normal body yielded at package compose:
+ * unit count, source span, a skeletal era census, and the one continuity-ledger
  * handle where every evicted unit's placement row lives (spec: per-section
- * pointers to the ledger, not per-unit receipt spam). A missing ledger handle
- * renders the declared degradation line — never a dead pointer.
+ * pointers to the ledger, not per-unit receipt spam). The caller wraps this in
+ * the section's normal frame. A missing ledger handle renders the declared
+ * degradation line — never a dead pointer.
  */
 function buildSectionEvictionEnvelope(args: {
   sectionId: RebirthPackageV7CollapseSectionId;
@@ -3287,10 +3289,10 @@ export function renderRebirthPackageV6WithReport(
   const sectionBudget = envelopeOverrun ? 0 : Math.max(0, budget - envelopeChars);
   if (!envelopeOverrun && rendered.length <= sectionBudget) return finish(rendered, []);
 
-  // Authorization, execution truth, active edits, and recovery stay whole.
-  // Never slice a framed section mid-line: that can hide an omitted-file or
-  // truncation receipt and make partial evidence look complete. Optional
-  // cognition/conversation are admitted only at complete section boundaries.
+  // These bodies stay whole. Every admitted section FRAME is protected below;
+  // optional means only that its normal body may yield to a framed elision
+  // receipt. Never slice a framed section mid-line: that can hide an omitted-
+  // file or truncation receipt and make partial evidence look complete.
   const protectedIds = new Set<RebirthPackageV6SectionId>([
     'boundaryAndActiveTask',
     'brainMergeSynthesis',
@@ -3308,20 +3310,59 @@ export function renderRebirthPackageV6WithReport(
     return [];
   };
 
+  const framedElisionSection = (
+    section: RenderedRebirthPackageV6Section,
+    compactReceipt: boolean,
+  ): string => {
+    const units = citizenUnits(section.id);
+    let body: string;
+    if (units.length > 0) {
+      body = buildSectionEvictionEnvelope({
+        sectionId: section.id as RebirthPackageV7CollapseSectionId,
+        units,
+        omissionHandle: continuityLedgerOmissionHandle(model, section.id),
+        includeCensus: !compactReceipt,
+      });
+    } else if (section.id === 'cognitiveArtifacts' && model.cognitiveArtifacts.length > 0) {
+      const omissionHandle = continuityLedgerOmissionHandle(model, 'cognitiveArtifacts');
+      body = `[EVICTED section=cognitiveArtifacts units=${model.cognitiveArtifacts.length}`
+        + `${omissionHandle ? ` recover=${omissionHandle}` : ''}]`
+        + (omissionHandle ? '' : '\nCognitive artifacts evicted; ledger unreachable');
+    } else if (section.id === 'recentConversation'
+      && (model.recentConversation.length > 0 || conversationEndpointReceipt(model).length > 0)) {
+      const transcriptHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
+      const endpointBodies = Number(Boolean(model.boundaryAndActiveTask.activeRequest))
+        + Number(Boolean(model.boundaryAndActiveTask.lastMaterialAssistant));
+      body = `[EVICTED section=recentConversation rows=${model.recentConversation.length}`
+        + ` endpoint-bodies-relocated=${endpointBodies}`
+        + `${transcriptHandle ? ` recover=${transcriptHandle}` : ''}]`
+        + (transcriptHandle ? '' : '\nRecent conversation evicted; exact recovery unavailable');
+    } else {
+      // An admitted zero-unit section can still carry capture-degradation truth.
+      // Preserve its structural slot even when that larger diagnostic body
+      // cannot fit; Recovery Index remains the canonical expansion directory.
+      body = `[EVICTED section=${section.id} units=0]`
+        + '\nSection body yielded to package pressure; inspect Recovery Index.';
+    }
+    return frameSection(section.id, body);
+  };
+
   const compose = (
     sectionsArg: readonly RenderedRebirthPackageV6Section[],
     includedOptional: ReadonlySet<RebirthPackageV6SectionId>,
+    compactElisionReceipts = false,
     protectedOverrun = false,
   ): string => {
-    const omitted = optional
+    const bodyElided = optional
       .filter((section) => !includedOptional.has(section.id))
       .map((section) => section.id);
     const blocks: string[] = declaration ? [declaration] : [];
     for (const section of sectionsArg) {
-      if (section.id === 'recoveryIndex' && (omitted.length > 0 || protectedOverrun)) {
+      if (section.id === 'recoveryIndex' && (bodyElided.length > 0 || protectedOverrun)) {
         blocks.push(
           `[REBIRTH-V6-PACKAGE-ELISION original-chars=${initialRendered.length} budget=${budget}`
-          + ` envelope-chars=${envelopeChars} omitted-sections=${omitted.join(',') || 'none'}`
+          + ` envelope-chars=${envelopeChars}`
+          + ` elided-section-bodies=${bodyElided.join(',') || 'none'}`
           + ` protected-overrun=${protectedOverrun || envelopeOverrun}`
           + ` recover=${recover}]`,
         );
@@ -3330,46 +3371,23 @@ export function renderRebirthPackageV6WithReport(
         blocks.push(section.text);
         continue;
       }
-      // A whole omitted collapse-citizen section leaves an eviction envelope at
-      // its chronological slot: count + span + skeletal era census + the one
-      // ledger handle. Under protected-overrun the census is dropped so the
-      // declared overrun never grows an unbounded tail.
-      const units = citizenUnits(section.id);
-      if (units.length > 0) {
-        blocks.push(buildSectionEvictionEnvelope({
-          sectionId: section.id as RebirthPackageV7CollapseSectionId,
-          units,
-          omissionHandle: continuityLedgerOmissionHandle(model, section.id),
-          includeCensus: !protectedOverrun,
-        }));
-      } else if (section.id === 'cognitiveArtifacts' && model.cognitiveArtifacts.length > 0) {
-        const omissionHandle = continuityLedgerOmissionHandle(model, 'cognitiveArtifacts');
-        blocks.push(
-          `[EVICTED section=cognitiveArtifacts units=${model.cognitiveArtifacts.length}`
-          + `${omissionHandle ? ` recover=${omissionHandle}` : ''}]`
-          + (omissionHandle ? '' : '\nCognitive artifacts evicted; ledger unreachable'),
-        );
-      } else if (section.id === 'recentConversation'
-        && (model.recentConversation.length > 0 || conversationEndpointReceipt(model).length > 0)) {
-        const transcriptHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
-        const endpointBodies = Number(Boolean(model.boundaryAndActiveTask.activeRequest))
-          + Number(Boolean(model.boundaryAndActiveTask.lastMaterialAssistant));
-        blocks.push(
-          `[EVICTED section=recentConversation rows=${model.recentConversation.length}`
-          + ` endpoint-bodies-relocated=${endpointBodies}`
-          + `${transcriptHandle ? ` recover=${transcriptHandle}` : ''}]`
-          + (transcriptHandle ? '' : '\nRecent conversation evicted; exact recovery unavailable'),
-        );
-      }
+      // The normal body may yield, but the title/open/body/close frame is part
+      // of the protected minimum package and can never disappear.
+      blocks.push(framedElisionSection(section, compactElisionReceipts || protectedOverrun));
     }
     return blocks.join('\n\n');
   };
 
   const included = new Set<RebirthPackageV6SectionId>();
-  const protectedOnly = compose(sections, included);
-  if (protectedOnly.length > sectionBudget) {
-    return finish(compose(sections, included, true), optional.map((section) => section.id));
+  const fullReceiptMinimum = compose(sections, included);
+  const compactReceiptMinimum = compose(sections, included, true);
+  if (compactReceiptMinimum.length > sectionBudget) {
+    return finish(compose(sections, included, true, true), optional.map((section) => section.id));
   }
+  // Era censuses are useful but not part of a section's protected minimum. If
+  // they alone would force an overrun, retain every frame with compact receipts
+  // and spend the remaining budget on actual section bodies.
+  const compactElisionReceipts = fullReceiptMinimum.length > sectionBudget;
 
   // Reduced-cap admission (missing middle): a candidate that exceeds the
   // section budget at its current cap is retried at a bounded sequence of
@@ -3400,19 +3418,19 @@ export function renderRebirthPackageV6WithReport(
 
   for (const section of optional) {
     const candidate = new Set(included).add(section.id);
-    if (compose(sections, candidate).length <= sectionBudget) {
+    if (compose(sections, candidate, compactElisionReceipts).length <= sectionBudget) {
       included.add(section.id);
       continue;
     }
     if (section.id !== 'cognitiveArtifacts' && section.id !== 'recentConversation') continue;
-    const remaining = sectionBudget - compose(sections, included).length;
+    const remaining = sectionBudget - compose(sections, included, compactElisionReceipts).length;
     if (remaining <= 0) continue;
     let probeCap = Math.min(sectionLimits[section.id], remaining);
     for (let attempt = 0; attempt < 4 && probeCap >= 1; attempt += 1) {
       const candidateLimits = { ...sectionLimits, [section.id]: probeCap };
       const candidateSections = renderSectionsWithLimits(model, candidateLimits);
       const candidateSection = candidateSections.find((probe) => probe.id === section.id);
-      const fits = compose(candidateSections, candidate).length <= sectionBudget
+      const fits = compose(candidateSections, candidate, compactElisionReceipts).length <= sectionBudget
         && reducedCapAdmitsContent(section.id, candidateSection);
       if (fits) {
         sections = candidateSections;
@@ -3424,7 +3442,7 @@ export function renderRebirthPackageV6WithReport(
     }
   }
   return finish(
-    compose(sections, included),
+    compose(sections, included, compactElisionReceipts),
     optional.filter((section) => !included.has(section.id)).map((section) => section.id),
   );
 }
