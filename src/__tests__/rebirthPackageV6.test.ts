@@ -169,6 +169,14 @@ function model(
 }
 
 describe('Rebirth Package v6', () => {
+  it('labels the package capture as an artifact without changing its provenance id', () => {
+    const boundary = renderRebirthPackageV6Sections(model())
+      .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+
+    expect(boundary).toContain('capture-artifact=capture-1');
+    expect(boundary).not.toContain('\ncapture=capture-1');
+  });
+
   it('renders indexed cognition absence and degradation without claiming the stores are empty', () => {
     const cognitionText = (value: RebirthPackageV6Model): string => (
       renderRebirthPackageV6Sections(value)
@@ -380,7 +388,7 @@ describe('Rebirth Package v6', () => {
       // Unresolved open loop survives; transient process voice goes first.
       expect(text).toContain('Q'.repeat(300));
       expect(text).not.toContain('F'.repeat(300));
-      expect(text).toMatch(/cognition: rendered=\d+ captured=4 matched=6 · omitted-units=\d+ · suppressed\{/u);
+      expect(text).toMatch(/cognition: rendered=\d+ captured=4 matched=6 · package-truncation-remainder=\d+ · suppressed\{/u);
       expect(text).toContain('dropped-whole by lowest budget priority');
       // The capture receipt is protected: it survives pressure that rows do not.
       expect(text).toContain('Capture receipt: status=complete');
@@ -432,7 +440,7 @@ describe('Rebirth Package v6', () => {
         unit.sectionId === 'cognitiveArtifacts'
         && (unit.placement !== 'rendered' || unit.projection?.mode === 'truncated')
       ));
-      const declared = text.match(/cognition: rendered=\d+ captured=8 matched=8 · omitted-units=(\d+)/u);
+      const declared = text.match(/cognition: rendered=\d+ captured=8 matched=8 · package-truncation-remainder=(\d+)/u);
       expect(declared).not.toBeNull();
       expect(omitted).toHaveLength(Number(declared![1]));
       const command = 'continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1" section_id="cognitiveArtifacts" omitted_only=true include_unknown_source_time=true limit=200';
@@ -700,7 +708,7 @@ describe('Rebirth Package v6', () => {
     const section = rendered.split('[REBIRTH-V6-SECTION id=recentConversation')[1]
       ?.split('[REBIRTH-V6-SECTION-END id=recentConversation]')[0] ?? '';
 
-    expect(section).toContain('Endpoint relocation receipt');
+    expect(section).toContain('Endpoint messages: Boundary.');
     expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
     expect(rendered.match(/I will implement it now\./gu)).toHaveLength(1);
   });
@@ -801,6 +809,7 @@ describe('Rebirth Package v6', () => {
     expect(section!.text).not.toContain('+?/−?');
     expect(section!.text).not.toContain('preview partial:');
     expect(section!.text).not.toContain('capture=unknown');
+    expect(section!.text).not.toContain('capture-artifact=unknown');
   });
 
   it('compacts provenance ids that embed the artifact note so each note renders once', () => {
@@ -922,7 +931,7 @@ describe('Rebirth Package v6', () => {
     expect(handles.get('transcript')?.handle)
       .toBe('tap_instance_messages action="canonical" target_instance_id="instance-a"');
     expect(handles.get('cognition')?.handle)
-      .toBe('tap_star action="rolodex" instance="instance-a"');
+      .toBe('psychic_pov view="rolodex" instance="instance-a"');
     expect(handles.get('task-rail')?.handle)
       .toBe('task_rail mode="load" operation="detail" instance_id="instance-a"');
     expect(handles.get('atlas-edit-capture')?.handle)
@@ -1242,7 +1251,7 @@ describe('Rebirth Package v6', () => {
     }).find((entry) => entry.id === 'recentConversation');
 
     expect(section?.complete).toBe(false);
-    expect(section?.text).toContain('Endpoint relocation receipt');
+    expect(section?.text).toContain('Endpoint messages: Boundary.');
     expect(section?.text).toContain('SECOND_NEWEST_TURN_MUST_SURVIVE');
     expect(section?.text).toContain('NEWEST_TURN_MUST_SURVIVE');
     expect(section?.text).not.toContain('OVERSIZED_OLDER_TURN');
@@ -1273,7 +1282,7 @@ describe('Rebirth Package v6', () => {
     }).find((entry) => entry.id === 'recentConversation');
 
     expect(section?.complete).toBe(false);
-    expect(section?.text).toContain('Endpoint relocation receipt');
+    expect(section?.text).toContain('Endpoint messages: Boundary.');
     expect(section?.text).toContain('NEWEST_CANARY');
     expect(section?.text).not.toContain('OLDER_TINY_CAP');
     expect(section?.text).toContain('latest-tail=omitted');

@@ -1078,7 +1078,7 @@ function defaultRecoveryHandles(args: {
       id: 'cognition',
       label: 'chronological cognitive artifact rolodex',
       handle: hasIdentity
-        ? `tap_star action="rolodex" instance=${quotedId}`
+        ? `psychic_pov view="rolodex" instance=${quotedId}`
         : '',
       status: hasIdentity ? 'available' : 'unavailable',
       count: args.cognitionCount,
@@ -1540,10 +1540,43 @@ function boundedText(
   return { text: `${text.slice(0, keep)}${marker}`, complete: false };
 }
 
-function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
-  const boundary = model.boundaryAndActiveTask;
+/**
+ * Capture-degradation predicate shared by the boundary renderer below and the
+ * rebirth sidecar's build counter (via computeRebirthCaptureDegradedLanesFromPackage).
+ * A lane is capture-degraded when its read explicitly failed
+ * (store-unreachable-at-capture, capture-read-incomplete) OR when lineage
+ * ancestors were deliberately omitted because no authoritative fork-capture
+ * frontier resolved — both lineage-feeder paths (unfrontiered omission and
+ * resolution failure) end their reason with "ancestor live tails were not
+ * read", a phrase pinned by rebirthLineageFeeders tests. 2026-08-28 lesson:
+ * the remote-mirror executor resolved zero frontiers for ~18h while
+ * degradedResponses stayed 0 — the predicate and the counter must share one
+ * definition so a lineage-truncated build can never look clean again.
+ */
+export const REBIRTH_CAPTURE_GAP_REASON_RE =
+  /store-unreachable-at-capture|capture-read-incomplete|ancestor live tails were not read/i;
+
+/** Structural minimum the degraded-lane computation needs from the v6 model. */
+export interface RebirthCaptureDegradedLaneSource {
+  operatorVault?: { readonly partialReason?: string | null } | null;
+  episodeChapterIndex?: { readonly partialReason?: string | null } | null;
+  lifeLedger?: { readonly partialReason?: string | null } | null;
+  cognitiveArtifactCapture?: { readonly status?: string | null } | null;
+  activeEditDelta?: {
+    readonly state?: string;
+    readonly files?: readonly unknown[];
+    readonly reasons?: readonly unknown[];
+  } | null;
+}
+
+/**
+ * Canonical degraded-lane census: the package boundary header and the sidecar
+ * degradation telemetry both consume this single selection, so a truncated
+ * capture can never look clean on one surface and degraded on the other.
+ */
+export function computeRebirthCaptureDegradedLanes(model: RebirthCaptureDegradedLaneSource): string[] {
   const degradedLanes: string[] = [];
-  const captureGap = /store-unreachable-at-capture|capture-read-incomplete/i;
+  const captureGap = REBIRTH_CAPTURE_GAP_REASON_RE;
   if (captureGap.test(model.operatorVault?.partialReason ?? '')) degradedLanes.push('operator-vault');
   if (captureGap.test(model.episodeChapterIndex?.partialReason ?? '')) degradedLanes.push('episode-chapter-index');
   if (captureGap.test(model.lifeLedger?.partialReason ?? '')) degradedLanes.push('life-ledger');
@@ -1551,19 +1584,74 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
     || model.cognitiveArtifactCapture?.status === 'unavailable') {
     degradedLanes.push('cognition');
   }
+  const aed = model.activeEditDelta;
   if (
-    model.activeEditDelta.state !== 'exact'
-    && model.activeEditDelta.files.length > 0
-    && model.activeEditDelta.reasons.some((reason) => (
-      /unavailable|capture.*(?:failed|unreachable)|without an immutable Atlas capture/i.test(reason)
+    aed
+    && aed.state !== undefined
+    && aed.state !== 'exact'
+    && Array.isArray(aed.files)
+    && aed.files.length > 0
+    && Array.isArray(aed.reasons)
+    && aed.reasons.some((reason) => (
+      typeof reason === 'string'
+      && /unavailable|capture.*(?:failed|unreachable)|without an immutable Atlas capture/i.test(reason)
     ))
   ) {
     degradedLanes.push('active-edit-delta');
   }
+  return degradedLanes;
+}
+
+function asLaneRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/**
+ * Cross-process entry point for the rebirth sidecar: accepts the built
+ * package object (or its v6 model directly), unwraps pkg.rebirthV6 when
+ * present, and applies the canonical lane census. Never throws — telemetry
+ * must not fail a build.
+ */
+export function computeRebirthCaptureDegradedLanesFromPackage(pkg: unknown): string[] {
+  const record = asLaneRecord(pkg);
+  if (!record) return [];
+  const model = asLaneRecord(record.rebirthV6) ?? record;
+  const lane = (key: string): { partialReason: string | null } | null => {
+    const value = asLaneRecord(model[key]);
+    return value
+      ? { partialReason: typeof value.partialReason === 'string' ? value.partialReason : null }
+      : null;
+  };
+  const cognition = asLaneRecord(model.cognitiveArtifactCapture);
+  const aed = asLaneRecord(model.activeEditDelta);
+  return computeRebirthCaptureDegradedLanes({
+    operatorVault: lane('operatorVault'),
+    episodeChapterIndex: lane('episodeChapterIndex'),
+    lifeLedger: lane('lifeLedger'),
+    cognitiveArtifactCapture: cognition
+      ? { status: typeof cognition.status === 'string' ? cognition.status : null }
+      : null,
+    activeEditDelta: aed
+      ? {
+        state: typeof aed.state === 'string' ? aed.state : undefined,
+        files: Array.isArray(aed.files) ? aed.files : [],
+        reasons: Array.isArray(aed.reasons) ? aed.reasons : [],
+      }
+      : null,
+  });
+}
+
+function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
+  const boundary = model.boundaryAndActiveTask;
+  // One canonical census: the rendered header and the exported helper are the
+  // same call, so sidecar telemetry and the package header can never drift.
+  const degradedLanes = computeRebirthCaptureDegradedLanes(model);
   const lines = [
     `contract=${model.version}`,
     `lifecycle=${boundary.lifecycle} · ${boundary.lifecycleMeaning}`,
-    `capture=${boundary.captureId} · captured-at=${boundary.capturedAt ?? 'unknown'} · frontier=${boundary.sourceFrontier ?? 'unknown'}`,
+    `capture-artifact=${boundary.captureId} · captured-at=${boundary.capturedAt ?? 'unknown'} · frontier=${boundary.sourceFrontier ?? 'unknown'}`,
     ...(degradedLanes.length > 0
       ? [`capture-degraded=${degradedLanes.join(',')} · status=partial · affected lanes remain recoverable below`]
       : []),
@@ -1912,7 +2000,7 @@ function cognitionSuppressionHeader(
   for (const row of suppressed) byKind.set(row.kind, (byKind.get(row.kind) ?? 0) + 1);
   const parts = [
     `cognition: rendered=${shown} captured=${total} matched=${totalMatched ?? 'unknown'}`,
-    `omitted-units=${omittedCount}`,
+    `package-truncation-remainder=${omittedCount}`,
   ];
   if (suppressed.length > 0) {
     const counts = [...byKind.entries()]
@@ -2222,7 +2310,7 @@ function renderConversation(model: RebirthPackageV6Model, maxChars: number): { t
   // the exact endpoint identities, timestamps, and bytes.
   const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
   const endpointReceipt = fullEndpointReceipt
-    ? 'Endpoint relocation receipt.'
+    ? 'Endpoint messages: Boundary.'
     : '';
   const endpointSeparatorChars = endpointReceipt && dialogueText ? 2 : 0;
   const dialogueBudget = Math.max(0, maxChars - endpointReceipt.length - endpointSeparatorChars);
