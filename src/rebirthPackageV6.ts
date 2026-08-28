@@ -1539,6 +1539,18 @@ function omissionRecoveryClause(handle: string | null): string {
   return handle ? `recover=${handle}` : 'omitted units are ledger-unreachable';
 }
 
+function boundedProjectionFallback(
+  text: string,
+  maxChars: number,
+  keepNewest: boolean,
+): string {
+  const cap = Math.max(0, Math.floor(maxChars));
+  if (cap === 0) return '';
+  if (cap === 1) return '…';
+  const keep = cap - 1;
+  return keepNewest ? `…${text.slice(-keep)}` : `${text.slice(0, keep)}…`;
+}
+
 function boundedText(
   text: string,
   maxChars: number,
@@ -1548,12 +1560,18 @@ function boundedText(
   const markerFor = (stored: number): string => recoveryHandle
     ? `\n[… stored ${stored} of ${text.length} chars · recover: ${recoveryHandle} …]`
     : `\n[… stored ${stored} of ${text.length} chars · exact recovery unavailable …]`;
+  if (markerFor(0).length > maxChars) {
+    return { text: boundedProjectionFallback(text, maxChars, false), complete: false };
+  }
   let keep = Math.max(0, maxChars - markerFor(0).length);
   // Digit-width can change after the first estimate. Two bounded iterations
   // reach a stable marker length for every practical section cap.
   keep = Math.max(0, maxChars - markerFor(keep).length);
   keep = Math.max(0, maxChars - markerFor(keep).length);
   const marker = markerFor(keep);
+  if (marker.length > maxChars) {
+    return { text: boundedProjectionFallback(text, maxChars, false), complete: false };
+  }
   return { text: `${text.slice(0, keep)}${marker}`, complete: false };
 }
 
@@ -1566,10 +1584,16 @@ function boundedNewestText(
   const markerFor = (stored: number): string => authoritativeHistoryHandle
     ? `[… older prefix omitted · stored newest ${stored} of ${text.length} chars · recovery=authoritative-history ${authoritativeHistoryHandle} · byte-exact event replay=unavailable …]\n`
     : `[… older prefix omitted · stored newest ${stored} of ${text.length} chars · authoritative history recovery=unavailable · byte-exact event replay=unavailable …]\n`;
+  if (markerFor(0).length > maxChars) {
+    return { text: boundedProjectionFallback(text, maxChars, true), complete: false };
+  }
   let keep = Math.max(0, maxChars - markerFor(0).length);
   keep = Math.max(0, maxChars - markerFor(keep).length);
   keep = Math.max(0, maxChars - markerFor(keep).length);
   const marker = markerFor(keep);
+  if (marker.length > maxChars) {
+    return { text: boundedProjectionFallback(text, maxChars, true), complete: false };
+  }
   return { text: `${marker}${text.slice(text.length - keep)}`, complete: false };
 }
 
@@ -1766,7 +1790,7 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
   }
   if (now?.currentRail) {
     lines.push(
-      `current-rail=${now.currentRail.railId} · state=${now.currentRail.state} · active-step=${now.currentRail.activeStepId ?? 'none'} · step-status=${now.currentRail.activeStepStatus ?? 'unknown'} · ${formatSource(now.currentRail.source)}`,
+      `current-rail=${now.currentRail.railId} · state=${now.currentRail.state} · active-step=${now.currentRail.activeStepId ?? 'none'} · step-status=${now.currentRail.activeStepId ? (now.currentRail.activeStepStatus ?? 'unknown') : 'n/a'} · ${formatSource(now.currentRail.source)}`,
     );
   } else {
     lines.push(`current-rail=unknown · state=unknown · ${unknownSource}`);
@@ -2064,7 +2088,13 @@ function cognitionSuppressionHeader(
   for (const row of suppressed) byKind.set(row.kind, (byKind.get(row.kind) ?? 0) + 1);
   const parts = [
     `cognition: rendered=${shown} captured=${total} matched=${totalMatched ?? 'unknown'}`,
-    `package-truncation-remainder=${omittedCount}`,
+    // incompleteRows = |rows dropped-whole ∪ rows shipped truncated| (a
+    // provenance-id union at the call site) — every matched row not rendered
+    // in full. The label names the counter honestly (the old
+    // "truncation-remainder" name implied truncated-only and reconciled
+    // against nothing) and carries its own definition so the census
+    // reconciles against suppressed{...} + projected{truncated:n} below.
+    `incomplete-rows=${omittedCount} (=suppressed-whole ∪ truncated)`,
   ];
   if (suppressed.length > 0) {
     const counts = [...byKind.entries()]

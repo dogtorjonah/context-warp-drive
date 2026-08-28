@@ -388,7 +388,7 @@ describe('Rebirth Package v6', () => {
       // Unresolved open loop survives; transient process voice goes first.
       expect(text).toContain('Q'.repeat(300));
       expect(text).not.toContain('F'.repeat(300));
-      expect(text).toMatch(/cognition: rendered=\d+ captured=4 matched=6 · package-truncation-remainder=\d+ · suppressed\{/u);
+      expect(text).toMatch(/cognition: rendered=\d+ captured=4 matched=6 · incomplete-rows=\d+ \(=suppressed-whole ∪ truncated\) · suppressed\{/u);
       expect(text).toContain('dropped-whole by lowest budget priority');
       // The capture receipt is protected: it survives pressure that rows do not.
       expect(text).toContain('Capture receipt: status=complete');
@@ -440,7 +440,7 @@ describe('Rebirth Package v6', () => {
         unit.sectionId === 'cognitiveArtifacts'
         && (unit.placement !== 'rendered' || unit.projection?.mode === 'truncated')
       ));
-      const declared = text.match(/cognition: rendered=\d+ captured=8 matched=8 · package-truncation-remainder=(\d+)/u);
+      const declared = text.match(/cognition: rendered=\d+ captured=8 matched=8 · incomplete-rows=(\d+) \(=suppressed-whole ∪ truncated\)/u);
       expect(declared).not.toBeNull();
       expect(omitted).toHaveLength(Number(declared![1]));
       const command = 'continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1" section_id="cognitiveArtifacts" omitted_only=true include_unknown_source_time=true limit=200';
@@ -935,8 +935,9 @@ describe('Rebirth Package v6', () => {
     const section = renderRebirthPackageV6Sections(legacy, {
       sectionMaxChars: { activeEditDelta: 520 },
     }).find((candidate) => candidate.id === 'activeEditDelta');
+    const banner = 'evidence=bounded edit log; immutable capture unavailable: legacy Active Edit Delta adapted without an immutable Atlas capture';
 
-    expect(section?.text).toContain('evidence=bounded edit log; immutable capture unavailable');
+    expect(section?.text).toContain(banner);
     expect(section?.text).toContain('NEWEST_OPERATIONAL_EDIT');
     expect(section?.text).not.toContain('OLD_EDIT_BODY');
     expect(section?.text).toContain('older prefix omitted · stored newest');
@@ -945,6 +946,19 @@ describe('Rebirth Package v6', () => {
     );
     expect(section?.text).toContain('byte-exact event replay=unavailable');
     expect(section?.text).not.toContain('exact recovery unavailable');
+
+    const newestTinyCap = banner.length + 2;
+    const newestTiny = renderRebirthPackageV6Sections(legacy, {
+      sectionMaxChars: { activeEditDelta: newestTinyCap },
+    }).find((candidate) => candidate.id === 'activeEditDelta');
+    expect(newestTiny?.text).toContain(`chars=${newestTinyCap}]`);
+    expect(newestTiny?.text).toContain(`${banner}\n…\n[/REBIRTH-V6-SECTION]`);
+
+    const bannerTiny = renderRebirthPackageV6Sections(legacy, {
+      sectionMaxChars: { activeEditDelta: 8 },
+    }).find((candidate) => candidate.id === 'activeEditDelta');
+    expect(bannerTiny?.text).toContain('chars=8]');
+    expect(bannerTiny?.text).toContain(`${banner.slice(0, 7)}…\n[/REBIRTH-V6-SECTION]`);
   });
 
   it('compacts provenance ids that embed the artifact note so each note renders once', () => {
@@ -1172,6 +1186,146 @@ describe('Rebirth Package v6', () => {
     expect(value.activeEditDelta.files).toEqual([
       expect.objectContaining({ filePath: 'src/edit.ts', baselineQuality: 'baseline_unknown' }),
     ]);
+  });
+
+  it('labels a fully resolved rail as awaiting closeout, never an open review demand', () => {
+    // task-rail lifecycle: state 'review' ⟺ every step resolved, one refresh
+    // from 'complete'. Only a needs_review STEP (rail forced to 'blocked') is
+    // an open demand.
+    const continuityReceipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      sourceStatus: 'idle',
+      instance: { instanceId: 'instance-a', instanceName: 'worker-a', runtimeStatus: 'idle' },
+      rail: {
+        railId: 'rail-resolved',
+        title: 'Resolved rail',
+        state: 'review',
+        updatedAt: '2026-08-02T18:00:00.000Z',
+      },
+    });
+    const value = adaptLegacyRebirthPackageToV6({ continuityReceipt });
+    expect(value.executionState.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'review', text: 'all-resolved-awaiting-closeout' }),
+    ]));
+    expect(value.executionState.facts.some((fact) => fact.text === 'needs_review')).toBe(false);
+  });
+
+  it('labels an ordinary active rail as review state none, no demand text', () => {
+    const continuityReceipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      rail: {
+        railId: 'rail-active',
+        title: 'Active rail',
+        state: 'active',
+        updatedAt: '2026-08-02T18:00:00.000Z',
+        activeStep: { id: 'step-1', title: 'Work', status: 'active' },
+      },
+    });
+    const value = adaptLegacyRebirthPackageToV6({ continuityReceipt });
+    expect(value.executionState.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'review', text: 'none' }),
+    ]));
+    expect(value.executionState.facts.some(
+      (fact) => fact.kind === 'review' && fact.text !== 'none',
+    )).toBe(false);
+  });
+
+  it('rejects the membership scope/source-time footnote as a coordination room row', () => {
+    const continuityReceipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      chatroomMembership: '[CHATROOM MEMBERSHIP]\n  scope=current room membership only; source-time reflects latest known join, not room activity\n  fix-rebirth — worker-a\n[END CHATROOM MEMBERSHIP]',
+    });
+    const value = adaptLegacyRebirthPackageToV6({ continuityReceipt });
+    expect(value.executionState.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'coordination', text: 'room=fix-rebirth' }),
+    ]));
+    expect(value.executionState.facts.some((fact) => fact.text.includes('scope='))).toBe(false);
+  });
+
+  it('admits an anchored label-less outcome only from the trusted rail channel', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      validationSources: [
+        { text: 'validation: 189 focused tests passed', sourceTimestamp: '2026-08-27T02:32:26.983Z' },
+        { text: 'All local validation green; remote typechecks queued at sealed post-repair tree', sourceTimestamp: '2026-08-28T06:08:04.688Z', trustedOutcomeChannel: true },
+      ],
+    });
+    expect(receipt.validation.fact)
+      .toBe('All local validation green; remote typechecks queued at sealed post-repair tree');
+  });
+
+  it('keeps the strict label gate for prose and rejects modal futures on the trusted channel', () => {
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      validationSources: [
+        { text: 'validation: 189 focused tests passed', sourceTimestamp: '2026-08-27T02:32:26.983Z' },
+        // Label-less outcome on an UNTRUSTED source: still rejected.
+        { text: '63/63 passed', sourceTimestamp: '2026-08-28T06:08:04.688Z' },
+        // Anchored but modal/future: rejected even on the trusted channel.
+        { text: 'All tests should pass once I run them', sourceTimestamp: '2026-08-28T06:09:00.000Z', trustedOutcomeChannel: true },
+        // Anchored outcome on the trusted channel: admitted, freshest wins.
+        { text: '54/54 tests passed', sourceTimestamp: '2026-08-28T06:10:00.000Z', trustedOutcomeChannel: true },
+      ],
+    });
+    expect(receipt.validation.fact).toBe('54/54 tests passed');
+  });
+
+  it('renders step-status=n/a when the current rail has no active step', () => {
+    const base = model();
+    const value = buildRebirthPackageV6Model({
+      ...base,
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          forkPurpose: null,
+          parentIdentity: null,
+          parentStatus: null,
+          currentRail: {
+            railId: 'rail-resolved',
+            state: 'review',
+            activeStepId: null,
+            activeStepStatus: null,
+            source: { provenanceId: 'rail:rail-resolved', sourceAt: '2026-08-02T18:01:00.000Z', status: 'exact' },
+          },
+        },
+      },
+    });
+    const boundary = renderRebirthPackageV6Sections(value)
+      .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+    const card = boundary.split('[FACTUAL NOW CARD · descriptive boundary facts]')[1]
+      ?.split('[/FACTUAL NOW CARD]')[0] ?? '';
+    expect(card).toContain('current-rail=rail-resolved · state=review · active-step=none · step-status=n/a');
+
+    // Second half of the invariant: a step id whose status could not be
+    // resolved keeps the honest 'unknown', distinct from the n/a above.
+    const unknown = buildRebirthPackageV6Model({
+      ...base,
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          forkPurpose: null,
+          parentIdentity: null,
+          parentStatus: null,
+          currentRail: {
+            railId: 'rail-mid',
+            state: 'active',
+            activeStepId: 'step-9',
+            activeStepStatus: null,
+            source: { provenanceId: 'rail:rail-mid', sourceAt: '2026-08-02T18:02:00.000Z', status: 'exact' },
+          },
+        },
+      },
+    });
+    const unknownCard = (renderRebirthPackageV6Sections(unknown)
+      .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '')
+      .split('[FACTUAL NOW CARD · descriptive boundary facts]')[1]
+      ?.split('[/FACTUAL NOW CARD]')[0] ?? '';
+    expect(unknownCard).toContain('active-step=step-9 · step-status=unknown');
   });
 
   it('adapts an unresolved assistant action ahead of an older rail action', () => {

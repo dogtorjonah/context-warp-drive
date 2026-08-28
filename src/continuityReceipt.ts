@@ -109,6 +109,14 @@ export interface ContinuityReceiptValidationSource {
   readonly text: string;
   /** Authoritative source time of the text carrying the fact, when known. */
   readonly sourceTimestamp?: string;
+  /**
+   * True only for rail-execution ACK channels (cognitive artifacts of type
+   * 'rail'): permits the scanner to admit an anchored outcome assertion
+   * without the explicit Validation:/Verification: label. Never set for free
+   * prose, conversation, chat, glyph, or star rows — those stay under the
+   * strict label gate so a plan or mention can never impersonate an outcome.
+   */
+  readonly trustedOutcomeChannel?: boolean;
 }
 
 /** Canonical event range of the predecessor trace at package creation. */
@@ -480,7 +488,11 @@ function parseChatroomNames(value: string | undefined): string[] {
   return value
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !/^\[(?:END )?CHATROOM MEMBERSHIP\]$/u.test(line))
+    // Room rows are emitted as `name — members` by the digest's
+    // buildChatroomMembershipSection; the [CHATROOM MEMBERSHIP] markers and
+    // the scope/source-time footnote line carry no separator and are not
+    // rooms. Requiring the separator keeps label/footnote lines out.
+    .filter((line) => /\s+—\s+/u.test(line))
     .map((line) => line.split(/\s+—\s+/u)[0]?.trim() ?? '')
     .filter(Boolean);
 }
@@ -549,9 +561,15 @@ function buildReceiptLiveState(args: {
     : captureSource('bundled-active-edit-delta', captureId);
   const rooms = parseChatroomNames(parts.chatroomMembership);
   const railConflictsWithRuntime = disagreements.some((item) => item.includes('runtime status=idle'));
-  const reviewState = rail?.activeStep?.status === 'needs_review' || rail?.state === 'review'
+  // task-rail lifecycle (refreshRailState): state 'review' ⟺ every step is
+  // resolved and the rail is one refresh from 'complete' — a closeout
+  // reminder, not an open review demand. A genuine open demand is a
+  // needs_review STEP (which forces the rail into 'blocked', never 'review').
+  const reviewState = rail?.activeStep?.status === 'needs_review'
     ? 'needs_review'
-    : 'none';
+    : rail?.state === 'review'
+      ? 'all-resolved-awaiting-closeout'
+      : 'none';
   const blockers = rail?.activeStep?.status === 'blocked' ? [rail.activeStep.title] : [];
   const frontier = parts.rawTailFrontier ?? (parts.canonicalRange
     ? {
@@ -707,6 +725,17 @@ export function detectContinuityHazards(sources: readonly string[]): string[] {
 const VALIDATION_FACT_PATTERN = /^(?:validation|verification)(?:\s+(?:passed|state|fact|facts))?\s*:/iu;
 
 /**
+ * Anchored outcome assertion, admitted ONLY on the trusted rail-execution
+ * channel (trustedOutcomeChannel sources — rail ACK notes are self-reported
+ * execution records, not prose). The assertion must OPEN the line so plans
+ * and quotations cannot impersonate an outcome, and any modal/future marker
+ * disqualifies the line. Everything without the trust bit stays under the
+ * strict label gate above.
+ */
+const TRUSTED_VALIDATION_OUTCOME_PATTERN = /^(?:all\s+(?:(?:local|focused|scoped|full|relay|monorepo|standalone|both|the)\s+)*(?:validation|tests?|typechecks?|vitest|suites?|specs?)\b[^\n:]*\b(?:green|passed|pass|clean)\b|(?:[\w./-]+\s+)?\d+\s*\/\s*\d+\s*(?:tests?|specs?|suites?|assertions?)?\s*(?:passed|pass|green|clean)\b)/iu;
+const MODAL_FUTURE_MARKER = /\b(?:should|will|would|could|once|until|if|plan(?:ned|ning)?|pending|waiting|todo|needs?\s+to|going\s+to)\b/iu;
+
+/**
  * Latest explicit validation/verification fact across prose blobs. Structured
  * sources sort by authoritative source time; input order is only a deterministic
  * tie-break, and unknown-time prose cannot supersede a timestamped outcome.
@@ -734,12 +763,19 @@ function findLatestValidationFactWithSource(
   for (const [sourceOrder, source] of sources.entries()) {
     const text = typeof source === 'string' ? source : source.text;
     const sourceTimestamp = typeof source === 'string' ? undefined : source.sourceTimestamp;
+    const trustedOutcomeChannel = typeof source !== 'string' && source.trustedOutcomeChannel === true;
     const parsedSourceTime = sourceTimestamp ? Date.parse(sourceTimestamp) : Number.NaN;
     for (const [lineOrder, line] of text.split('\n').entries()) {
       const trimmed = line.trim();
-      if (!VALIDATION_FACT_PATTERN.test(trimmed)) continue;
+      const labeled = VALIDATION_FACT_PATTERN.test(trimmed);
+      if (!labeled) {
+        const trustedOutcome = trustedOutcomeChannel
+          && TRUSTED_VALIDATION_OUTCOME_PATTERN.test(trimmed)
+          && !MODAL_FUTURE_MARKER.test(trimmed);
+        if (!trustedOutcome) continue;
+      }
       const candidate = {
-        fact: trimmed.replace(/^[^:]+:\s*/u, ''),
+        fact: labeled ? trimmed.replace(/^[^:]+:\s*/u, '') : trimmed,
         ...(sourceTimestamp ? { sourceTimestamp } : {}),
         ...(Number.isFinite(parsedSourceTime) ? { sourceTimeMs: parsedSourceTime } : {}),
         sourceOrder,
