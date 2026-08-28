@@ -760,6 +760,52 @@ function normalizeCognitiveRows(
     ));
 }
 
+/**
+ * Streaming providers can emit the leading register glyph as its own pre-tool
+ * text block; persistence then mints `id:segment-N` continuation rows for the
+ * post-tool text of the SAME message (localMessages dedupe). Rendering every
+ * fragment under its own envelope spends a full provenance header on a 1-char
+ * glyph row while substantive rows are omitted. Adjacent fragments of one
+ * message merge below — only when one side carries no word characters — so
+ * every producer path (relay assembler, sidecar, legacy) inherits one envelope
+ * per message without touching the exact transcript bytes. Substantive
+ * segments stay separate: their per-fragment envelopes are visible evidence.
+ */
+const CONVERSATION_SEGMENT_SUFFIX = /:segment-\d+$/u;
+
+function conversationRowBaseId(provenanceId: string): string {
+  return provenanceId.replace(CONVERSATION_SEGMENT_SUFFIX, '');
+}
+
+function isGlyphOnlyConversationText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && trimmed.length <= 8 && !/[A-Za-z0-9]/u.test(trimmed);
+}
+
+function mergeGlyphOnlyConversationSegments(
+  rows: readonly RebirthPackageV6ConversationRow[],
+): RebirthPackageV6ConversationRow[] {
+  const merged: RebirthPackageV6ConversationRow[] = [];
+  for (const row of rows) {
+    const previous = merged.at(-1);
+    if (
+      previous
+      && previous.role === row.role
+      && previous.sourceAt === row.sourceAt
+      && conversationRowBaseId(previous.provenanceId) === conversationRowBaseId(row.provenanceId)
+      && (isGlyphOnlyConversationText(previous.text) || isGlyphOnlyConversationText(row.text))
+    ) {
+      merged[merged.length - 1] = {
+        ...previous,
+        text: `${previous.text}\n${row.text}`,
+      };
+      continue;
+    }
+    merged.push(row);
+  }
+  return merged;
+}
+
 function normalizeConversationRows(
   rows: readonly RebirthPackageV6ConversationRow[],
   activeRequest: string | null,
@@ -767,7 +813,7 @@ function normalizeConversationRows(
 ): RebirthPackageV6ConversationRow[] {
   const excluded = new Set([activeRequest, lastAssistant].filter((value): value is string => Boolean(value)));
   const seen = new Set<string>();
-  return [...rows]
+  const normalized = [...rows]
     .filter((row) => {
       const text = row.text.trim();
       if (!text) return false;
@@ -811,6 +857,7 @@ function normalizeConversationRows(
       seen.add(identity);
       return true;
     });
+  return mergeGlyphOnlyConversationSegments(normalized);
 }
 
 /**

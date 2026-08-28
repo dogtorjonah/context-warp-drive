@@ -793,6 +793,105 @@ describe('Rebirth Package v6', () => {
     expect(section?.text).toContain('Keep Atlas semantics stable.');
   });
 
+  it('coalesces a glyph-only base row into its same-message segment continuation', () => {
+    // D5: a streaming provider can emit the leading register glyph as its own
+    // pre-tool block; persistence mints `id:segment-N` for the post-tool text
+    // of the SAME message. One envelope per message — never a full header
+    // spent on a 1-char row.
+    const value = model({
+      recentConversation: [{
+        provenanceId: 'message:assistant-5',
+        sourceAt: '2026-08-02T17:59:00.000Z',
+        role: 'assistant',
+        text: '🔍',
+      }, {
+        provenanceId: 'message:assistant-5:segment-1',
+        sourceAt: '2026-08-02T17:59:00.000Z',
+        role: 'assistant',
+        text: 'Full connective map almost complete.',
+      }],
+    });
+    expect(value.recentConversation.map((row) => row.provenanceId))
+      .toEqual(['message:assistant-5']);
+    const merged = value.recentConversation
+      .find((row) => row.provenanceId === 'message:assistant-5');
+    expect(merged?.text).toBe('🔍\nFull connective map almost complete.');
+    expect(merged?.sourceAt).toBe('2026-08-02T17:59:00.000Z');
+
+    const section = renderRebirthPackageV6Sections(value)
+      .find((entry) => entry.id === 'recentConversation');
+    expect(section?.text.match(/source=message:assistant-5/gu)).toHaveLength(1);
+    expect(section?.text).not.toContain('segment-1');
+  });
+
+  it('coalesces a trailing glyph-only segment into its substantive base row', () => {
+    const value = model({
+      recentConversation: [{
+        provenanceId: 'message:assistant-6',
+        sourceAt: '2026-08-02T17:59:10.000Z',
+        role: 'assistant',
+        text: 'Narration with words.',
+      }, {
+        provenanceId: 'message:assistant-6:segment-1',
+        sourceAt: '2026-08-02T17:59:10.000Z',
+        role: 'assistant',
+        text: '🏁',
+      }],
+    });
+    expect(value.recentConversation.map((row) => row.provenanceId))
+      .toEqual(['message:assistant-6']);
+    expect(value.recentConversation
+      .find((row) => row.provenanceId === 'message:assistant-6')?.text)
+      .toBe('Narration with words.\n🏁');
+  });
+
+  it('keeps two substantive segments of one message as separate envelopes', () => {
+    const value = model({
+      recentConversation: [{
+        provenanceId: 'message:assistant-7',
+        sourceAt: '2026-08-02T17:59:20.000Z',
+        role: 'assistant',
+        text: 'First half of the answer.',
+      }, {
+        provenanceId: 'message:assistant-7:segment-1',
+        sourceAt: '2026-08-02T17:59:20.000Z',
+        role: 'assistant',
+        text: 'Second half after the tool call.',
+      }],
+    });
+    expect(value.recentConversation.map((row) => row.provenanceId))
+      .toEqual(['message:assistant-7', 'message:assistant-7:segment-1']);
+  });
+
+  it('does not merge segment fragments across an interleaved newer row', () => {
+    const value = model({
+      recentConversation: [{
+        provenanceId: 'message:assistant-8',
+        sourceAt: '2026-08-02T17:59:30.000Z',
+        role: 'assistant',
+        text: '🔍',
+      }, {
+        provenanceId: 'message:user-8',
+        sourceAt: '2026-08-02T17:59:31.000Z',
+        role: 'user',
+        text: 'Interleaved question.',
+      }, {
+        provenanceId: 'message:assistant-8:segment-1',
+        sourceAt: '2026-08-02T17:59:32.000Z',
+        role: 'assistant',
+        text: 'Post-tool body.',
+      }],
+    });
+    // Chronological sort places the user row between the two fragments, so
+    // they are not adjacent and keep their own envelopes.
+    expect(value.recentConversation.map((row) => row.provenanceId))
+      .toEqual([
+        'message:assistant-8',
+        'message:user-8',
+        'message:assistant-8:segment-1',
+      ]);
+  });
+
   it('keeps the endpoint relocation receipt when admitted dialogue consumes the section cap', () => {
     const value = model({
       recentConversation: [{
