@@ -133,6 +133,12 @@ export interface RebirthPackageV6NowCard {
     readonly activeStepStatus: string | null;
     readonly source: RebirthPackageV6SourceRef;
   } | null;
+  /** Additive capture outcome: absent means a legacy package that cannot distinguish none from unknown. */
+  readonly currentRailAvailability?: {
+    readonly status: 'current' | 'none' | 'unavailable';
+    readonly reason: string | null;
+    readonly source: RebirthPackageV6SourceRef;
+  };
 }
 
 export interface RebirthPackageV6BoundaryAndActiveTask {
@@ -1671,6 +1677,14 @@ export interface RebirthCaptureDegradedLaneSource {
     readonly files?: readonly unknown[];
     readonly reasons?: readonly unknown[];
   } | null;
+  boundaryAndActiveTask?: {
+    readonly nowCard?: {
+      readonly currentRailAvailability?: {
+        readonly status?: string;
+        readonly reason?: string | null;
+      } | null;
+    } | null;
+  } | null;
 }
 
 /**
@@ -1703,6 +1717,9 @@ export function computeRebirthCaptureDegradedLanes(model: RebirthCaptureDegraded
   ) {
     degradedLanes.push('active-edit-delta');
   }
+  if (model.boundaryAndActiveTask?.nowCard?.currentRailAvailability?.status === 'unavailable') {
+    degradedLanes.push('task-rail');
+  }
   return degradedLanes;
 }
 
@@ -1730,6 +1747,9 @@ export function computeRebirthCaptureDegradedLanesFromPackage(pkg: unknown): str
   };
   const cognition = asLaneRecord(model.cognitiveArtifactCapture);
   const aed = asLaneRecord(model.activeEditDelta);
+  const boundary = asLaneRecord(model.boundaryAndActiveTask);
+  const nowCard = asLaneRecord(boundary?.nowCard);
+  const railAvailability = asLaneRecord(nowCard?.currentRailAvailability);
   return computeRebirthCaptureDegradedLanes({
     operatorVault: lane('operatorVault'),
     episodeChapterIndex: lane('episodeChapterIndex'),
@@ -1742,6 +1762,20 @@ export function computeRebirthCaptureDegradedLanesFromPackage(pkg: unknown): str
         state: typeof aed.state === 'string' ? aed.state : undefined,
         files: Array.isArray(aed.files) ? aed.files : [],
         reasons: Array.isArray(aed.reasons) ? aed.reasons : [],
+      }
+      : null,
+    boundaryAndActiveTask: boundary
+      ? {
+        nowCard: nowCard
+          ? {
+            currentRailAvailability: railAvailability
+              ? {
+                status: typeof railAvailability.status === 'string' ? railAvailability.status : undefined,
+                reason: typeof railAvailability.reason === 'string' ? railAvailability.reason : null,
+              }
+              : null,
+          }
+          : null,
       }
       : null,
   });
@@ -1772,6 +1806,11 @@ function formatBuilderIdentityLine(builder: RebirthPackageV6BoundaryAndActiveTas
     ? ` · built=${Math.round(builder.builtMs)}ms`
     : '';
   return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${builtMs}`;
+}
+
+function boundedRailAvailabilityReason(value: string | null | undefined): string {
+  return (value ?? 'unspecified').replace(/\s+/gu, '-').replace(/[^A-Za-z0-9:_.-]/gu, '').slice(0, 120)
+    || 'unspecified';
 }
 
 function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
@@ -1838,6 +1877,15 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
   if (now?.currentRail) {
     lines.push(
       `current-rail=${now.currentRail.railId} · state=${now.currentRail.state} · active-step=${now.currentRail.activeStepId ?? 'none'} · step-status=${now.currentRail.activeStepId ? (now.currentRail.activeStepStatus ?? 'unknown') : 'n/a'} · ${formatSource(now.currentRail.source)}`,
+    );
+  } else if (now?.currentRailAvailability?.status === 'none') {
+    lines.push(
+      `current-rail=none · state=n/a · active-step=n/a · step-status=n/a · ${formatSource(now.currentRailAvailability.source)}`,
+    );
+  } else if (now?.currentRailAvailability?.status === 'unavailable') {
+    const reason = boundedRailAvailabilityReason(now.currentRailAvailability.reason);
+    lines.push(
+      `current-rail=unavailable:${reason} · state=unavailable · active-step=unavailable · step-status=unavailable · ${formatSource(now.currentRailAvailability.source)}`,
     );
   } else {
     lines.push(`current-rail=unknown · state=unknown · ${unknownSource}`);
@@ -2124,8 +2172,8 @@ function cognitionSuppressionHeader(
   total: number,
   shown: number,
   suppressed: readonly RebirthPackageV6CognitiveArtifact[],
-  projectedCount: number,
-  omittedCount: number,
+  renderedTruncatedCount: number,
+  incompleteCount: number,
   totalMatched: number | null,
   omissionHandle: string | null,
   capture: RebirthPackageV6CognitiveArtifactCapture | undefined,
@@ -2135,13 +2183,11 @@ function cognitionSuppressionHeader(
   for (const row of suppressed) byKind.set(row.kind, (byKind.get(row.kind) ?? 0) + 1);
   const parts = [
     `cognition: rendered=${shown} captured=${total} matched=${totalMatched ?? 'unknown'}`,
-    // incompleteRows = |rows dropped-whole ∪ rows shipped truncated| (a
-    // provenance-id union at the call site) — every matched row not rendered
-    // in full. The label names the counter honestly (the old
-    // "truncation-remainder" name implied truncated-only and reconciled
-    // against nothing) and carries its own definition so the census
-    // reconciles against suppressed{...} + projected{truncated:n} below.
-    `incomplete-rows=${omittedCount} (=suppressed-whole ∪ truncated)`,
+    // These are disjoint rendered populations: every dropped-whole row plus
+    // every kept row whose body is truncated. A truncated row that was also
+    // dropped belongs only to suppressed-whole, so the two visible counters
+    // add exactly to incomplete-rows without a hidden overlap.
+    `incomplete-rows=${incompleteCount} (=suppressed-whole + rendered-truncated)`,
   ];
   if (suppressed.length > 0) {
     const counts = [...byKind.entries()]
@@ -2150,7 +2196,9 @@ function cognitionSuppressionHeader(
       .join(', ');
     parts.push(`suppressed{${counts}} dropped-whole by lowest budget priority`);
   }
-  if (projectedCount > 0) parts.push(`projected{truncated:${projectedCount}}`);
+  if (renderedTruncatedCount > 0) {
+    parts.push(`projected{rendered-truncated:${renderedTruncatedCount}}`);
+  }
   const relaySuppression = capture?.relaySuppression;
   if (relaySuppression) {
     const relaySelectionSuppressed = relaySuppression.rootDuplicate
@@ -2184,7 +2232,7 @@ function cognitionSuppressionHeader(
       parts.push(`relay-recover=${relayRecoveryHandle ?? 'unavailable'}`);
     }
   }
-  if (omittedCount > 0) parts.push(omissionRecoveryClause(omissionHandle));
+  if (incompleteCount > 0) parts.push(omissionRecoveryClause(omissionHandle));
   return `[${parts.join(' · ')}]`;
 }
 
@@ -2235,24 +2283,21 @@ function renderCognition(model: RebirthPackageV6Model, maxChars: number): Render
     rows: readonly RebirthPackageV6CognitiveArtifact[],
     demandProbe: boolean,
   ): RenderedV6SectionBody | null => {
-    const projectedCount = rows.filter((row) => row.projection === 'truncated').length;
     const assemble = (keep: readonly RebirthPackageV6CognitiveArtifact[]): string => {
       const kept = new Set(keep.map((row) => row.provenanceId));
       const suppressed = rows.filter((row) => !kept.has(row.provenanceId));
-      const omittedIds = new Set(suppressed.map((row) => row.provenanceId));
-      for (const row of rows) {
-        if (row.projection === 'truncated') omittedIds.add(row.provenanceId);
-      }
+      const renderedTruncatedCount = keep.filter((row) => row.projection === 'truncated').length;
+      const incompleteCount = suppressed.length + renderedTruncatedCount;
       const lines: string[] = [];
       lines.push(
         cognitionSuppressionHeader(
           rows.length,
           keep.length,
           suppressed,
-          projectedCount,
-          omittedIds.size,
+          renderedTruncatedCount,
+          incompleteCount,
           capture?.totalMatched ?? null,
-          suppressed.length > 0 || projectedCount > 0 ? omissionHandle : null,
+          incompleteCount > 0 ? omissionHandle : null,
           capture,
           recoveryHandle,
         ),
@@ -2310,7 +2355,8 @@ function renderCognition(model: RebirthPackageV6Model, maxChars: number): Render
     }
     return {
       text,
-      complete: keep.length === rows.length && projectedCount === 0,
+      complete: keep.length === rows.length
+        && rows.every((row) => row.projection !== 'truncated'),
       unitPlacements,
     };
   };

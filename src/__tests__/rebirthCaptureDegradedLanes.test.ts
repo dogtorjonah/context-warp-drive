@@ -91,6 +91,19 @@ describe('computeRebirthCaptureDegradedLanes', () => {
       activeEditDelta: { state: 'exact', files: [{}], reasons: ['edit capture unavailable'] },
     })).toEqual([]);
   });
+
+  it('flags an unavailable task-rail observation but not known absence', () => {
+    expect(computeRebirthCaptureDegradedLanes({
+      boundaryAndActiveTask: {
+        nowCard: { currentRailAvailability: { status: 'unavailable', reason: 'read-failed:EIO' } },
+      },
+    })).toEqual(['task-rail']);
+    expect(computeRebirthCaptureDegradedLanes({
+      boundaryAndActiveTask: {
+        nowCard: { currentRailAvailability: { status: 'none', reason: null } },
+      },
+    })).toEqual([]);
+  });
 });
 
 describe('computeRebirthCaptureDegradedLanesFromPackage', () => {
@@ -104,6 +117,16 @@ describe('computeRebirthCaptureDegradedLanesFromPackage', () => {
     expect(computeRebirthCaptureDegradedLanesFromPackage({
       operatorVault: { partialReason: OMISSION_REASON },
     })).toEqual(['operator-vault']);
+  });
+
+  it('unwraps the task-rail degradation lane from a package boundary', () => {
+    expect(computeRebirthCaptureDegradedLanesFromPackage({
+      rebirthV6: {
+        boundaryAndActiveTask: {
+          nowCard: { currentRailAvailability: { status: 'unavailable', reason: 'invalid-json' } },
+        },
+      },
+    })).toEqual(['task-rail']);
   });
 
   it('never throws and returns no lanes for garbage input', () => {

@@ -181,7 +181,7 @@ describe('chronological provenance', () => {
       sourceEventCount: 42,
       sourceFirstTimestamp: '2026-07-11T04:00:00.000Z',
       sourceLastTimestamp: '2026-07-11T04:41:00.000Z',
-      createdTimestamp: '2026-07-11T04:42:00.000Z',
+      createdTimestamp: '2026-07-11T04:44:00.000Z',
       rawTailCount: 1,
       rawResumeTimestamp: '2026-07-11T04:43:00.000Z',
     });
@@ -193,11 +193,26 @@ describe('chronological provenance', () => {
     expect(rendered).toContain(
       'source-scope-note=lineage-sections-carry-older-per-unit-spans',
     );
-    expect(rendered).toContain('created=instance-1:event#42 @ 2026-07-11T04:42:00.000Z');
+    expect(rendered).toContain('created=instance-1:event#43 @ 2026-07-11T04:44:00.000Z');
     expect(rendered).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
     expect(rendered).toContain(
       'raw-resumes=instance-1:event#42 @ 2026-07-11T04:43:00.000Z (1 exact)',
     );
+  });
+
+  it('places package creation at the source frontier when no raw tail follows', () => {
+    const rendered = renderContinuityPackageProvenance({
+      artifact: 'rebirth-package#continuation',
+      traceId: 'instance-1',
+      sourceEventCount: 42,
+      sourceFirstTimestamp: '2026-07-11T04:00:00.000Z',
+      sourceLastTimestamp: '2026-07-11T04:41:00.000Z',
+      createdTimestamp: '2026-07-11T04:42:00.000Z',
+      rawTailCount: 0,
+    });
+
+    expect(rendered).toContain('created=instance-1:event#42 @ 2026-07-11T04:42:00.000Z');
+    expect(rendered).toContain('raw-resumes=none (0 exact)');
   });
 
   it('keeps malformed continuity-package clocks unknown instead of borrowing another clock', () => {
@@ -216,7 +231,7 @@ describe('chronological provenance', () => {
     expect(rendered).toContain(
       'source[canonical-epoch-tail]=instance-1:event#0..instance-1:event#1 n=2 @ time unknown..time unknown',
     );
-    expect(rendered).toContain('created=instance-1:event#2 @ time unknown');
+    expect(rendered).toContain('created=instance-1:event#3 @ time unknown');
     expect(rendered).toContain('raw-resumes=instance-1:event#2 @ time unknown (1 exact)');
   });
 

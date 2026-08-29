@@ -91,6 +91,14 @@ export interface ContinuityReceiptRail {
   readonly activeStepRawLine?: string;
 }
 
+export type ContinuityReceiptRailCaptureStatus = 'current' | 'none' | 'unavailable';
+
+/** Capture outcome is separate from the optional rail value: none is known absence, unavailable is failed observation. */
+export interface ContinuityReceiptRailCapture {
+  readonly status: ContinuityReceiptRailCaptureStatus;
+  readonly reason?: string;
+}
+
 /** Open file claims and recent edit evidence at the boundary. */
 export interface ContinuityReceiptEditClaim {
   /** False when no Active Edit Delta section was bundled at all. */
@@ -107,6 +115,8 @@ export interface ContinuityReceiptValidation {
 
 export interface ContinuityReceiptValidationSource {
   readonly text: string;
+  /** Stable provenance identity of the text carrying the fact, when known. */
+  readonly sourceId?: string;
   /** Authoritative source time of the text carrying the fact, when known. */
   readonly sourceTimestamp?: string;
   /**
@@ -430,6 +440,8 @@ export interface ContinuityReceiptParts {
   readonly sourceStatus?: string;
   readonly capturedAt?: string;
   readonly rail?: ContinuityReceiptRail;
+  /** Explicit capture outcome; absent only for legacy callers that cannot distinguish none from unknown. */
+  readonly railCapture?: ContinuityReceiptRailCapture;
   readonly pendingAssistantAction?: PendingAssistantAction;
   /** Resolved after operator request and pending assistant action, before rail fallback. */
   readonly nextAction?: string;
@@ -448,6 +460,8 @@ export interface ContinuityReceiptParts {
   readonly validationFact?: string;
   /** Authoritative source time of validationFact, when the caller has it. */
   readonly validationFactSourceTimestamp?: string;
+  /** Stable provenance identity of validationFact, when the caller has it. */
+  readonly validationFactSourceId?: string;
   /** Prose blobs scanned for the latest explicit validation/verification line. */
   readonly validationSources?: readonly (string | ContinuityReceiptValidationSource)[];
   /** Extra hazard descriptors beyond auto-detection. */
@@ -503,6 +517,7 @@ function buildReceiptLiveState(args: {
   parts: ContinuityReceiptParts;
   activeRequest?: { readonly text: string; readonly totalChars: number };
   validationFact?: string;
+  validationSourceId?: string;
   validationSourceTimestamp?: string;
   disagreements: readonly string[];
   claims: readonly string[];
@@ -514,6 +529,7 @@ function buildReceiptLiveState(args: {
     parts,
     activeRequest,
     validationFact,
+    validationSourceId,
     validationSourceTimestamp,
     disagreements,
     claims,
@@ -532,6 +548,14 @@ function buildReceiptLiveState(args: {
     ? parts.activeRequestSourceId?.trim() || `${captureId}:embedded-active-request`
     : 'none';
   const rail = parts.rail;
+  const railCapture = rail
+    ? { status: 'current' as const }
+    : parts.railCapture;
+  const railCaptureNote = railCapture?.status === 'none'
+    ? 'none:no task rail exists at capture'
+    : railCapture?.status === 'unavailable'
+      ? `unavailable:${railCapture.reason?.trim() || 'unspecified'}`
+      : 'no live rail snapshot resolved';
   const pendingAssistantAction = parts.pendingAssistantAction;
   const railSource = rail
     ? captureSource('task-rail', rail.railId || 'legacy-rail', {
@@ -624,16 +648,20 @@ function buildReceiptLiveState(args: {
       },
     } : {}),
     rail: {
-      status: rail ? 'current' : 'unknown',
+      status: rail || railCapture?.status === 'none' ? 'current' : 'unknown',
       source: railSource,
       ...(rail ? { value: rail } : {}),
-      ...(!rail ? { note: 'no live rail snapshot resolved' } : {}),
+      ...(!rail ? { note: railCaptureNote } : {}),
     },
     step: {
-      status: rail?.activeStep ? 'current' : 'unknown',
+      status: rail?.activeStep || railCapture?.status === 'none' ? 'current' : 'unknown',
       source: stepSource,
       ...(rail?.activeStep ? { value: rail.activeStep } : {}),
-      ...(!rail?.activeStep ? { note: 'no active/blocking rail step resolved' } : {}),
+      ...(!rail?.activeStep ? {
+        note: railCapture?.status === 'none'
+          ? 'not-applicable:no task rail exists at capture'
+          : railCaptureNote,
+      } : {}),
     },
     claims: {
       status: 'current',
@@ -650,7 +678,7 @@ function buildReceiptLiveState(args: {
     },
     validation: {
       status: validationFact ? 'current' : 'unknown',
-      source: captureSource('explicit-validation-scan', captureId, {
+      source: captureSource('explicit-validation-scan', validationSourceId?.trim() || captureId, {
         coordinate: 'latest-explicit-fact',
         ...(validationSourceTimestamp ? { sourceTimestamp: validationSourceTimestamp } : {}),
       }),
@@ -658,16 +686,16 @@ function buildReceiptLiveState(args: {
       ...(!validationFact ? { note: 'step status alone is not validation evidence' } : {}),
     },
     review: {
-      status: rail ? 'current' : 'unknown',
+      status: rail || railCapture?.status === 'none' ? 'current' : 'unknown',
       source: railSource,
-      ...(rail ? { value: { state: reviewState } } : {}),
-      ...(!rail ? { note: 'review state unavailable without a rail snapshot' } : {}),
+      ...(rail || railCapture?.status === 'none' ? { value: { state: reviewState } } : {}),
+      ...(!rail && railCapture?.status !== 'none' ? { note: railCaptureNote } : {}),
     },
     blockers: {
-      status: rail ? 'current' : 'unknown',
+      status: rail || railCapture?.status === 'none' ? 'current' : 'unknown',
       source: railSource,
       value: blockers,
-      ...(!rail ? { note: 'blocker state unavailable without a rail snapshot' } : {}),
+      ...(!rail ? { note: railCapture?.status === 'none' ? 'none:no task rail exists at capture' : railCaptureNote } : {}),
     },
     rooms: {
       status: parts.chatroomMembership !== undefined ? 'current' : 'unknown',
@@ -725,14 +753,14 @@ export function detectContinuityHazards(sources: readonly string[]): string[] {
 const VALIDATION_FACT_PATTERN = /^(?:validation|verification)(?:\s+(?:passed|state|fact|facts))?\s*:/iu;
 
 /**
- * Anchored outcome assertion, admitted ONLY on the trusted rail-execution
+ * Outcome assertion admitted ONLY on the trusted rail-execution
  * channel (trustedOutcomeChannel sources — rail ACK notes are self-reported
- * execution records, not prose). The assertion must OPEN the line so plans
- * and quotations cannot impersonate an outcome, and any modal/future marker
- * disqualifies the line. Everything without the trust bit stays under the
- * strict label gate above.
+ * execution records, not prose). The outcome marker may appear anywhere in
+ * the ACK note because the channel already supplies the structural trust; any
+ * modal/future marker still disqualifies the line. Everything without the
+ * trust bit stays under the strict label gate above.
  */
-const TRUSTED_VALIDATION_OUTCOME_PATTERN = /^(?:all\s+(?:(?:local|focused|scoped|full|relay|monorepo|standalone|both|the)\s+)*(?:validation|tests?|typechecks?|vitest|suites?|specs?)\b[^\n:]*\b(?:green|passed|pass|clean)\b|(?:[\w./-]+\s+)?\d+\s*\/\s*\d+\s*(?:tests?|specs?|suites?|assertions?)?\s*(?:passed|pass|green|clean)\b)/iu;
+const TRUSTED_VALIDATION_OUTCOME_PATTERN = /\b(?:green|passed|pass|clean|succeeded|successful)\b/iu;
 const MODAL_FUTURE_MARKER = /\b(?:should|will|would|could|once|until|if|plan(?:ned|ning)?|pending|waiting|todo|needs?\s+to|going\s+to)\b/iu;
 
 /**
@@ -749,6 +777,7 @@ export function findLatestValidationFact(texts: readonly string[]): string | und
 
 interface ContinuityValidationFactMatch {
   readonly fact: string;
+  readonly sourceId?: string;
   readonly sourceTimestamp?: string;
 }
 
@@ -762,6 +791,7 @@ function findLatestValidationFactWithSource(
   }) | undefined;
   for (const [sourceOrder, source] of sources.entries()) {
     const text = typeof source === 'string' ? source : source.text;
+    const sourceId = typeof source === 'string' ? undefined : source.sourceId;
     const sourceTimestamp = typeof source === 'string' ? undefined : source.sourceTimestamp;
     const trustedOutcomeChannel = typeof source !== 'string' && source.trustedOutcomeChannel === true;
     const parsedSourceTime = sourceTimestamp ? Date.parse(sourceTimestamp) : Number.NaN;
@@ -776,6 +806,7 @@ function findLatestValidationFactWithSource(
       }
       const candidate = {
         fact: labeled ? trimmed.replace(/^[^:]+:\s*/u, '') : trimmed,
+        ...(sourceId ? { sourceId } : {}),
         ...(sourceTimestamp ? { sourceTimestamp } : {}),
         ...(Number.isFinite(parsedSourceTime) ? { sourceTimeMs: parsedSourceTime } : {}),
         sourceOrder,
@@ -804,6 +835,7 @@ function findLatestValidationFactWithSource(
   return latest
     ? {
         fact: latest.fact,
+        ...(latest.sourceId ? { sourceId: latest.sourceId } : {}),
         ...(latest.sourceTimestamp ? { sourceTimestamp: latest.sourceTimestamp } : {}),
       }
     : undefined;
@@ -840,6 +872,9 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
   const validationMatch = parts.validationFact
     ? {
         fact: parts.validationFact,
+        ...(parts.validationFactSourceId
+          ? { sourceId: parts.validationFactSourceId }
+          : {}),
         ...(parts.validationFactSourceTimestamp
           ? { sourceTimestamp: parts.validationFactSourceTimestamp }
           : {}),
@@ -877,6 +912,7 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
       parts,
       activeRequest,
       validationFact,
+      validationSourceId: validationMatch?.sourceId,
       validationSourceTimestamp: validationMatch?.sourceTimestamp,
       disagreements,
       claims,
@@ -1177,6 +1213,21 @@ export function normalizeContinuityReceiptRail(value: unknown): ContinuityReceip
     ...(typeof value.updatedAt === 'string' ? { updatedAt: value.updatedAt } : {}),
     ...(typeof value.rawLine === 'string' ? { rawLine: value.rawLine } : {}),
     ...(typeof value.activeStepRawLine === 'string' ? { activeStepRawLine: value.activeStepRawLine } : {}),
+  };
+}
+
+export function normalizeContinuityReceiptRailCapture(
+  value: unknown,
+): ContinuityReceiptRailCapture | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.status !== 'current' && value.status !== 'none' && value.status !== 'unavailable') {
+    return undefined;
+  }
+  return {
+    status: value.status,
+    ...(typeof value.reason === 'string' && value.reason.trim()
+      ? { reason: value.reason.trim() }
+      : {}),
   };
 }
 

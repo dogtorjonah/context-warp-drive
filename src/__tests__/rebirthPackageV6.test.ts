@@ -317,7 +317,7 @@ describe('Rebirth Package v6', () => {
       // scarcity projection without dropping the row wholesale.
       const contended = cognition(value, 1400);
       expect(contended).toContain(`projection=truncated stored=${REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS}/${body.length} chars`);
-      expect(contended).toContain('projected{truncated:1}');
+      expect(contended).toContain('projected{rendered-truncated:1}');
       // No rendered artifact body may exceed the per-entry cap under pressure.
       expect(contended).not.toContain('x'.repeat(REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS + 1));
     });
@@ -388,7 +388,7 @@ describe('Rebirth Package v6', () => {
       // Unresolved open loop survives; transient process voice goes first.
       expect(text).toContain('Q'.repeat(300));
       expect(text).not.toContain('F'.repeat(300));
-      expect(text).toMatch(/cognition: rendered=\d+ captured=4 matched=6 · incomplete-rows=\d+ \(=suppressed-whole ∪ truncated\) · suppressed\{/u);
+      expect(text).toMatch(/cognition: rendered=\d+ captured=4 matched=6 · incomplete-rows=\d+ \(=suppressed-whole \+ rendered-truncated\) · suppressed\{/u);
       expect(text).toContain('dropped-whole by lowest budget priority');
       // The capture receipt is protected: it survives pressure that rows do not.
       expect(text).toContain('Capture receipt: status=complete');
@@ -423,8 +423,8 @@ describe('Rebirth Package v6', () => {
     it('publishes one capture-scoped command whose ledger rows equal the declared omitted count', () => {
       const rows = Array.from({ length: 8 }, (_, index) => artifact({
         provenanceId: `omission:${index}`,
-        kind: index === 0 ? 'question' : 'decision',
-        text: index === 7 ? 'P'.repeat(1_200) : String(index).repeat(260),
+        kind: index === 0 ? 'question' : index === 7 ? 'flow' : 'decision',
+        text: index === 0 || index === 7 ? 'P'.repeat(1_200) : String(index).repeat(260),
         sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
       }));
       const value = model({
@@ -440,9 +440,20 @@ describe('Rebirth Package v6', () => {
         unit.sectionId === 'cognitiveArtifacts'
         && (unit.placement !== 'rendered' || unit.projection?.mode === 'truncated')
       ));
-      const declared = text.match(/cognition: rendered=\d+ captured=8 matched=8 · incomplete-rows=(\d+) \(=suppressed-whole ∪ truncated\)/u);
+      const declared = text.match(/cognition: rendered=\d+ captured=8 matched=8 · incomplete-rows=(\d+) \(=suppressed-whole \+ rendered-truncated\)/u);
       expect(declared).not.toBeNull();
       expect(omitted).toHaveLength(Number(declared![1]));
+      const suppressedWhole = record.units.filter((unit) => (
+        unit.sectionId === 'cognitiveArtifacts' && unit.placement !== 'rendered'
+      ));
+      const renderedTruncated = record.units.filter((unit) => (
+        unit.sectionId === 'cognitiveArtifacts'
+        && unit.placement === 'rendered'
+        && unit.projection?.mode === 'truncated'
+      ));
+      expect(suppressedWhole.some((unit) => unit.projection?.mode === 'truncated')).toBe(true);
+      expect(text).toContain(`projected{rendered-truncated:${renderedTruncated.length}}`);
+      expect(Number(declared![1])).toBe(suppressedWhole.length + renderedTruncated.length);
       const command = 'continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1" section_id="cognitiveArtifacts" omitted_only=true include_unknown_source_time=true limit=200';
       expect(text.match(new RegExp(command.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'gu'))).toHaveLength(1);
       expect(text).not.toContain('unit_ids=');
@@ -724,6 +735,34 @@ describe('Rebirth Package v6', () => {
     expect(card).toContain('parent-status=unknown');
     expect(card).toContain('current-rail=unknown · state=unknown');
     expect(card).not.toMatch(/\b(?:should|must|recommend|safe-action|next-action)\b/iu);
+  });
+
+  it('renders known rail absence as none and failed capture as reasoned unavailable', () => {
+    const base = model();
+    const source = { provenanceId: 'capture-1:task-rail-capture', sourceAt: null, status: 'partial' as const };
+    const renderWith = (status: 'none' | 'unavailable', reason: string | null) => (
+      renderRebirthPackageV6Sections(model({
+        boundaryAndActiveTask: {
+          ...base.boundaryAndActiveTask,
+          nowCard: {
+            forkPurpose: null,
+            parentIdentity: null,
+            parentStatus: null,
+            currentRail: null,
+            currentRailAvailability: { status, reason, source },
+          },
+        },
+      })).find((section) => section.id === 'boundaryAndActiveTask')?.text ?? ''
+    );
+
+    const none = renderWith('none', null);
+    expect(none).toContain('current-rail=none · state=n/a · active-step=n/a · step-status=n/a');
+    expect(none).not.toContain('capture-degraded=task-rail');
+
+    const unavailable = renderWith('unavailable', 'read-failed:EIO');
+    expect(unavailable).toContain('capture-degraded=task-rail');
+    expect(unavailable).toContain('current-rail=unavailable:read-failed:EIO');
+    expect(unavailable).not.toContain('current-rail=unknown');
   });
 
   it('renders a persisted v6 package that predates the lineage sections', () => {
@@ -1357,12 +1396,13 @@ describe('Rebirth Package v6', () => {
       boundary: 'continuation',
       predecessorName: 'worker-a',
       validationSources: [
-        { text: 'validation: 189 focused tests passed', sourceTimestamp: '2026-08-27T02:32:26.983Z' },
-        { text: 'All local validation green; remote typechecks queued at sealed post-repair tree', sourceTimestamp: '2026-08-28T06:08:04.688Z', trustedOutcomeChannel: true },
+        { text: 'validation: 189 focused tests passed', sourceId: 'rail:old/step:s6', sourceTimestamp: '2026-08-27T02:32:26.983Z' },
+        { text: 'Fresh green at exact working tree + class sweep clean', sourceId: 'rail:new/step:b4', sourceTimestamp: '2026-08-28T17:06:28.638Z', trustedOutcomeChannel: true },
       ],
     });
     expect(receipt.validation.fact)
-      .toBe('All local validation green; remote typechecks queued at sealed post-repair tree');
+      .toBe('Fresh green at exact working tree + class sweep clean');
+    expect(receipt.liveState?.validation.source.id).toBe('rail:new/step:b4');
   });
 
   it('keeps the strict label gate for prose and rejects modal futures on the trusted channel', () => {
@@ -1376,7 +1416,7 @@ describe('Rebirth Package v6', () => {
         // Anchored but modal/future: rejected even on the trusted channel.
         { text: 'All tests should pass once I run them', sourceTimestamp: '2026-08-28T06:09:00.000Z', trustedOutcomeChannel: true },
         // Anchored outcome on the trusted channel: admitted, freshest wins.
-        { text: '54/54 tests passed', sourceTimestamp: '2026-08-28T06:10:00.000Z', trustedOutcomeChannel: true },
+        { text: '54/54 tests passed', sourceId: 'rail:valid/step:s6', sourceTimestamp: '2026-08-28T06:10:00.000Z', trustedOutcomeChannel: true },
       ],
     });
     expect(receipt.validation.fact).toBe('54/54 tests passed');

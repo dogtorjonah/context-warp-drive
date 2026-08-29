@@ -816,12 +816,23 @@ export function renderContinuityPackageProvenance(
   const frontier: ChronologicalPoint = sourceEventCount !== undefined
     ? { traceId: input.traceId, unit: 'event', index: sourceEventCount }
     : { traceId: input.traceId, unit: 'event', id: 'live-frontier' };
+  const rawTailOffset = Number.isInteger(input.rawTailCount) && input.rawTailCount > 0
+    ? input.rawTailCount
+    : 0;
   const transformedAt: ChronologicalPoint = {
-    ...frontier,
+    traceId: input.traceId,
+    unit: 'event',
+    ...(sourceEventCount !== undefined
+      ? { index: sourceEventCount + rawTailOffset }
+      : { id: 'package-created' }),
     timestamp: knownTimestamp(input.createdTimestamp),
   };
   const rawResumesAt: ChronologicalPoint = {
-    ...frontier,
+    traceId: input.traceId,
+    unit: 'event',
+    ...(sourceEventCount !== undefined
+      ? { index: sourceEventCount }
+      : { id: 'raw-tail-start' }),
     timestamp: knownTimestamp(input.rawResumeTimestamp),
   };
   return renderChronologicalProvenance({
