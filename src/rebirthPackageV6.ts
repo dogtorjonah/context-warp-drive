@@ -7,6 +7,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 
 import type { ContinuityLiveFieldSource, ContinuityReceipt } from './continuityReceipt.ts';
 import type { FoldMessage } from './rollingFold.ts';
@@ -490,6 +491,15 @@ export interface RenderRebirthPackageV6Options {
    * fixtures that must render at exactly the declared section caps.
    */
   readonly adaptiveBackfill?: boolean;
+  /**
+   * Measure cumulative CPU wall time for each canonical section across every
+   * render pass (adaptive backfill, shrink probes, and final admission).
+   * Disabled by default so preview/golden callers retain the prior zero-cost
+   * pure render path.
+   */
+  readonly measureSectionTimings?: boolean;
+  /** Deterministic test seam; production uses the monotonic performance clock. */
+  readonly sectionTimingClock?: () => number;
 }
 
 export interface RenderedRebirthPackageV6Section {
@@ -2780,39 +2790,88 @@ interface RenderedV6SectionBody {
 function renderSectionBodies(
   model: RebirthPackageV6Model,
   limits: Record<RebirthPackageV6SectionId, number>,
+  timing?: RebirthPackageV6SectionTimingAccumulator,
 ): Record<RebirthPackageV6SectionId, RenderedV6SectionBody> {
   const transcriptHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle || null;
   return {
-    boundaryAndActiveTask: renderBoundary(model, limits.boundaryAndActiveTask),
-    brainMergeSynthesis: boundedText(
+    boundaryAndActiveTask: measureSectionRender(timing, 'boundaryAndActiveTask', () => (
+      renderBoundary(model, limits.boundaryAndActiveTask)
+    )),
+    brainMergeSynthesis: measureSectionRender(timing, 'brainMergeSynthesis', () => boundedText(
       model.brainMergeSynthesis ?? '',
       limits.brainMergeSynthesis,
       model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle ?? null,
-    ),
-    executionState: renderExecution(model, limits.executionState),
-    activeEditDelta: renderActiveEdits(model, limits.activeEditDelta),
-    cognitiveArtifacts: renderCognition(model, limits.cognitiveArtifacts),
-    recentConversation: renderConversation(model, limits.recentConversation),
-    operatorVault: renderLineage(
+    )),
+    executionState: measureSectionRender(timing, 'executionState', () => (
+      renderExecution(model, limits.executionState)
+    )),
+    activeEditDelta: measureSectionRender(timing, 'activeEditDelta', () => (
+      renderActiveEdits(model, limits.activeEditDelta)
+    )),
+    cognitiveArtifacts: measureSectionRender(timing, 'cognitiveArtifacts', () => (
+      renderCognition(model, limits.cognitiveArtifacts)
+    )),
+    recentConversation: measureSectionRender(timing, 'recentConversation', () => (
+      renderConversation(model, limits.recentConversation)
+    )),
+    operatorVault: measureSectionRender(timing, 'operatorVault', () => renderLineage(
       lineageSection(model, 'operatorVault'),
       limits.operatorVault,
       transcriptHandle,
       continuityLedgerOmissionHandle(model, 'operatorVault'),
-    ),
-    episodeChapterIndex: renderLineage(
+    )),
+    episodeChapterIndex: measureSectionRender(timing, 'episodeChapterIndex', () => renderLineage(
       lineageSection(model, 'episodeChapterIndex'),
       limits.episodeChapterIndex,
       model.recoveryIndex.find((entry) => entry.id === 'context-warp-stores')?.handle || null,
       continuityLedgerOmissionHandle(model, 'episodeChapterIndex'),
-    ),
-    lifeLedger: renderLineage(
+    )),
+    lifeLedger: measureSectionRender(timing, 'lifeLedger', () => renderLineage(
       lineageSection(model, 'lifeLedger'),
       limits.lifeLedger,
       model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle || null,
       continuityLedgerOmissionHandle(model, 'lifeLedger'),
-    ),
-    recoveryIndex: renderRecovery(model, limits.recoveryIndex),
+    )),
+    recoveryIndex: measureSectionRender(timing, 'recoveryIndex', () => (
+      renderRecovery(model, limits.recoveryIndex)
+    )),
   };
+}
+
+export type RebirthPackageV6SectionTimings = Readonly<Partial<
+  Record<RebirthPackageV6SectionId, number>
+>>;
+
+interface RebirthPackageV6SectionTimingAccumulator {
+  readonly now: () => number;
+  readonly durations: Partial<Record<RebirthPackageV6SectionId, number>>;
+}
+
+function createSectionTimingAccumulator(
+  options: RenderRebirthPackageV6Options,
+): RebirthPackageV6SectionTimingAccumulator | undefined {
+  if (options.measureSectionTimings !== true) return undefined;
+  return {
+    now: options.sectionTimingClock ?? (() => performance.now()),
+    durations: {},
+  };
+}
+
+function measureSectionRender<T>(
+  timing: RebirthPackageV6SectionTimingAccumulator | undefined,
+  sectionId: RebirthPackageV6SectionId,
+  render: () => T,
+): T {
+  if (!timing) return render();
+  const startedAt = timing.now();
+  try {
+    return render();
+  } finally {
+    const duration = Math.max(0, timing.now() - startedAt);
+    if (Number.isFinite(duration)) {
+      timing.durations[sectionId] = (timing.durations[sectionId] ?? 0) + duration;
+    }
+  }
 }
 
 function admittedSectionIds(model: RebirthPackageV6Model): readonly RebirthPackageV6SectionId[] {
@@ -2875,6 +2934,14 @@ export function resolveAdaptiveSectionCaps(
   model: RebirthPackageV6Model,
   options: RenderRebirthPackageV6Options = {},
 ): Record<RebirthPackageV6SectionId, number> {
+  return resolveAdaptiveSectionCapsInternal(model, options);
+}
+
+function resolveAdaptiveSectionCapsInternal(
+  model: RebirthPackageV6Model,
+  options: RenderRebirthPackageV6Options,
+  timing?: RebirthPackageV6SectionTimingAccumulator,
+): Record<RebirthPackageV6SectionId, number> {
   const limits = { ...DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, ...options.sectionMaxChars };
   const budget = pushTargetChars(model, options);
   if (options.adaptiveBackfill === false || !Number.isFinite(budget) || budget <= 0) return limits;
@@ -2883,9 +2950,9 @@ export function resolveAdaptiveSectionCaps(
     : 0;
 
   const admitted = admittedSectionIds(model);
-  let bodies = renderSectionBodies(model, limits);
+  let bodies = renderSectionBodies(model, limits, timing);
   const framedLength = (): number => admitted
-    .map((id) => frameSection(id, bodies[id].text).length)
+    .map((id) => measureSectionRender(timing, id, () => frameSection(id, bodies[id].text).length))
     .reduce((total, length, index) => total + length + (index > 0 ? 2 : 0), 0);
 
   const availableSpare = (): number => budget
@@ -2911,7 +2978,7 @@ export function resolveAdaptiveSectionCaps(
       if (explicitCaps.has(id)) continue;
       if (bodies[id].complete) continue;
       limits[id] += spare;
-      bodies = renderSectionBodies(model, limits);
+      bodies = renderSectionBodies(model, limits, timing);
       // Recompute from the whole rendered package, not just this section's
       // growth. A later section can render a shorter receipt/row boundary and
       // release capacity that the earlier priority citizens must see again.
@@ -2942,12 +3009,13 @@ export function renderRebirthPackageV6Sections(
 function renderSectionsWithLimits(
   model: RebirthPackageV6Model,
   limits: Record<RebirthPackageV6SectionId, number>,
+  timing?: RebirthPackageV6SectionTimingAccumulator,
 ): readonly RenderedRebirthPackageV6Section[] {
-  const rendered = renderSectionBodies(model, limits);
+  const rendered = renderSectionBodies(model, limits, timing);
   return admittedSectionIds(model).map((id) => ({
     id,
     title: SECTION_TITLES[id],
-    text: frameSection(id, rendered[id].text),
+    text: measureSectionRender(timing, id, () => frameSection(id, rendered[id].text)),
     complete: rendered[id].complete,
     ...(rendered[id].collapse !== undefined ? { collapse: rendered[id].collapse } : {}),
     ...(rendered[id].unitPlacements !== undefined ? { unitPlacements: rendered[id].unitPlacements } : {}),
@@ -3012,6 +3080,8 @@ export interface RebirthPackageV7EvictionTelemetry {
 export interface RenderedRebirthPackageV6WithReport {
   readonly text: string;
   readonly collapse: RebirthPackageV7CollapseReport;
+  /** Cumulative measured render cost across every pass; absent when not requested. */
+  readonly sectionTimingsMs?: RebirthPackageV6SectionTimings;
 }
 
 function buildCollapseReport(
@@ -3158,6 +3228,7 @@ function shrinkCollapseSectionsToTarget(args: {
   initialSections: readonly RenderedRebirthPackageV6Section[];
   initialText: string;
   targetChars: number;
+  timing?: RebirthPackageV6SectionTimingAccumulator;
 }): RebirthPackageV7ShrinkOutcome {
   let limits = { ...args.initialLimits };
   let sections = args.initialSections;
@@ -3170,7 +3241,7 @@ function shrinkCollapseSectionsToTarget(args: {
     cap: number,
   ): { limits: Record<RebirthPackageV6SectionId, number>; sections: readonly RenderedRebirthPackageV6Section[]; text: string } => {
     const candidateLimits = { ...limits, [id]: cap };
-    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits);
+    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits, args.timing);
     shrinkRenders += 1;
     return {
       limits: candidateLimits,
@@ -3247,8 +3318,9 @@ export function renderRebirthPackageV6WithReport(
   const envelopeChars = Number.isFinite(options.envelopeChars)
     ? Math.max(0, Math.floor(options.envelopeChars ?? 0))
     : 0;
-  const initialLimits = resolveAdaptiveSectionCaps(model, options);
-  const initialSections = renderSectionsWithLimits(model, initialLimits);
+  const sectionTiming = createSectionTimingAccumulator(options);
+  const initialLimits = resolveAdaptiveSectionCapsInternal(model, options, sectionTiming);
+  const initialSections = renderSectionsWithLimits(model, initialLimits, sectionTiming);
   const initialRendered = joinRenderedSections(initialSections, declaration);
   const targetSectionChars = Number.isFinite(pushTarget) && pushTarget > 0
     ? Math.max(0, Math.floor(pushTarget) - envelopeChars)
@@ -3261,6 +3333,7 @@ export function renderRebirthPackageV6WithReport(
       initialSections,
       initialText: initialRendered,
       targetChars: targetSectionChars,
+      timing: sectionTiming,
     })
     : {
       sections: initialSections,
@@ -3322,6 +3395,7 @@ export function renderRebirthPackageV6WithReport(
     return {
       text,
       collapse: buildCollapseReport(sections, omittedSectionIds, telemetry),
+      ...(sectionTiming ? { sectionTimingsMs: { ...sectionTiming.durations } } : {}),
     };
   };
   if (!Number.isFinite(budget) || budget <= 0) return finish(rendered, []);
@@ -3474,7 +3548,7 @@ export function renderRebirthPackageV6WithReport(
     let probeCap = Math.min(sectionLimits[section.id], remaining);
     for (let attempt = 0; attempt < 4 && probeCap >= 1; attempt += 1) {
       const candidateLimits = { ...sectionLimits, [section.id]: probeCap };
-      const candidateSections = renderSectionsWithLimits(model, candidateLimits);
+      const candidateSections = renderSectionsWithLimits(model, candidateLimits, sectionTiming);
       const candidateSection = candidateSections.find((probe) => probe.id === section.id);
       const fits = compose(candidateSections, candidate, compactElisionReceipts).length <= sectionBudget
         && reducedCapAdmitsContent(section.id, candidateSection);
