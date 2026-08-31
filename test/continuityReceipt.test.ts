@@ -619,4 +619,39 @@ describe('standalone scanners', () => {
     expect(findLatestValidationFact(['Validation passed: relay 297/297'])).toBe('relay 297/297');
     expect(findLatestValidationFact(['nothing here'])).toBeUndefined();
   });
+
+  test('a newer trusted rail outcome outranks an older labeled validation row', () => {
+    // Aug-30 audit B1: the Aug-26 rail ACK carried an explicit :validation:
+    // label and beat fresher structural truth whose notes read "456 tests
+    // across relay + context-warp". Known source time must rank first.
+    const older = {
+      text: 'validation: 189 focused tests passed 319/322',
+      sourceId: 'rail:old/step:f2',
+      sourceTimestamp: '2026-08-26T22:35:39.931Z',
+    } as const;
+    const newer = {
+      text: 'All green — 456 tests across relay + context-warp',
+      sourceId: 'rail:new/step:s7',
+      sourceTimestamp: '2026-08-29T14:13:32.487Z',
+      trustedOutcomeChannel: true,
+    } as const;
+    expect(findLatestValidationFact([older, newer])).toBe(newer.text);
+  });
+
+  test('a trusted rail outcome with an N/M tally is admitted without the explicit label', () => {
+    // The Aug-29 rail ACK notes read "38/38", "270/270", "456 tests" —
+    // none matched the old keyword-only outcome pattern.
+    expect(findLatestValidationFact([{
+      text: 'Broad battery green — 270/270 contextRebirthTool, 64/64 rebirthPackageV6',
+      sourceId: 'rail:new/step:s5',
+      sourceTimestamp: '2026-08-29T14:13:32.487Z',
+      trustedOutcomeChannel: true,
+    }])).toBe('Broad battery green — 270/270 contextRebirthTool, 64/64 rebirthPackageV6');
+    expect(findLatestValidationFact([{
+      text: 'relay suite is green (38/38)',
+      sourceId: 'rail:new/step:s5',
+      sourceTimestamp: '2026-08-29T14:10:50.478Z',
+      trustedOutcomeChannel: true,
+    }])).toBe('relay suite is green (38/38)');
+  });
 });

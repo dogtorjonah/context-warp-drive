@@ -194,6 +194,9 @@ export interface ContinuityReceiptLiveState {
   /** Newest assistant-created executable open loop, when one is still unresolved. */
   readonly assistantAction?: ContinuityLiveField<PendingAssistantAction>;
   readonly rail: ContinuityLiveField<ContinuityReceiptRail>;
+  /** Typed rail capture outcome. Takes precedence over the string-encoded
+   * `rail.note` when consumers derive rail availability. */
+  readonly railCapture?: ContinuityReceiptRailCapture;
   readonly step: ContinuityLiveField<ContinuityReceiptRailStep>;
   readonly claims: ContinuityLiveField<readonly string[]>;
   readonly edits: ContinuityLiveField<readonly string[]>;
@@ -653,6 +656,9 @@ function buildReceiptLiveState(args: {
       ...(rail ? { value: rail } : {}),
       ...(!rail ? { note: railCaptureNote } : {}),
     },
+    // Carry the structured capture alongside the encoded note so consumers can
+    // derive availability without string-prefix parsing.
+    ...(railCapture ? { railCapture } : {}),
     step: {
       status: rail?.activeStep || railCapture?.status === 'none' ? 'current' : 'unknown',
       source: stepSource,
@@ -760,7 +766,7 @@ const VALIDATION_FACT_PATTERN = /^(?:validation|verification)(?:\s+(?:passed|sta
  * modal/future marker still disqualifies the line. Everything without the
  * trust bit stays under the strict label gate above.
  */
-const TRUSTED_VALIDATION_OUTCOME_PATTERN = /\b(?:green|passed|pass|clean|succeeded|successful)\b/iu;
+const TRUSTED_VALIDATION_OUTCOME_PATTERN = /\b(?:green|passed|pass|clean|succeeded|successful)\b|\b\d+\s*\/\s*\d+\b/iu;
 const MODAL_FUTURE_MARKER = /\b(?:should|will|would|could|once|until|if|plan(?:ned|ning)?|pending|waiting|todo|needs?\s+to|going\s+to)\b/iu;
 
 /**

@@ -1233,12 +1233,16 @@ function receiptFactSource(
   source: ContinuityLiveFieldSource | undefined,
 ): Pick<RebirthPackageV6ExecutionFact, 'provenanceId' | 'sourceAt' | 'status'> {
   const sourceId = nonEmpty(source?.id);
+  // 'none' is a non-observation (capture lane reported no source), not a
+  // provenance identity: prefixing a minted hash with it fabricates a
+  // source-looking id for a row that asserts nothing was observed.
+  const usableSourceId = sourceId && sourceId !== 'none' ? sourceId : null;
   return {
-    provenanceId: sourceId
-      ? `${sourceId}:${stableTextIdentity(kind, text)}`
+    provenanceId: usableSourceId
+      ? `${usableSourceId}:${stableTextIdentity(kind, text)}`
       : stableTextIdentity(`receipt-${kind}`, text),
     sourceAt: knownSourceTime(source?.sourceTimestamp),
-    status: sourceId && sourceId !== 'none' ? 'exact' : 'partial',
+    status: usableSourceId ? 'exact' : 'partial',
   };
 }
 
@@ -1420,13 +1424,21 @@ export function adaptLegacyRebirthPackageToV6(
     }
   } else if (nonEmpty(legacy.resumePoint ?? legacy.taskRailContext)) {
     const text = nonEmpty(legacy.resumePoint ?? legacy.taskRailContext)!;
-    executionFacts.push({
-      provenanceId: stableTextIdentity('legacy-execution', text),
-      sourceAt: null,
-      status: 'partial',
-      kind: 'rail',
-      text,
-    });
+    // The no-rail Resume Point fallback is UI decoration over a predecessor
+    // thought bubble, not an observed rail state. Swallowing it as a structured
+    // rail fact renders prose-as-data in Execution State; only a resume point
+    // that carries actual rail structure (title/id/state line) is a fact.
+    const isDecorationOnly = /^── Resume Point ──\s*\n💭\s*Last thought:/u.test(text)
+      && !/^\[Task rail\]/mu.test(text);
+    if (!isDecorationOnly) {
+      executionFacts.push({
+        provenanceId: stableTextIdentity('legacy-execution', text),
+        sourceAt: null,
+        status: 'partial',
+        kind: 'rail',
+        text,
+      });
+    }
   }
   if (receipt?.sourceStatus) {
     executionFacts.push({

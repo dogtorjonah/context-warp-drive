@@ -1526,6 +1526,60 @@ describe('Rebirth Package v6', () => {
     ]));
   });
 
+  it('does not swallow a decoration-only Resume Point as a structured rail fact', () => {
+    // Aug-30 audit E1: the no-rail fallback renders "── Resume Point ──
+    // 💭 Last thought: …" (UI decoration over a thought bubble). Ingesting it
+    // as kind:'rail' with a minted legacy-execution id rendered prose-as-data
+    // in Execution State.
+    const value = adaptLegacyRebirthPackageToV6({
+      lifecycleBoundary: 'continuation',
+      resumePoint: '── Resume Point ──\n💭 Last thought: Finished, ready for next task',
+      predecessorName: 'worker-a',
+    });
+
+    expect(value.executionState.facts.some(
+      (fact) => fact.kind === 'rail' && fact.text.includes('Last thought:'),
+    )).toBe(false);
+  });
+
+  it('still admits a resume point that carries real rail structure', () => {
+    const value = adaptLegacyRebirthPackageToV6({
+      lifecycleBoundary: 'continuation',
+      resumePoint: [
+        '── Resume Point ──',
+        '📋 Continue fold-continuity repair (rail-9e2b1075) — active — 3/9 (33%)',
+        '▶ Active: step-4 [active]',
+      ].join('\n'),
+      predecessorName: 'worker-a',
+    });
+
+    expect(value.executionState.facts.some(
+      (fact) => fact.kind === 'rail' && fact.text.includes('rail-9e2b1075'),
+    )).toBe(true);
+  });
+
+  it('never mints a none-prefixed provenance id for a non-observed source', () => {
+    // Aug-30 audit E2: a review fact whose live-field source id is 'none'
+    // rendered as `source=none:review:<hash>` — a fabricated identity for a
+    // non-observation. The honest fallback identity has no none: prefix.
+    const continuityReceipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      capturedAt: '2026-08-30T23:00:00.000Z',
+      captureSourceId: 'capture-none-review',
+      railCapture: { status: 'unavailable', reason: 'worker-timeout' },
+    });
+    const value = adaptLegacyRebirthPackageToV6({ continuityReceipt });
+
+    const reviewFact = value.executionState.facts.find((fact) => fact.kind === 'review');
+    if (reviewFact) {
+      expect(reviewFact.provenanceId.startsWith('none:')).toBe(false);
+    }
+    for (const fact of value.executionState.facts) {
+      expect(fact.provenanceId.startsWith('none:')).toBe(false);
+    }
+  });
+
   it('flags stale rail direction while sourcing a mirrored next_action from the active request', () => {
     // Lived fixture: a 17:11 rail row still commanding after the operator
     // pivoted at 17:18:50. The rail must carry the measured-order flag, while
@@ -2054,6 +2108,26 @@ describe('Rebirth Package v6', () => {
     expect(rendered).toBe(baseline);
     expect(rendered).toContain('src/example.ts');
     expect(rendered).toContain('same_instance_hard_epoch');
+  });
+
+  it('measures every canonical section across adaptive and final render passes without changing bytes', () => {
+    let tick = 0;
+    const value = model();
+    const measured = renderRebirthPackageV6WithReport(value, {
+      measureSectionTimings: true,
+      sectionTimingClock: () => tick++,
+    });
+    const unmeasured = renderRebirthPackageV6WithReport(value);
+
+    expect(measured.text).toBe(unmeasured.text);
+    expect(unmeasured.sectionTimingsMs).toBeUndefined();
+    expect(Object.keys(measured.sectionTimingsMs ?? {}).sort())
+      .toEqual([...REBIRTH_PACKAGE_V6_SECTION_IDS].sort());
+    for (const sectionId of REBIRTH_PACKAGE_V6_SECTION_IDS) {
+      // One adaptive-cap render plus the final admission render proves the
+      // accumulator covers repeated passes instead of timing a cheap final pass.
+      expect(measured.sectionTimingsMs?.[sectionId]).toBeGreaterThanOrEqual(2);
+    }
   });
 
   it('uses the six-section contract for the host-unavailable hard-epoch fallback', () => {
