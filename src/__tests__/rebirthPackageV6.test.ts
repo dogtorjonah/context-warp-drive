@@ -1050,7 +1050,7 @@ describe('Rebirth Package v6', () => {
       .find((candidate) => candidate.id === 'activeEditDelta');
     expect(section).toBeTruthy();
     expect(section!.text).toContain(
-      'evidence=bounded edit log; immutable capture unavailable: legacy Active Edit Delta adapted without an immutable Atlas capture',
+      'evidence=bounded edit log; immutable capture not-requested: legacy Active Edit Delta adapted without an immutable Atlas capture',
     );
     // The timestamped edit log is real evidence and survives untouched.
     expect(section!.text).toContain('[06:51 PM UTC] Edit → relay/src/example.ts');
@@ -1081,12 +1081,16 @@ describe('Rebirth Package v6', () => {
     const section = renderRebirthPackageV6Sections(legacy, {
       sectionMaxChars: { activeEditDelta: 520 },
     }).find((candidate) => candidate.id === 'activeEditDelta');
-    const banner = 'evidence=bounded edit log; immutable capture unavailable: legacy Active Edit Delta adapted without an immutable Atlas capture';
+    const banner = 'evidence=bounded edit log; immutable capture not-requested: legacy Active Edit Delta adapted without an immutable Atlas capture';
 
     expect(section?.text).toContain(banner);
     expect(section?.text).toContain('NEWEST_OPERATIONAL_EDIT');
     expect(section?.text).not.toContain('OLD_EDIT_BODY');
-    expect(section?.text).toContain('older prefix omitted · stored newest');
+    // S11: the entry-aware cut renders explicit omitted-entries/omitted-chars and
+    // the retained tail starts at a clean entry header.
+    expect(section?.text).toContain('older prefix omitted');
+    expect(section?.text).toMatch(/omitted-entries=\d+ · omitted-chars=\d+/u);
+    expect(section?.text).toContain('kept newest');
     expect(section?.text).toContain(
       'recovery=authoritative-history atlas_query action="history" workspace="voxxo-swarm" author_instance_id="instance-a"',
     );

@@ -49,6 +49,8 @@ interface ManifestEntry {
   pkg: string;
   src: string;
   mode: ManifestMode;
+  /** Optional human rationale for the declared mode (derived entries only). */
+  note?: string;
 }
 
 // Same declarations as relay/data/mcp-forge/context-warp-parity MANIFEST.
@@ -76,6 +78,15 @@ const MANIFEST: ManifestEntry[] = [
   { pkg: 'src/persistence/sparseVector.ts', src: 'relay/src/persistence/sparseVector.ts', mode: 'identical' },
   { pkg: 'src/persistence/transcriptTypes.ts', src: 'relay/src/persistence/transcriptTypes.ts', mode: 'trim' },
   { pkg: 'src/glyphs.ts', src: 'packages/voxxo-codex/src/glyphs/index.ts', mode: 'derived' },
+  // Package-canonical rebirth renderer/collapse/receipt modules. The relay
+  // imports these DIRECTLY from the package (no relay-side shim or copy), so
+  // `shim`/`identical` cannot apply; the byte-parity that guards them is the
+  // package<->standalone walkFiles comparison below, named explicitly in the
+  // `shared rebirth renderer core is byte-identical to the standalone` test.
+  { pkg: 'src/rebirthPackageV6.ts', src: 'packages/context-warp/src/rebirthPackageV6.ts', mode: 'derived', note: 'package-canonical; relay imports directly; package==standalone byte-mirror via walkFiles' },
+  { pkg: 'src/generationalCollapse.ts', src: 'packages/context-warp/src/generationalCollapse.ts', mode: 'derived', note: 'package-canonical; relay imports directly; package==standalone byte-mirror via walkFiles' },
+  { pkg: 'src/continuityReceipt.ts', src: 'packages/context-warp/src/continuityReceipt.ts', mode: 'derived', note: 'package-canonical; relay imports directly; package==standalone byte-mirror via walkFiles' },
+  { pkg: 'src/__tests__/rebirthCaptureDegradedLanes.test.ts', src: 'packages/context-warp/src/__tests__/rebirthCaptureDegradedLanes.test.ts', mode: 'derived', note: 'package test; relay imports the tested renderer directly; package==standalone byte-mirror via walkFiles' },
 ];
 
 // Same declarations as the Forge server's standalone carve-outs.
@@ -275,6 +286,35 @@ describe('package ↔ standalone mirror parity', () => {
     }
     expect(failures).toEqual([]);
   });
+
+  it.skipIf(!existsSync(STANDALONE_ROOT))('the shared rebirth renderer core is byte-identical to the standalone', () => {
+    // These package-canonical modules have no relay copy (relay imports them
+    // directly), so they cannot be `shim`/`identical` manifest rows. They ARE
+    // byte-mirrored into the standalone (imported by fold.ts, FoldSession.ts,
+    // foldFreeze.ts, index.ts, continuityAudit.ts, host/continuityLedgerStore.ts),
+    // which the generic walkFiles pass above also covers. This test names the
+    // exact pairs so a renderer-core drift fails loudly and is traceable by name.
+    const corePairs = [
+      'src/rebirthPackageV6.ts',
+      'src/generationalCollapse.ts',
+      'src/continuityReceipt.ts',
+      'src/__tests__/rebirthCaptureDegradedLanes.test.ts',
+    ];
+    const failures: string[] = [];
+    for (const rel of corePairs) {
+      const pkgBuf = readFileSync(join(PKG_ROOT, rel));
+      const standaloneRel = RELOCATED_STANDALONE_PAIRS.get(rel) ?? rel;
+      const standaloneAbs = join(STANDALONE_ROOT, standaloneRel);
+      if (!existsSync(standaloneAbs)) {
+        failures.push(`${rel}: missing standalone pair ${standaloneRel}`);
+        continue;
+      }
+      if (!pkgBuf.equals(readFileSync(standaloneAbs))) {
+        failures.push(`${rel}: byte drift vs standalone (package=${pkgBuf.length}B standalone=${readFileSync(standaloneAbs).length}B)`);
+      }
+    }
+    expect(failures).toEqual([]);
+  });
 });
 
 describe('portable Task Rail semantic parity', () => {
@@ -426,6 +466,92 @@ describe('portable Task Rail semantic parity', () => {
         expect(standaloneApi.parseStepsFileText(input))
           .toEqual(packageApi.parseStepsFileText(input));
       }
+    },
+  );
+
+  it.skipIf(!existsSync(TASK_RAIL_PACKAGE_ROOT) || !existsSync(STANDALONE_TASK_RAIL))(
+    'governed done-ACKs fail closed identically (criterion→verdict parity)',
+    async () => {
+      const packageApi = await import(
+        /* @vite-ignore */ pathToFileURL(join(TASK_RAIL_PACKAGE_ROOT, 'src/index.ts')).href
+      );
+      const standaloneApi = await import(
+        /* @vite-ignore */ pathToFileURL(STANDALONE_TASK_RAIL).href
+      );
+      const now = '2026-07-22T05:30:00.000Z';
+
+      const governedSteps = [{
+        id: 'governed-step',
+        title: 'Governed',
+        instruction: 'Do governed work',
+        acceptanceCriteria: ['criterion-a', 'criterion-b'],
+        governance: 'governed' as const,
+        status: 'pending' as const,
+        createdAt: now,
+        updatedAt: now,
+        attempts: 0,
+      }];
+      const governedRailArgs = {
+        id: 'rail-governed',
+        instanceId: 'agent-parity',
+        title: 'Governed rail',
+        objective: 'Fail closed on missing verdicts.',
+        locked: true,
+        steps: governedSteps,
+      };
+      const packageRail = packageApi.createRail(governedRailArgs);
+      const standaloneRail = standaloneApi.createRail(governedRailArgs);
+
+      // Incomplete verdicts → both throw MissingAcceptanceEvidenceError with
+      // the same uncovered-criterion detail; neither mutates to done.
+      for (const partial of [
+        { criterion: 'criterion-a', verdict: 'pass' as const, evidence: 'ea' },
+      ]) {
+        const packageErr = (() => {
+          try {
+            packageApi.shoot(packageRail, {
+              ackStepId: 'governed-step',
+              ackStatus: 'done',
+              criterionVerdicts: [partial],
+            }, { now: '2026-07-22T05:31:00.000Z', actorId: 'agent-parity' });
+            return null;
+          } catch (e) { return e; }
+        })();
+        const standaloneErr = (() => {
+          try {
+            standaloneApi.shoot(standaloneRail, {
+              ackStepId: 'governed-step',
+              ackStatus: 'done',
+              criterionVerdicts: [partial],
+            }, { now: '2026-07-22T05:31:00.000Z', actorId: 'agent-parity' });
+            return null;
+          } catch (e) { return e; }
+        })();
+        expect(packageErr).toBeInstanceOf(packageApi.MissingAcceptanceEvidenceError);
+        expect(standaloneErr).toBeInstanceOf(standaloneApi.MissingAcceptanceEvidenceError);
+        expect((standaloneErr as Error).message).toContain('criterion-b');
+      }
+      // Neither rail advanced the governed step to done.
+      expect(packageRail.steps.find((s: { id: string }) => s.id === 'governed-step')?.status).toBe('pending');
+      expect(standaloneRail.steps.find((s: { id: string }) => s.id === 'governed-step')?.status).toBe('pending');
+
+      // Complete verdicts → both accept and record criterionVerdicts.
+      const full = [
+        { criterion: 'criterion-a', verdict: 'pass' as const, evidence: 'ea' },
+        { criterion: 'criterion-b', verdict: 'pass' as const, evidence: 'eb' },
+      ];
+      packageApi.shoot(packageRail, {
+        ackStepId: 'governed-step', ackStatus: 'done', criterionVerdicts: full,
+      }, { now: '2026-07-22T05:32:00.000Z', actorId: 'agent-parity' });
+      standaloneApi.shoot(standaloneRail, {
+        ackStepId: 'governed-step', ackStatus: 'done', criterionVerdicts: full,
+      }, { now: '2026-07-22T05:32:00.000Z', actorId: 'agent-parity' });
+      expect(packageRail.steps.find((s: { id: string }) => s.id === 'governed-step')?.status).toBe('done');
+      expect(standaloneRail.steps.find((s: { id: string }) => s.id === 'governed-step')?.status).toBe('done');
+      expect(packageRail.steps.find((s: { id: string }) => s.id === 'governed-step')?.criterionVerdicts)
+        .toEqual(full);
+      expect(standaloneRail.steps.find((s: { id: string }) => s.id === 'governed-step')?.criterionVerdicts)
+        .toEqual(full);
     },
   );
 });

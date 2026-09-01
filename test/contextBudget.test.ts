@@ -35,7 +35,7 @@ describe('resolveContextBudget', () => {
   it('requests 250K for every spawnable engine when the physical window admits it', () => {
     const engines = [
       'claude', 'claude-api', 'claude-cli', 'claude-interactive',
-      'codex', 'codex-api', 'openai',
+      'codex', 'codex-api',
       'gemini', 'gemini-api',
       'minimax', 'mistral', 'grok', 'glm', 'deepseek', 'kimi', 'qwen', 'inkling', 'local',
     ];
@@ -121,10 +121,10 @@ describe('resolveContextBudget', () => {
     expect(noPressure.tailEpochCapTokens).toBe(10_000);
   });
 
-  it('classifies 400k-family OpenAI models as balanced mid-tier budgets', () => {
-    const exact = resolveContextBudget({ engine: 'openai', model: 'gpt-5.4-mini' });
-    const prefixed = resolveContextBudget({ engine: 'openai', model: 'gpt-5.4-mini-2026-06-17' });
-    const engineDefault = resolveContextBudget({ engine: 'openai' });
+  it('classifies 400k-family OpenAI models on the Codex API surface as balanced mid-tier budgets', () => {
+    const exact = resolveContextBudget({ engine: 'codex-api', model: 'gpt-5.4-mini' });
+    const prefixed = resolveContextBudget({ engine: 'codex-api', model: 'gpt-5.4-mini-2026-06-17' });
+    const engineDefault = resolveContextBudget({ engine: 'codex-api' });
 
     expect(exact.contextWindowTokens).toBe(400_000);
     expect(exact.limitSource).toBe('model-or-engine-table');
@@ -139,7 +139,7 @@ describe('resolveContextBudget', () => {
 
     expect(prefixed.contextWindowTokens).toBe(exact.contextWindowTokens);
     expect(prefixed.budgetTier).toBe(exact.budgetTier);
-    expect(engineDefault.contextWindowTokens).toBe(400_000);
+    expect(engineDefault.contextWindowTokens).toBe(1_048_576);
     expect(engineDefault.limitSource).toBe('engine-default');
   });
 

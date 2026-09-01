@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   isGenuineRebirthOperatorMessage,
   isRelayGeneratedReviewWaveMessage,
+  resolveRebirthDialogueHydrationLimits,
   selectRoleAwareRebirthDialogueWindow,
+  selectRoleAwareRebirthDialogueWithBackfill,
 } from '../rebirthDialogue.ts';
 
 const legacyWavePrompt = [
@@ -69,6 +71,58 @@ describe('rebirth dialogue control-message classification', () => {
     expect(selected.coverage).toMatchObject({
       persistedGenuineUsers: 1,
       selectedGenuineUsers: 1,
+    });
+  });
+
+  it('extends older genuine dialogue behind the independent role-quota floor', () => {
+    const messages = Array.from({ length: 6 }, (_, index) => ({
+      id: `m${index}`,
+      type: index % 2 === 0 ? 'user' : 'assistant_text',
+      text: `row-${index}`,
+      created_at: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    }));
+
+    const selected = selectRoleAwareRebirthDialogueWithBackfill(messages, {
+      recentUserMessages: 1,
+      recentAssistantMessages: 1,
+      recentAmbientMessages: 0,
+      backfillBudgetChars: 'row-2'.length + 'row-3'.length,
+    });
+
+    expect(selected.messages.map((message) => message.id)).toEqual(['m2', 'm3', 'm4', 'm5']);
+    expect(selected.coverage).toMatchObject({
+      selectedGenuineUsers: 2,
+      selectedAssistants: 2,
+    });
+  });
+
+  it('stops backfill at the first older row that cannot fit, preserving chronology', () => {
+    const messages = [
+      { id: 'oldest', type: 'user', text: 'fits', created_at: '2026-01-01T00:00:00.000Z' },
+      { id: 'blocker', type: 'assistant_text', text: 'does-not-fit', created_at: '2026-01-01T00:00:01.000Z' },
+      { id: 'new-user', type: 'user', text: 'new user', created_at: '2026-01-01T00:00:02.000Z' },
+      { id: 'new-assistant', type: 'assistant_text', text: 'new assistant', created_at: '2026-01-01T00:00:03.000Z' },
+    ];
+
+    const selected = selectRoleAwareRebirthDialogueWithBackfill(messages, {
+      recentUserMessages: 1,
+      recentAssistantMessages: 1,
+      recentAmbientMessages: 0,
+      backfillBudgetChars: 'fits'.length,
+    });
+
+    expect(selected.messages.map((message) => message.id)).toEqual(['new-user', 'new-assistant']);
+  });
+
+  it('keeps the bounded source window separate from independent role floors', () => {
+    expect(resolveRebirthDialogueHydrationLimits({
+      recentUserMessages: 15,
+      recentAssistantMessages: 15,
+      transcriptMessageBudget: 1_000,
+    })).toEqual({
+      recentUserMessages: 15,
+      recentAssistantMessages: 15,
+      transcriptMessageBudget: 1_000,
     });
   });
 

@@ -260,6 +260,27 @@ export interface TaskRailModelTransitionReceipt {
   attempts: TaskRailModelTransitionAttempt[];
 }
 
+/**
+ * Step-level acceptance governance. `governed` steps fail closed at done-ACK
+ * unless every acceptance criterion carries a recorded verdict; `lightweight`
+ * (or absent) preserves legacy note/evidence-only ACKs for read-only or
+ * trivial work. Optional and author-declared — never inferred from content.
+ * (Port of package-canonical @voxxo/task-rail types.ts:254.)
+ */
+export type TaskRailStepGovernance = 'governed' | 'lightweight';
+
+/** Structured verdict for one acceptance criterion, recorded at ACK time. */
+export interface TaskRailCriterionVerdict {
+  /**
+   * Criterion identity: the exact criterion text from acceptanceCriteria, or
+   * its 0-based position as `index:<n>`. Text match is trim-insensitive.
+   */
+  criterion: string;
+  verdict: 'pass' | 'fail' | 'not_applicable';
+  /** Evidence reference — test run, hash-attested artifact, diff, URL. */
+  evidence?: string;
+}
+
 /** A single step within a task rail or draft. */
 export interface TaskRailStep {
   id: string;
@@ -268,6 +289,10 @@ export interface TaskRailStep {
   acceptanceCriteria: string[];
   notes?: string;
   scope?: string;
+  /** Acceptance governance classification. Absent ⇒ lightweight (legacy). */
+  governance?: TaskRailStepGovernance;
+  /** Criterion→verdict mapping recorded by the terminal done-ACK. */
+  criterionVerdicts?: TaskRailCriterionVerdict[];
   /** Optional and AI-authored. Missing means no model switch is requested. */
   modelPreference?: TaskRailModelPreference;
   /** Authenticated operator override; never populated from ordinary agent step input. */
@@ -833,6 +858,7 @@ export interface StepUpdateFields {
   scope?: string | null;
   modelPreference?: TaskRailModelPreference | null;
   reviewCheckpoint?: TaskRailReviewCheckpoint | null;
+  governance?: TaskRailStepGovernance | null;
   status?: TaskRailStepStatus;
 }
 
@@ -858,6 +884,7 @@ export function updateStepFields(
   if (changes.scope !== undefined) step.scope = changes.scope ?? undefined;
   if (changes.modelPreference !== undefined) step.modelPreference = changes.modelPreference ?? undefined;
   if (changes.reviewCheckpoint !== undefined) step.reviewCheckpoint = changes.reviewCheckpoint ?? undefined;
+  if (changes.governance !== undefined) step.governance = changes.governance ?? undefined;
   if (changes.status !== undefined) {
     step.status = changes.status;
     if (changes.status === 'pending') {
@@ -909,6 +936,7 @@ export function batchUpdateStepFields(
     if (changes.scope !== undefined) step.scope = changes.scope ?? undefined;
     if (changes.modelPreference !== undefined) step.modelPreference = changes.modelPreference ?? undefined;
     if (changes.reviewCheckpoint !== undefined) step.reviewCheckpoint = changes.reviewCheckpoint ?? undefined;
+    if (changes.governance !== undefined) step.governance = changes.governance ?? undefined;
     if (changes.status !== undefined) {
       step.status = changes.status;
       if (changes.status === 'pending') {
@@ -1026,10 +1054,64 @@ export function clearRail(
 // ══════════════════════════════════════════════════════════════════════
 
 /**
+ * Thrown when a `governance="governed"` step is ACKed done without a complete
+ * criterion→verdict mapping. Governed work must never reach a terminal done
+ * state on narrative alone — every authored acceptance criterion needs a
+ * recorded pass/not_applicable verdict (fail verdicts require blocked or
+ * needs_review instead). Lightweight steps keep legacy note/evidence ACKs.
+ * (Port of package-canonical @voxxo/task-rail lifecycle.ts:573.)
+ */
+export class MissingAcceptanceEvidenceError extends Error {
+  constructor(stepId: string, detail: string) {
+    super(`Step "${stepId}" is governed and cannot be ACKed done: ${detail}`);
+    this.name = 'MissingAcceptanceEvidenceError';
+  }
+}
+
+/** A verdict entry covers a criterion by trimmed exact text or `index:<n>`. */
+function criterionVerdictCovers(verdictCriterion: string, criterion: string, index: number): boolean {
+  const needle = verdictCriterion.trim();
+  if (!needle) return false;
+  if (needle === criterion.trim()) return true;
+  return needle === `index:${index}`;
+}
+
+/** Fail-closed validation for terminal done ACKs on governed steps. */
+function assertGovernedDoneEvidence(
+  step: TaskRailStep,
+  verdicts: TaskRailCriterionVerdict[] | undefined,
+): void {
+  if (step.acceptanceCriteria.length === 0) {
+    throw new MissingAcceptanceEvidenceError(
+      step.id,
+      'no acceptance criteria are authored. Add acceptance_criteria (load operation="update") or reclassify the step as governance="lightweight".',
+    );
+  }
+  const failed = (verdicts ?? []).filter((verdict) => verdict.verdict === 'fail');
+  if (failed.length > 0) {
+    throw new MissingAcceptanceEvidenceError(
+      step.id,
+      `criterion verdict(s) report fail (${failed.map((verdict) => verdict.criterion).join('; ')}). Use ack_status="blocked" or "needs_review" instead of done.`,
+    );
+  }
+  const uncovered = step.acceptanceCriteria.filter((criterion, index) =>
+    !(verdicts ?? []).some((verdict) => criterionVerdictCovers(verdict.criterion, criterion, index)),
+  );
+  if (uncovered.length > 0) {
+    throw new MissingAcceptanceEvidenceError(
+      step.id,
+      `missing criterion_verdicts for: ${uncovered.map((criterion) => `"${criterion}"`).join('; ')}. Map every criterion to {criterion, verdict: "pass"|"not_applicable", evidence} in the ACK.`,
+    );
+  }
+}
+
+/**
  * Acknowledge a step with a new status. Used by shoot and sprint modes.
  *
  * Sets completedAt when status is 'done' or 'skipped'.
  * Does NOT auto-activate the next step — the caller handles that.
+ * Governed steps ACKed done fail closed via MissingAcceptanceEvidenceError
+ * when their criterion→verdict mapping is absent or incomplete.
  *
  * Returns the updated step.
  * Throws if the step is not found or the ack status is invalid.
@@ -1038,17 +1120,25 @@ export function ackStep(
   rail: TaskRailLifecycle,
   stepId: string,
   ackStatus: TaskRailStepStatus,
-  ctx?: LifecycleContext & { evidence?: string },
+  ctx?: LifecycleContext & { evidence?: string; criterionVerdicts?: TaskRailCriterionVerdict[] },
 ): TaskRailStep {
   const found = findStep(rail.steps, stepId);
   if (!found) throw new Error(`Step not found: ${stepId}`);
   const step = found.step;
   const timestamp = ts(ctx?.now);
 
+  // Governed steps fail closed: a terminal done verdict requires a complete
+  // criterion→verdict mapping recorded atomically with the ACK. The check
+  // runs BEFORE any mutation so a rejected ACK leaves the rail untouched.
+  if (ackStatus === 'done' && step.governance === 'governed') {
+    assertGovernedDoneEvidence(step, ctx?.criterionVerdicts);
+  }
+
   step.status = ackStatus;
   step.updatedAt = timestamp;
   if (ctx?.note) step.lastNote = ctx.note;
   if (ctx?.evidence) step.evidence = ctx.evidence;
+  if (ctx?.criterionVerdicts) step.criterionVerdicts = ctx.criterionVerdicts;
   if (ackStatus === 'done' || ackStatus === 'skipped') {
     step.completedAt = timestamp;
   }
@@ -1512,6 +1602,8 @@ export interface ShootArgs {
   acks?: ShootAckInput[];
   note?: string;
   evidence?: string;
+  /** Criterion→verdict mapping for a single governed done-ACK. */
+  criterionVerdicts?: TaskRailCriterionVerdict[];
   /**
    * Leave the next pending step untouched when an external scheduler must
    * complete a durable handoff before that step may become active. Pure
@@ -1527,6 +1619,12 @@ export interface ShootAckInput {
   ackStepId?: string;
   note?: string;
   evidence?: string;
+  /**
+   * Criterion→verdict mapping recorded with this ACK. Required (complete
+   * coverage, no fail verdicts) when the step is governance="governed" and
+   * the ACK is done; otherwise optional.
+   */
+  criterionVerdicts?: TaskRailCriterionVerdict[];
 }
 
 export interface ShootResult {
@@ -1621,6 +1719,7 @@ function resolveAckInputs(args: ShootArgs): ShootAckInput[] {
     ackStepId: args.ackStepId,
     note: args.note,
     evidence: args.evidence,
+    criterionVerdicts: args.criterionVerdicts,
   }];
 }
 
@@ -1685,6 +1784,7 @@ export function shoot(
       ...ctx,
       note: ack.note ?? args.note ?? ctx?.note,
       evidence: ack.evidence ?? args.evidence,
+      criterionVerdicts: ack.criterionVerdicts,
     });
     ackedSteps.push(acked);
 
@@ -1850,6 +1950,7 @@ export interface TaskRailStepSeed {
   acceptanceCriteria?: string[];
   notes?: string;
   scope?: string;
+  governance?: TaskRailStepGovernance;
   modelPreference?: TaskRailModelPreference;
   reviewCheckpoint?: TaskRailReviewCheckpoint;
   status?: TaskRailStepStatus;
@@ -1877,6 +1978,7 @@ export function createTaskRailStep(seed: TaskRailStepSeed, now?: string): TaskRa
     acceptanceCriteria: seed.acceptanceCriteria ?? [],
     ...(seed.notes ? { notes: seed.notes } : {}),
     ...(seed.scope ? { scope: seed.scope } : {}),
+    ...(seed.governance ? { governance: seed.governance } : {}),
     ...(seed.modelPreference ? { modelPreference: cloneModelPreference(seed.modelPreference) } : {}),
     ...(seed.reviewCheckpoint ? { reviewCheckpoint: cloneReviewCheckpoint(seed.reviewCheckpoint) } : {}),
     status: seed.status ?? 'pending',

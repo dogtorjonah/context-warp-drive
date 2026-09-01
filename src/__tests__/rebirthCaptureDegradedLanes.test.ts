@@ -379,7 +379,7 @@ describe('boundary header and lane census can never drift', () => {
         },
         activeEditDelta: exactDelta({
           state: 'unknown',
-          reasons: ['without an immutable Atlas capture'],
+          reasons: ['edit capture unreachable'],
         }),
       },
       expectedLanes: [

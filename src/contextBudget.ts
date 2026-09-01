@@ -566,7 +566,6 @@ const KNOWN_ENGINE_DEFAULTS = new Set([
   'kimi',
   'minimax',
   'mistral',
-  'openai',
   'qwen',
 ]);
 

@@ -115,6 +115,14 @@ export interface CollapseOptions {
   readonly rangeRecover?: string | null;
   /** Emitted when even the floor representation cannot fit. */
   readonly floorRecover?: string | null;
+  /**
+   * Optional recency floor (B7): the newest `recencyFloorK` units of kind
+   * `recencyFloorKind` (e.g. the K newest lives) never demote below t1, so
+   * pressure is absorbed by older units first. Applies only to units whose
+   * sourceAt is known (unknown-time units are always demotable).
+   */
+  readonly recencyFloorK?: number;
+  readonly recencyFloorKind?: CollapseUnitKind;
 }
 
 export interface CollapseUnitPlacement {
@@ -167,7 +175,7 @@ export function formatCollapseReceipt(unit: CollapseUnit): string {
       + ` stored-bytes=${unit.projection.storedBytes} source-bytes=${unit.projection.sourceBytes}`
     : '';
   return `[RECEIPT kind=${unit.kind} id=${unit.id} span=${unitSpan(unit)}`
-    + ` sha256=${sha} chars=${unit.verbatim.length}${projection}`
+    + ` sha256=${sha} verbatim-chars-total=${unit.verbatim.length}${projection}`
     + ` claim="${oneLine(unit.claim, 160).replace(/"/gu, "'")}" recover=${unit.recover}]`;
 }
 
@@ -202,7 +210,7 @@ export function formatCollapseEraBlock(units: readonly CollapseUnit[]): string {
   const chars = units.reduce((total, unit) => total + unit.verbatim.length, 0);
   return [
     `[ERA kind=${first.kind} key=${first.eraKey ?? first.kind} span=${span}`
-    + ` n=${units.length} chars=${chars} recover=${first.recover}]`,
+    + ` n=${units.length} verbatim-chars-total=${chars} recover=${first.recover}]`,
     ...samples,
     units.length > samples.length ? `· … ${units.length - samples.length} more in this era` : '',
   ].filter(Boolean).join('\n');
@@ -218,14 +226,24 @@ function compareUnits(left: CollapseUnit, right: CollapseUnit): number {
   return left.id.localeCompare(right.id);
 }
 
-/** A unit without a verified hash can never mint a receipt: T2 is its floor. */
+/** A unit's demotion floor, mint-gate aware (B7). */
 function floorTier(unit: CollapseUnit): CollapseTier {
-  return unit.verified === true && Boolean(unit.sha256) ? 't4' : 't2';
+  // Verified, hashed units may demote all the way to a T4 rollup. Unverified
+  // units may ALSO roll up to T4 (a rollup names only span+count+recover and
+  // mints no per-unit hash, so the "never mint a dead pointer" rationale is
+  // preserved) but must SKIP the T3 receipt tier (a receipt mints a per-unit
+  // hash, which an unverified unit cannot attest). Both floor at T4.
+  return 't4';
 }
 
-function nextTier(tier: CollapseTier): CollapseTier | null {
+function nextTier(tier: CollapseTier, skipReceipt = false): CollapseTier | null {
   const index = COLLAPSE_TIERS.indexOf(tier);
-  return index >= 0 && index < COLLAPSE_TIERS.length - 1 ? COLLAPSE_TIERS[index + 1] : null;
+  if (index < 0 || index >= COLLAPSE_TIERS.length - 1) return null;
+  // B7 mint-gate split: an unverified unit skips the T3 receipt tier (a receipt
+  // mints a per-unit hash an unverified unit cannot attest) and rolls straight
+  // to T4 (a rollup names only span+count+recover, so it is safe).
+  if (skipReceipt && tier === 't2') return 't4';
+  return COLLAPSE_TIERS[index + 1];
 }
 
 function previousTier(tier: CollapseTier): CollapseTier | null {
@@ -240,6 +258,8 @@ interface RenderState {
   readonly demotionKnown: readonly CollapseUnit[];
   readonly unknown: readonly CollapseUnit[];
   readonly tiers: Map<string, CollapseTier>;
+  /** Unit ids protected by the B7 recency floor (never demote below t1). */
+  readonly recencyProtectedIds: ReadonlySet<string>;
 }
 
 function renderRun(
@@ -314,17 +334,33 @@ function renderState(state: RenderState, rangeRecover: string | null | undefined
 
 /**
  * Demotion order: unknown-time units first (they can claim no recency), then
- * the oldest known-time unit. Units never skip a tier in one step, and a unit
- * without a mint-verified hash stops at its floor.
+ * the oldest known-time unit. Units never skip a tier in one step (except the
+ * B7 mint-gate split where an unverified unit skips the T3 receipt), and a
+ * unit stops at its effective floor: the B7 recency floor (newest-K lives never
+ * below t1) or the mint-gate floor (t4 rollup) otherwise.
  */
+function effectiveFloor(unit: CollapseUnit, state: RenderState): CollapseTier {
+  if (state.recencyProtectedIds.has(unit.id)) {
+    const current = state.tiers.get(unit.id) ?? 't0';
+    // The newest-K lives never demote below t1: if already at/below t1 (t0 or
+    // t1) their floor is t1; otherwise keep their current (higher) tier where
+    // it is, since only demotion can move them and the floor check compares
+    // against the current tier.
+    const currentIndex = COLLAPSE_TIERS.indexOf(current);
+    const t1Index = COLLAPSE_TIERS.indexOf('t1');
+    return currentIndex <= t1Index ? 't1' : current;
+  }
+  return floorTier(unit);
+}
+
 function nextDemotionCandidate(state: RenderState): CollapseUnit | null {
   for (const unit of state.unknown) {
     const tier = state.tiers.get(unit.id) ?? 't0';
-    if (tier !== floorTier(unit)) return unit;
+    if (tier !== effectiveFloor(unit, state)) return unit;
   }
   for (const unit of state.demotionKnown) {
     const tier = state.tiers.get(unit.id) ?? 't0';
-    if (tier !== floorTier(unit)) return unit;
+    if (tier !== effectiveFloor(unit, state)) return unit;
   }
   return null;
 }
@@ -338,7 +374,26 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
     : demotionKnown;
   const unknown = sorted.filter((unit) => !unit.sourceAt);
   const tiers = new Map<string, CollapseTier>(sorted.map((unit) => [unit.id, 't0' as CollapseTier]));
-  const state: RenderState = { known, demotionKnown, unknown, tiers };
+  // B7 recency floor: the newest K units of the named kind are protected from
+  // demoting below t1, so the OLDEST units absorb floor pressure first.
+  const recencyFloorK = Math.max(0, Math.floor(options.recencyFloorK ?? 0));
+  const recencyKind = options.recencyFloorKind;
+  const demotionKnownByTime = [...demotionKnown];
+  let recencyProtectedIds = new Set<string>();
+  if (recencyFloorK > 0 && recencyKind) {
+    const eligible = demotionKnownByTime
+      .filter((unit) => unit.kind === recencyKind)
+      .sort(compareUnits)
+      .slice(-recencyFloorK);
+    recencyProtectedIds = new Set(eligible.map((unit) => unit.id));
+  }
+  const state: RenderState = {
+    known,
+    demotionKnown,
+    unknown,
+    tiers,
+    recencyProtectedIds,
+  };
 
   if (sorted.length === 0) {
     return {
@@ -373,7 +428,9 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
       const candidate = nextDemotionCandidate(state);
       if (!candidate) break;
       const current = tiers.get(candidate.id) ?? 't0';
-      const demoted = nextTier(current);
+      // B7 mint-gate split: unverified units skip the T3 receipt tier and roll
+      // straight to T4. Verified units walk every tier normally.
+      const demoted = nextTier(current, candidate.verified !== true);
       if (!demoted) break;
       saved += Math.max(1, unitSizeAt(candidate, current) - unitSizeAt(candidate, demoted));
       tiers.set(candidate.id, demoted);

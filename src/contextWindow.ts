@@ -23,6 +23,7 @@
 
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // ── Claude models ──
+  'claude-fable-5-1': 1_000_000, // Fable 5.1 (2026-09-01 launch): provider docs state 1M is both default and maximum ("Context window 1M tokens (default and maximum)"); same deliberate 1M family exception as below
   'claude-fable-5': 1_000_000, // Fable 5: 1M — ≥351k live context observed+billed on gHMKZbT6 (2026-06-10) disproved the 200k floor; matches provider-reported window
   'claude-opus-4-20250514': 200_000,
   'claude-opus-4': 200_000,
@@ -84,6 +85,10 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'gpt-4o-mini': 128_000,
   'gpt-4-turbo': 128_000,
   'gpt-4': 8_192,
+
+  // ── OpenRouter Ox Alpha ──
+  'stealth/ox-alpha': 1_048_576,
+  'ox-alpha': 1_048_576,
 
   // ── Gemini models ──
   'gemini-3.1-pro-preview': 1_048_576,
@@ -193,7 +198,7 @@ const ENGINE_DEFAULTS: Record<string, number> = {
   minimax: 512_000, // guaranteed floor, not the advertised 1M ceiling (see MiniMax-M3 above)
   mistral: 128_000,
   grok: 1_000_000,
-  openai: 400_000,
+  openrouter: 1_048_576,
   glm: 200_000,
   deepseek: 1_000_000,
   kimi: 256_000,
@@ -225,9 +230,6 @@ function contextWindowOverrideForEngineModel(modelLower: string, engineLower: st
   // have different effective windows. Resolve the API surface before the generic
   // model table so gpt-5.5/codex-5.5 can be 1M on API and 258K on CLI.
   if (engineLower === 'codex-api' && isCodexApiLargeContextModel(modelLower)) {
-    return 1_048_576;
-  }
-  if (engineLower === 'openai' && (modelLower === 'gpt-5.6' || modelLower.startsWith('gpt-5.6-'))) {
     return 1_048_576;
   }
   return undefined;

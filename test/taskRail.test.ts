@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BlockedSprintError,
   DraftRailError,
+  MissingAcceptanceEvidenceError,
   TASK_RAIL_ROLES,
   TASK_RAIL_ROLE_STATUSES,
   TASK_RAIL_TEMPLATE_VERSION,
@@ -473,5 +474,63 @@ describe('portable task rail', () => {
     expect(() => parseStepsFileText('[{"title":"unterminated"}')).toThrow(
       /steps_file starts with "\[" but is not valid JSON/,
     );
+  });
+
+  it('fails a governed done-ACK closed until every criterion has a verdict', () => {
+    const rail = startTaskRail({
+      id: 'rail-governed',
+      ownerId: 'local-agent',
+      title: 'Governed rail',
+      objective: 'Fail closed on missing verdicts.',
+      locked: true,
+      now: '2026-06-17T22:00:00.000Z',
+      steps: [{
+        id: 'g1',
+        instruction: 'Governed work',
+        acceptanceCriteria: ['criterion-a', 'criterion-b'],
+        governance: 'governed',
+      }],
+    });
+    sprint(rail, { sprintCount: 1 }, { now: '2026-06-17T22:01:00.000Z', actorId: 'local-agent' });
+
+    // Incomplete verdicts throw MissingAcceptanceEvidenceError and do not mutate
+    // to done (the step stays at its pre-ACK reservation status, no verdicts).
+    expect(() => shoot(rail, {
+      ackStepId: 'g1',
+      ackStatus: 'done',
+      criterionVerdicts: [{ criterion: 'criterion-a', verdict: 'pass', evidence: 'ea' }],
+    }, { now: '2026-06-17T22:02:00.000Z', actorId: 'local-agent' }))
+      .toThrow(MissingAcceptanceEvidenceError);
+    const step = rail.steps.find((s) => s.id === 'g1');
+    expect(step?.status).not.toBe('done');
+    expect(step?.criterionVerdicts).toBeUndefined();
+
+    // A fail verdict is also rejected for a done ACK.
+    expect(() => shoot(rail, {
+      ackStepId: 'g1',
+      ackStatus: 'done',
+      criterionVerdicts: [
+        { criterion: 'criterion-a', verdict: 'pass', evidence: 'ea' },
+        { criterion: 'criterion-b', verdict: 'fail', evidence: 'eb' },
+      ],
+    }, { now: '2026-06-17T22:03:00.000Z', actorId: 'local-agent' }))
+      .toThrow(/report fail/);
+    expect(rail.steps.find((s) => s.id === 'g1')?.status).not.toBe('done');
+
+    // Complete pass coverage accepts and records criterionVerdicts atomically.
+    shoot(rail, {
+      ackStepId: 'g1',
+      ackStatus: 'done',
+      criterionVerdicts: [
+        { criterion: 'criterion-a', verdict: 'pass', evidence: 'ea' },
+        { criterion: 'criterion-b', verdict: 'pass', evidence: 'eb' },
+      ],
+    }, { now: '2026-06-17T22:04:00.000Z', actorId: 'local-agent' });
+    const done = rail.steps.find((s) => s.id === 'g1');
+    expect(done?.status).toBe('done');
+    expect(done?.criterionVerdicts).toEqual([
+      { criterion: 'criterion-a', verdict: 'pass', evidence: 'ea' },
+      { criterion: 'criterion-b', verdict: 'pass', evidence: 'eb' },
+    ]);
   });
 });

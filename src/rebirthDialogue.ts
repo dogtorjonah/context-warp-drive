@@ -22,6 +22,20 @@ export interface RebirthDialogueWindowOptions {
   readonly recentAmbientMessages: number;
 }
 
+export interface RebirthDialogueBackfillOptions extends RebirthDialogueWindowOptions {
+  /** Authentic older dialogue admitted beyond the guaranteed role quotas. */
+  readonly backfillBudgetChars: number;
+}
+
+export interface RebirthDialogueHydrationOptions {
+  /** Independent correctness floor for genuine operator rows. */
+  readonly recentUserMessages: number;
+  /** Independent correctness floor for assistant rows. */
+  readonly recentAssistantMessages: number;
+  /** Total bounded persisted-message source window available to backfill. */
+  readonly transcriptMessageBudget: number;
+}
+
 export interface RebirthDialogueWindowCoverage {
   readonly persistedGenuineUsers: number;
   readonly persistedAssistants: number;
@@ -191,5 +205,72 @@ export function selectRoleAwareRebirthDialogueWindow<T extends RebirthDialogueMe
       selectedAssistants: assistants.length,
       selectedAmbient: ambient.length,
     },
+  };
+}
+
+/**
+ * Preserve independent role quotas as a guaranteed recent floor, then extend
+ * backward with genuine dialogue while an explicit source-character budget
+ * remains. The extension never invents or slices a row: if the next older row
+ * does not fit, selection stops so chronology does not develop a hidden hole.
+ */
+export function selectRoleAwareRebirthDialogueWithBackfill<T extends RebirthDialogueMessageLike>(
+  messages: readonly T[],
+  options: RebirthDialogueBackfillOptions,
+): RebirthDialogueWindow<T> {
+  const base = selectRoleAwareRebirthDialogueWindow(messages, options);
+  const budget = positiveInteger(options.backfillBudgetChars);
+  if (budget === 0) return base;
+
+  const expanded = selectRoleAwareRebirthDialogueWindow(messages, {
+    recentUserMessages: messages.length,
+    recentAssistantMessages: messages.length,
+    recentAmbientMessages: options.recentAmbientMessages,
+  });
+  const selected = new Set(base.messages);
+  let admittedChars = 0;
+  for (let index = expanded.messages.length - 1; index >= 0; index -= 1) {
+    const message = expanded.messages[index];
+    if (selected.has(message)) continue;
+    const chars = ((message.text ?? message.tx) ?? '').trim().length;
+    if (admittedChars + chars > budget) break;
+    selected.add(message);
+    admittedChars += chars;
+  }
+
+  const selectedMessages = expanded.messages.filter((message) => selected.has(message));
+  let selectedGenuineUsers = 0;
+  let selectedAssistants = 0;
+  let selectedAmbient = 0;
+  for (const message of selectedMessages) {
+    const type = message.type ?? message.ty ?? '';
+    if (type === 'user') selectedGenuineUsers += 1;
+    else if (type === 'assistant_text') selectedAssistants += 1;
+    else selectedAmbient += 1;
+  }
+  return {
+    messages: selectedMessages,
+    coverage: {
+      ...expanded.coverage,
+      selectedGenuineUsers,
+      selectedAssistants,
+      selectedAmbient,
+    },
+  };
+}
+
+/**
+ * Normalize independent role floors and the total bounded source window.
+ * Source capacity is deliberately not promoted into a per-role requirement:
+ * doing so makes a 1,000-row source window demand 1,000 users plus 1,000
+ * assistants and forces a full-history scan on every mature trace.
+ */
+export function resolveRebirthDialogueHydrationLimits(
+  options: RebirthDialogueHydrationOptions,
+): RebirthDialogueHydrationOptions {
+  return {
+    recentUserMessages: positiveInteger(options.recentUserMessages),
+    recentAssistantMessages: positiveInteger(options.recentAssistantMessages),
+    transcriptMessageBudget: positiveInteger(options.transcriptMessageBudget),
   };
 }

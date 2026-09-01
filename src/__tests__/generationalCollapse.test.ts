@@ -68,13 +68,19 @@ describe('generational collapse', () => {
     expect(a.text).toBe(b.text);
   });
 
-  it('never mints a receipt for an unverified unit (mint gate: floor is t2)', () => {
+  it('never mints a RECEIPT for an unverified unit (B7 mint-gate split: floor t2, may roll up to t4, never t3)', () => {
     const units = lineage(8).map((u) => ({ ...u, verified: false, sha256: null }));
     const result = collapseUnits({ units, maxChars: 200 });
     for (const placement of result.placements) {
-      expect(['t0', 't1', 't2']).toContain(placement.tier);
+      // Unverified units may demote to t2 (era) and then DIRECTLY to t4
+      // (rollup — no per-unit hash minted) but must never land on a t3
+      // receipt (which would mint a per-unit hash they cannot attest).
+      expect(['t0', 't1', 't2', 't4']).toContain(placement.tier);
     }
+    // No unit may mint a t3 receipt.
     expect(result.text).not.toContain('[RECEIPT');
+    // The rollup is the sanctioned floor landing for unverified units.
+    expect(result.text).toContain('[ROLLUP');
   });
 
   it('quarantines unknown-time units and demotes them before known-time units', () => {
@@ -92,10 +98,43 @@ describe('generational collapse', () => {
     const single = unit({ id: 'r1' });
     const receipt = formatCollapseReceipt(single);
     expect(receipt).toMatch(
-      /^\[RECEIPT kind=operator id=r1 span=\S+\.\.\S+ sha256=[0-9a-f]{12} chars=\d+ claim="[^"]*" recover=.+\]$/u,
+      /^\[RECEIPT kind=operator id=r1 span=\S+\.\.\S+ sha256=[0-9a-f]{12} verbatim-chars-total=\d+ claim="[^"]*" recover=.+\]$/u,
     );
     const rollup = formatCollapseRollup(lineage(3), 'tap_star action="harvest"');
     expect(rollup).toMatch(/^\[ROLLUP kind=operator n=3 span=\S+\.\.\S+ recover=tap_star action="harvest"\]$/u);
+  });
+
+  it('declares a projection with byte-faithful stored/source counts instead of claiming full proof', () => {
+    // Non-ASCII body so chars and bytes diverge (é = 2 bytes UTF-8). The
+    // receipt must report byte counts that attest the STORED prefix and name
+    // the SOURCE dimensions, so no reader mistakes the stored hash for
+    // full-artifact proof.
+    const head = 'café ☕ '.repeat(3); // 6 chars, 8 bytes each in the 'é ☕ ' triplet
+    const truncated = unit({
+      id: 'p1',
+      verbatim: head,
+      projection: {
+        mode: 'truncated',
+        algorithm: 'head-clamp',
+        version: 1,
+        storedChars: head.length,
+        storedBytes: Buffer.byteLength(head, 'utf8'),
+        sourceChars: 900,
+        sourceBytes: 1_400,
+      },
+    });
+    const receipt = formatCollapseReceipt(truncated);
+    // Projection marker names mode+version and all four dimensions.
+    expect(receipt).toContain('projection=truncated/v1');
+    expect(receipt).toContain(`stored-chars=${head.length}`);
+    expect(receipt).toContain(`stored-bytes=${Buffer.byteLength(head, 'utf8')}`);
+    expect(receipt).toContain('source-chars=900');
+    expect(receipt).toContain('source-bytes=1400');
+    // Byte count diverges from char count — proving non-ASCII bytes counted.
+    expect(Buffer.byteLength(head, 'utf8')).not.toBe(head.length);
+    // A projection is never allowed to look like a full-verbatim receipt: the
+    // stored-char count must be smaller than the source-char count.
+    expect(head.length).toBeLessThan(900);
   });
 
   it('degrades to a single honest rollup under floor pressure', () => {
