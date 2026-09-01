@@ -120,6 +120,19 @@ describe('Gemini CLI message rendering', () => {
       [{ text: 'latest' }, { text: vault }],
     ]);
   });
+
+  test('does not append a second vault to an authoritative rebirth package', () => {
+    const vault = '[User Message Vault]\nkeep this\n[/User Message Vault]';
+    const rebirth = `[CONTEXT REBIRTH]\nauthoritative continuity\n${vault}`;
+    const view: GeminiCliFoldMessage[] = [{
+      id: 'm-rebirth',
+      timestamp: '2026-06-18T00:00:00.000Z',
+      type: 'user',
+      content: [{ text: rebirth }],
+    }];
+
+    expect(appendUserMessageVaultToGeminiCliView(view, vault)).toBe(view);
+  });
 });
 
 describe('Gemini CLI measured-token scanning', () => {

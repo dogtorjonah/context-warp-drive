@@ -36,6 +36,8 @@ import {
   DEFAULT_ASSISTANT_TEXT_BUDGET,
   resolveFoldConfigForBand,
   resolveColdFoldConfigForBand,
+  USER_MESSAGE_VAULT_END,
+  USER_MESSAGE_VAULT_PREFIX,
   type FoldMessage,
   type FoldConfig,
   type FoldResult,
@@ -145,6 +147,25 @@ export const DEFAULT_FOLD_TAIL_EPOCH_MIN_RUNWAY_TOKENS = DEFAULT_CONTEXT_BUDGET_
  */
 const DEFAULT_FULL_RETENTION_FRACTION = 0.125;
 const DEFAULT_ESSENCE_RETENTION_FRACTION = 0.25;
+
+function newestUserMessageHasEmbeddedRebirthUserMessageVault(
+  messages: readonly FoldMessage[],
+): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'user') continue;
+    if (typeof message.content !== 'string') return false;
+    const trimmed = message.content.trimEnd();
+    const isRebirthPackage = trimmed.trimStart().startsWith('[CONTEXT REBIRTH]')
+      || /^package_version:\s*\d+\s*\n\[CONTEXT REBIRTH\]/.test(trimmed.trimStart());
+    if (!isRebirthPackage) return false;
+    const start = trimmed.lastIndexOf(USER_MESSAGE_VAULT_PREFIX);
+    return start >= 0
+      && trimmed.indexOf(USER_MESSAGE_VAULT_END, start + USER_MESSAGE_VAULT_PREFIX.length)
+        === trimmed.length - USER_MESSAGE_VAULT_END.length;
+  }
+  return false;
+}
 
 function positiveFinite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
@@ -625,6 +646,7 @@ export class FoldSession {
    */
   private applyVault(outcome: FoldOutcome): FoldOutcome {
     if (!this.vaultEnabled) return outcome;
+    if (newestUserMessageHasEmbeddedRebirthUserMessageVault(outcome.messages)) return outcome;
     const vault = renderUserMessageVault(this.userMessageVaultEntries, {
       visibleUserMessages: outcome.messages,
       assistantEntries: this.assistantGlyphVaultEntries,
@@ -646,6 +668,7 @@ export class FoldSession {
    */
   private applyUnsealedVaultOverlay(outcome: FoldOutcome): FoldOutcome {
     if (!this.vaultEnabled) return outcome;
+    if (newestUserMessageHasEmbeddedRebirthUserMessageVault(outcome.messages)) return outcome;
     const unsealedRows = selectVaultDeltaRows(selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
       visibleUserMessages: outcome.messages,
       newestOperatorUnanswered: this.newestOperatorUnanswered,
@@ -692,6 +715,9 @@ export class FoldSession {
     additionallyVisible: readonly FoldMessage[] = [],
   ): FoldMessage[] {
     if (!this.vaultEnabled) return view;
+    if (newestUserMessageHasEmbeddedRebirthUserMessageVault(
+      additionallyVisible.length > 0 ? view.concat(additionallyVisible) : view,
+    )) return view;
     // Live (unanswered-newest) rows are deferred from sealing: they ride the
     // transient applyVault path with the LIVE marker until answered, then seal
     // normally under the unchanged fingerprint. Cache-safe by construction —
@@ -721,6 +747,9 @@ export class FoldSession {
     additionallyVisible: readonly FoldMessage[] = [],
   ): { view: FoldMessage[]; fingerprints: string[] } {
     if (!this.vaultEnabled) return { view, fingerprints: [] };
+    if (newestUserMessageHasEmbeddedRebirthUserMessageVault(
+      additionallyVisible.length > 0 ? view.concat(additionallyVisible) : view,
+    )) return { view, fingerprints: [] };
     const rows = selectSealableVaultRows(
       selectVaultRows(this.userMessageVaultEntries, this.assistantGlyphVaultEntries, {
         visibleUserMessages: additionallyVisible.length > 0 ? view.concat(additionallyVisible) : view,

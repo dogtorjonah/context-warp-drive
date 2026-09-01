@@ -1300,6 +1300,27 @@ interface VaultBakeHarness {
 }
 
 describe('FoldSession per-band vault sealing', () => {
+  it('suppresses only the active rebirth package and resumes vaulting on the next user turn', () => {
+    const embeddedVault = [
+      '[User Message Vault]',
+      'already embedded continuity',
+      '[/User Message Vault]',
+    ].join('\n');
+    const rebirthPackage = `[CONTEXT REBIRTH]\nauthoritative package\n${embeddedVault}`;
+    const session = vaultSession();
+    const harness = session as unknown as VaultBakeHarness;
+    session.recordOperatorMessage('later vault-only continuity', '2026-06-19T10:00:00Z');
+    session.recordAssistantMessage('🏁 continuity settled', '2026-06-19T10:01:00Z');
+
+    const rebirthView: FoldMessage[] = [{ role: 'user', content: rebirthPackage }];
+    expect(harness.bakeVault([...rebirthView], 'full')).toEqual(rebirthView);
+
+    const ordinaryTurn: FoldMessage[] = [{ role: 'user', content: 'ordinary follow-up' }];
+    const resumed = harness.bakeVault([...rebirthView], 'full', ordinaryTurn);
+    expect(vaultText(resumed)).toContain('later vault-only continuity');
+    expect(vaultText(resumed).match(/\[User Message Vault\]/gu)).toHaveLength(2);
+  });
+
   it('excludes the unanswered row from every freeze bake helper, then admits it once answered', () => {
     const operatorText = 'OPERATOR-LIVE-BAKE must remain transient until answered';
     const baseView: FoldMessage[] = [{ role: 'user', content: 'folded base view' }];

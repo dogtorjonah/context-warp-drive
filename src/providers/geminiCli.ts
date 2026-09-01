@@ -17,6 +17,8 @@ import {
   countChars,
   foldContext,
   resolveFoldConfigForBand,
+  USER_MESSAGE_VAULT_END,
+  USER_MESSAGE_VAULT_PREFIX,
   type FoldConfig,
   type FoldMessage,
   type FoldResult,
@@ -228,6 +230,16 @@ export function appendUserMessageVaultToGeminiCliView(
       (part) => typeof part?.text === 'string' && part.text.trim().length > 0,
     );
     if (!hasText) continue;
+    const existingText = message.content.map((part) => part.text).join('\n').trim();
+    const isRebirthPackage = existingText.startsWith('[CONTEXT REBIRTH]')
+      || /^package_version:\s*\d+\s*\n\[CONTEXT REBIRTH\]/.test(existingText);
+    const vaultStart = existingText.lastIndexOf(USER_MESSAGE_VAULT_PREFIX);
+    if (
+      isRebirthPackage
+      && vaultStart >= 0
+      && existingText.indexOf(USER_MESSAGE_VAULT_END, vaultStart + USER_MESSAGE_VAULT_PREFIX.length)
+        === existingText.length - USER_MESSAGE_VAULT_END.length
+    ) return messages;
     const next = messages.slice();
     next[i] = { ...message, content: [...message.content, { text: vault }] };
     return next;
