@@ -96,6 +96,15 @@ export function isGenuineRebirthOperatorMessage(text: string | null | undefined)
   if (/^\[(?:DIGEST DELTA|Digest Delta|RELAY DIGEST DELTA|Control Signals|System)\]/u.test(trimmed)) {
     return false;
   }
+  // Relay signaling deliveries are authoring frames, not operator requests.
+  // They are NOT genuine-user messages and must never consume genuine-operator
+  // dialogue quota even when their text is later relayed into a trace. Control
+  // signals are prefixed `control signal from <sender>` at delivery
+  // (build-queue / forge job / peer). Follow-up: the persistence path stamps
+  // og:'relay' on signals end-to-end so classification stops depending on text.
+  if (/^control signal from\b/iu.test(trimmed) || /^\[Control Signal from\b/u.test(trimmed)) {
+    return false;
+  }
   // `sidequest-cleanup` is retired as an active lifecycle surface, but its
   // persisted user-role rows remain historical synthetic input forever.
   if (/^\[(?:long-horizon-continue|sidequest-cleanup)\b/iu.test(trimmed)) return false;

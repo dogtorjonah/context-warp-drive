@@ -22,6 +22,7 @@ import {
 import { parseHistoricalPayloadRecord } from '../src/rollingFold.ts';
 import { renderEpochContinuityCapsule } from '../src/epochContinuityCapsule.ts';
 import { unresolvedPendingAssistantContinuityState } from '../src/pendingAssistantAction.ts';
+import { findAnchoredProviderRuntimeErrorLine } from '../src/rawRebirthSeed.ts';
 import type { RawTraceCoordinate, RawTraceCoordinateArtifact } from '../src/rawRebirthSeed.ts';
 import type { FoldMessage } from '../src/fold.ts';
 
@@ -193,7 +194,7 @@ describe('raw rebirth seed renderer', () => {
 
     expect(seed.match(new RegExp(activeRequest, 'g'))).toHaveLength(1);
     expect(seed).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
-    expect(seed).toContain('raw-resumes=source-agent:event#live-frontier @ time unknown (1 exact)');
+    expect(seed).toContain('raw-resumes=source-agent:event#raw-tail-start @ time unknown (1 exact)');
     expect(seed).toContain('── Last User + AI Messages (READ FIRST) ──');
     expect(seed).toContain(`👤 LAST USER MESSAGE (active request):\n${activeRequest}`);
     expect(seed).not.toContain('active request (verbatim; sole authoritative body)');
@@ -1572,5 +1573,37 @@ describe('portable citation markers ([message N] refs)', () => {
         process.env.VOXXO_REBIRTH_SEED_MSG_MARKERS = original;
       }
     }
+  });
+});
+
+describe('findAnchoredProviderRuntimeErrorLine (raw A6 anchored-marker guard)', () => {
+  const M = '⚠️ UNRESOLVED PROVIDER/RUNTIME ERROR';
+
+  test('accepts a line whose leading token (after an optional [time] prefix) IS the marker', () => {
+    const line = findAnchoredProviderRuntimeErrorLine(
+      `[2026-09-02T11:00:00.000Z] ${M} (not assistant speech):\nAPI Error: 529 Overloaded`,
+    );
+    expect(line).toBe(`[2026-09-02T11:00:00.000Z] ${M} (not assistant speech):`);
+  });
+
+  test('accepts a bare marker at line start with trailing upstream prose', () => {
+    expect(findAnchoredProviderRuntimeErrorLine(`${M} (not assistant speech):\nFailed to authenticate.`))
+      .toBe(`${M} (not assistant speech):`);
+  });
+
+  test('rejects quoted-in-prose marker (mid-line assistant speech is never a blocker source)', () => {
+    const quoted = `I quoted "${M}" while discussing diagnostics and it shipped fine.`;
+    expect(findAnchoredProviderRuntimeErrorLine(quoted)).toBeUndefined();
+  });
+
+  test('rejects an ordinary line that merely contains the marker as an inline substring', () => {
+    expect(findAnchoredProviderRuntimeErrorLine(`The relay appends ${M} only when it is the generated marker.`))
+      .toBeUndefined();
+  });
+
+  test('treats empty/null/undefined text as no anchor', () => {
+    expect(findAnchoredProviderRuntimeErrorLine(undefined)).toBeUndefined();
+    expect(findAnchoredProviderRuntimeErrorLine('')).toBeUndefined();
+    expect(findAnchoredProviderRuntimeErrorLine(null)).toBeUndefined();
   });
 });

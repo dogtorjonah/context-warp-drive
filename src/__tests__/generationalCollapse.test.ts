@@ -148,6 +148,29 @@ describe('generational collapse', () => {
     expect(result.chars).toBeLessThanOrEqual(120);
   });
 
+  it('never emits a partial executable handle when the floor rollup exceeds a positive cap (audit-2 A14)', () => {
+    // A recover command far longer than the floor cap: legacy `rollup.slice`
+    // would cut it mid-token (`…action="fetch" owne…`), and the executed-handle
+    // gate then harvests a corrupt command. The floor branch must ship a WHOLE
+    // census line WITHOUT a recover= command rather than a partial handle, and
+    // stay under the cap.
+    const LONG_RECOVER = 'continuity_ledger action="fetch" owner="inst-a" capture_id="cap-1" section_id="operatorVault" omitted_only=true include_unknown_source_time=true limit=200';
+    const units = lineage(40).map((unit, i) => ({
+      ...unit,
+      id: `op:${i}`,
+      recover: `${LONG_RECOVER} unit=${i}`,
+    }));
+    for (const cap of [120, 150, 90]) {
+      const result = collapseUnits({ units, maxChars: cap });
+      expect(result.droppedToFloorRollup).toBe(units.length);
+      expect(result.text.startsWith('[ROLLUP')).toBe(true);
+      expect(result.chars).toBeLessThanOrEqual(cap);
+      // No partial executable command: any recover=/ledger= token is whole, and
+      // a reset census never carries a truncated `action=`.
+      expect(result.text).not.toContain('action="fetch"');
+    }
+  });
+
   it('always respects the cap across a wide budget sweep', () => {
     const units = lineage(40);
     for (const cap of [150, 400, 900, 2_000, 5_000, 20_000]) {
@@ -184,5 +207,56 @@ describe('generational collapse', () => {
     );
     expect(outcome.grants[0].granted).toBe(0);
     expect(outcome.grants[0].result.complete).toBe(true);
+  });
+
+  it('releases the recency floor only after every unprotected unit hits its floor (audit-2 A14 gate)', () => {
+    // audit-2 scramble DECISIVE 2: the terminal A14 repair lets protected
+    // newest-K units demote BELOW their t1 digest floor when the section still
+    // cannot fit after every unprotected unit reached its own floor. Without
+    // the release gate the protected digests stay pinned at t1 forever and the
+    // section falls through to the floor census even though demoting the
+    // protected units would fit the cap. Phase 1 proves the section fits
+    // WITHOUT the census only because the protected units demoted below t1;
+    // phase 2 proves irreducible pressure still lands on a WHOLE handle-free
+    // census inside the cap.
+    const LONG_RECOVER = 'continuity_ledger action="fetch" owner="inst-a" capture_id="cap-1" section_id="episodeChapterIndex" omitted_only=true include_unknown_source_time=true limit=200';
+    const makeEpisode = (minute: number): CollapseUnit => ({
+      id: `ep:${String(minute).padStart(2, '0')}`,
+      sourceAt: `2026-08-02T17:${String(minute).padStart(2, '0')}:00.000Z`,
+      kind: 'episode',
+      verbatim: `EPISODE ${minute} ${'V'.repeat(280)}`,
+      digest: `EPISODE ${minute} ${'D'.repeat(220)}`,
+      eraKey: '2026-08-02',
+      claim: `episode ${minute}`,
+      recover: `${LONG_RECOVER} unit=${minute}`,
+      sha256: 'a'.repeat(64),
+      verified: true,
+    });
+    const units = Array.from({ length: 40 }, (_, minute) => makeEpisode(minute));
+    const newestIds = new Set(['ep:37', 'ep:38', 'ep:39']);
+    const options = { recencyFloorK: 3, recencyFloorKind: 'episode' as const };
+    // Phase 1 (cap 400): the three protected t1 digests (~223 chars each) plus
+    // the 37-unit t4 rollup exceed the cap; only demoting the protected units
+    // below t1 lets the whole run fuse into one t4 rollup that fits. Without
+    // the release gate, droppedToFloorRollup would be 40 (floor census).
+    const released = collapseUnits({ units, maxChars: 400, ...options });
+    expect(released.chars).toBeLessThanOrEqual(400);
+    expect(released.droppedToFloorRollup).toBe(0);
+    const tiers = new Map(released.placements.map((placement) => [placement.id, placement.tier]));
+    for (const id of newestIds) {
+      // Protected newest episodes demoted BELOW their t1 digest floor — the
+      // release-gate behavior (they end fused into the t4 run with everyone).
+      expect(['t2', 't3', 't4']).toContain(tiers.get(id));
+    }
+    // Phase 2 (cap 100): even the fully fused all-t4 rollup cannot fit, so the
+    // floor branch ships a WHOLE handle-free census inside the cap — no
+    // recover= token, no truncated `action=`, honest n= count.
+    const census = collapseUnits({ units, maxChars: 100, ...options });
+    expect(census.droppedToFloorRollup).toBe(units.length);
+    expect(census.text.startsWith('[ROLLUP')).toBe(true);
+    expect(census.chars).toBeLessThanOrEqual(100);
+    expect(census.text).not.toContain('recover=');
+    expect(census.text).not.toContain('action="fetch"');
+    expect(census.text).toContain('n=40');
   });
 });

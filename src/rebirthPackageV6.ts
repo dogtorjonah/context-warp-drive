@@ -9,10 +9,15 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
-import type { ContinuityLiveFieldSource, ContinuityReceipt } from './continuityReceipt.ts';
+import type {
+  ContinuityHazardDescriptor,
+  ContinuityLiveFieldSource,
+  ContinuityReceipt,
+} from './continuityReceipt.ts';
 import type { FoldMessage } from './rollingFold.ts';
 import {
   COLLAPSE_TIERS,
+  COLLAPSE_TIER_NAMES,
   collapseUnits,
   type CollapseResult,
   type CollapseUnit,
@@ -152,6 +157,14 @@ export interface RebirthPackageV6NowCard {
   readonly lineageChain?: readonly {
     readonly instanceId: string;
     readonly instanceName: string | null;
+    /**
+     * The display name this identity had at THIS hop's EARLIEST span (audit-2
+     * A11). When a current `instanceName` differs (the instance was renamed
+     * mid-life over a sustained assignment), the renderer prints `born-as=`
+     * beside the current name so a reader is not misled by a stale birth name
+     * on an hop that was later renamed.
+     */
+    readonly bornAs?: string | null;
     readonly sourceAt: string | null;
     readonly sourceEndAt?: string | null;
     /** Null means the captured inputs did not carry an authoritative runtime state. */
@@ -165,6 +178,13 @@ export interface RebirthPackageV6NowCard {
   readonly ops?: {
     readonly repositoryState: 'clean' | 'dirty' | 'unknown';
     readonly repositoryReason: string | null;
+    /**
+     * Optional per-root repository capture (audit-2 A18): each entry names one
+     * workspace root's branch, HEAD sha7, dirty/staged counts, and capture
+     * time, or an explicit fail-open error. Rendered in place of the legacy
+     * single `repositoryState` string when present.
+     */
+    readonly repositories?: readonly RebirthPackageV6RepositoryState[];
     readonly ownedLiveChildren: readonly { readonly id: string; readonly name: string }[];
     readonly squad: string | null;
     readonly rooms: readonly string[];
@@ -175,6 +195,23 @@ export interface RebirthPackageV6NowCard {
 export interface RebirthPackageV6RuntimeModelSnapshot {
   readonly engine: string | null;
   readonly model: string | null;
+}
+
+/**
+ * One repository root's captured git state (audit-2 A18). Feeder-populated from
+ * a bounded off-thread probe per workspace root; error entries carry an honest
+ * fail-open reason instead of synthesized values.
+ */
+export interface RebirthPackageV6RepositoryState {
+  /** Workspace root display name (e.g. the Atlas workspace name). */
+  readonly name: string;
+  readonly branch: string | null;
+  readonly sha7: string | null;
+  readonly dirtyCount: number | null;
+  readonly stagedCount: number | null;
+  readonly capturedAt: string | null;
+  /** Set when the probe failed; branch/sha/counts stay null. */
+  readonly error: string | null;
 }
 
 /**
@@ -229,6 +266,24 @@ export interface RebirthPackageV6BoundaryAndActiveTask {
     readonly pointMessageId: string | null;
   } | null;
   /**
+   * Optional life/boundary facts (audit-2 A24): the trigger of THIS boundary,
+   * the predecessor life identity, whether the predecessor produced material
+   * output, and which life carried the last-material-assistant message.
+   * Feeder-populated (assembler); absent/null = not supplied at assembly time,
+   * rendering nothing rather than an invented value.
+   */
+  readonly lifeFacts?: {
+    readonly boundaryTrigger?: string | null;
+    readonly predecessorLifeId?: string | null;
+    readonly predecessorMaterialOutput?: 'yes' | 'no' | null;
+    readonly lastMaterialAssistantLifeId?: string | null;
+    /**
+     * Authoritative source of the newest life artifact these facts derive from
+     * (audit-2 freeze): a derived lifecycle claim never renders unstamped.
+     */
+    readonly source?: RebirthPackageV6SourceRef | null;
+  } | null;
+  /**
    * Identity of the builder process that produced this delivered package: which
    * build path ran (sidecar inline / sidecar worker pool / relay worker
    * fallback), where it is hosted, and the exact immutable source-tree identity
@@ -243,6 +298,14 @@ export interface RebirthPackageV6BoundaryAndActiveTask {
     readonly treeSha256: string;
     readonly fileCount: number;
     readonly totalBytes: number;
+    /**
+     * Package-build phase duration (audit-2 A17). Renamed from the ambiguous
+     * `builtMs`: only the pre-render package-build phase is knowable at stamp
+     * time; prompt-render/context phases finish after the delivered bytes
+     * exist and live in the build response timings, never here.
+     */
+    readonly packageBuildMs?: number | null;
+    /** Legacy alias retained so persisted pre-A17 artifacts stay valid. */
     readonly builtMs?: number | null;
   } | null;
 }
@@ -259,9 +322,17 @@ export interface RebirthPackageV6ExecutionFact {
     | 'claim'
     | 'validation'
     | 'review'
+    | 'life'
     | 'runtime'
     | 'coordination';
   readonly text: string;
+  /**
+   * Snapshot-time stamp (audit-2 A21): coordination/membership facts whose row
+   * records a membership-snapshot observation time rather than the source row's
+   * own event time. Rendered as ` · observed-at=` when present and never used
+   * as the fact's chronology.
+   */
+  readonly observedAt?: string;
   /**
    * Measured chronology flag: present only when this fact's source time and
    * the active request's source time are BOTH known and this row is strictly
@@ -313,6 +384,20 @@ export interface RebirthPackageV6EditFile {
   readonly diffHandle: string | null;
   /** Null for sensitive-withheld files and unavailable exact recovery. */
   readonly snapshotHandle: string | null;
+  /**
+   * Blocking graduation gate when this row did NOT graduate to a hunks render
+   * (audit-2 A5): `claim-held` | `no-frozen-atlas-row` | `cross-workspace` |
+   * `capture-timeout` or a feeder-supplied value. Rendered as ` · gate=` on the
+   * file header so a non-graduated edit names its gate instead of looking like
+   * an omission. Absent on graduated rows and legacy rows.
+   */
+  readonly graduationGate?: string | null;
+  /**
+   * True when an atlas_landed closure graduated while an edit claim was held
+   * (audit-2 A5 policy c) — settled bytes are Atlas-recoverable, so the
+   * pointer renders `closure=atlas_landed(claim=held)`.
+   */
+  readonly graduatedUnderHeldClaim?: boolean;
   readonly reason: string | null;
 }
 
@@ -321,6 +406,16 @@ export interface RebirthPackageV6ActiveEditDelta {
   readonly state: RebirthPackageV6EditState;
   readonly capturedSourceAt: string | null;
   readonly completedObservedAt: string | null;
+  /**
+   * Optional Atlas-landed capture telemetry (audit-2 A5): the frozen
+   * atlasLandedEntries capture envelope that graded per-file graduation.
+   * Feeder-populated; absent = legacy bytes unchanged.
+   */
+  readonly atlasLandedCapture?: {
+    readonly status: 'complete' | 'timeout' | 'error';
+    readonly count: number;
+    readonly elapsedMs: number;
+  } | null;
   readonly inheritedCaptureIds: readonly string[];
   readonly files: readonly RebirthPackageV6EditFile[];
   readonly omittedFiles: number;
@@ -395,6 +490,16 @@ export interface RebirthPackageV6ConversationRow {
   readonly sourceAt: string | null;
   readonly role: 'user' | 'assistant' | 'runtime';
   readonly text: string;
+  /**
+   * Segment coalescing (audit-2 A1): when persistence mints `:segment-N`
+   * continuation rows for one streamed message, normalization joins the rows
+   * into a single envelope whose `text` is the byte-exact concatenation of the
+   * exact deltas in source order. `segmentOffsets` records the character offset
+   * of each later segment's seam within `text` so the renderer can surface
+   * visible `⟨segment-N⟩` markers without corrupting the attested bytes.
+   * Absent on ordinary single-row messages and persisted legacy rows.
+   */
+  readonly segmentOffsets?: readonly number[];
 }
 
 export interface RebirthPackageV6RecoveryHandle {
@@ -690,6 +795,13 @@ export const REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS = 5_000;
 export const LIFE_LEDGER_RECENCY_FLOOR_K = 5;
 
 /**
+ * Audit-2 A14: the Episode Chapter Index gets the same newest-K recency floor
+ * as the life ledger — the newest 5 episodes never demote below digest, so the
+ * current lineage head always stays per-row even when the partition is small.
+ */
+export const EPISODE_CHAPTER_RECENCY_FLOOR_K = 5;
+
+/**
  * Adaptive Backfill priority (spec §7.1). Unspent budget flows left to right;
  * hard-pressure degradation (§8) returns it right to left.
  *
@@ -775,6 +887,31 @@ function compareSourceRows(
 export const REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS = 600;
 
 /**
+ * Audit-2 A22: high-value recent rows (result/hazard/decision < 24h old at the
+ * capture instant) may store up to 900 chars per entry; everything else keeps
+ * the 600-char scarcity cap. Reference time is the model's own `capturedAt`,
+ * never the wall clock, so render and ledger-capture projections stay
+ * byte-identical for the same model (deterministic).
+ */
+export const REBIRTH_PACKAGE_V6_COGNITION_RECENT_KIND_MAX_CHARS = 900;
+const COGNITION_RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function cognitiveEntryCapChars(
+  row: Pick<RebirthPackageV6CognitiveArtifact, 'kind' | 'sourceAt'>,
+  referenceAt: string | null,
+): number {
+  if (row.kind === 'result' || row.kind === 'hazard' || row.kind === 'decision') {
+    if (row.sourceAt && referenceAt) {
+      const ageMs = Date.parse(referenceAt) - Date.parse(row.sourceAt);
+      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < COGNITION_RECENT_WINDOW_MS) {
+        return REBIRTH_PACKAGE_V6_COGNITION_RECENT_KIND_MAX_CHARS;
+      }
+    }
+  }
+  return REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS;
+}
+
+/**
  * Apply the per-entry cap as a DECLARED projection.
  *
  * Dynamic fill (operator directive 2026-08-26): this no longer runs at
@@ -800,12 +937,14 @@ export const REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS = 600;
  */
 function projectCognitiveRow(
   row: RebirthPackageV6CognitiveArtifact,
+  referenceAt: string | null,
 ): RebirthPackageV6CognitiveArtifact {
   if (row.projection === 'truncated') return row;
+  const cap = cognitiveEntryCapChars(row, referenceAt);
   const sourceChars = row.text.length;
-  if (sourceChars <= REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS) return row;
+  if (sourceChars <= cap) return row;
   const projected = row.text
-    .slice(0, REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS)
+    .slice(0, cap)
     .replace(/\s+$/u, '');
   return {
     ...row,
@@ -830,6 +969,23 @@ function normalizeCognitiveRows(
       seen.add(row.provenanceId);
       return true;
     });
+  // Audit-2 A22: near-duplicate collapse. Rows sharing kind + authority whose
+  // normalized text opens with the same long bounded prefix are the same
+  // thought re-emitted (e.g. a co-executor approval fan-out differing only in
+  // a trailing rail id); keep the NEWEST known-time row of each head. The 80
+  // normalized chars and kind+authority equality keep the rule conservative —
+  // a genuine artifact that merely shares an opener with another row of a
+  // different kind or authority is never suppressed.
+  const headSeen = new Set<string>();
+  const nearDeduped: RebirthPackageV6CognitiveArtifact[] = [];
+  for (let index = retained.length - 1; index >= 0; index -= 1) {
+    const row = retained[index]!;
+    const head = `${row.kind}\0${row.authority}\0${row.text.replace(/\s+/gu, ' ').trim().slice(0, 80)}`;
+    if (headSeen.has(head)) continue;
+    headSeen.add(head);
+    nearDeduped.push(row);
+  }
+  nearDeduped.reverse();
   // God Rule 8: never infer chronological order from IDs or position. Selecting
   // "newest" is legitimate ONLY among rows with a known source time; for an
   // unknown-time flow row, compareSourceRows falls back to provenance-ID
@@ -840,65 +996,115 @@ function normalizeCognitiveRows(
   //    banner, where they make no recency claim. They are never selected as
   //    the live flow.
   let newestKnownFlowIndex = -1;
-  for (let index = 0; index < retained.length; index += 1) {
-    const row = retained[index];
+  for (let index = 0; index < nearDeduped.length; index += 1) {
+    const row = nearDeduped[index];
     if (row.kind !== 'flow' || !row.sourceAt) continue;
     newestKnownFlowIndex = index;
   }
-  if (newestKnownFlowIndex < 0) return retained;
+  if (newestKnownFlowIndex < 0) return nearDeduped;
   // Keep exactly one live flow (the newest known-time one) plus every
   // unknown-time flow row (so renderCognition quarantines each under the
   // "not part of the chronology" banner); an older known-time flow drops.
-  return retained
+  return nearDeduped
     .filter((row, index) => (
       row.kind !== 'flow' || index === newestKnownFlowIndex || !row.sourceAt
     ));
 }
 
 /**
- * Streaming providers can emit the leading register glyph as its own pre-tool
- * text block; persistence then mints `id:segment-N` continuation rows for the
- * post-tool text of the SAME message (localMessages dedupe). Rendering every
- * fragment under its own envelope spends a full provenance header on a 1-char
- * glyph row while substantive rows are omitted. Adjacent fragments of one
- * message merge below — only when one side carries no word characters — so
- * every producer path (relay assembler, sidecar, legacy) inherits one envelope
- * per message without touching the exact transcript bytes. Substantive
- * segments stay separate: their per-fragment envelopes are visible evidence.
+ * Conversation segment coalescing (audit-2 A1).
+ *
+ * Persistence mints `id:segment-N` continuation rows when a streaming message
+ * is interrupted by a tool boundary (`segmentTextForCumulativePatch` stores
+ * the exact delta of each continuation). Rendering every fragment under its
+ * own envelope spent a full provenance header per fragment AND let endpoint
+ * selection pick a fragment (the last-material-assistant opened mid-token in
+ * the audited package). All rows of one message coalesce into a single
+ * envelope whose text is the byte-exact delta join and whose `segmentOffsets`
+ * record the seams so the renderer can surface visible `⟨segment-N⟩` markers
+ * without corrupting the attested bytes.
  */
-const CONVERSATION_SEGMENT_SUFFIX = /:segment-\d+$/u;
+export const CONVERSATION_SEGMENT_SUFFIX = /:segment-\d+$/u;
 
-function conversationRowBaseId(provenanceId: string): string {
+/** Stable message identity for a conversation row: the id minus any segment suffix. */
+export function conversationRowBaseId(provenanceId: string): string {
   return provenanceId.replace(CONVERSATION_SEGMENT_SUFFIX, '');
 }
 
-function isGlyphOnlyConversationText(text: string): boolean {
-  const trimmed = text.trim();
-  return trimmed.length > 0 && trimmed.length <= 8 && !/[A-Za-z0-9]/u.test(trimmed);
+/** Segment ordinal of a row: 0 = the base row, N for `:segment-N`. */
+function conversationSegmentOrdinal(provenanceId: string): number {
+  const match = provenanceId.match(/:segment-(\d+)$/u);
+  return match ? Number.parseInt(match[1]!, 10) : 0;
 }
 
-function mergeGlyphOnlyConversationSegments(
+/**
+ * Pure group-and-join over rows sharing one message identity. Rows that share
+ * a base provenance id, role, AND source time are one streamed message's
+ * fragments (persistence mints `:segment-N` continuation rows under the same
+ * source time for one message), so they fuse into a single envelope. The
+ * fusion is ORDER-ROBUST: fragments are grouped by identity and joined by
+ * NUMERIC segment ordinal (base = 0, then 1..N) regardless of the order the
+ * caller presents them in. That independence is load-bearing — a lexicographic
+ * provenance sort orders `:segment-10` before `:segment-2`, so a single-pass
+ * adjacent merge would transpose multi-digit fragments (audit-2 scramble
+ * DECISIVE 1); grouping by identity and sorting by numeric ordinal keeps the
+ * joined text base,1..N under any caller ordering. Rows of the same base id
+ * but a different source time are NOT fused (a genuinely separate later
+ * message), and a row of different role or time keeps its own envelope. A
+ * group of one passes through unchanged (a lone `:segment-N` row keeps its own
+ * provenance shape). A replayed fragment with the same identity, ordinal, and
+ * time is deduplicated (first occurrence wins) so it cannot double-count. The
+ * coalesced text is the exact concatenation of member deltas in ordinal order;
+ * `segmentOffsets` records the seams so the renderer can surface visible
+ * `⟨segment-N⟩` markers without corrupting the attested bytes. Exported as the
+ * typed helper contract for assembler endpoint selection (Lane B): endpoint
+ * keys dedupe on `conversationRowBaseId`, never on a fragment.
+ */
+export function coalesceConversationSegments(
   rows: readonly RebirthPackageV6ConversationRow[],
 ): RebirthPackageV6ConversationRow[] {
-  const merged: RebirthPackageV6ConversationRow[] = [];
+  interface FragmentGroup {
+    entries: Map<number, RebirthPackageV6ConversationRow>;
+  }
+  const groups = new Map<string, FragmentGroup>();
+  const order: string[] = [];
   for (const row of rows) {
-    const previous = merged.at(-1);
-    if (
-      previous
-      && previous.role === row.role
-      && previous.sourceAt === row.sourceAt
-      && conversationRowBaseId(previous.provenanceId) === conversationRowBaseId(row.provenanceId)
-      && (isGlyphOnlyConversationText(previous.text) || isGlyphOnlyConversationText(row.text))
-    ) {
-      merged[merged.length - 1] = {
-        ...previous,
-        text: `${previous.text}\n${row.text}`,
-      };
+    const baseId = conversationRowBaseId(row.provenanceId);
+    const key = `${baseId}\u0000${row.role}\u0000${row.sourceAt ?? ''}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { entries: new Map() };
+      groups.set(key, group);
+      order.push(key);
+    }
+    const ordinal = conversationSegmentOrdinal(row.provenanceId);
+    // A replayed fragment with the same identity + ordinal + time would
+    // otherwise double-count; the first occurrence in source order wins.
+    if (!group.entries.has(ordinal)) group.entries.set(ordinal, row);
+  }
+  const out: RebirthPackageV6ConversationRow[] = [];
+  for (const key of order) {
+    const entries = groups.get(key)!.entries;
+    if (entries.size === 1) {
+      // A group of one passes through unchanged.
+      out.push(entries.values().next().value!);
       continue;
     }
-    merged.push(row);
+    const byOrdinal = [...entries.entries()].sort((left, right) => left[0] - right[0]);
+    const first = byOrdinal[0]![1];
+    const baseId = conversationRowBaseId(first.provenanceId);
+    const offsets = first.segmentOffsets ? [...first.segmentOffsets] : [];
+    let text = first.text;
+    for (let index = 1; index < byOrdinal.length; index += 1) {
+      // The seam offset is the joined-text length BEFORE this fragment appends,
+      // so the renderer can surface `⟨segment-N⟩` collocation markers without
+      // corrupting the attested bytes.
+      offsets.push(text.length);
+      text += byOrdinal[index]![1].text;
+    }
+    out.push({ ...first, provenanceId: baseId, text, segmentOffsets: offsets });
   }
-  return merged;
+  return out;
 }
 
 function normalizeConversationRows(
@@ -907,8 +1113,12 @@ function normalizeConversationRows(
   lastAssistant: string | null,
 ): RebirthPackageV6ConversationRow[] {
   const excluded = new Set([activeRequest, lastAssistant].filter((value): value is string => Boolean(value)));
+  // Coalesce FIRST (audit-2 A1): promoted endpoints are whole messages, so
+  // exclusion must compare coalesced text — comparing fragments would let a
+  // coalesced message render twice (once in Boundary, once in Conversation).
+  const coalesced = coalesceConversationSegments([...rows].sort(compareSourceRows));
   const seen = new Set<string>();
-  const normalized = [...rows]
+  const normalized = coalesced
     .filter((row) => {
       const text = row.text.trim();
       if (!text) return false;
@@ -945,14 +1155,13 @@ function normalizeConversationRows(
       }
       return ![...candidates].some((candidate) => excluded.has(candidate));
     })
-    .sort(compareSourceRows)
     .filter((row) => {
       const identity = `${row.provenanceId}\0${row.text}`;
       if (seen.has(identity)) return false;
       seen.add(identity);
       return true;
     });
-  return mergeGlyphOnlyConversationSegments(normalized);
+  return normalized;
 }
 
 /**
@@ -1235,6 +1444,11 @@ function defaultRecoveryHandles(args: {
       status: hasIdentity ? 'partial' : 'unavailable',
       count: null,
       frontier: args.sourceFrontier,
+      // Audit-2 A15: explicit truthful reason describing the re-derivation
+      // contract (no invented frontier or omission phrase).
+      reason: hasIdentity
+        ? 'summary-only; re-derived from the raw transcript; exact rebirth artifacts are separately indexed'
+        : undefined,
     },
     {
       id: 'cognition',
@@ -1565,8 +1779,41 @@ export function adaptLegacyRebirthPackageToV6(
       ...receiptFactSource('validation', validation, source),
     });
   }
-  const hazards = new Set(receipt?.hazards ?? []);
-  for (const hazard of hazards) {
+  const bareHazards = receipt?.hazards ?? [];
+  // Audit-2 A6 precedence repair (scramble-closeout DECISIVE, entered #42903):
+  // the legacy string-array hazards mint unknown-time blockers, and the old
+  // loop pre-seeded the seen-set with them, so a same-text source-carrying
+  // descriptor (hazardsWithSource) was dropped as a "duplicate" — the
+  // source-less row always won and every stamped blocker stayed quarantined
+  // as unknown-time. Source-carrying descriptors now WIN same-text dedupe:
+  // emit each winning descriptor FIRST (first descriptor text wins), then only
+  // bare hazards not represented by one. `emitted` ends as the same
+  // suppression surface the live-state blocker loop below has always seen
+  // (bare texts ∪ descriptor texts), so that path's precedence is unchanged.
+  const emitted = new Set<string>();
+  for (const hazard of receipt?.hazardsWithSource ?? []) {
+    if (emitted.has(hazard.text)) continue;
+    emitted.add(hazard.text);
+    const excerpt = typeof hazard.excerpt === 'string' && hazard.excerpt.trim()
+      ? ` · excerpt=${JSON.stringify(hazard.excerpt.trim().slice(0, 140))}`
+      : '';
+    const text = `${hazard.text}${excerpt}`;
+    // receiptFactSource reads only `id` + `sourceTimestamp`; the other
+    // ContinuityLiveFieldSource fields (kind/capturedAt/coordinate) are
+    // irrelevant to a descriptor that names its own source row, so a minimal
+    // live-field-shaped object carries exactly those two.
+    const source = hazard.sourceId || hazard.sourceTimestamp
+      ? { kind: 'blocker-hazard', id: hazard.sourceId ?? '', sourceTimestamp: hazard.sourceTimestamp ?? '', capturedAt: '' }
+      : undefined;
+    executionFacts.push({
+      kind: 'blocker',
+      text,
+      ...receiptFactSource('blocker', text, source),
+    });
+  }
+  for (const hazard of bareHazards) {
+    if (emitted.has(hazard)) continue;
+    emitted.add(hazard);
     executionFacts.push({
       kind: 'blocker',
       text: hazard,
@@ -1574,7 +1821,7 @@ export function adaptLegacyRebirthPackageToV6(
     });
   }
   for (const blocker of receipt?.liveState?.blockers.value ?? []) {
-    if (hazards.has(blocker)) continue;
+    if (emitted.has(blocker)) continue;
     executionFacts.push({
       kind: 'blocker',
       text: blocker,
@@ -1786,31 +2033,42 @@ function boundedNewestText(
   const firstHeader = text.indexOf('\n[', windowStart);
   if (firstHeader >= 0) alignedStart = firstHeader + 1;
   const stored = text.length - alignedStart;
-  // ── omitted-entry / omitted-char accounting (S11 audit edge) ──
-  // The boundary alignment can drop whole entries BETWEEN the budget-fitted
-  // window start and the aligned cut. Count them (line-starting '[' headers in
-  // that prefix) and the exact chars dropped so the marker reports both
-  // `omitted-entries=N` and `omitted-chars=N`, not a vague "stored newest".
-  const omittedChars = Math.max(0, alignedStart - windowStart);
-  let omittedEntries = 0;
-  if (omittedChars > 0) {
-    let idx = text.indexOf('\n[', windowStart);
-    while (idx >= 0 && idx < alignedStart) {
-      omittedEntries += 1;
+  // ── honest omission accounting (audit-2 A3) ──
+  // The S11-era marker reported only the boundary-alignment sacrifice BETWEEN
+  // the budget-fitted window start and the aligned cut — `omitted-entries=1 ·
+  // omitted-chars=314` on a 135k text whose real omitted prefix was ~112k
+  // under-reported by two orders of magnitude. The marker now reports the TRUE
+  // omission (the whole `[0, alignedStart)` prefix: chars and whole entries)
+  // plus the alignment sacrifice made inside that prefix to reach a clean
+  // entry boundary.
+  const countEntryHeaders = (startInclusive: number, endExclusive: number): number => {
+    let count = 0;
+    let idx = text.indexOf('\n[', startInclusive);
+    while (idx >= 0 && idx < endExclusive) {
+      count += 1;
       idx = text.indexOf('\n[', idx + 1);
     }
-  }
+    return count;
+  };
+  const prefixChars = alignedStart;
+  const prefixEntries = prefixChars > 0
+    ? countEntryHeaders(0, alignedStart) + (text.startsWith('[') ? 1 : 0)
+    : 0;
+  const sacrificeChars = Math.max(0, alignedStart - windowStart);
+  const sacrificeEntries = sacrificeChars > 0 ? countEntryHeaders(windowStart, alignedStart) : 0;
   let marker = markerFor(stored, 0);
-  // Prefer a marker that names the entry/char accounting when it fits; the plain
-  // marker stays as the guaranteed-fit fallback so marker+body never exceeds the
-  // cap.
+  // Prefer a marker that names the full omission accounting when EVERY appended
+  // byte is admission-checked: marker + retained body must fit the cap, never
+  // the marker alone (09-01 self-lint residual). The plain marker stays as the
+  // guaranteed-fit fallback so marker+body never exceeds the cap.
   const detailedMarker = stored < text.length
     ? `[… older prefix omitted · kept newest ${stored} of ${text.length} chars`
-      + ` · omitted-entries=${omittedEntries} · omitted-chars=${omittedChars}`
+      + ` · omitted-prefix=${prefixChars} (${prefixEntries} entries)`
+      + ` · alignment-sacrifice=${sacrificeChars}/${sacrificeEntries}`
       + ` · recovery=authoritative-history ${authoritativeHistoryHandle ?? 'unavailable'}`
       + ` · byte-exact event replay=unavailable …]\n`
     : '';
-  if (detailedMarker && detailedMarker.length <= maxChars) marker = detailedMarker;
+  if (detailedMarker && detailedMarker.length + stored <= maxChars) marker = detailedMarker;
   if (marker.length > maxChars || stored < 0) {
     return { text: boundedProjectionFallback(text, maxChars, true), complete: false };
   }
@@ -1975,16 +2233,27 @@ function formatBuilderIdentityLine(builder: RebirthPackageV6BoundaryAndActiveTas
   const endpoint = typeof builder.endpoint === 'string' && builder.endpoint.trim()
     ? ` @ ${builder.endpoint.trim()}`
     : '';
-  const treeSha = typeof builder.treeSha256 === 'string' && /^[0-9a-f]{64}$/.test(builder.treeSha256)
-    ? `${builder.treeSha256.slice(0, 12)}…`
-    : 'unknown';
+  // Audit-2 A17: the new producer stamp (`packageBuildMs`) earns the full
+  // `sha256:<16 hex>` source identity; stored pre-A17 builder rows (legacy
+  // `builtMs` only) keep their prior 12-char rendering byte-identically.
+  const hasProducerStamp = typeof builder.packageBuildMs === 'number'
+    && Number.isFinite(builder.packageBuildMs) && builder.packageBuildMs >= 0;
+  const fullSha = typeof builder.treeSha256 === 'string' && /^[0-9a-f]{64}$/.test(builder.treeSha256);
+  const treeSha = hasProducerStamp && fullSha
+    ? `sha256:${builder.treeSha256.slice(0, 16)}`
+    : fullSha
+      ? `${builder.treeSha256.slice(0, 12)}…`
+      : 'unknown';
   const files = Number.isSafeInteger(builder.fileCount) && builder.fileCount >= 0
     ? String(builder.fileCount)
     : 'unknown';
+  const packageBuildMs = hasProducerStamp
+    ? ` · package-build=${Math.round(builder.packageBuildMs)}ms`
+    : '';
   const builtMs = typeof builder.builtMs === 'number' && Number.isFinite(builder.builtMs) && builder.builtMs >= 0
     ? ` · built=${Math.round(builder.builtMs)}ms`
     : '';
-  return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${builtMs}`;
+  return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${packageBuildMs}${builtMs}`;
 }
 
 function boundedRailAvailabilityReason(value: string | null | undefined): string {
@@ -2034,6 +2303,35 @@ function partialLaneCensus(model: RebirthPackageV6Model): string[] {
   return [...new Set(lanes)];
 }
 
+/**
+ * Section-absence census (audit-2 A28): every model-declared section id that
+ * this render will NOT admit, with its canonical order and the reason. Absence
+ * from the rendered package is explicit, so a successor reading `order=N`
+ * frame headers can distinguish a never-captured section from a dropped one.
+ * Structural sections (boundary/execution/AED/cognition/recovery) are always
+ * admitted and never listed.
+ */
+function omittedSectionList(model: RebirthPackageV6Model): string[] {
+  const admitted = new Set(admittedSectionIds(model));
+  const entries: string[] = [];
+  for (const id of REBIRTH_PACKAGE_V6_SECTION_IDS) {
+    if (admitted.has(id)) continue;
+    const order = REBIRTH_PACKAGE_V6_SECTION_IDS.indexOf(id) + 1;
+    let reason: string;
+    if (id === 'brainMergeSynthesis') {
+      reason = 'no-donor';
+    } else if (id === 'recentConversation') {
+      reason = 'no-dialogue-captured';
+    } else if (id === 'operatorVault' || id === 'episodeChapterIndex' || id === 'lifeLedger') {
+      reason = model[id] === undefined ? 'predates-v7-model' : 'captured-empty';
+    } else {
+      continue;
+    }
+    entries.push(`${id}(order=${order},reason=${reason})`);
+  }
+  return entries;
+}
+
 function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
   const boundary = model.boundaryAndActiveTask;
   // One canonical census: the rendered header and the exported helper are the
@@ -2045,10 +2343,13 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
     `lifecycle=${boundary.lifecycle} · ${boundary.lifecycleMeaning}`,
     `capture-artifact=${boundary.captureId} · captured-at=${boundary.capturedAt ?? 'unknown'} · frontier=${boundary.sourceFrontier ?? 'unknown'}`,
     ...(partialLanes.length > 0
-      ? [`partial-lanes=${partialLanes.join(',')} · classes=horizon|cap|store|not-requested|unknown`]
+      ? [`capture-partial-lanes=${partialLanes.join(',')} · class-vocabulary=horizon|cap|store|not-requested|unknown`]
       : []),
     ...(degradedLanes.length > 0
       ? [`capture-degraded=${degradedLanes.join(',')} · status=partial · per-lane recovery truth renders in each affected section`]
+      : []),
+    ...(omittedSectionList(model).length > 0
+      ? [`sections-omitted=${omittedSectionList(model).join(',')}`]
       : []),
     `instance=${boundary.instanceName} (${boundary.instanceId}) · predecessor=${boundary.predecessorName ?? boundary.predecessorInstanceId ?? 'none'}`,
     `workspace=${boundary.workspace} · cwd=${boundary.cwd ?? 'unknown'}`,
@@ -2139,13 +2440,19 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
     const chain = now.lineageChain
       .map((hop) => {
         const label = hop.instanceName ? `${hop.instanceName} (${hop.instanceId})` : hop.instanceId;
+        // Audit-2 A11: when the birth name differs from the current display
+        // name at this hop, surface born-as so a rename never reads as a stale
+        // hop or a mislabeled identity.
+        const bornAs = hop.bornAs && hop.bornAs.trim() && hop.bornAs.trim() !== hop.instanceName
+          ? ` · born-as=${hop.bornAs.trim()}`
+          : '';
         const span = hop.sourceAt
           ? `${hop.sourceAt.slice(0, 10)}→${hop.sourceEndAt?.slice(0, 10) ?? 'now'}`
           : 'span=unknown';
         const runtimeState = hop.archived === true
           ? 'archived'
           : hop.archived === false ? 'live-at-capture' : 'state=unknown';
-        return `${label} · ${span} · ${runtimeState}`;
+        return `${label}${bornAs} · ${span} · ${runtimeState}`;
       })
       .join(' → ');
     lines.push(`lineage-chain=${chain}`);
@@ -2155,10 +2462,37 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
       ? now.ops.ownedLiveChildren.map((child) => `${child.name}(${child.id})`).join(',')
       : 'none';
     const rooms = now.ops.rooms.length > 0 ? now.ops.rooms.join(',') : 'none';
+    // Audit-2 A18: per-root repository captures render their measured branch/
+    // sha/dirty/staged facts; the legacy single-string disposition stays
+    // byte-identical when no per-root capture rode the model.
+    const repos = now.ops.repositories ?? [];
+    const git = repos.length > 0
+      ? `git:${repos.map((repo) => {
+        const label = repo.error
+          ? `${repo.name}:error:${boundedRailAvailabilityReason(repo.error)}`
+          : `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7 ?? '…'} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'} as-of=${repo.capturedAt ?? 'unknown'}`;
+        return label;
+      }).join(' | ')}`
+      : `git:${now.ops.repositoryState}${now.ops.repositoryReason ? `:${boundedRailAvailabilityReason(now.ops.repositoryReason)}` : ''}`;
     lines.push(
-      `ops=git:${now.ops.repositoryState}${now.ops.repositoryReason ? `:${boundedRailAvailabilityReason(now.ops.repositoryReason)}` : ''}`
-      + ` · owned-live-children=${owned} · squad=${now.ops.squad ?? 'none'} · rooms=${rooms} · ${formatSource(now.ops.source)}`,
+      `ops=${git} · owned-live-children=${owned} · squad=${now.ops.squad ?? 'none'} · rooms=${rooms} · ${formatSource(now.ops.source)}`,
     );
+  }
+  if (boundary.lifeFacts) {
+    const lf = boundary.lifeFacts;
+    const parts: string[] = [];
+    if (lf.boundaryTrigger != null) parts.push(`boundary-trigger=${lf.boundaryTrigger}`);
+    if (lf.predecessorLifeId != null) parts.push(`predecessor-life=${lf.predecessorLifeId}`);
+    if (lf.predecessorMaterialOutput != null) {
+      parts.push(`predecessor-material-output=${lf.predecessorMaterialOutput}`);
+    }
+    if (lf.lastMaterialAssistantLifeId != null) {
+      parts.push(`last-material-assistant-life=${lf.lastMaterialAssistantLifeId}`);
+    }
+    if (parts.length > 0) {
+      const stamp = lf.source ? ` · ${formatSource(lf.source)}` : ' · source=unknown · source-time=unknown';
+      lines.push(`life-facts=${parts.join(' · ')}${stamp}`);
+    }
   }
   const vaultNewest = model.operatorVault?.units
     .flatMap((unit) => knownSourceTime(unit.sourceAt) ? [knownSourceTime(unit.sourceAt)!] : [])
@@ -2223,16 +2557,24 @@ function renderExecution(model: RebirthPackageV6Model, maxChars: number): { text
   const known = model.executionState.facts.filter((fact) => fact.sourceAt);
   const unknown = model.executionState.facts.filter((fact) => !fact.sourceAt);
   const factPrefix = (fact: RebirthPackageV6ExecutionFact): string => (
-    fact.kind === 'review' ? `review-demand=${fact.text}` : `${fact.kind} · ${fact.text}`
+    // Audit-2 A12: the label describes the fact's kind, not a demand claim.
+    fact.kind === 'review' ? `rail-review-state=${fact.text}` : `${fact.kind} · ${fact.text}`
+  );
+  const factSuffix = (fact: RebirthPackageV6ExecutionFact): string => (
+    `${fact.observedAt ? ` · observed-at=${fact.observedAt}` : ''}${fact.predatesActiveRequest ? ' · authority=predates-active-request' : ''}`
   );
   const lines = known.map((fact) => (
-    `- ${factPrefix(fact)} · source=${fact.provenanceId} · source-time=${fact.sourceAt} · status=${fact.status}${fact.predatesActiveRequest ? ' · authority=predates-active-request' : ''}`
+    `- ${factPrefix(fact)} · source=${fact.provenanceId} · source-time=${fact.sourceAt} · status=${fact.status}${factSuffix(fact)}`
   ));
-  for (const reason of model.executionState.unknownReasons) lines.push(`- unknown: ${reason}`);
+  for (const reason of model.executionState.unknownReasons) {
+    // Audit-2 A21: an unresolved disagreement between captured facts is a
+    // conflict, not an unknown; a genuinely unknown reason keeps its label.
+    lines.push(/conflicts?\b/iu.test(reason) ? `- conflict: ${reason}` : `- unknown: ${reason}`);
+  }
   if (unknown.length > 0) {
     lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
     for (const fact of unknown) {
-      lines.push(`- ${factPrefix(fact)} · source=${fact.provenanceId} · status=${fact.status}`);
+      lines.push(`- ${factPrefix(fact)} · source=${fact.provenanceId} · status=${fact.status}${factSuffix(fact)}`);
     }
   }
   if (lines.length === 0) lines.push('- execution state captured as empty');
@@ -2257,7 +2599,13 @@ function editFileStats(file: RebirthPackageV6EditFile): string {
 }
 
 function editFileHeaderLine(file: RebirthPackageV6EditFile): string {
-  return `${file.changeKind.toUpperCase()} ${file.filePath} · ${file.ownership} · baseline=${file.baselineQuality} · ${editFileStats(file)} · validation=${file.validationState} · closure=${file.closureState}`;
+  // Audit-2 A5: an atlas_landed closure that graduated under a held claim
+  // carries the pointer; a non-graduated row names its blocking gate.
+  const closure = file.closureState === 'atlas_landed' && file.graduatedUnderHeldClaim
+    ? 'atlas_landed(claim=held)'
+    : file.closureState;
+  const gate = file.graduationGate ? ` · gate=${file.graduationGate}` : '';
+  return `${file.changeKind.toUpperCase()} ${file.filePath} · ${file.ownership} · baseline=${file.baselineQuality} · ${editFileStats(file)} · validation=${file.validationState} · closure=${closure}${gate}`;
 }
 
 /** Exact per-file block the Active Edit Delta section renders for one capture row. */
@@ -2348,7 +2696,7 @@ function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): Rend
     return { text: `${banner}\n${body.text}`, complete: body.complete };
   }
   const lines = [
-    `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · source-time=${delta.capturedSourceAt ?? 'unknown'} · observed-at=${delta.completedObservedAt ?? 'unknown'}`,
+    `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · source-time=${delta.capturedSourceAt ?? 'unknown'} · observed-at=${delta.completedObservedAt ?? 'unknown'}${delta.atlasLandedCapture ? ` · atlas-landed-capture=${delta.atlasLandedCapture.status} rows=${delta.atlasLandedCapture.count} elapsed=${delta.atlasLandedCapture.elapsedMs}ms` : ''}`,
   ];
   if (delta.state === 'none' && delta.files.length === 0) {
     lines.push('Exact immutable capture proved zero open attributable diffs.');
@@ -2679,12 +3027,40 @@ function renderCognition(model: RebirthPackageV6Model, maxChars: number): Render
   // Contention: the pre-dynamic scarcity behavior, unchanged (#41011) — every
   // row at its declared per-entry projection, then whole-unit drops by
   // admission priority. projectCognitiveRow is idempotent, so persisted
-  // pre-projected rows pass through byte-identically.
-  return renderRows(sourceRows.map(projectCognitiveRow), false)!;
+  // pre-projected rows pass through byte-identically. The projection reference
+  // instant is the model's own capturedAt (audit-2 A22), so a contended render
+  // and its ledger capture agree byte-for-byte for the same model.
+  const referenceAt = model.boundaryAndActiveTask.capturedAt;
+  return renderRows(sourceRows.map((row) => projectCognitiveRow(row, referenceAt)), false)!;
 }
 
 function conversationRowText(row: RebirthPackageV6ConversationRow): string {
-  return `[${row.role} · source=${row.provenanceId} · source-time=${row.sourceAt ?? 'unknown'}]\n${row.text}`;
+  const baseProvenance = conversationRowBaseId(row.provenanceId);
+  // Audit-2 A1: a coalesced message keeps one envelope on the base id and
+  // renders visible `⟨segment-N⟩` seam markers at the recorded offsets. The
+  // model text stays the byte-exact delta join; markers are render-only.
+  const seamMarkers = row.segmentOffsets?.length
+    ? renderConversationSeams(row.text, row.segmentOffsets)
+    : null;
+  const text = seamMarkers ?? row.text;
+  const segments = row.segmentOffsets?.length
+    ? ` · segments=${row.segmentOffsets.length + 1}`
+    : '';
+  return `[${row.role} · source=${baseProvenance}${segments} · source-time=${row.sourceAt ?? 'unknown'}]\n${text}`;
+}
+
+/** Render-only seam markers for a coalesced segmented message (audit-2 A1). */
+function renderConversationSeams(text: string, offsets: readonly number[]): string {
+  let out = '';
+  let cursor = 0;
+  for (let index = 0; index < offsets.length; index += 1) {
+    const offset = offsets[index];
+    if (offset < cursor || offset > text.length) continue;
+    out += text.slice(cursor, offset);
+    out += `⟨segment-${index + 1}⟩`;
+    cursor = offset;
+  }
+  return `${out}${text.slice(cursor)}`;
 }
 
 function conversationOmissionMarker(args: {
@@ -2698,8 +3074,15 @@ function conversationOmissionMarker(args: {
   if (args.omittedKnown.length > 0) {
     const first = args.omittedKnown[0].sourceAt!;
     const last = args.omittedKnown.at(-1)!.sourceAt!;
+    // Audit-2 A23: name the bounded candidate window so the count never reads
+    // as the whole transcript — `N of W candidate rows omitted` — and carry
+    // the cut time on the recover handle (`after=`) so a successor can resume
+    // from the omission boundary.
+    const window = args.omittedKnown.length + args.retainedKnown.length;
     parts.push(
-      `${args.omittedKnown.length} earlier known-time row${args.omittedKnown.length === 1 ? '' : 's'} omitted`,
+      args.omittedKnown.length === window
+        ? `all ${window} known-time candidate row${window === 1 ? '' : 's'} omitted`
+        : `${args.omittedKnown.length} of ${window} known-time candidate rows omitted`,
       `source-time-range=${first}..${last}`,
     );
   }
@@ -2711,7 +3094,12 @@ function conversationOmissionMarker(args: {
   const retainedFrom = args.retainedKnown[0]?.sourceAt;
   if (retainedFrom) parts.push(`retained-from=${retainedFrom}`);
   if (args.latestKnownTailOmitted) parts.push('latest-known-row-tail omitted');
-  parts.push(args.recoveryHandle ? `recover=${args.recoveryHandle}` : 'exact recovery unavailable');
+  const after = args.omittedKnown.at(-1)?.sourceAt;
+  parts.push(
+    args.recoveryHandle
+      ? `recover=${args.recoveryHandle}${after ? ` after=${after}` : ''}`
+      : 'exact recovery unavailable',
+  );
   return `[… ${parts.join(' · ')} …]`;
 }
 
@@ -3004,7 +3392,7 @@ function collapseWithReceipt(
     `\n[COLLAPSE units=${units.length} t0=${result.tierCounts.t0}`
     + ` t1=${result.tierCounts.t1} t2=${result.tierCounts.t2}`
     + ` t3=${result.tierCounts.t3} t4=${result.tierCounts.t4}`
-    + ` tiers-legend=${COLLAPSE_TIERS.join('/')}`
+    + ` tiers=${COLLAPSE_TIERS.map((tier) => `${tier}:${COLLAPSE_TIER_NAMES[tier]}`).join(',')}`
     + ` recover=${recover ?? 'unavailable'}]`
   );
   const full = collapse(budget);
@@ -3012,6 +3400,10 @@ function collapseWithReceipt(
   // +16 pads for digit-width drift between the two passes' tier counts.
   const reserve = tierReceipt(full).length + 16;
   const bounded = collapse(budget - reserve);
+  // The second pass re-collapses at `budget - reserve` purely to make room for
+  // the appended receipt. collapseUnits' floor branch is handle-safe (it never
+  // character-slices a recover command), so bounded.text at a floor clamp is a
+  // whole handle-free rollup — safe to append the receipt beside.
   return { text: `${bounded.text}${tierReceipt(bounded)}`, collapse: bounded, complete: false };
 }
 
@@ -3022,8 +3414,9 @@ function renderLineage(
   omissionHandle: string | null,
   recencyFloorK = 0,
   recencyFloorKind?: CollapseUnitKind,
+  headerLines: readonly string[] = [],
 ): RenderedV6SectionBody {
-  const header: string[] = [];
+  const header: string[] = [...headerLines];
   if (section.partialReason) {
     header.push(
       omissionHandle
@@ -3061,11 +3454,31 @@ function renderLineage(
   };
 }
 
+/**
+ * Content sort direction per section (audit-2 A27): renders `dir=` on the
+ * section frame header so a successor knows whether the section streams
+ * oldest-first (asc) or newest-first (desc) without reading the body. Sections
+ * whose body is not a time-ordered stream (boundary, merge synthesis, recovery
+ * directory) carry no dir.
+ */
+const SECTION_SORT_DIRECTION: Readonly<Partial<Record<RebirthPackageV6SectionId, 'asc' | 'desc'>>> =
+  Object.freeze({
+    executionState: 'asc',
+    activeEditDelta: 'asc',
+    cognitiveArtifacts: 'desc',
+    recentConversation: 'asc',
+    operatorVault: 'desc',
+    episodeChapterIndex: 'desc',
+    lifeLedger: 'desc',
+    recoveryIndex: 'asc',
+  });
+
 function frameSection(id: RebirthPackageV6SectionId, body: string): string {
   const order = REBIRTH_PACKAGE_V6_SECTION_IDS.indexOf(id) + 1;
+  const direction = SECTION_SORT_DIRECTION[id];
   return [
     `── ${SECTION_TITLES[id]} ──`,
-    `${V6_SECTION_OPEN_PREFIX} id=${id} order=${order} chars=${body.length}]`,
+    `${V6_SECTION_OPEN_PREFIX} id=${id} order=${order}${direction ? ` dir=${direction}` : ''} chars=${body.length}]`,
     body,
     V6_SECTION_CLOSE,
   ].join('\n');
@@ -3106,6 +3519,63 @@ interface RenderedV6SectionBody {
   readonly unitPlacements?: readonly RebirthPackageV6UnitPlacement[];
 }
 
+/**
+ * Life-ledger section annotations (audit-2 A7/A26): a static legend explaining
+ * the per-row labels (assembler-supplied row text) and a cadence line derived
+ * ONLY from unit fields (sourceAt/sourceEndAt) relative to the model's own
+ * capturedAt. `at-cap` is deliberately NOT derived: the per-life package size
+ * is not a typed unit field, and parsing row bodies for a measurement would
+ * duplicate the feeder's job (residual, not computed).
+ */
+function lifeLedgerHeaderLines(
+  section: RebirthPackageV7LineageSection,
+  capturedAt: string | null,
+): string[] {
+  const units = section.units.filter((unit) => unit.kind === 'life');
+  if (units.length === 0) return [];
+  const lines: string[] = [
+    'legend: one line per life boundary · boundary=<trigger> · prior-status=<predecessor runtime status at the boundary> · runtime=<engine>/<model> · package-chars=<chars of the birth package>',
+  ];
+  const refAt = knownSourceTime(capturedAt);
+  const refMs = refAt ? Date.parse(refAt) : Number.NaN;
+  const cadenceParts: string[] = [];
+  if (Number.isFinite(refMs)) {
+    const windowMs = 24 * 60 * 60 * 1000;
+    const last24 = units.filter((unit) => {
+      const start = knownSourceTime(unit.sourceAt);
+      if (!start) return false;
+      const startMs = Date.parse(start);
+      return Number.isFinite(startMs) && startMs <= refMs && refMs - startMs <= windowMs;
+    }).length;
+    cadenceParts.push(`lives-24h=${last24}`);
+  } else {
+    cadenceParts.push('lives-24h=unknown (no captured-at reference)');
+  }
+  const durationsMs = units.flatMap((unit) => {
+    const start = knownSourceTime(unit.sourceAt);
+    const end = knownSourceTime(unit.sourceEndAt ?? null);
+    if (!start || !end) return [];
+    const startMs = Date.parse(start);
+    const endMs = Date.parse(end);
+    return Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs ? [endMs - startMs] : [];
+  });
+  if (durationsMs.length > 0) {
+    const sorted = [...durationsMs].sort((a, b) => a - b);
+    const median = sorted.length % 2 === 1
+      ? sorted[(sorted.length - 1) / 2]!
+      : (sorted[sorted.length / 2 - 1]! + sorted[sorted.length / 2]!) / 2;
+    const minutes = Math.round(median / 60000);
+    const suffix = durationsMs.length === units.length
+      ? ''
+      : ` (over ${durationsMs.length} of ${units.length} known spans)`;
+    cadenceParts.push(`median-life=${minutes}m${suffix}`);
+  } else {
+    cadenceParts.push('median-life=unknown (no life spans with known start+end)');
+  }
+  lines.push(`cadence=${cadenceParts.join(' · ')}`);
+  return lines;
+}
+
 function renderSectionBodies(
   model: RebirthPackageV6Model,
   limits: Record<RebirthPackageV6SectionId, number>,
@@ -3144,6 +3614,8 @@ function renderSectionBodies(
       limits.episodeChapterIndex,
       model.recoveryIndex.find((entry) => entry.id === 'context-warp-stores')?.handle || null,
       continuityLedgerOmissionHandle(model, 'episodeChapterIndex'),
+      EPISODE_CHAPTER_RECENCY_FLOOR_K,
+      'episode',
     )),
     lifeLedger: measureSectionRender(timing, 'lifeLedger', () => renderLineage(
       lineageSection(model, 'lifeLedger'),
@@ -3152,6 +3624,7 @@ function renderSectionBodies(
       continuityLedgerOmissionHandle(model, 'lifeLedger'),
       LIFE_LEDGER_RECENCY_FLOOR_K,
       'life',
+      lifeLedgerHeaderLines(lineageSection(model, 'lifeLedger'), model.boundaryAndActiveTask.capturedAt),
     )),
     recoveryIndex: measureSectionRender(timing, 'recoveryIndex', () => (
       renderRecovery(model, limits.recoveryIndex)
@@ -3333,7 +3806,21 @@ function renderSectionsWithLimits(
   timing?: RebirthPackageV6SectionTimingAccumulator,
 ): readonly RenderedRebirthPackageV6Section[] {
   const rendered = renderSectionBodies(model, limits, timing);
-  return admittedSectionIds(model).map((id) => ({
+  // Audit-2 A13: a render-incomplete trailer on the Recovery Index names every
+  // admitted section whose body did not fully render at its FINAL cap (budget
+  // truncation, collapse demotion, elision). The trailer is admission-checked:
+  // if it cannot fit the Recovery Index's own cap it is omitted rather than
+  // pushing the section over budget.
+  const admitted = admittedSectionIds(model);
+  const incomplete = admitted.filter((id) => !rendered[id].complete);
+  if (incomplete.length > 0 && admitted.includes('recoveryIndex')) {
+    const trailer = `\n[RENDER-INCOMPLETE sections: ${incomplete.join(',')}]`;
+    const recovery = rendered.recoveryIndex;
+    if (recovery.text.length + trailer.length <= limits.recoveryIndex) {
+      rendered.recoveryIndex = { ...recovery, text: `${recovery.text}${trailer}` };
+    }
+  }
+  return admitted.map((id) => ({
     id,
     title: SECTION_TITLES[id],
     text: measureSectionRender(timing, id, () => frameSection(id, rendered[id].text)),
@@ -3930,12 +4417,14 @@ export function lintPackageSelfChecks(model: RebirthPackageV6Model, renderedText
     );
   }
 
-  // Rule 2 — '(inline body below)' with no body. A recovery handle whose label
-  // advertises an inline body but carries none is a dangling pointer.
+  // Rule 2 — an inline-body promise with no body. A recovery handle whose label
+  // advertises an inline body but carries none is a dangling pointer. The
+  // predicate matches the bounded phrase with or without its parentheses
+  // (audit-2 A29-2: it previously required the literal `(inline body below)`).
   for (const entry of model.recoveryIndex) {
-    if (/inline body below/i.test(entry.label) && !entry.inlineEvidence?.trim()) {
+    if (/inline\s*body\s+below/iu.test(entry.label.trim()) && !entry.inlineEvidence?.trim()) {
       checks.push(
-        `⚠ self-check: recovery lane ${entry.id} labels "(inline body below)" but carries no inline evidence — dangling label.`,
+        `⚠ self-check: recovery lane ${entry.id} labels "inline body below" but carries no inline evidence — dangling label.`,
       );
     }
   }
@@ -4037,7 +4526,8 @@ function withSelfLint(
   budgetLeft -= header.length;
   let admitted = 0;
   for (const check of checks) {
-    const line = `${admitted === 0 ? '\n' : '\n'}${check}`;
+    // Audit-2 A29-3: the ternary was a no-op (`\n` both branches).
+    const line = `\n${check}`;
     if (line.length > budgetLeft) break;
     out += line;
     budgetLeft -= line.length;
@@ -4159,8 +4649,9 @@ function buildCognitiveLedgerUnits(model: RebirthPackageV6Model): readonly Colla
     // construction, while a full-fidelity render ships a body whose stored
     // ledger copy is a byte-exact declared PREFIX of it — sha256 attests the
     // stored projection or the entirety of real source bytes, never an
-    // undeclared slice.
-    const row = projectCognitiveRow(sourceRow);
+    // undeclared slice. Both call sites share the model's capturedAt as the
+    // projection reference instant (audit-2 A22).
+    const row = projectCognitiveRow(sourceRow, model.boundaryAndActiveTask.capturedAt);
     const verbatim = cognitionRowBody(row);
     const projection = row.projection === 'truncated'
       && row.storedChars !== undefined

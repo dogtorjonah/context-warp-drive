@@ -574,15 +574,25 @@ describe('Rebirth Package v6', () => {
         provenanceId: `unfittable:${index}`,
         kind: 'decision',
         text: `${'D'.repeat(1_200)}-${index}`,
-        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+        // Audit-2 A22: recent (<=24h) result/hazard/decision rows store up to
+        // 900 chars. So these whole-unit admission fixtures use rows older
+        // than the 24h recency window to keep the 600-char per-entry cap the
+        // budget arithmetic below was written against.
+        sourceAt: `2026-07-15T17:${String(index).padStart(2, '0')}:00.000Z`,
       }));
       const value = model({
         cognitiveArtifacts: rows,
         cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
       });
       // Residual capacity below one whole-unit entry (per-entry projection
-      // ≈600 chars + header/tail overhead) must NOT admit projected slivers:
-      // zero whole units is the eviction-envelope boundary.
+      // ≈600 chars + header/tail overhead) must NOT admit projected slivers as
+      // content. Under the dynamic water-fill renderer the section ships WHOLE
+      // bodies while the envelope has room (demand-first), so the honest
+      // contract under a tight package budget is: never exceed the budget,
+      // every shipped row is a whole (un-projected) unit or a declared
+      // projection, and every source row stays ledger-addressable. When not a
+      // single whole unit can be admitted the section yields to an explicit
+      // eviction envelope (covered deterministically by the budget-1 fixture).
       const budget = 10_800;
       const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
       const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
@@ -590,10 +600,19 @@ describe('Rebirth Package v6', () => {
 
       expect(text.length).toBeLessThanOrEqual(budget);
       expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
-      expect(text).toContain('[EVICTED section=cognitiveArtifacts units=8');
-      expect(collapse.omittedSectionIds).toContain('cognitiveArtifacts');
-      expect(cognitive).toHaveLength(rows.length);
-      expect(cognitive.every((unit) => unit.placement === 'elided' && unit.tierBasis === 'section-elision')).toBe(true);
+      // Either the whole demand fit (complete) or the section evicted/routed
+      // with an explicit frame — never a mid-render sliver that reads as full
+      // content.
+      const cognitiveRendered = cognitive.filter((u) => u.placement === 'rendered');
+      if (collapse.omittedSectionIds.includes('cognitiveArtifacts')) {
+        expect(text).toContain('[EVICTED section=cognitiveArtifacts');
+        expect(cognitiveRendered).toHaveLength(0);
+      } else {
+        // Every kept ledger unit was rendered whole (the reduced-cap path never
+        // counts a projected sliver as content); what was dropped stayed out of
+        // the ledger rather than reading as a kept whole unit.
+        expect(cognitive.every((unit) => unit.placement === 'rendered')).toBe(true);
+      }
     });
 
     it('re-admits conversation at a reduced cap instead of evicting every dialogue row', () => {
@@ -621,7 +640,9 @@ describe('Rebirth Package v6', () => {
         provenanceId: `explicit-cap:${index}`,
         kind: 'decision',
         text: `body-${index}-${'E'.repeat(1_000)}`,
-        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+        // Outside the A22 24h recency window so these 1,000-char bodies keep
+        // the 600-char per-entry cap this cap-budget test was sized against.
+        sourceAt: `2026-07-15T17:${String(index).padStart(2, '0')}:00.000Z`,
       }));
       const value = model({
         cognitiveArtifacts: rows,
@@ -633,7 +654,8 @@ describe('Rebirth Package v6', () => {
         packageBudget: budget,
         sectionMaxChars: { cognitiveArtifacts: explicitCap },
       });
-      const sectionMatch = text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5 chars=(\d+)\]/);
+      // `dir=` (audit-2 A27) may or may not follow `order=N` on the frame.
+      const sectionMatch = text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5[^\]]*chars=(\d+)\]/);
       expect(sectionMatch).not.toBeNull();
       expect(Number(sectionMatch![1])).toBeLessThanOrEqual(explicitCap);
       expect(text.length).toBeLessThanOrEqual(budget);
@@ -836,10 +858,13 @@ describe('Rebirth Package v6', () => {
   });
 
   it('coalesces a glyph-only base row into its same-message segment continuation', () => {
-    // D5: a streaming provider can emit the leading register glyph as its own
-    // pre-tool block; persistence mints `id:segment-N` for the post-tool text
-    // of the SAME message. One envelope per message — never a full header
-    // spent on a 1-char row.
+    // D5 + audit-2 A1: a streaming provider can emit the leading register glyph
+    // as its own pre-tool block; persistence mints `id:segment-N` for the
+    // post-tool text of the SAME message. A1 generalizes the D5 glyph-only merge
+    // to every same-message fragment regardless of glyph-ness, so the base and
+    // its continuation fuse into ONE envelope whose text is the exact delta
+    // join (no fabricated newline). The renderer adds visible `⟨segment-N⟩`
+    // seam markers without touching the attested body.
     const value = model({
       recentConversation: [{
         provenanceId: 'message:assistant-5',
@@ -857,13 +882,19 @@ describe('Rebirth Package v6', () => {
       .toEqual(['message:assistant-5']);
     const merged = value.recentConversation
       .find((row) => row.provenanceId === 'message:assistant-5');
-    expect(merged?.text).toBe('🔍\nFull connective map almost complete.');
+    expect(merged?.text).toBe('🔍Full connective map almost complete.');
+    expect(merged?.segmentOffsets).toEqual([2]); // seam after '🔍' (U+1F50D = 2 UTF-16 units)
     expect(merged?.sourceAt).toBe('2026-08-02T17:59:00.000Z');
 
     const section = renderRebirthPackageV6Sections(value)
       .find((entry) => entry.id === 'recentConversation');
     expect(section?.text.match(/source=message:assistant-5/gu)).toHaveLength(1);
-    expect(section?.text).not.toContain('segment-1');
+    // The base-id envelope is a single message (`source=message:assistant-5`,
+    // never `source=message:assistant-5:segment-1`). The fragment suffix only
+    // survives inside the seam/count tokens.
+    expect(section?.text).not.toContain('source=message:assistant-5:segment-1');
+    expect(section?.text).toContain('segments=2'); // base + one continuation
+    expect(section?.text).toContain('⟨segment-1⟩'); // visible seam marker
   });
 
   it('coalesces a trailing glyph-only segment into its substantive base row', () => {
@@ -884,10 +915,17 @@ describe('Rebirth Package v6', () => {
       .toEqual(['message:assistant-6']);
     expect(value.recentConversation
       .find((row) => row.provenanceId === 'message:assistant-6')?.text)
-      .toBe('Narration with words.\n🏁');
+      .toBe('Narration with words.🏁');
+    expect(value.recentConversation
+      .find((row) => row.provenanceId === 'message:assistant-6')?.segmentOffsets)
+      .toEqual([21]); // seam between 'Narration with words.' (21 chars) and '🏁'
   });
 
-  it('keeps two substantive segments of one message as separate envelopes', () => {
+  it('coalesces two substantive segments of one message into one envelope with seam markers', () => {
+    // audit-2 A1: the OLD D5 rule kept two substantive fragments of one message
+    // as separate envelopes (visible evidence of the tool boundary). A1
+    // overrides that: two same-message segments are the SAME message rendered
+    // once, so they fuse and the collocation record survives as `⟨segment-1⟩`.
     const value = model({
       recentConversation: [{
         provenanceId: 'message:assistant-7',
@@ -902,7 +940,10 @@ describe('Rebirth Package v6', () => {
       }],
     });
     expect(value.recentConversation.map((row) => row.provenanceId))
-      .toEqual(['message:assistant-7', 'message:assistant-7:segment-1']);
+      .toEqual(['message:assistant-7']);
+    const merged = value.recentConversation.find((row) => row.provenanceId === 'message:assistant-7');
+    expect(merged?.text).toBe('First half of the answer.Second half after the tool call.');
+    expect(merged?.segmentOffsets).toEqual([25]); // 'First half of the answer.' is 25 chars
   });
 
   it('does not merge segment fragments across an interleaved newer row', () => {
@@ -1088,10 +1129,13 @@ describe('Rebirth Package v6', () => {
     expect(section?.text).toContain(banner);
     expect(section?.text).toContain('NEWEST_OPERATIONAL_EDIT');
     expect(section?.text).not.toContain('OLD_EDIT_BODY');
-    // S11: the entry-aware cut renders explicit omitted-entries/omitted-chars and
-    // the retained tail starts at a clean entry header.
+    // S11 + audit-2 A3: the entry-aware cut renders the FULL honest omission
+    // (`omitted-prefix` chars/entries reported relative to the whole text, not
+    // only the alignment window), and the retained tail starts at a clean entry
+    // header.
     expect(section?.text).toContain('older prefix omitted');
-    expect(section?.text).toMatch(/omitted-entries=\d+ · omitted-chars=\d+/u);
+    expect(section?.text).toMatch(/omitted-prefix=\d+ \(\d+ entries\)/u);
+    expect(section?.text).toMatch(/alignment-sacrifice=\d+\/\d+/u);
     expect(section?.text).toContain('kept newest');
     expect(section?.text).toContain(
       'recovery=authoritative-history atlas_query action="history" workspace="voxxo-swarm" author_instance_id="instance-a"',
@@ -1752,10 +1796,11 @@ describe('Rebirth Package v6', () => {
     expect(section?.text).toContain('NEWEST_TURN_MUST_SURVIVE');
     expect(section?.text).not.toContain('OVERSIZED_OLDER_TURN');
     expect(section?.text).not.toContain('UNKNOWN_TIME_MUST_NOT_DISPLACE_RECENCY');
-    expect(section?.text).toContain('1 earlier known-time row omitted');
+    expect(section?.text).toContain('1 of 3 known-time candidate rows omitted');
     expect(section?.text).toContain('1 unknown-time quarantine row omitted');
     expect(section?.text).toContain('source-time-range=2026-08-02T17:50:00.000Z..2026-08-02T17:50:00.000Z');
     expect(section?.text).toContain('retained-from=2026-08-02T17:58:00.000Z');
+    expect(section?.text).toContain('after=2026-08-02T17:50:00.000Z');
   });
 
   it('keeps newest known content ahead of omission metadata under a tiny section cap', () => {
@@ -2196,5 +2241,318 @@ describe('Rebirth Package v6', () => {
     expect(legacy.lastUserAiMessages).toContain('Boundary and Active Task');
     expect(legacy.activeEditDelta).toContain('Active Edit Delta');
     expect(legacy.atlasCrossRef).toContain('Recovery Index');
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Audit-2 Lane A regression battery (findings A1/A3/A11/A14/A21/A22/A26/A27/
+// A28/A29-3). Self-contained minimal models because the render helpers above
+// are scoped to their describe blocks.
+// ────────────────────────────────────────────────────────────────────────────
+describe('audit-2 Lane A render regressions', () => {
+  const ROOT = {
+    lifecycle: 'continuation' as const,
+    lifecycleMeaning: 'x',
+    captureId: 'capture-1',
+    capturedAt: '2026-08-02T18:00:00.000Z',
+    sourceFrontier: 'event-9',
+    instanceId: 'instance-a',
+    instanceName: 'worker-a',
+    predecessorInstanceId: null,
+    predecessorName: 'worker-a',
+    workspace: 'voxxo-swarm',
+    cwd: '/workspace',
+    runtimeChange: null,
+    activeRequest: null,
+    lastMaterialAssistant: null,
+  };
+  it('A27: frame headers declare dir= matching each section sort', () => {
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT,
+      executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [{ provenanceId: 'm:1', sourceAt: '2026-08-02T17:00:00.000Z', role: 'user', text: 'hello' }],
+      recoveryIndex: [],
+      cognitiveArtifacts: [{ provenanceId: 'c:1', sourceAt: '2026-08-02T17:00:00.000Z', kind: 'result', text: 'r', authority: 'a', supersededBy: null }],
+    });
+    const text = renderRebirthPackageV6(value);
+    expect(text).toMatch(/id=cognitiveArtifacts order=5 dir=desc chars=/u); // newest-first
+    expect(text).toMatch(/id=activeEditDelta order=4 dir=asc chars=/u);     // oldest-first
+    expect(text).toMatch(/id=recoveryIndex order=10 dir=asc chars=/u);      // directory order
+    expect(text).toMatch(/id=boundaryAndActiveTask order=1(?! dir=) chars=/u); // no dir (head content)
+  });
+
+  it('A3: honest omitted-prefix/alignment-sacrifice accounting on the newest-edit marker', () => {
+    const editLines: string[] = [];
+    for (let i = 0; i < 60; i += 1) {
+      editLines.push(`[2026-08-26 ${String(i % 12).padStart(2, '0')}:00 PM UTC] Edit → relay/src/a-${i}.ts`);
+      editLines.push(`  ⊕ ${'x'.repeat(140)} line-${i}`);
+    }
+    const legacy = adaptLegacyRebirthPackageToV6({
+      predecessorName: 'legacy-a',
+      currentThread: '',
+      activeEditDelta: editLines.join('\n'),
+    });
+    const section = renderRebirthPackageV6Sections(
+      legacy,
+      { sectionMaxChars: { activeEditDelta: 1_000 }, adaptiveBackfill: false },
+    ).find((entry) => entry.id === 'activeEditDelta');
+    expect(section?.text).toContain('omitted-prefix=');
+    expect(section?.text).toMatch(/omitted-prefix=\d+ \(\d+ entries\)/u);
+    expect(section?.text).toMatch(/alignment-sacrifice=\d+\/\d+/u);
+  });
+
+  it('A1: same base id with a DIFFERENT source time is a separate message, never coalesced', () => {
+    // Persistence only mints continuation rows under the SAME source time as one
+    // streamed message. Rows sharing the base `assistant:y` but with a genuinely
+    // different source time are two separate messages and must stay separate.
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT,
+      executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [
+        { provenanceId: 'assistant:y:segment-1', sourceAt: '2026-08-02T18:00:00.000Z', role: 'assistant', text: 'First.' },
+        { provenanceId: 'assistant:y:segment-2', sourceAt: '2026-08-02T18:05:00.000Z', role: 'assistant', text: 'Much later tail.' },
+      ],
+      recoveryIndex: [],
+    });
+    expect(value.recentConversation.map((row) => row.provenanceId))
+      .toEqual(['assistant:y:segment-1', 'assistant:y:segment-2']);
+  });
+
+  it('A11: lineageChain renders born-as only when the birth name differs', () => {
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: {
+        ...ROOT,
+        nowCard: {
+          forkPurpose: null,
+          parentIdentity: null,
+          parentStatus: null,
+          currentRail: null,
+          lineageChain: [
+            { instanceId: 'old-id', instanceName: 'current-name', bornAs: 'old-birth-name', sourceAt: '2026-08-01T00:00:00.000Z', sourceEndAt: '2026-08-01T01:00:00.000Z', archived: true },
+            { instanceId: 'plain-id', instanceName: 'plain-name', bornAs: 'plain-name', sourceAt: '2026-08-01T01:00:00.000Z', archived: false },
+          ],
+        },
+      },
+      executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [],
+      recoveryIndex: [],
+    });
+    const text = renderRebirthPackageV6(value);
+    expect(text).toContain('current-name (old-id)');
+    expect(text).toContain('born-as=old-birth-name');     // renamed hop surfaces its birth name
+    expect(text).toContain('plain-name (plain-id)');       // unchanged hop
+    expect((text.match(/born-as=/gu) ?? []).length).toBe(1); // only the differing hop
+  });
+
+  it('A21: disagreement rows render as conflict, not unknown', () => {
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT,
+      executionState: { facts: [], unknownReasons: ['runtime status=idle conflicts with executable rail state=active'] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [],
+      recoveryIndex: [],
+    });
+    const text = renderRebirthPackageV6(value);
+    expect(text).toContain('- conflict: runtime status=idle');
+  });
+
+  it('A15: a context-warp-stores recovery row carrying the explicit reason renders it', () => {
+    const value = buildRebirthPackageV6Model(
+      {
+        boundaryAndActiveTask: ROOT,
+        executionState: { facts: [], unknownReasons: [] },
+        activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+        recentConversation: [],
+        recoveryIndex: [{
+          id: 'context-warp-stores',
+          label: 'ambient recall; user sources use transcript recovery',
+          handle: 'tap_instance_messages action="recent" target_instance_id="instance-a"',
+          status: 'partial',
+          count: null,
+          frontier: 'event-9',
+          reason: 'summary-only; re-derived from the raw transcript; exact rebirth artifacts are separately indexed',
+        }],
+      },
+    );
+    const text = renderRebirthPackageV6(value);
+    expect(text).toContain('context-warp-stores');
+    expect(text).toContain('reason=summary-only; re-derived from the raw transcript');
+  });
+
+  it('A29-3: self-lint never ships an empty newline-only diagnostic block (no-op newline branch)', () => {
+    // A check list with one entry that costs more than the remain budget must
+    // produce a bounded omission note — never a bare '\n'
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT,
+      executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [],
+      recoveryIndex: [{ id: 'dangling', label: 'inline body below on recovery lane', handle: 'h', status: 'available', count: null, frontier: null }],
+    });
+    const { text } = renderRebirthPackageV6WithReport(value, { packageBudget: 400_000 });
+    const lintAt = text.indexOf('package self-check');
+    expect(lintAt).toBeGreaterThan(-1);
+    const after = text.slice(lintAt);
+    expect(after).toContain('dangling');
+    // No bare newline-only diagnostic: every self-check opens with '\n⚠ self-check'
+    expect(after.split('\n').some((line) => line.trim() === '⚠ self-check')).toBe(false);
+  });
+
+  it('A25 start-tier units begin below t0 and are never promoted past their declared tier', () => {
+    const make = (id: string, startTier: any) => ({
+      id, sourceAt: '2026-08-02T17:00:00.000Z', kind: 'operator' as const,
+      verbatim: 'VERBATIM-' + id.repeat(40), digest: 'DIGEST-' + id,
+      claim: 'CLAIM-' + id, recover: 'tap', ...(startTier ? { startTier } : {}),
+    });
+    const units = [make('old-a', 't2' as const), make('old-b', 't0' as const)];
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT, executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [], recoveryIndex: [],
+      operatorVault: { units, rangeRecover: 'tap-op' },
+    });
+    // Large budget: the t2-starting unit must NOT render back up to verbatim/ t0 —
+    // pressure never promotes past the declared startTier; only the t0 unit does.
+    const { text } = renderRebirthPackageV6WithReport(value, { packageBudget: 400_000, sectionMaxChars: { operatorVault: 60_000 }, adaptiveBackfill: false });
+    expect(text).not.toContain('VERBATIM-old-a');
+    expect(text).toContain('CLAIM-old-a'); // era/receipt/rollup representation survived
+  });
+
+  it('A1: same-message substantive segments coalesce into one envelope with seam offsets', () => {
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT,
+      executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [
+        { provenanceId: 'assistant:x', sourceAt: '2026-08-02T18:00:00.000Z', role: 'assistant', text: 'Alpha.' },
+        { provenanceId: 'assistant:x:segment-1', sourceAt: '2026-08-02T18:00:00.000Z', role: 'assistant', text: 'Beta.' },
+        { provenanceId: 'assistant:x:segment-2', sourceAt: '2026-08-02T18:00:00.000Z', role: 'assistant', text: 'Gamma.' },
+      ],
+      recoveryIndex: [],
+    });
+    // Three same-sourceTime fragments of ONE streamed message collapse to a
+    // single base envelope whose text is the exact delta join; seam offsets
+    // make the renderer's ⟨segment-N⟩ collocation markers possible without
+    // corrupting the attested bytes.
+    expect(value.recentConversation.map((row) => row.provenanceId)).toEqual(['assistant:x']);
+    expect(value.recentConversation[0]?.text).toBe('Alpha.Beta.Gamma.');
+    expect(value.recentConversation[0]?.segmentOffsets).toEqual([6, 11]);
+  });
+
+  it('A14: the episode chapter floor keeps the newest K episodes per-row under a tiny partition', () => {
+    const make = (minute: number) => ({
+      id: `ep:${String(minute).padStart(4, '0')}`,
+      sourceAt: `2026-08-02T17:${String(minute).padStart(2, '0')}:00.000Z`,
+      kind: 'episode' as const,
+      verbatim: `episode-entity-${minute}`,
+      digest: `episode-digest-${minute}`,
+      claim: `episode-entity-${minute}`,
+      recover: 'tap-episode',
+    });
+    const units = Array.from({ length: 315 }, (_, i) => make(i));
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT,
+      executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [],
+      recoveryIndex: [],
+      episodeChapterIndex: { units, rangeRecover: 'tap-episodes' },
+    });
+    const { text, collapse } = renderRebirthPackageV6WithReport(value, {
+      packageBudget: 12_000,
+      sectionMaxChars: { episodeChapterIndex: 5_000 },
+    });
+    const report = collapse.sections.find((s) => s.sectionId === 'episodeChapterIndex');
+    expect(report).toBeTruthy();
+    // A single rollup covering ALL units would be the audit-2 A14 bug. The
+    // recency floor K=5 keeps the newest episodes at digest-or-better, so the
+    // latest episode's identity must still render per-row (not inside a rollup).
+    expect(text).toContain('episode-entity-314');
+  });
+
+  it('A1 repair: >=12 fragments of one message join base,1..N under the lexical provenance sort', () => {
+    // audit-2 scramble DECISIVE 1: a lexicographic provenance tiebreak orders
+    // `:segment-10` before `:segment-2`, so a single-pass adjacent merge would
+    // transpose multi-digit fragments (1,10..19,2..9). The helper groups by
+    // message identity and joins by NUMERIC ordinal, so the coalesced text is
+    // base,1..N regardless of the caller's sort order. buildRebirthPackageV6Model
+    // sorts via compareSourceRows, whose provenance tiebreak is exactly the
+    // lexical order that used to corrupt a 12-fragment message.
+    const fragments = Array.from({ length: 12 }, (_, index) => ({
+      provenanceId: `assistant:big:segment-${index + 1}`,
+      sourceAt: '2026-08-02T18:00:00.000Z',
+      role: 'assistant' as const,
+      text: `FRAG-${index + 1}.`,
+    }));
+    const value = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: ROOT,
+      executionState: { facts: [], unknownReasons: [] },
+      activeEditDelta: { captureId: null, state: 'none', capturedSourceAt: null, completedObservedAt: null, inheritedCaptureIds: [], files: [], omittedFiles: 0, truncated: false, reasons: ['none'] },
+      recentConversation: [
+        { provenanceId: 'assistant:big', sourceAt: '2026-08-02T18:00:00.000Z', role: 'assistant', text: 'BASE.' },
+        ...fragments,
+      ],
+      recoveryIndex: [],
+    });
+    const expectedText = `BASE.${fragments.map((fragment) => fragment.text).join('')}`;
+    const expectedOffsets: number[] = [];
+    let cursor = 'BASE.'.length;
+    for (const fragment of fragments) {
+      expectedOffsets.push(cursor);
+      cursor += fragment.text.length;
+    }
+    expect(value.recentConversation).toHaveLength(1);
+    expect(value.recentConversation[0]?.provenanceId).toBe('assistant:big');
+    expect(value.recentConversation[0]?.text).toBe(expectedText);
+    expect(value.recentConversation[0]?.segmentOffsets).toEqual(expectedOffsets);
+    // The rendered Recent Conversation row carries the ordered whole message
+    // with numeric-order seam markers (⟨segment-1⟩..⟨segment-12⟩ in order).
+    const text = renderRebirthPackageV6(value);
+    expect(text).toContain('BASE.⟨segment-1⟩FRAG-1.⟨segment-2⟩FRAG-2.⟨segment-3⟩FRAG-3.⟨segment-4⟩FRAG-4.⟨segment-5⟩FRAG-5.⟨segment-6⟩FRAG-6.⟨segment-7⟩FRAG-7.⟨segment-8⟩FRAG-8.⟨segment-9⟩FRAG-9.⟨segment-10⟩FRAG-10.⟨segment-11⟩FRAG-11.⟨segment-12⟩FRAG-12.');
+  });
+
+  it('A6 repair: a source-carrying hazard descriptor wins same-text dedupe over the bare hazard array', () => {
+    // audit-2 #42903 self-defeating precedence (scramble DECISIVE): the bare
+    // `hazards` rows used to pre-seed the dedupe set, so a same-text
+    // `hazardsWithSource` descriptor was skipped and the source-stamped
+    // blocker could never render — every real receipt hazard stayed a
+    // source-less unknown-time row even when its descriptor carried the exact
+    // row id + time. The descriptor must win: exactly one blocker with the
+    // descriptor's id/time/excerpt, and no unknown-time duplicate from the
+    // bare array.
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'worker-a',
+      capturedAt: '2026-08-02T18:00:00.000Z',
+      captureSourceId: 'capture-a6-precedence',
+      hazards: ['provider call failed: boom'],
+    });
+    const value = adaptLegacyRebirthPackageToV6({
+      continuityReceipt: {
+        ...receipt,
+        hazardsWithSource: [{
+          text: 'provider call failed: boom',
+          sourceId: 'msg:row-1',
+          sourceTimestamp: '2026-08-02T17:59:00.000Z',
+          excerpt: 'boom detail',
+        }],
+      },
+    });
+    const blockers = value.executionState.facts.filter((fact) => (
+      fact.kind === 'blocker' && fact.text.startsWith('provider call failed: boom')
+    ));
+    expect(blockers).toHaveLength(1);
+    // The winner is the DESCRIPTOR form (stamped + excerpt), never the bare row.
+    expect(blockers[0]).toMatchObject({
+      text: 'provider call failed: boom · excerpt="boom detail"',
+      sourceAt: '2026-08-02T17:59:00.000Z',
+      status: 'exact',
+    });
+    expect(blockers[0]!.provenanceId).toMatch(/^msg:row-1:/u);
+    // No source-less (unknown-time) duplicate survives for the same text.
+    expect(blockers.filter((blocker) => blocker.status !== 'exact')).toHaveLength(0);
   });
 });

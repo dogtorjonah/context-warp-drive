@@ -2107,6 +2107,29 @@ function foldMessageSourceTimestamp(message: FoldMessage | undefined): string | 
   return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : undefined;
 }
 
+/**
+ * Find the FIRST line in `text` that IS the generated provider-runtime marker
+ * shape: an optional `[<time>] ` prefix followed by the marker as the line's
+ * leading token (then any upstream-appended prose such as
+ * ` (not assistant speech): <err>`). This is how the relay/native callers emit
+ * an unresolved surrogate row. Mid-line quoted prose
+ * (`I quoted ⚠️ UNRESOLVED ...`) starts with ordinary words, never the marker,
+ * so it is NOT an authoritative blocker source. Returns the full trimmed
+ * marker line (preserving any trailing upstream prose) or undefined when no
+ * anchored marker line exists. Pure — exported so the raw hard-epoch descriptor
+ * path is unit-testable without widening the descriptor API.
+ */
+export function findAnchoredProviderRuntimeErrorLine(text: string | undefined | null): string | undefined {
+  if (!text) return undefined;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (/^(?:\[[^\]\n]+\]\s*)?⚠️ UNRESOLVED PROVIDER\/RUNTIME ERROR/u.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return undefined;
+}
+
 /** Resolve one emitted coordinate to the exact source row it names. */
 export function resolveRawTraceCoordinateSource(
   coordinate: RawTraceCoordinate,
@@ -3189,6 +3212,51 @@ export function buildRawRebirthSeedFromMessages(
       lastUserAiMessages,
       activeRequestText,
     });
+    // A6 source-stamped hazard descriptors for the raw hard-epoch path. The
+    // portable builder must NOT classify a provider error from speech, and must
+    // NOT resurrect a resolved/quoted marker from arbitrary history — it only
+    // forwards a descriptor when the legacy prose receipt ALREADY derived a
+    // hazard (legacyReceipt.hazards), which means the canonical marker reached
+    // `lastUserAiMessages` unresolved-after-latest-assistant (a surrogate the
+    // relay/native+worker callers classify upstream into that marker). We then
+    // take the NEWEST pre-frontier assistant/model row whose OWN rendered text
+    // carries an anchored marker line, preserving the exact trailing semantics.
+    // Each descriptor carries the exact row's sourceIdentity (never a synthetic
+    // positional coordinate) and tsMs→ISO when present; missing provenance is
+    // omitted (the receipt renders the blocker unknown rather than fabricated).
+    const rawRuntimeErrorMarkedSources = legacyReceipt.hazards.length > 0
+      ? (() => {
+          // NEWEST trailing marker row is authoritative, and only when it truly
+          // trails the genuine assistant frontier: once we walk backward and hit
+          // a genuine assistant (assistant/model text WITHOUT an anchored marker
+          // line), any older marker row is no longer unresolved-after-latest-
+          // assistant and must NOT be resurrected into a blocker.
+          for (let i = traceEnd - 1; i >= 0; i -= 1) {
+            const message = messages[i];
+            if (!message) continue;
+            if (message.role !== 'assistant' && message.role !== 'model') continue;
+            const text = messageValueToText(message);
+            if (!text) continue;
+            const markerLine = findAnchoredProviderRuntimeErrorLine(text);
+            if (!markerLine) {
+              // A genuine assistant (no anchored marker) caps the backtrack: a
+              // marker row below it is resolved-by-later-speech, never a source.
+              break;
+            }
+            const descriptor = {
+              text: markerLine,
+              // Only an exact persisted identity is a blocker source id — a
+              // `synthetic-position` coordinate must never become provenance.
+              ...(message.sourceIdentity?.trim() && message.sourceIdentityAuthority !== 'synthetic-position'
+                ? { sourceId: message.sourceIdentity.trim() }
+                : {}),
+              ...(foldMessageSourceTimestamp(message) ? { sourceTimestamp: foldMessageSourceTimestamp(message) } : {}),
+            };
+            return [descriptor];
+          }
+          return [];
+        })()
+      : [];
     const rawResumeTimestamp = foldMessageSourceTimestamp(messages[traceEnd]);
     continuityReceipt = buildContinuityReceipt({
       boundary: 'same_instance_hard_epoch',
@@ -3208,6 +3276,9 @@ export function buildRawRebirthSeedFromMessages(
         }),
       ) ?? undefined,
       nextAction: legacyReceipt.nextAction,
+      ...(rawRuntimeErrorMarkedSources.length > 0
+        ? { hazardSourceDescriptors: rawRuntimeErrorMarkedSources }
+        : {}),
       activeRequestText,
       activeRequestSourceId: suppliedRequestSource?.sourceId?.trim() || 'unknown',
       activeRequestSourceCoordinate: tracedActiveRequestText

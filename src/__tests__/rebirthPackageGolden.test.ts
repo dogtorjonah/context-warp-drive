@@ -218,7 +218,7 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     const hash = createHash('sha256').update(first.text, 'utf8').digest('hex');
     // Frozen byte-exact hash of the full render. Update deliberately only when
     // the renderer's formatting/honesty output intentionally changes.
-    expect(hash).toBe('51197657ae5030389e096c2adb2791c2c18b78cb6f9bacc982348bc319c409d6');
+    expect(hash).toBe('cda3207f426dfbc01642624c6c59ff90496f5a2cd4eb9443ba8f9bc9d4176eb2');
   });
 
   it('renders every section into the framed output', () => {
@@ -236,7 +236,7 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     ]) {
       expect(text, `section ${marker}`).toContain(marker);
     }
-    expect([...text.matchAll(/\[REBIRTH-V6-SECTION id=([A-Za-z]+) order=(\d+) chars=\d+\]/gu)]
+    expect([...text.matchAll(/\[REBIRTH-V6-SECTION id=([A-Za-z]+) order=(\d+)(?: dir=\w+)? chars=\d+\]/gu)]
       .map((match) => `${match[1]}:${match[2]}`)).toEqual([
       'boundaryAndActiveTask:1',
       'executionState:3',
@@ -277,9 +277,9 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     });
     const { text } = renderRebirthPackageV6WithReport(withReviewDemand, { packageBudget: 150_000 });
     expect(text).toContain('schema=rebirth-package-v7/v1 · render=v6-sections · capture-naming=v2');
-    expect(text).toContain('partial-lanes=active-edit-delta:not-requested · classes=horizon|cap|store|not-requested|unknown');
+    expect(text).toContain('capture-partial-lanes=active-edit-delta:not-requested · class-vocabulary=horizon|cap|store|not-requested|unknown');
     expect(text).toContain('vault-newest=2026-09-01T20:47:52.476Z · active-request=2026-09-01T20:47:52.476Z');
-    expect(text).toContain('- review-demand=independent correction review pending · source=review:bench');
+    expect(text).toContain('- rail-review-state=independent correction review pending · source=review:bench');
     expect(text).toContain('[EXACT ACTIVE REQUEST · 48 chars · source=msg_active · source-time=2026-09-01T20:47:52.476Z · status=exact]');
     expect(text).toContain('[LAST MATERIAL ASSISTANT · 24 chars · source=msg_last · source-time=2026-09-01T20:48:13.307Z · status=exact]');
   });
@@ -429,7 +429,7 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     // The adversarial renderer fixture emits the two expected diagnostics from
     // the real final render, not only from a direct lint helper invocation.
     expect(text).toContain('self-check: cognition lists missing families glyph,atlas while matched=5000');
-    expect(text).toContain('self-check: recovery lane dangling labels "(inline body below)" but carries no inline evidence');
+    expect(text).toContain('self-check: recovery lane dangling labels "inline body below" but carries no inline evidence');
     // ...and final text + envelope never exceed the declared budget.
     expect(text.length).toBeLessThanOrEqual(budget);
     expect(collapse.telemetry.hardOverrunChars).toBe(0);

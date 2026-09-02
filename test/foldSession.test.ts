@@ -203,15 +203,17 @@ describe('FoldSession E10 sawtooth eviction', () => {
     // Canonical v6 hard epochs use the fixed six-frame package instead of the
     // retired flat Raw Trace Coordinate Closet.
     const v6Frames = [
-      ['boundaryAndActiveTask', 1],
-      ['executionState', 3],
-      ['activeEditDelta', 4],
-      ['cognitiveArtifacts', 5],
-      ['recentConversation', 6],
-      ['recoveryIndex', 10],
+      ['boundaryAndActiveTask', 1, null],
+      ['executionState', 3, 'asc'],
+      ['activeEditDelta', 4, 'asc'],
+      ['cognitiveArtifacts', 5, 'desc'],
+      ['recentConversation', 6, 'asc'],
+      ['recoveryIndex', 10, 'asc'],
     ] as const;
-    for (const [frameId, order] of v6Frames) {
-      expect(preparedText).toContain(`[REBIRTH-V6-SECTION id=${frameId} order=${order} chars=`);
+    for (const [frameId, order, direction] of v6Frames) {
+      expect(preparedText).toContain(
+        `[REBIRTH-V6-SECTION id=${frameId} order=${order}${direction ? ` dir=${direction}` : ''} chars=`,
+      );
     }
     expect(preparedText.indexOf('[REBIRTH-V6-SECTION id=boundaryAndActiveTask'))
       .toBeLessThan(preparedText.indexOf('[REBIRTH-V6-SECTION id=recoveryIndex'));

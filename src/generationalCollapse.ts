@@ -104,6 +104,18 @@ export interface CollapseUnit {
     readonly sourceChars: number;
     readonly sourceBytes: number;
   } | null;
+  /**
+   * Deliberate starting tier (audit-2 A25). When present the unit is placed at
+   * this tier BEFORE pressure demotion runs — it never renders above it, and
+   * adaptive backfill never promotes it past it. Used to keep deliberately
+   * decayed lineage (e.g. older-ancestor operator-vault rows rolled to t2 era
+   * blocks) out of the verbatim water-fill while leaving younger lineage
+   * verbatim. A unit placed at its start tier is not counted as a demotion
+   * (the render is complete at the declared starting representation); pressure
+   * may still demote it below the start tier, and it stays demotable to its
+   * mint-gate floor. Absent = the unit starts at t0 exactly as before.
+   */
+  readonly startTier?: CollapseTier;
 }
 
 export interface CollapseOptions {
@@ -258,8 +270,12 @@ interface RenderState {
   readonly demotionKnown: readonly CollapseUnit[];
   readonly unknown: readonly CollapseUnit[];
   readonly tiers: Map<string, CollapseTier>;
-  /** Unit ids protected by the B7 recency floor (never demote below t1). */
-  readonly recencyProtectedIds: ReadonlySet<string>;
+  /**
+   * Unit ids protected by the B7 recency floor (never demote below t1). Mutable:
+   * the audit-2 A14 floor-overflow path clears it when the section cannot fit
+   * under cap with protected digests, then lets protected units demote.
+   */
+  recencyProtectedIds: Set<string>;
 }
 
 function renderRun(
@@ -373,7 +389,12 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
     ? [...demotionKnown].reverse()
     : demotionKnown;
   const unknown = sorted.filter((unit) => !unit.sourceAt);
-  const tiers = new Map<string, CollapseTier>(sorted.map((unit) => [unit.id, 't0' as CollapseTier]));
+  // Deliberate start tiers (audit-2 A25): a unit that declares `startTier`
+  // begins at that tier instead of t0 — deliberate decay that pressure may
+  // deepen but adaptive backfill never reverses past the declared tier.
+  const tiers = new Map<string, CollapseTier>(sorted.map((unit) => (
+    [unit.id, unit.startTier && COLLAPSE_TIERS.includes(unit.startTier) ? unit.startTier : 't0' as CollapseTier]
+  )));
   // B7 recency floor: the newest K units of the named kind are protected from
   // demoting below t1, so the OLDEST units absorb floor pressure first.
   const recencyFloorK = Math.max(0, Math.floor(options.recencyFloorK ?? 0));
@@ -412,19 +433,23 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
   // Each unit can be demoted at most COLLAPSE_TIERS.length - 1 times, so this
   // loop is bounded by construction and always terminates.
   const demotionCeiling = sorted.length * (COLLAPSE_TIERS.length - 1);
-  const unitSizeAt = (unit: CollapseUnit, tier: CollapseTier): number => (
-    renderRun([unit], tier, options.rangeRecover).length
-  );
-  // Demote in estimate-sized batches, then re-render exactly. Aggregate tiers
-  // (era/rollup fusion) make the per-unit estimate conservative, so a batch can
-  // undershoot — the outer loop simply runs again. It never overshoots into
-  // demoting more than the overflow justifies, and the exact rendered text is
-  // always the authority for whether the section fits.
+  // Audit-2 A14 repair: demote in SMALL exact-re-render batches, never on the
+  // per-unit estimate alone. The old estimator accumulated
+  // `max(1, per-unit size delta)` until it covered the overflow; for units
+  // whose per-unit receipt/rollup representation is no smaller than their
+  // verbatim (short episodes, small operator rows), every step "saved" only 1
+  // estimated char while the REAL savings only materialize when the exact
+  // re-render fuses whole runs into era blocks and rollups. The estimator
+  // therefore demoted every unit to its floor before the exact re-render
+  // showed a single ~680-char rollup fit under a 5k partition — zero chapters
+  // retained per-row. Exact re-render after every bounded batch makes the
+  // measured text the authority again: the batch can never demote more than
+  // `MAX_DEMOTIONS_PER_BATCH` units past the point where the section fits, and
+  // each re-render is cheap because batches are small.
+  const MAX_DEMOTIONS_PER_BATCH = 8;
   while (text.length > maxChars && demotions < demotionCeiling) {
-    const overflow = text.length - maxChars;
-    let saved = 0;
     let applied = 0;
-    while (saved < overflow && demotions < demotionCeiling) {
+    while (applied < MAX_DEMOTIONS_PER_BATCH && demotions < demotionCeiling) {
       const candidate = nextDemotionCandidate(state);
       if (!candidate) break;
       const current = tiers.get(candidate.id) ?? 't0';
@@ -432,7 +457,6 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
       // straight to T4. Verified units walk every tier normally.
       const demoted = nextTier(current, candidate.verified !== true);
       if (!demoted) break;
-      saved += Math.max(1, unitSizeAt(candidate, current) - unitSizeAt(candidate, demoted));
       tiers.set(candidate.id, demoted);
       demotions += 1;
       applied += 1;
@@ -440,17 +464,73 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
     if (applied === 0) break;
     text = renderState(state, options.rangeRecover);
   }
+  // Recency-floor overflow (audit-2 A14 gate fix): when demotion has exhausted
+  // every DEMOTABLE unit but the text still exceeds maxChars because newest-K
+  // recency-protected units are pinned at their digest floor (t1), the floor is
+  // a PRESSURE PREFERENCE, not a hard promise. Continuing to ship > maxChars
+  // would let this section overrun its declared cap and character-truncate a
+  // trailing ledger/recover handle mid-token (the executed-handle invariant:
+  // every advertised handle stays whole). So when the loop above terminates
+  // over budget, we release the recency floor and let the protected units
+  // demote too — so the existing floor-pressure rollup below can fit under
+  // maxChars exactly as it does for non-recency sections. A recency floor
+  // reverts to a single rollup rather than a cap-over-shipped truncation.
+  if (text.length > maxChars && state.recencyProtectedIds.size > 0) {
+    const protectedUnits = sorted.filter((unit) => state.recencyProtectedIds.has(unit.id));
+    state.recencyProtectedIds = new Set();
+    for (const unit of protectedUnits) {
+      const current = tiers.get(unit.id) ?? 't0';
+      const demoted = nextTier(current, unit.verified !== true);
+      if (demoted) {
+        tiers.set(unit.id, demoted);
+        demotions += 1;
+      }
+    }
+    text = renderState(state, options.rangeRecover);
+    // Finish walking every unit to its true floor until the section fits.
+    while (text.length > maxChars && demotions < demotionCeiling) {
+      let applied = 0;
+      while (applied < MAX_DEMOTIONS_PER_BATCH && demotions < demotionCeiling) {
+        const candidate = nextDemotionCandidate(state);
+        if (!candidate) break;
+        const current = tiers.get(candidate.id) ?? 't0';
+        const demoted = nextTier(current, candidate.verified !== true);
+        if (!demoted) break;
+        tiers.set(candidate.id, demoted);
+        demotions += 1;
+        applied += 1;
+      }
+      if (applied === 0) break;
+      text = renderState(state, options.rangeRecover);
+    }
+  }
 
   let droppedToFloorRollup = 0;
   if (text.length > maxChars) {
-    // Floor pressure: everything is already at its floor and still overflows.
-    // Degrade to a single honest rollup line rather than a truncated body that
-    // would make partial evidence look complete (spec §8).
+    // Floor pressure: every unit is already at its floor and still overflows.
+    // Degrade to a single honest rollup line (spec §8). NEVER character-slice a
+    // rollup here: its `recover=` may carry a full executable ledger command,
+    // and cutting it mid-token advertises a corrupt pointer (the executed-handle
+    // invariant — "ledger fetch handle without owner"). If the recover-bearing
+    // rollup cannot fit a positive cap, emit a whole census rollup WITHOUT a
+    // recover=` command token — never `recover=none` (which the schema layer
+    // rejects as a tool) and never a partial handle. The ledger recovery route
+    // lives in the `[COLLAPSE ...]` receipt the caller appends / the recovery
+    // index, so a recover-less census line stays truthful and handle-safe.
     droppedToFloorRollup = sorted.length;
     const rollup = formatCollapseRollup(sorted, options.floorRecover ?? options.rangeRecover);
-    text = rollup.length <= maxChars || maxChars === 0 ? rollup : rollup.slice(0, maxChars);
+    if (rollup.length <= maxChars || maxChars === 0) {
+      text = rollup;
+    } else {
+      const kinds = [...new Set(sorted.map((unit) => unit.kind))].sort().join('+');
+      let compact = `[ROLLUP kind=${kinds} n=${sorted.length}]`;
+      if (compact.length > maxChars || maxChars === 0) compact = `[ROLLUP n=${sorted.length}]`;
+      // `recover=` is deliberately absent: the command could not fit whole and
+      // a partial `recover=` would be harvested as a corrupt executable handle.
+      // The recovery route stays in the caller's appended receipt / index.
+      text = compact;
+    }
   }
-
   const tierCounts: Record<CollapseTier, number> = { t0: 0, t1: 0, t2: 0, t3: 0, t4: 0 };
   for (const unit of sorted) tierCounts[tiers.get(unit.id) ?? 't0'] += 1;
 
@@ -560,32 +640,39 @@ function promotionCost<TId extends string>(
   const byId = new Map(section.units.map((unit) => [unit.id, unit]));
   const demoted = current.placements.filter((placement) => placement.tier !== 't0');
   if (demoted.length === 0) return null;
-  // placements are chronological; the newest demoted unit is the last one.
-  const target = demoted.at(-1)!;
-  const unit = byId.get(target.id);
-  if (!unit) return null;
-  const promoted = previousTier(target.tier);
-  if (!promoted) return null;
-  const probeUnits = section.units;
-  const cap = section.baseCap + alreadyGranted;
-  // Grow the cap until the target unit actually reaches the promoted tier. The
-  // step is the measured size delta of that unit's own representation, so the
-  // search converges in a couple of probes instead of scanning char by char.
-  const sizeAt = (tier: CollapseTier): number => renderRun([unit], tier, section.rangeRecover ?? null).length;
-  let step = Math.max(1, sizeAt(promoted) - sizeAt(target.tier));
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const probeCap = cap + step;
-    const probe = collapseUnits({
-      units: probeUnits,
-      maxChars: probeCap,
-      rangeRecover: section.rangeRecover ?? null,
-      floorRecover: section.floorRecover ?? null,
-    });
-    const placed = probe.placements.find((placement) => placement.id === unit.id);
-    if (placed && COLLAPSE_TIERS.indexOf(placed.tier) <= COLLAPSE_TIERS.indexOf(promoted)) {
-      return step;
+  // placements are chronological; scan newest-first for the newest demoted unit
+  // that CAN be promoted — a deliberate-start unit (audit-2 A25) is never
+  // promoted above its declared startTier, so units parked at their start tier
+  // are skipped in favor of genuinely pressure-demoted younger units.
+  for (const target of [...demoted].reverse()) {
+    const unit = byId.get(target.id);
+    if (!unit) continue;
+    const startTier = unit.startTier && COLLAPSE_TIERS.includes(unit.startTier) ? unit.startTier : null;
+    const promoted = previousTier(target.tier);
+    if (!promoted) continue;
+    if (startTier && COLLAPSE_TIERS.indexOf(promoted) < COLLAPSE_TIERS.indexOf(startTier)) continue;
+    const probeUnits = section.units;
+    const cap = section.baseCap + alreadyGranted;
+    // Grow the cap until the target unit actually reaches the promoted tier.
+    // The step is the measured size delta of that unit's own representation,
+    // so the search converges in a couple of probes instead of scanning char
+    // by char.
+    const sizeAt = (tier: CollapseTier): number => renderRun([unit], tier, section.rangeRecover ?? null).length;
+    let step = Math.max(1, sizeAt(promoted) - sizeAt(target.tier));
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const probeCap = cap + step;
+      const probe = collapseUnits({
+        units: probeUnits,
+        maxChars: probeCap,
+        rangeRecover: section.rangeRecover ?? null,
+        floorRecover: section.floorRecover ?? null,
+      });
+      const placed = probe.placements.find((placement) => placement.id === unit.id);
+      if (placed && COLLAPSE_TIERS.indexOf(placed.tier) <= COLLAPSE_TIERS.indexOf(promoted)) {
+        return step;
+      }
+      step *= 2;
     }
-    step *= 2;
   }
   return null;
 }

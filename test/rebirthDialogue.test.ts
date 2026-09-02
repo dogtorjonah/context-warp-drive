@@ -66,6 +66,14 @@ describe('rebirth dialogue window', () => {
     expect(isGenuineRebirthOperatorMessage('Why did [Chronological Provenance v1] hide my turn?')).toBe(true);
   });
 
+  test('denies relay control-signal deliveries as genuine operator speech (A9)', () => {
+    expect(isGenuineRebirthOperatorMessage('control signal from [build-queue] [BUILD ✗ remote-1] typecheck FAILED')).toBe(false);
+    expect(isGenuineRebirthOperatorMessage('control signal from [forge] job complete')).toBe(false);
+    expect(isGenuineRebirthOperatorMessage('[Control Signal from ] relay control frame')).toBe(false);
+    // Operator prose discussing a control signal stays genuine.
+    expect(isGenuineRebirthOperatorMessage('Why did the control signal from build-queue fail?')).toBe(true);
+  });
+
   test('keeps chronological order after independently applying role quotas', () => {
     const selected = selectRoleAwareRebirthDialogueWindow([
       { id: 'u1', type: 'user', text: 'u1' },

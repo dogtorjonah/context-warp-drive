@@ -231,6 +231,11 @@ export interface ContinuityReceipt {
   readonly validation: ContinuityReceiptValidation;
   /** Unresolved hazards the successor must not miss (bounded descriptors). */
   readonly hazards: readonly string[];
+  /** Optional source-stamped hazards (A6): descriptor objects carrying the
+   *  authoritative row identity + excerpt for each hazard emitted from a
+   *  structured source. Mirrors `hazards` texts; absent on legacy persisted
+   *  receipts and on hazards detected without a structured source. */
+  readonly hazardsWithSource?: readonly ContinuityHazardDescriptor[];
   readonly canonicalRange?: ContinuityReceiptCanonicalRange;
   /** Disagreements detected among bundled sources at assembly time. */
   readonly disagreements: readonly string[];
@@ -471,6 +476,12 @@ export interface ContinuityReceiptParts {
   readonly hazards?: readonly string[];
   /** Text blocks scanned for unresolved provider/runtime error markers. */
   readonly hazardSources?: readonly string[];
+  /** Optional source-stamped hazard descriptors (A6) supplied by the caller
+   *  (e.g. the trailing-error row's id/timestamp) alongside the scanned blob.
+   *  When present they populate receipt.hazardsWithSource so a downstream
+   *  blocker fact carries authoritative source provenance instead of minting
+   *  `sourceAt: null` for a source whose real identity is known. */
+  readonly hazardSourceDescriptors?: readonly ContinuityHazardDescriptor[];
   readonly canonicalRange?: ContinuityReceiptCanonicalRange;
   readonly chatroomMembership?: string;
   /** Latest authoritative join time among the caller's current room memberships. */
@@ -753,11 +764,63 @@ const PROVIDER_RUNTIME_ERROR_MARKER = '⚠️ UNRESOLVED PROVIDER/RUNTIME ERROR'
 const PROVIDER_RUNTIME_ERROR_HAZARD =
   'unresolved provider/runtime error captured after the last genuine assistant message (not assistant speech; verify provider/session state before acting)';
 
+/** A hazard with optional authoritative source provenance. When the caller
+ *  passes a structured hazard source (row id + timestamp) alongside the text,
+ *  the descriptor carries it so a downstream blocker fact never mints
+ *  `sourceAt: null` for a source whose real identity is known (A6). */
+export interface ContinuityHazardDescriptor {
+  readonly text: string;
+  readonly sourceId?: string;
+  readonly sourceTimestamp?: string;
+  /** Bounded excerpt of the matched source text (the marker vicinity). */
+  readonly excerpt?: string;
+}
+
+export type ContinuityHazardSource =
+  | string
+  | ContinuityHazardDescriptor;
+
+const PROVIDER_ERROR_EXCERPT_LIMIT = 160;
+
+// Preserve the historical no-source behavior for callers that pass plain text.
+function descriptorFor(source: string | ContinuityHazardSource): ContinuityHazardDescriptor | null {
+  if (typeof source === 'string') {
+    if (!source.includes(PROVIDER_RUNTIME_ERROR_MARKER)) return null;
+    // Keep the full text as the excerpt when no separate excerpt was passed.
+    const match = source.match(new RegExp(`.{0,80}${escapeRegExp(PROVIDER_RUNTIME_ERROR_MARKER)}.*`, 's'));
+    return {
+      text: PROVIDER_RUNTIME_ERROR_HAZARD,
+      excerpt: match?.[0]?.slice(0, PROVIDER_ERROR_EXCERPT_LIMIT),
+    };
+  }
+  return source.text.includes(PROVIDER_RUNTIME_ERROR_MARKER)
+    ? {
+        text: PROVIDER_RUNTIME_ERROR_HAZARD,
+        ...(source.sourceId ? { sourceId: source.sourceId } : {}),
+        ...(source.sourceTimestamp ? { sourceTimestamp: source.sourceTimestamp } : {}),
+        excerpt: source.excerpt ?? source.text.slice(0, PROVIDER_ERROR_EXCERPT_LIMIT),
+      }
+    : null;
+}
+
+export function detectContinuityHazardDescriptors(
+  sources: readonly (string | ContinuityHazardSource)[],
+): ContinuityHazardDescriptor[] {
+  const descriptors: ContinuityHazardDescriptor[] = [];
+  for (const source of sources) {
+    const descriptor = descriptorFor(source);
+    if (descriptor) descriptors.push(descriptor);
+  }
+  return descriptors;
+}
+
 /** Detect unresolved provider/runtime error remainders in bundled text. */
-export function detectContinuityHazards(sources: readonly string[]): string[] {
-  return sources.some((source) => source.includes(PROVIDER_RUNTIME_ERROR_MARKER))
-    ? [PROVIDER_RUNTIME_ERROR_HAZARD]
-    : [];
+export function detectContinuityHazards(sources: readonly (string | ContinuityHazardSource)[]): string[] {
+  return detectContinuityHazardDescriptors(sources).map((descriptor) => descriptor.text);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 const VALIDATION_FACT_PATTERN = /^(?:validation|verification)(?:\s+(?:passed|state|fact|facts))?\s*:/iu;
@@ -914,6 +977,14 @@ export function buildContinuityReceipt(parts: ContinuityReceiptParts): Continuit
       fact: validationFact,
     },
     hazards: [...detectContinuityHazards(parts.hazardSources ?? []), ...(parts.hazards ?? [])],
+    ...(parts.hazardSourceDescriptors?.length
+      ? {
+          hazardsWithSource: [
+            ...detectContinuityHazardDescriptors(parts.hazardSourceDescriptors),
+            ...(parts.hazards ?? []).map((text) => ({ text } as ContinuityHazardDescriptor)),
+          ],
+        }
+      : {}),
     canonicalRange: parts.canonicalRange,
     disagreements,
     liveState: buildReceiptLiveState({
@@ -1168,6 +1239,17 @@ function isContinuityReceiptLiveState(value: unknown): value is ContinuityReceip
           || isPendingAssistantAction(value.assistantAction.value))));
 }
 
+function isContinuityHazardDescriptor(value: unknown): value is ContinuityHazardDescriptor {
+  if (!isRecord(value) || typeof value.text !== 'string') return false;
+  return (value.sourceId === undefined || typeof value.sourceId === 'string')
+    && (value.sourceTimestamp === undefined || typeof value.sourceTimestamp === 'string')
+    && (value.excerpt === undefined || typeof value.excerpt === 'string');
+}
+
+function isContinuityHazardDescriptorArray(value: unknown): value is ContinuityHazardDescriptor[] {
+  return Array.isArray(value) && value.every(isContinuityHazardDescriptor);
+}
+
 /** Structural check for the typed render path. Unknown/newer versions fail so older runtimes degrade to prose synthesis instead of misrendering. */
 export function isContinuityReceipt(value: unknown): value is ContinuityReceipt {
   if (!isRecord(value)) return false;
@@ -1178,6 +1260,7 @@ export function isContinuityReceipt(value: unknown): value is ContinuityReceipt 
   if (!isRecord(value.editClaim) || !isStringArray(value.editClaim.claims) || !isStringArray(value.editClaim.editEvidenceFiles)) return false;
   if (!isRecord(value.validation)) return false;
   if (!isStringArray(value.hazards) || !isStringArray(value.disagreements)) return false;
+  if (value.hazardsWithSource !== undefined && !isContinuityHazardDescriptorArray(value.hazardsWithSource)) return false;
   if (value.pendingAssistantAction !== undefined
     && !isPendingAssistantAction(value.pendingAssistantAction)) return false;
   if (value.liveState !== undefined && !isContinuityReceiptLiveState(value.liveState)) return false;
