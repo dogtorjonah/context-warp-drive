@@ -89,11 +89,11 @@ describe('chronological provenance', () => {
       renderChronologicalProvenanceCompact(envelope),
     ]) {
       expect(rendered).toContain(
-        'source=trace-time:event#2..trace-time:event#4 n=3 @ time unknown..time unknown',
+        'source=trace-time:event#2..trace-time:event#4 (inclusive) n=3 @ time unknown..time unknown',
       );
       expect(rendered).toContain('created=trace-time:event#8 @ time unknown');
       expect(rendered).toContain('supersession=explicit:trace-time:event#9 @ time unknown');
-      expect(rendered).toContain('raw-resumes=trace-time:event#5 @ time unknown');
+      expect(rendered).toContain('raw-resumes=trace-time:event#5 @ time unknown (first raw row)');
     }
 
     const partial = renderChronologicalProvenance({
@@ -104,7 +104,7 @@ describe('chronological provenance', () => {
       },
     });
     expect(partial).toContain(
-      'source=trace-time:event#2..trace-time:event#4 n=3 @ 2026-07-20T08:00:00.000Z..time unknown',
+      'source=trace-time:event#2..trace-time:event#4 (inclusive) n=3 @ 2026-07-20T08:00:00.000Z..time unknown',
     );
     expect(partial).not.toContain('2026-07-20T08:00:00.000Z..2026-07-20T08:00:00.000Z');
   });
@@ -127,14 +127,58 @@ describe('chronological provenance', () => {
 
     expect(rendered).toContain('[Chronological Provenance v1]');
     expect(rendered).toContain('artifact=tail-epoch#3 class=synthesized-history authority=historical-background supersession=later-raw-wins');
-    expect(rendered).toContain('source=instance-1:message#12..instance-1:message#17 n=6');
+    expect(rendered).toContain('source=instance-1:message#12..instance-1:message#17 (inclusive) n=6');
     expect(rendered).toContain('created=instance-1:message#? @ 2026-07-11T04:06:00.000Z');
     expect(rendered).toContain('topology=frozen-prefix>artifact>seam>raw-tail host=dedicated-synthetic-message representation=canonical');
-    expect(rendered).toContain('raw-resumes=instance-1:message#18 @ time unknown (4 exact)');
+    expect(rendered).toContain('raw-resumes=instance-1:message#18 @ time unknown (first raw row) (4 exact)');
     expect(rendered).toContain(
       'stack=frozen-prefix>tail-epoch#3[message:12..18)>seam@2026-07-11T04:06:00.000Z>raw-tail@message#18(+4)',
     );
     expect(isSyntheticContextText(rendered as string)).toBe(true);
+  });
+
+  it('labels the source end inclusive and the seam as the first raw row (audit-3 B15)', () => {
+    // Audit-3 B15: when the source range is numeric its end is END-INCLUSIVE
+    // (`(inclusive)`); the raw-resume row that follows it is the FIRST RAW ROW.
+    // When both stamps share the same millisecond (the audit's exact seam
+    // ambiguity — provenance mints the request row at the source frontier), the
+    // renderer says so explicitly instead of leaving two identical stamps to
+    // disambiguate a reader who cannot tell the seats apart.
+    const rendered = renderContinuityPackageProvenance({
+      artifact: 'rebirth-package#same-ms-seam',
+      traceId: 'instance-7',
+      sourceEventCount: 42,
+      sourceFirstTimestamp: '2026-07-11T04:00:00.000Z',
+      sourceLastTimestamp: '2026-07-11T04:43:00.000Z', // == raw resume instant
+      createdTimestamp: '2026-07-11T04:44:00.000Z',
+      rawTailCount: 1,
+      rawResumeTimestamp: '2026-07-11T04:43:00.000Z',
+    }) as string;
+    // Source range end carries the inclusive seat (not an open upper bound).
+    expect(rendered).toContain(
+      'source[canonical-epoch-tail]=instance-7:event#0..instance-7:event#41 (inclusive) n=42',
+    );
+    // The seam row is the first raw row AFTER the inclusive source end. When
+    // the resume shares the source-end instant, the renderer says so inline so
+    // the coordinate disambiguates even at identical timestamps.
+    expect(rendered).toContain(
+      'raw-resumes=instance-7:event#42 @ 2026-07-11T04:43:00.000Z (first raw row) same-ms; raw tail begins at instance-7:event#42 (1 exact)',
+    );
+
+    const noSameMs = renderContinuityPackageProvenance({
+      artifact: 'rebirth-package#distinct-instant',
+      traceId: 'instance-8',
+      sourceEventCount: 4,
+      sourceFirstTimestamp: '2026-07-11T05:00:00.000Z',
+      sourceLastTimestamp: '2026-07-11T05:01:00.000Z',
+      createdTimestamp: '2026-07-11T05:02:00.000Z',
+      rawTailCount: 1,
+      rawResumeTimestamp: '2026-07-11T05:01:30.000Z',
+    }) as string;
+    // A later raw-resume instant must NOT claim a same-ms relationship.
+    expect(noSameMs).not.toContain('same-ms');
+    // But it still names the first raw row seat.
+    expect(noSameMs).toContain('(first raw row)');
   });
 
   it('fails visibly on contradictory ranges instead of fabricating coordinates', () => {
@@ -188,7 +232,7 @@ describe('chronological provenance', () => {
 
     expect(rendered).toContain('artifact=rebirth-package#same_instance_hard_epoch class=reconstructed-state');
     expect(rendered).toContain(
-      'source[canonical-epoch-tail]=instance-1:event#0..instance-1:event#41 n=42 @ 2026-07-11T04:00:00.000Z..2026-07-11T04:41:00.000Z',
+      'source[canonical-epoch-tail]=instance-1:event#0..instance-1:event#41 (inclusive) n=42 @ 2026-07-11T04:00:00.000Z..2026-07-11T04:41:00.000Z',
     );
     expect(rendered).toContain(
       'source-scope-note=lineage-sections-carry-older-per-unit-spans',
@@ -196,7 +240,7 @@ describe('chronological provenance', () => {
     expect(rendered).toContain('created=instance-1:event#43 @ 2026-07-11T04:44:00.000Z');
     expect(rendered).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
     expect(rendered).toContain(
-      'raw-resumes=instance-1:event#42 @ 2026-07-11T04:43:00.000Z (1 exact)',
+      'raw-resumes=instance-1:event#42 @ 2026-07-11T04:43:00.000Z (first raw row) (1 exact)',
     );
   });
 
@@ -229,10 +273,10 @@ describe('chronological provenance', () => {
 
     expect(rendered).not.toContain('provenance=invalid');
     expect(rendered).toContain(
-      'source[canonical-epoch-tail]=instance-1:event#0..instance-1:event#1 n=2 @ time unknown..time unknown',
+      'source[canonical-epoch-tail]=instance-1:event#0..instance-1:event#1 (inclusive) n=2 @ time unknown..time unknown',
     );
     expect(rendered).toContain('created=instance-1:event#3 @ time unknown');
-    expect(rendered).toContain('raw-resumes=instance-1:event#2 @ time unknown (1 exact)');
+    expect(rendered).toContain('raw-resumes=instance-1:event#2 @ time unknown (first raw row) (1 exact)');
   });
 
   it('makes a transient boundary notice an explicit alias of the canonical epoch', () => {
@@ -245,7 +289,7 @@ describe('chronological provenance', () => {
     expect(rendered).toContain('artifact=tail-epoch#4 class=boundary');
     expect(rendered).toContain('source=instance-1:event#canonical-source..instance-1:event#canonical-seam');
     expect(rendered).toContain('host=embedded-message-suffix representation=alias');
-    expect(rendered).toContain('raw-resumes=instance-1:event#this-message @ time unknown(2 exact)');
+    expect(rendered).toContain('raw-resumes=instance-1:event#this-message @ time unknown (first raw row)(2 exact)');
   });
 
   it('never reuses the source end-ordinal as the embedded alias creation coordinate', () => {

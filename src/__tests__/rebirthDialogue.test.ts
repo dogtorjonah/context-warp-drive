@@ -4,6 +4,7 @@ import {
   isGenuineRebirthOperatorMessage,
   isRelayGeneratedReviewWaveMessage,
   resolveRebirthDialogueHydrationLimits,
+  selectRebirthDialogueExchanges,
   selectRoleAwareRebirthDialogueWindow,
   selectRoleAwareRebirthDialogueWithBackfill,
 } from '../rebirthDialogue.ts';
@@ -124,6 +125,54 @@ describe('rebirth dialogue control-message classification', () => {
       recentAssistantMessages: 15,
       transcriptMessageBudget: 1_000,
     });
+  });
+
+  it('selects and tags newest whole exchanges with a logical-reply cap', () => {
+    const messages = [
+      { id: 'old-op', type: 'user', text: 'old question', created_at: '2026-01-01T00:00:00.000Z' },
+      { id: 'old-reply', type: 'assistant_text', text: 'old reply', created_at: '2026-01-01T00:00:01.000Z' },
+      { id: 'new-op', type: 'user', text: 'new question', created_at: '2026-01-01T00:01:00.000Z' },
+      ...['r1', 'r2', 'r3'].map((id, index) => ({
+        id,
+        type: 'assistant_text',
+        text: id,
+        created_at: `2026-01-01T00:01:0${index + 1}.000Z`,
+      })),
+      { id: 'r4', type: 'assistant_text', text: 'r4-head', created_at: '2026-01-01T00:01:04.000Z' },
+      { id: 'r4:segment-1', type: 'assistant_text', text: 'r4-tail', created_at: '2026-01-01T00:01:05.000Z' },
+      { id: 'r5', type: 'assistant_text', text: 'r5', created_at: '2026-01-01T00:01:06.000Z' },
+    ];
+
+    const selected = selectRebirthDialogueExchanges(messages, {
+      maxExchanges: 1,
+      maxRepliesPerExchange: 4,
+      backfillBudgetChars: 0,
+    });
+
+    // Old exchange is outside the newest-one floor; oldest logical reply r1
+    // drops, while the r4 segment run is kept atomically as ONE reply.
+    expect(selected.map((row) => row.id)).toEqual([
+      'new-op', 'r2', 'r3', 'r4', 'r4:segment-1', 'r5',
+    ]);
+    expect(new Set(selected.map((row) => row.exchangeId))).toEqual(new Set(['new-op']));
+  });
+
+  it('backfills only whole exchanges and tags leading assistants to a pre: exchange', () => {
+    const leading = [
+      { id: 'lead-a', type: 'assistant_text', text: 'leading reply', created_at: '2026-01-01T00:00:00.000Z' },
+      { id: 'op', type: 'user', text: 'question', created_at: '2026-01-01T00:00:01.000Z' },
+      { id: 'reply', type: 'assistant_text', text: 'answer', created_at: '2026-01-01T00:00:02.000Z' },
+    ];
+    const selected = selectRebirthDialogueExchanges(leading, {
+      maxExchanges: 1,
+      maxRepliesPerExchange: 4,
+      backfillBudgetChars: 'leading reply'.length,
+    });
+    expect(selected.map((row) => [row.id, row.exchangeId])).toEqual([
+      ['lead-a', 'pre:lead-a'],
+      ['op', 'op'],
+      ['reply', 'op'],
+    ]);
   });
 
   it('rejects relay-authored atlas-debt nudges persisted with a user role', () => {

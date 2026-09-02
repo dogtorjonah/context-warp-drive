@@ -127,7 +127,7 @@ describe('raw rebirth seed renderer', () => {
     expect(seed.startsWith('[CONTEXT REBIRTH] Lifecycle boundary: continuation for "source-agent"')).toBe(true);
     expect(seed).toContain('artifact=rebirth-package#continuation class=reconstructed-state authority=current-as-of-frontier');
     expect(seed).toContain(
-      'source[canonical-epoch-tail]=source-agent:event#0..source-agent:event#41 n=42 @ 2026-07-28T21:00:00.000Z..2026-07-28T21:41:00.000Z',
+      'source[canonical-epoch-tail]=source-agent:event#0..source-agent:event#41 (inclusive) n=42 @ 2026-07-28T21:00:00.000Z..2026-07-28T21:41:00.000Z',
     );
     expect(seed).toContain('created=source-agent:event#42 @ 2026-07-28T21:42:00.000Z');
     expect(seed).toContain('topology=raw-history>artifact>seam>none host=continuity-package');
@@ -194,7 +194,7 @@ describe('raw rebirth seed renderer', () => {
 
     expect(seed.match(new RegExp(activeRequest, 'g'))).toHaveLength(1);
     expect(seed).toContain('topology=raw-history>artifact>seam>raw-tail host=continuity-package');
-    expect(seed).toContain('raw-resumes=source-agent:event#raw-tail-start @ time unknown (1 exact)');
+    expect(seed).toContain('raw-resumes=source-agent:event#raw-tail-start @ time unknown (first raw row) (1 exact)');
     expect(seed).toContain('── Last User + AI Messages (READ FIRST) ──');
     expect(seed).toContain(`👤 LAST USER MESSAGE (active request):\n${activeRequest}`);
     expect(seed).not.toContain('active request (verbatim; sole authoritative body)');

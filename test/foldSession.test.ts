@@ -337,7 +337,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(liveObjectiveIndex).toBeGreaterThanOrEqual(0);
     expect(joined).toContain('[Chronological Provenance v1]');
     expect(joined).toContain('artifact=tail-epoch#1');
-    expect(joined).toContain('raw-resumes=?:message#3 @ time unknown (2 exact)');
+    expect(joined).toContain('raw-resumes=?:message#3 @ time unknown (first raw row) (2 exact)');
     expect(appended.messages.slice(-2)).toEqual(grown.slice(-2));
   });
 

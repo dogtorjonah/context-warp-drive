@@ -283,3 +283,161 @@ export function resolveRebirthDialogueHydrationLimits(
     transcriptMessageBudget: positiveInteger(options.transcriptMessageBudget),
   };
 }
+
+/* ------------------------------------------------------------------------
+ * Audit-3 A5/C6 (seam S2 conversation-exchange/v1): exchange-native selection.
+ *
+ * The defect: independent user/assistant quotas plus newest-first overflow let
+ * operator floors survive while their replies were evicted (the 23-hour hole:
+ * 15 operator rows with zero replies rendered). The exchange model makes the
+ * EXCHANGE the selection/eviction unit: one genuine operator row plus its
+ * material assistant replies travel together, exchanges are selected
+ * newest-first, and the renderer evicts whole exchanges oldest-first.
+ *
+ * Exchange identity (frozen S2 grammar): the exchange id is the OPERATOR
+ * row's id; leading assistant rows before any operator row form the leading
+ * exchange `pre:<first-row-id>`. Every selected row carries the tag so the
+ * assembler can forward it and the renderer can group by it; untagged legacy
+ * rows degrade to one group per row at render (never mis-tagged).
+ * --------------------------------------------------------------------- */
+
+/** Audit-3 S2: material assistant replies retained per exchange (newest K). */
+export const DEFAULT_REBIRTH_DIALOGUE_EXCHANGE_REPLY_LIMIT = 4;
+
+export interface RebirthDialogueExchangeSelectionOptions {
+  /** Newest exchanges guaranteed in the window (operator turn + its replies). */
+  readonly maxExchanges: number;
+  /** Material assistant replies retained per exchange, newest first kept. */
+  readonly maxRepliesPerExchange: number;
+  /**
+   * Authentic older exchanges admitted whole beyond the exchange floor while
+   * this source-character budget remains. Stops at the first exchange that
+   * does not fit so chronology never develops a hidden hole (same doctrine as
+   * the character backfill above).
+   */
+  readonly backfillBudgetChars: number;
+}
+
+/** Exchange tag attached to every row the exchange selector admits. */
+export interface RebirthDialogueExchangeTag {
+  readonly exchangeId: string;
+}
+
+/** Stability key for one logical streamed message (id minus `:segment-N`). */
+function rebirthDialogueMessageBaseId(id: string): string {
+  return id.replace(/:segment-\d+$/u, '');
+}
+
+/**
+ * Select the newest genuine exchanges from an ordered dialogue candidate
+ * stream and tag every admitted row with its exchange id.
+ *
+ * Membership walk is chronological: a genuine-operator row opens a new
+ * exchange; every later assistant row joins until the next operator row.
+ * Relay-authored user-role rows and non-dialogue rows never start or join an
+ * exchange (they were never dialogue). Within an exchange the operator row is
+ * always kept; replies keep the NEWEST `maxRepliesPerExchange` logical
+ * assistant messages — segment fragments of one streamed message (`:segment-N`
+ * continuation ids) count and travel as ONE logical reply so a kept reply
+ * never renders headless or tailless.
+ */
+export function selectRebirthDialogueExchanges<T extends RebirthDialogueMessageLike>(
+  messages: readonly T[],
+  options: RebirthDialogueExchangeSelectionOptions,
+): Array<T & RebirthDialogueExchangeTag> {
+  const maxExchanges = positiveInteger(options.maxExchanges);
+  const maxReplies = positiveInteger(options.maxRepliesPerExchange);
+  const backfillBudget = positiveInteger(options.backfillBudgetChars);
+  if (maxExchanges === 0) return [];
+
+  const indexed = messages.map((message, inputIndex) => ({ message, inputIndex }));
+  const chronologyKnown = indexed.every(({ message }) => sourceEpochMs(message) !== null);
+  const ordered = chronologyKnown
+    ? [...indexed].sort((left, right) => (
+        sourceEpochMs(left.message)! - sourceEpochMs(right.message)!
+        || (left.message.id ?? '').localeCompare(right.message.id ?? '')
+        || left.inputIndex - right.inputIndex
+      ))
+    : indexed;
+
+  interface Exchange {
+    readonly id: string;
+    /** Operator row first (absent on the leading `pre:` exchange), then replies. */
+    readonly operator: { message: T; inputIndex: number } | null;
+    readonly replies: Array<{ message: T; inputIndex: number }>;
+  }
+  const exchanges: Exchange[] = [];
+  const openLeadingExchange = (first: { message: T; inputIndex: number }): Exchange => {
+    const firstId = first.message.id?.trim() || `row-${first.inputIndex}`;
+    const leading: Exchange = { id: `pre:${firstId}`, operator: null, replies: [] };
+    exchanges.push(leading);
+    return leading;
+  };
+  for (const row of ordered) {
+    const type = row.message.type ?? row.message.ty ?? '';
+    const text = (row.message.text ?? row.message.tx)?.trim() ?? '';
+    if (!text) continue;
+    if (type === 'user') {
+      // Relay-authored user-role rows are not dialogue and never consume
+      // exchange structure (same predicate as the role-window helpers).
+      if (!isGenuineRebirthOperatorMessage(text)) continue;
+      exchanges.push({
+        id: row.message.id?.trim() || `row-${row.inputIndex}`,
+        operator: row,
+        replies: [],
+      });
+      continue;
+    }
+    if (type !== 'assistant_text') continue;
+    const current = exchanges.length > 0 ? exchanges[exchanges.length - 1]! : openLeadingExchange(row);
+    current.replies.push(row);
+  }
+
+  // Per-exchange content: the operator row plus the newest K logical replies.
+  // A fragment run (`base`, `base:segment-1`, …) is one logical reply and is
+  // kept or dropped as a run.
+  const keptRows = (exchange: Exchange): Array<{ message: T; inputIndex: number }> => {
+    if (maxReplies <= 0) return exchange.operator ? [exchange.operator] : [];
+    const runs: Array<Array<{ message: T; inputIndex: number }>> = [];
+    for (const reply of exchange.replies) {
+      const baseId = rebirthDialogueMessageBaseId(reply.message.id?.trim() || `row-${reply.inputIndex}`);
+      const previous = runs[runs.length - 1];
+      const previousBaseId = previous
+        ? rebirthDialogueMessageBaseId(previous[0]!.message.id?.trim() || `row-${previous[0]!.inputIndex}`)
+        : null;
+      if (previous && previousBaseId === baseId) {
+        previous.push(reply);
+      } else {
+        runs.push([reply]);
+      }
+    }
+    const kept = runs.slice(-maxReplies).flat();
+    return exchange.operator ? [exchange.operator, ...kept] : kept;
+  };
+
+  // Newest `maxExchanges` exchanges form the guaranteed floor; older exchanges
+  // backfill whole while the character budget remains (exchange-granular, so a
+  // backfilled operator row always brings its material replies along).
+  const floorStart = Math.max(0, exchanges.length - maxExchanges);
+  const selected = new Set<number>();
+  for (let index = floorStart; index < exchanges.length; index += 1) selected.add(index);
+  let admittedChars = 0;
+  for (let index = floorStart - 1; index >= 0; index -= 1) {
+    const rows = keptRows(exchanges[index]!);
+    if (rows.length === 0) continue;
+    const chars = rows.reduce((total, row) => total + ((row.message.text ?? row.message.tx) ?? '').trim().length, 0);
+    if (admittedChars + chars > backfillBudget) break;
+    selected.add(index);
+    admittedChars += chars;
+  }
+
+  const out: Array<T & RebirthDialogueExchangeTag> = [];
+  for (let index = 0; index < exchanges.length; index += 1) {
+    if (!selected.has(index)) continue;
+    const exchange = exchanges[index]!;
+    for (const row of keptRows(exchange)) {
+      out.push({ ...row.message, exchangeId: exchange.id });
+    }
+  }
+  return out;
+}

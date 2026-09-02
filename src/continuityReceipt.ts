@@ -603,11 +603,17 @@ function buildReceiptLiveState(args: {
   // resolved and the rail is one refresh from 'complete' — a closeout
   // reminder, not an open review demand. A genuine open demand is a
   // needs_review STEP (which forces the rail into 'blocked', never 'review').
+  // A rail whose state machine reached 'complete' terminalizes its recorded
+  // review checkpoints (terminal done-ACKs on the review gate carry the
+  // verdict), so it renders review='complete' — never 'none' (audit-3 A10:
+  // an independently reviewed, complete rail must not read as unreviewed).
   const reviewState = rail?.activeStep?.status === 'needs_review'
     ? 'needs_review'
     : rail?.state === 'review'
       ? 'all-resolved-awaiting-closeout'
-      : 'none';
+      : rail?.state === 'complete'
+        ? 'complete'
+        : 'none';
   const blockers = rail?.activeStep?.status === 'blocked' ? [rail.activeStep.title] : [];
   const frontier = parts.rawTailFrontier ?? (parts.canonicalRange
     ? {
@@ -844,8 +850,10 @@ const MODAL_FUTURE_MARKER = /\b(?:should|will|would|could|once|until|if|plan(?:n
  * bounds display). This is THE scan — both the receipt assembler and any legacy
  * surface share it, so validation state cannot diverge.
  */
-export function findLatestValidationFact(texts: readonly string[]): string | undefined {
-  return findLatestValidationFactWithSource(texts)?.fact;
+export function findLatestValidationFact(
+  sources: readonly (string | ContinuityReceiptValidationSource)[],
+): string | undefined {
+  return findLatestValidationFactWithSource(sources)?.fact;
 }
 
 interface ContinuityValidationFactMatch {

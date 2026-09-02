@@ -379,6 +379,44 @@ describe('buildContinuityReceipt (typed assembly)', () => {
     });
     expect(receipt.disagreements).toHaveLength(0);
   });
+
+  test('a complete rail renders rail-review-state=complete, never none (audit-3 A10)', () => {
+    // An independently reviewed rail that reached the terminal 'complete' state
+    // has closed its review gate via terminal done-ACKs; the receipt must never
+    // present it as unreviewed ('none').
+    const complete = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      rail: { ...TYPED_RAIL, state: 'complete', doneSteps: TYPED_RAIL.totalSteps, percentComplete: 100 },
+    });
+    expect(complete.liveState?.review.value?.state).toBe('complete');
+    // The active rail with no review signal (needs_review step absent, not in a
+    // review/complete state) stays 'none' — the honest open case.
+    const active = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      rail: { ...TYPED_RAIL, state: 'active' },
+    });
+    expect(active.liveState?.review.value?.state).toBe('none');
+  });
+
+  test('a needs_review step and the resolved review state keep their semantics', () => {
+    const needsReview = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      rail: {
+        ...TYPED_RAIL,
+        activeStep: { ...TYPED_RAIL.activeStep!, status: 'needs_review' },
+      },
+    });
+    expect(needsReview.liveState?.review.value?.state).toBe('needs_review');
+    const resolved = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      rail: { ...TYPED_RAIL, state: 'review' },
+    });
+    expect(resolved.liveState?.review.value?.state).toBe('all-resolved-awaiting-closeout');
+  });
 });
 
 describe('continuityReceiptFromProse (legacy fallback)', () => {

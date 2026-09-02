@@ -218,7 +218,7 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     const hash = createHash('sha256').update(first.text, 'utf8').digest('hex');
     // Frozen byte-exact hash of the full render. Update deliberately only when
     // the renderer's formatting/honesty output intentionally changes.
-    expect(hash).toBe('cda3207f426dfbc01642624c6c59ff90496f5a2cd4eb9443ba8f9bc9d4176eb2');
+    expect(hash).toBe('c88407e7747e8f0bb9c82948261b35e32b0c01b241f00fb93ce1b8e4b078af11');
   });
 
   it('renders every section into the framed output', () => {
@@ -276,8 +276,8 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
       lifeLedger: base.lifeLedger,
     });
     const { text } = renderRebirthPackageV6WithReport(withReviewDemand, { packageBudget: 150_000 });
-    expect(text).toContain('schema=rebirth-package-v7/v1 · render=v6-sections · capture-naming=v2');
-    expect(text).toContain('capture-partial-lanes=active-edit-delta:not-requested · class-vocabulary=horizon|cap|store|not-requested|unknown');
+    expect(text).toContain('versions=model:rebirth-package-v7/v1 · render:v6-sections · capture-id:naming-v2 · provenance:v1 · frame:rebirth-v6-section');
+    expect(text).toContain('capture-partial-lanes=active-edit-delta:not-requested · class-vocabulary=horizon|cap|store|merge|not-requested|unknown');
     expect(text).toContain('vault-newest=2026-09-01T20:47:52.476Z · active-request=2026-09-01T20:47:52.476Z');
     expect(text).toContain('- rail-review-state=independent correction review pending · source=review:bench');
     expect(text).toContain('[EXACT ACTIVE REQUEST · 48 chars · source=msg_active · source-time=2026-09-01T20:47:52.476Z · status=exact]');
@@ -391,7 +391,8 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     });
     const { text } = renderRebirthPackageV6WithReport(withHandle, { packageBudget: 150_000 });
     expect(text).toContain('capture_id="c1" mode="unified"');
-    expect(text).toContain('recover=atlas_agent_diff');
+    expect(text).toContain('- R1 = atlas_agent_diff instance_id="inst-a" capture_id="c1" mode="unified"');
+    expect(text).toContain('recover=R1');
   });
 
   it('keeps final text + envelope within the declared budget even with lint findings', () => {

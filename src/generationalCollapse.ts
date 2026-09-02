@@ -208,7 +208,65 @@ export function formatCollapseRollup(
   return `[ROLLUP kind=${kinds.join('+')} n=${units.length} span=${span} recover=${recover}]`;
 }
 
-/** T2 era block: one paragraph per contiguous era of demoted units. */
+/**
+ * T2 era block: one paragraph per contiguous era of demoted units. The era
+ * header carries a bounded topical hint (audit-3 C10) so an opaque id-only
+ * digest ("operator message msg_… · … 45 more") still tells a successor WHAT
+ * the era was about. Topics derive ONLY from each unit's claim/digest title
+ * text — never from verbatim bodies — and never fabricate when the claims are
+ * template stubs (operator/life rows carry no content words).
+ */
+const ERA_TOPIC_LIMIT = 3;
+const ERA_BASENAME_RE = /([A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:ts|tsx|js|mjs|cjs|json|md|mdx|sql|css|html|sh|py))\b/gu;
+const ERA_CONTENT_WORD_RE = /[A-Za-z][A-Za-z-]{3,}/gu;
+const ERA_NOISE_LEAD = new Set([
+  'operator', 'message', 'episode', 'life', 'boundary', 'rebirth', 'unknown',
+  'with', 'from', 'that', 'this', 'have', 'were', 'been', 'into', 'after',
+]);
+
+function eraTopics(units: readonly CollapseUnit[]): string[] {
+  const topics: string[] = [];
+  const seen = new Set<string>();
+  // A row is content-bearing only when its claim/digest carries a real title,
+  // not an auto-generated provenance stub. Operator rows emit `operator message
+  // msg_<id>` and life rows `life rebirth:<id> · span=…` — neither is topical.
+  const isStub = (unit: CollapseUnit): boolean => {
+    const claim = (unit.claim ?? '').trim();
+    if (/^(operator|life|episode)\s+message\s+msg_/u.test(claim)) return true;
+    if (/^life\s+rebirth:[0-9a-f-]+/u.test(claim)) return true;
+    if (unit.kind === 'life' || unit.kind === 'operator') return true;
+    return false;
+  };
+  const sources = units
+    .filter((unit) => !isStub(unit))
+    .slice(0, 6)
+    .flatMap((unit) => [unit.claim, unit.digest].filter(
+      (value): value is string => typeof value === 'string' && value.length > 0,
+    ));
+  if (sources.length === 0) return topics;
+  // Path basenames first: the highest-signal topic for code-carrying eras.
+  for (const source of sources) {
+    for (const match of source.matchAll(ERA_BASENAME_RE)) {
+      const basename = match[1].toLowerCase();
+      if (seen.has(basename) || topics.length >= ERA_TOPIC_LIMIT) continue;
+      seen.add(basename);
+      topics.push(match[1]);
+    }
+    if (topics.length >= ERA_TOPIC_LIMIT) return topics;
+  }
+  // Content-word fallback over the same title sources.
+  for (const source of sources) {
+    for (const match of source.matchAll(ERA_CONTENT_WORD_RE)) {
+      const word = match[0].toLowerCase();
+      if (ERA_NOISE_LEAD.has(word) || word.startsWith('msg_') || seen.has(word)) continue;
+      if (topics.length >= ERA_TOPIC_LIMIT) return topics;
+      seen.add(word);
+      topics.push(match[0]);
+    }
+  }
+  return topics;
+}
+
 export function formatCollapseEraBlock(units: readonly CollapseUnit[]): string {
   const first = units[0];
   const times = units
@@ -220,9 +278,11 @@ export function formatCollapseEraBlock(units: readonly CollapseUnit[]): string {
     : 'unknown..unknown';
   const samples = units.slice(0, 3).map((unit) => `· ${oneLine(unit.claim, 140)}`);
   const chars = units.reduce((total, unit) => total + unit.verbatim.length, 0);
+  const topics = eraTopics(units);
+  const topicsClause = topics.length > 0 ? ` · topics=${topics.join(',')}` : '';
   return [
     `[ERA kind=${first.kind} key=${first.eraKey ?? first.kind} span=${span}`
-    + ` n=${units.length} verbatim-chars-total=${chars} recover=${first.recover}]`,
+    + ` n=${units.length} verbatim-chars-total=${chars}${topicsClause} recover=${first.recover}]`,
     ...samples,
     units.length > samples.length ? `· … ${units.length - samples.length} more in this era` : '',
   ].filter(Boolean).join('\n');
@@ -349,11 +409,13 @@ function renderState(state: RenderState, rangeRecover: string | null | undefined
 }
 
 /**
- * Demotion order: unknown-time units first (they can claim no recency), then
- * the oldest known-time unit. Units never skip a tier in one step (except the
- * B7 mint-gate split where an unverified unit skips the T3 receipt), and a
- * unit stops at its effective floor: the B7 recency floor (newest-K lives never
- * below t1) or the mint-gate floor (t4 rollup) otherwise.
+ * Demotion order: unknown-time units first at the same tier (they can claim no
+ * recency), then breadth-first by tier — the oldest demotable unit at the
+ * lowest populated tier wins (audit-3 B6 ladder; see nextDemotionCandidate).
+ * Units never skip a tier in one step (except the B7 mint-gate split where an
+ * unverified unit skips the T3 receipt), and a unit stops at its effective
+ * floor: the B7 recency floor (newest-K lives never below t1) or the mint-gate
+ * floor (t4 rollup) otherwise.
  */
 function effectiveFloor(unit: CollapseUnit, state: RenderState): CollapseTier {
   if (state.recencyProtectedIds.has(unit.id)) {
@@ -369,14 +431,51 @@ function effectiveFloor(unit: CollapseUnit, state: RenderState): CollapseTier {
   return floorTier(unit);
 }
 
-function nextDemotionCandidate(state: RenderState): CollapseUnit | null {
-  for (const unit of state.unknown) {
-    const tier = state.tiers.get(unit.id) ?? 't0';
-    if (tier !== effectiveFloor(unit, state)) return unit;
+/**
+ * Demotion order (audit-3 B6). Breadth-first across tiers: the selected unit is
+ * the oldest DEMOTABLE unit at the LOWEST populated tier (demotable = current
+ * tier above effectiveFloor), so a whole cohort moves one tier before any unit
+ * crosses a second — the old depth-first let ONE unit cascade t0→t4 while the
+ * other four tiers stayed empty on real specimen shapes (351 episodes/5k and
+ * 145 lives/10k both collapsed to t0 + t4 only).
+ *
+ * The audit-2 B7 recency floor (newest-K lives/episodes never demote below
+ * t1) is honored as a genuine LAST RESORT: a recency-protected head unit is
+ * demoted ONLY when NO unprotected unit anywhere is still demotable. This
+ * keeps the newest per-row verbatim head visible for as long as ANY
+ * unprotected older unit can still absorb pressure — a breadth-first sweep
+ * must not spend the protected head's bytes while old units deeper in the
+ * ladder could free the same capacity first. Unknown-time units still demote
+ * before known-time units (they claim no recency); oldest-first within a tier.
+ */
+function firstDemotableAt(pool: readonly CollapseUnit[], tier: CollapseTier, state: RenderState, excludeProtected: boolean): CollapseUnit | null {
+  for (const unit of pool) {
+    const current = state.tiers.get(unit.id) ?? 't0';
+    if (current !== tier) continue;
+    if (current === effectiveFloor(unit, state)) continue;
+    if (excludeProtected && state.recencyProtectedIds.has(unit.id)) continue;
+    return unit;
   }
-  for (const unit of state.demotionKnown) {
-    const tier = state.tiers.get(unit.id) ?? 't0';
-    if (tier !== effectiveFloor(unit, state)) return unit;
+  return null;
+}
+
+/** Age-vector candidates honoring breadth-first + recency-floor-last-resort. */
+function nextDemotionCandidate(state: RenderState): CollapseUnit | null {
+  // 1) If any unprotected unit is demotable at any tier, breadth-first across
+  //    tiers selects it — protected heads are never spent while unprotected
+  //    pressure remains absorbable anywhere up the ladder.
+  for (const tier of COLLAPSE_TIERS) {
+    const candidate = firstDemotableAt(state.unknown, tier, state, true)
+      ?? firstDemotableAt(state.demotionKnown, tier, state, true);
+    if (candidate) return candidate;
+  }
+  // 2) Only when every unprotected unit has reached its effective floor may a
+  //    protected head demote (down to its t1 floor) to absorb residual
+  //    pressure — the audit-2 A14 floor-release path.
+  for (const tier of COLLAPSE_TIERS) {
+    const candidate = firstDemotableAt(state.unknown, tier, state, false)
+      ?? firstDemotableAt(state.demotionKnown, tier, state, false);
+    if (candidate) return candidate;
   }
   return null;
 }

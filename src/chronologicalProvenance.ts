@@ -526,6 +526,12 @@ function sourceText(span: ChronologicalSpan): string {
     && endExclusive?.index !== undefined
     && span.start.unit === endExclusive.unit
     && (span.start.traceId ?? '') === (endExclusive.traceId ?? '');
+  // Audit-3 B15: a numeric source span is END-INCLUSIVE — the coordinate that
+  // follows the last included source row (endExclusive) is shown as its
+  // 1-based last member and the range is labelled `(inclusive)` so a reader
+  // never mistakes the seam for an open upper bound. `empty@` stays a point
+  // (a span that contains nothing); a lone endExclusive (no numeric start or
+  // mismatched frame) stays its abstract coordinate.
   const end = numericRange && endExclusive.index! > span.start.index!
     ? pointCoordinate({ ...endExclusive, index: endExclusive.index! - 1 })
     : numericRange && endExclusive.index === span.start.index
@@ -535,7 +541,10 @@ function sourceText(span: ChronologicalSpan): string {
   const firstTime = span.start.timestamp;
   const lastTime = span.lastTimestamp ?? span.endExclusive?.timestamp;
   const time = ` @ ${firstTime ?? 'time unknown'}..${lastTime ?? 'time unknown'}`;
-  return `${start}..${end}${count}${time}`;
+  const inclusiveWord = numericRange && endExclusive.index! > span.start.index!
+    ? ' (inclusive)'
+    : '';
+  return `${start}..${end}${inclusiveWord}${count}${time}`;
 }
 
 function sourceFieldName(envelope: ChronologicalProvenanceEnvelope): string {
@@ -544,6 +553,53 @@ function sourceFieldName(envelope: ChronologicalProvenanceEnvelope): string {
 
 function sourceScopeNote(envelope: ChronologicalProvenanceEnvelope): string {
   return envelope.sourceScopeNote ? `source-scope-note=${envelope.sourceScopeNote}` : '';
+}
+
+/**
+ * Audit-3 B15: render the raw-tail resume coordinate with EXPLICIT seat labels
+ * so a reader can never confuse the source's last included row with the first
+ * raw row that follows it. The source end is END-INCLUSIVE (already labelled
+ * `(inclusive)` in sourceText); the seam raw row is the FIRST RAW ROW. When an
+ * authoritative timestamp is present AND equals the source-end instant (the
+ * audit's exact ambiguity — provenance mints the request row at the same ms as
+ * the source frontier), add a `same-ms` note that names the ordinal so
+ * inclusivity is unambiguous even at identical timestamps.
+ *
+ * The pre-existing timestamp/exact-count grammar is preserved byte-identically
+ * (` @ <time>` retains an explicit `time unknown` — GOD RULE 8 — and the
+ * `(N exact)` clause keeps its exact spacing per render form). Only the
+ * additive seat/same-ms labels are new, so stored provenance lines from before
+ * audit-3 keep rendering unchanged apart from the two additive safety labels.
+ */
+function rawResumesText(
+  envelope: ChronologicalProvenanceEnvelope,
+  opts: { singleLine?: boolean } = {},
+): string {
+  if (!envelope.rawResumesAt) return 'none (0 exact)';
+  const resume = envelope.rawResumesAt;
+  const coordinate = pointCoordinate(resume);
+  const timestamp = pointTimestamp(resume);
+  // The seam raw row is always the first row after the inclusive source end,
+  // whatever ordinal a particular builder uses for it (some use endExclusive,
+  // others endExclusive+1); the label names its SEAT, not a guess at a fixed
+  // +1 offset.
+  const seatLabel = ' (first raw row)';
+  // Same-ms detection: the resume row may carry the same source instant as the
+  // last source row (both stamped at the boundary seam). Add an explicit marker
+  // that names the resume ordinal so identical timestamps cannot be mistaken
+  // for a duplicate seat.
+  const lastTime = envelope.source.lastTimestamp
+    ?? envelope.source.endExclusive?.timestamp;
+  let extra = seatLabel;
+  if (lastTime && resume.timestamp && lastTime === resume.timestamp) {
+    extra = `${seatLabel} same-ms; raw tail begins at ${coordinate}`;
+  }
+  // Preserve the prior spacing contract per render form: multi-line keeps a
+  // space before `(N exact)`; the compact (single-line) form historically had
+  // none (`…(2 exact)`). Both gain the additive seat label + same-ms note.
+  const close = opts.singleLine ? '' : ' ';
+  const exact = `${close}(${envelope.topology.rawTailCount} exact)`;
+  return `${coordinate}${timestamp}${extra}${exact}`;
 }
 
 function supersessionText(envelope: ChronologicalProvenanceEnvelope): string {
@@ -611,9 +667,7 @@ export function renderChronologicalProvenance(
     // Absent authority is 'unknown'; only a builder may assert 'operator-message'.
     ? `objective-provenance=${envelope.liveObjectiveProvenance} objective-source=${envelope.liveObjectiveSource ?? (objective ? 'unknown' : 'none')}`
     : '';
-  const rawFrontier = envelope.rawResumesAt
-    ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)} (${envelope.topology.rawTailCount} exact)`
-    : `none (0 exact)`;
+  const rawFrontier = rawResumesText(envelope);
   const supersession = supersessionText(envelope);
   return [
     CHRONOLOGICAL_PROVENANCE_PREFIX,
@@ -638,9 +692,11 @@ export function renderChronologicalProvenanceCompact(
 ): string | null {
   const validation = validateChronologicalProvenance(envelope);
   if (!validation.valid) return renderInvalidChronologicalProvenance(envelope, validation.errors);
-  const rawFrontier = envelope.rawResumesAt
-    ? `${pointCoordinate(envelope.rawResumesAt)}${pointTimestamp(envelope.rawResumesAt)}(${envelope.topology.rawTailCount} exact)`
-    : 'none';
+  // Audit-3 B15: the compact form reuses the same raw-frontier label (with the
+  // single-line spacing variant) so the `(first raw row)`/`same-ms; raw tail
+  // begins at …` disambiguation is identical on multi-line and single-line
+  // provenance artifacts.
+  const rawFrontier = rawResumesText(envelope, { singleLine: true });
   const scopeNote = sourceScopeNote(envelope);
   return `${CHRONOLOGICAL_PROVENANCE_PREFIX} artifact=${envelope.artifact} class=${envelope.contentClass} ${sourceFieldName(envelope)}=${sourceText(envelope.source)}${scopeNote ? ` ${scopeNote}` : ''} created=${pointCoordinate(envelope.transformedAt)}${pointTimestamp(envelope.transformedAt)} authority=${envelope.authority} supersession=${supersessionText(envelope)}${chronologicalEnvelopeOriginField(envelope, true)} topology=${envelope.topology.previous}>artifact>${envelope.topology.next} host=${envelope.topology.host} representation=${envelope.topology.representation} raw-resumes=${rawFrontier}`;
 }

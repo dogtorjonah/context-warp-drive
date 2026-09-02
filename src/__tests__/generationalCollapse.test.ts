@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   adaptiveBackfill,
   collapseUnits,
+  formatCollapseEraBlock,
   formatCollapseReceipt,
   formatCollapseRollup,
   type CollapseUnit,
@@ -79,8 +80,15 @@ describe('generational collapse', () => {
     }
     // No unit may mint a t3 receipt.
     expect(result.text).not.toContain('[RECEIPT');
-    // The rollup is the sanctioned floor landing for unverified units.
-    expect(result.text).toContain('[ROLLUP');
+    // Audit-3 B6: the breadth-first ladder demotes whole cohorts one tier at a
+    // time, so under a 200-char cap the 8 content-light units may come to rest
+    // at t1 (digest) without ever reaching a t4 rollup — that is the intended
+    // fix (tiers spread; the old depth-first walk forced one cascading unit to
+    // t4). What must hold: no unpublished digest/tier overflows the cap and no
+    // t3 receipt is minted for an unverified unit.
+    expect(result.chars).toBeLessThanOrEqual(200);
+    expect(result.tierCounts.t1 + result.tierCounts.t2).toBeGreaterThan(0);
+    expect(result.tierCounts.t3).toBe(0);
   });
 
   it('quarantines unknown-time units and demotes them before known-time units', () => {
@@ -207,6 +215,88 @@ describe('generational collapse', () => {
     );
     expect(outcome.grants[0].granted).toBe(0);
     expect(outcome.grants[0].result.complete).toBe(true);
+  });
+
+  describe('breadth-first tier ladder (audit-3 B6)', () => {
+    // Specimen shapes: 351 episodes / 5k cap and 145 lives / 10k cap collapsed
+    // only t0 + t4 because nextDemotionCandidate depth-first cascaded the one
+    // oldest unit through every tier. The ladder must demote whole cohorts one
+    // tier at a time: every demotable t0→t1 before any t1→t2.
+    const makeVerbatim = (id: string): CollapseUnit => ({
+      id,
+      sourceAt: '2026-08-02T00:00:00.000Z',
+      kind: 'episode',
+      verbatim: `[episode ${id}] ${'body '.repeat(300)}`.trim(),
+      digest: `- ${id} digest`,
+      eraKey: '2026-08-02',
+      claim: `episode ${id}: some long-running claim about ${id}`,
+      recover: `tap_instance_messages action="recent" target_instance_id="x"`,
+      sha256: 'a'.repeat(64),
+      verified: true,
+    });
+    // Give every unit a distinct sourceAt so demotion-order tie-breaks are
+    // deterministic oldest-first (compareUnits), while preserving the
+    // immutable CollapseUnit contract.
+    const shape351 = Array.from({ length: 351 }, (_, i) => ({
+      ...makeVerbatim(`e${i}`),
+      sourceAt: new Date(Date.UTC(2026, 5, 1 + i)).toISOString(),
+    }));
+
+    it('populates at least 3 tiers (t1 and t2 non-zero) for a 351-unit chapter shape under 5k', () => {
+      const result = collapseUnits({ units: shape351, maxChars: 5_000, renderOrder: 'newest_first' });
+      expect(result.chars).toBeLessThanOrEqual(5_000);
+      // Breadth-first means digest+era cohorts form before the deepest unit
+      // reaches its floor; a depth-first walk would leave tiers 1-3 empty.
+      expect(result.tierCounts.t1).toBeGreaterThan(0);
+      expect(result.tierCounts.t2).toBeGreaterThan(0);
+    });
+
+    it('demotes the whole lowest population before the next tier (no single-unit cascade)', () => {
+      // 12 units, cap sized so roughly the oldest cohort must demote but a
+      // depth-first cascade would drive ONE unit all the way to t4 first.
+      const units = Array.from({ length: 12 }, (_, i) => ({
+        ...makeVerbatim(`s${i}`),
+        sourceAt: new Date(Date.UTC(2026, 5, 1 + i)).toISOString(),
+      }));
+      const result = collapseUnits({ units, maxChars: 2_400, renderOrder: 'newest_first' });
+      // t1 populated and t4 NOT populated proves every demotion stopped at t1
+      // (breadth) rather than one unit cascading to the floor (depth).
+      expect(result.tierCounts.t1).toBeGreaterThan(0);
+      expect(result.tierCounts.t4).toBe(0);
+    });
+  });
+
+  describe('era topical hint (audit-3 C10)', () => {
+    it('annotates an era header with distinct path basenames when era claims carry them', () => {
+      const units = [
+        unit({ id: 'u0', kind: 'episode', sourceAt: '2026-07-13T00:00:00.000Z',
+          claim: 'episode 1: touched rebirthPackageV6.ts and generationalCollapse.ts',
+          digest: 'episode 1: touched rebirthPackageV6.ts and generationalCollapse.ts' }),
+        unit({ id: 'u1', kind: 'episode', sourceAt: '2026-07-13T00:01:00.000Z',
+          claim: 'episode 2: touched rebirthPackageV6.ts and foldTerms.ts',
+          digest: 'episode 2: touched rebirthPackageV6.ts and foldTerms.ts' }),
+      ];
+      const era = formatCollapseEraBlock(units);
+      // Basenames are the highest-signal topic; the hint must surface the
+      // distinct ones up to ERA_TOPIC_LIMIT and stay append-only/parseable.
+      expect(era).toContain('[ERA kind=episode');
+      expect(era).toContain('rebirthPackageV6.ts');
+      expect(era).toContain('generationalCollapse.ts');
+      expect(era).toContain('recover=');
+    });
+
+    it('never fabricates a topic from template-stub claims (operator/life rows)', () => {
+      const units = [
+        unit({ id: 'm0', kind: 'operator', claim: 'operator message msg_abc', digest: 'operator message msg_abc' }),
+        unit({ id: 'm1', kind: 'operator', claim: 'operator message msg_def', digest: 'operator message msg_def' }),
+      ];
+      const era = formatCollapseEraBlock(units);
+      expect(era).toContain('[ERA kind=operator');
+      // msg_ ids and operator/message are noise-led; no content word is
+      // invented from them — the hint clause stays absent.
+      expect(era).not.toContain('topics=msg_');
+      expect(era).not.toContain('topics=operator');
+    });
   });
 
   it('releases the recency floor only after every unprotected unit hits its floor (audit-2 A14 gate)', () => {

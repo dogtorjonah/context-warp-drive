@@ -185,11 +185,46 @@ export interface RebirthPackageV6NowCard {
      * single `repositoryState` string when present.
      */
     readonly repositories?: readonly RebirthPackageV6RepositoryState[];
-    readonly ownedLiveChildren: readonly { readonly id: string; readonly name: string }[];
+    /**
+     * One spawn/parent-owned child instance at capture (audit-2 A2 → audit-3
+     * A2 owned-children/v1). A legacy relay-native build feeds one flat
+     * `{id,name}` child per legacy delegated row; when the capture supplies the
+     * richer status facts, live/hibernated/done counts and teardown-pending
+     * derive from them. All fields optional + additive — a `{id,name}` row is
+     * still valid and renders byte-identically to a retained legacy package.
+     */
+    readonly ownedLiveChildren: readonly {
+      readonly id: string;
+      readonly name: string;
+      /** Runtime status at capture. Absent on legacy parentId rows. */
+      readonly status?: string | null;
+      readonly engine?: string | null;
+      readonly model?: string | null;
+    }[];
     readonly squad: string | null;
-    readonly rooms: readonly string[];
+    /**
+     * Current room memberships at capture. A coordination row may carry source
+     * chronology — the caller's real join time (`sourceTime`) and the snapshot
+     * observation stamp (`observedAt`) are distinct (audit-3 A9); assembly may
+     * mark a room stale when the snapshot recorded no activity within 24h
+     * (`staleSince`, audit-3 B16). All optional: a flat string is a legacy
+     * membership name and renders unchanged.
+     */
+    readonly rooms: readonly (string | RebirthPackageV6RoomMeta)[];
     readonly source: RebirthPackageV6SourceRef;
   };
+}
+
+/** Additive per-room metadata for ops.rooms (audit-3 A9/B16). */
+export interface RebirthPackageV6RoomMeta {
+  readonly name: string;
+  readonly id?: string | null;
+  /** Authoritative source time of THIS caller's join, when the store knows it. */
+  readonly sourceTime?: string | null;
+  /** Snapshot-observation stamp (membership read), distinct from sourceTime. */
+  readonly observedAt?: string | null;
+  /** Set when the room showed no recent activity (>24h) at the snapshot. */
+  readonly staleSince?: string | null;
 }
 
 export interface RebirthPackageV6RuntimeModelSnapshot {
@@ -273,8 +308,22 @@ export interface RebirthPackageV6BoundaryAndActiveTask {
    * rendering nothing rather than an invented value.
    */
   readonly lifeFacts?: {
+    /**
+     * Audit-3 A12 (boundary-trigger/v1): the trigger of THIS capture's boundary.
+     * Populated from the request `boundary {trigger, requestedAt}` when the
+     * builder forwarded it — never the newest-LEDGER row's trigger (which is
+     * the predecessor, exposed separately as `predecessorBoundary`). Absent
+     * (legacy request without the field) renders `boundary-trigger=unknown`,
+     * never the ledger's. Audit-2 A24 semantics preserved: the predecessor life
+     * identity rides `predecessorLifeId`.
+     */
     readonly boundaryTrigger?: string | null;
+    /** Audit-2 A24: the durable predecessor life artifact id. */
     readonly predecessorLifeId?: string | null;
+    /** Audit-3 A12: the NEWEST-LEDGER-life trigger (the predecessor boundary),
+     *  emitted separately from THIS boundary's `boundaryTrigger`. Absent on
+     *  legacy models and when no known-time ledger life exists. */
+    readonly predecessorBoundary?: string | null;
     readonly predecessorMaterialOutput?: 'yes' | 'no' | null;
     readonly lastMaterialAssistantLifeId?: string | null;
     /**
@@ -307,6 +356,45 @@ export interface RebirthPackageV6BoundaryAndActiveTask {
     readonly packageBuildMs?: number | null;
     /** Legacy alias retained so persisted pre-A17 artifacts stay valid. */
     readonly builtMs?: number | null;
+    /**
+     * Audit-3 B4/C3: repo HEAD of the building process's cwd (sidecar repo root
+     * or relay worker root), `git rev-parse --short HEAD` bounded read; `unknown`
+     * when the read failed or didn't run. Answers "is the committed code live"
+     * from the artifact alone.
+     */
+    readonly gitSha7?: string | null;
+    /**
+     * Audit-3 B4/C3: sidecar process boot instant (ISO). Present when a sidecar
+     * actually built the package (worker pool or inline); absent on the relay
+     * worker fallback / relay main thread. A sidecar booted BEFORE the current
+     * repo HEAD commit never mislabels a stale process as fresh.
+     */
+    readonly sidecarBootedAt?: string | null;
+    /**
+     * Audit-3 B4/C3: relay process boot instant (ISO), always present — a rebirth
+     * originates on the relay, and a relay booted before its own active code was
+     * committed is exactly the "audit-2 code isn't live yet" case the artifact
+     * must expose.
+     */
+    readonly relayBootedAt?: string | null;
+    /**
+     * Audit-3 B5: relay-side request-preparation stage timings (parallel draws +
+     * serial repo probe + assembly), additive and optional; rendered as a stage
+     * list that reconciles to requestPrep.totalMs with an explicit other=.
+     */
+    readonly requestPrep?: {
+      readonly totalMs: number;
+      readonly snapshotMs?: number | null;
+      readonly frontierMs?: number | null;
+      readonly builderSourceMs?: number | null;
+      readonly executionStateMs?: number | null;
+      readonly atlasLandedMs?: number | null;
+      readonly repoStateMs?: number | null;
+      readonly parallelMaxMs?: number | null;
+      readonly otherMs?: number | null;
+    } | null;
+    /** Audit-3 B5: request→capture wall in ms (derived by the relay). */
+    readonly requestToCaptureMs?: number | null;
   } | null;
 }
 
@@ -426,7 +514,17 @@ export interface RebirthPackageV6ActiveEditDelta {
 export interface RebirthPackageV6CognitiveArtifact {
   readonly provenanceId: string;
   readonly sourceAt: string | null;
-  readonly kind: 'decision' | 'discovery' | 'hazard' | 'question' | 'result' | 'flow';
+  /** Registryglyph kind. `active_request` is S5 (audit-3 B7): a 🧭 continuity
+   *  claim is an observation, never an instruction — so it is never painted as
+   *  a `decision`. Additive: persisted v7 models carrying only the pre-S5
+   *  kinds stay valid. */
+  readonly kind: 'decision' | 'discovery' | 'hazard' | 'question' | 'result' | 'flow' | 'active_request';
+  /** S5 (audit-3 B1): how this row earned admission. `lineage-floor` = kept
+   *  only by the per-lineage recency floor, not by intrinsic currency — the
+   *  renderer may label it kept-by=lineage-floor. `required-overlay` = a
+   *  deliberately overlaid requirement. Absent = intrinsically current,
+   *  ordinary admission. Additive; persisted rows stay valid. */
+  readonly retention?: 'lineage-floor' | 'required-overlay';
   readonly text: string;
   readonly authority: string;
   readonly supersededBy: string | null;
@@ -500,6 +598,15 @@ export interface RebirthPackageV6ConversationRow {
    * Absent on ordinary single-row messages and persisted legacy rows.
    */
   readonly segmentOffsets?: readonly number[];
+  /**
+   * Audit-3 A5/C6 (exchange grouping): the operator row id of the exchange
+   * this row belongs to. The renderer selects/evicts WHOLE exchanges
+   * (operator row + its material assistant replies) by this id so an operator
+   * floor never survives without its reply (the audit-3 23-hour-hole defect).
+   * Additive + optional: legacy rows and pre-exchange captures carry no tag and
+   * are grouped by provenance fallback (single-row base), never mis-tagged.
+   */
+  readonly exchangeId?: string;
 }
 
 export interface RebirthPackageV6RecoveryHandle {
@@ -765,6 +872,106 @@ export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
 export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 150_000;
 
 /**
+ * Audit-3 C1: phase-aware section budgets.
+ *
+ * The generic default partition (`DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS`
+ * above) is phase-blind: it always gives 47%+ of the content budget to the
+ * closed-wave chat/cognition chatter that dominates a rail-complete
+ * continuation and under-prioritizes the pending/landed facts a successor in
+ * that phase actually needs. The execution phase is DERIVED from facts already
+ * on the model (never a new capture):
+ *
+ *   - rail-complete  → the current rail's state is 'complete' (or a terminal
+ *                      review-close state). AED cuts to its summary floor (the
+ *                      edits are landed; hunks are re-derivable from Atlas), a
+ *                      modest cognition sees the already-preserved key rows,
+ *                      and Recovery + Execution State get the room a handoff
+ *                      needs.
+ *   - rail-active    → the current rail is present and still open. The generic
+ *                      defaults above already distribute for this case, so the
+ *                      phase partition leaves them untouched (empty overrides
+ *                      => is a no-op).
+ *   - no-rail        → no current rail (idle/continuation without a rail). The
+ *                      density of landed-vs-pending still favors recovery/
+ *                      execution over live AED chatter, so it shares the
+ *                      rail-complete partition (operator-aligned: "what is
+ *                      pending, what landed, and the operator's last words —
+ *                      almost nothing else").
+ *
+ * The phase table is push-down over the defaults inside the section-allocator
+ * init, so an explicit caller-supplied `sectionMaxChars` override still wins
+ * for the sections it names (the phase partition only fills unstated slots).
+ */
+export type RebirthPackageExecutionPhase = 'rail-active' | 'rail-complete' | 'no-rail';
+
+/** W1-ratified rail-complete / no-rail partition (plan §3 Q4). */
+export const RAIL_COMPLETE_SECTION_OVERRIDES: Readonly<
+  Partial<Record<RebirthPackageV6SectionId, number>>
+> = Object.freeze({
+  activeEditDelta: 8_000,
+  cognitiveArtifacts: 30_000,
+  recoveryIndex: 8_000,
+  operatorVault: 25_000,
+  episodeChapterIndex: 8_000,
+});
+
+/** W1-ratified rail-complete / no-rail backfill priority (recovery/execution first). */
+export const RAIL_COMPLETE_BACKFILL_PRIORITY: readonly RebirthPackageV6SectionId[] = [
+  'recoveryIndex',
+  'executionState',
+  'operatorVault',
+  'recentConversation',
+  'lifeLedger',
+  'episodeChapterIndex',
+  'cognitiveArtifacts',
+  'activeEditDelta',
+] as const;
+
+/**
+ * Derive the current execution phase from the model's already-captured rail
+ * facts (audit-3 C1). No new capture: a present currentRail with a terminal
+ * `complete` state is rail-complete; a present/unknown-state rail is
+ * rail-active; an absent rail (currentRailAvailability none/unavailable or no
+ * currentRail card) is no-rail.
+ */
+export function deriveRebirthExecutionPhase(
+  model: Pick<RebirthPackageV6Model, 'boundaryAndActiveTask'>,
+): RebirthPackageExecutionPhase {
+  const now = model.boundaryAndActiveTask.nowCard;
+  const currentRail = now?.currentRail;
+  const availability = now?.currentRailAvailability;
+  if (!currentRail || !currentRail.state) {
+    // currentRail card missing entirely.
+    if (availability?.status === 'none' || availability?.status === 'unavailable') return 'no-rail';
+    return 'rail-active';
+  }
+  const state = currentRail.state;
+  if (state === 'complete' || state === 'review-closed' || state === 'all-resolved') return 'rail-complete';
+  if (state === 'none') return 'no-rail';
+  return 'rail-active';
+}
+
+/**
+ * Overrides for a phase. rail-active returns an empty record (the generic
+ * defaults already serve it); rail-complete and no-rail share the ratified
+ * rail-complete partition.
+ */
+export function sectionOverridesForPhase(
+  phase: RebirthPackageExecutionPhase,
+): Readonly<Partial<Record<RebirthPackageV6SectionId, number>>> {
+  return phase === 'rail-active' ? Object.freeze({}) : RAIL_COMPLETE_SECTION_OVERRIDES;
+}
+
+/** Machine-readable backfill order for the resolved phase. */
+export function backfillPriorityForPhase(
+  phase: RebirthPackageExecutionPhase,
+): readonly RebirthPackageV6SectionId[] {
+  return phase === 'rail-active'
+    ? REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY
+    : RAIL_COMPLETE_BACKFILL_PRIORITY;
+}
+
+/**
  * Brain Merge alone receives a larger water-fill envelope because its merge-
  * moment donor synthesis is one-time continuity that later rebirths cannot
  * reconstruct. Ordinary rebirths retain the 150k default above, and an
@@ -887,28 +1094,88 @@ function compareSourceRows(
 export const REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS = 600;
 
 /**
- * Audit-2 A22: high-value recent rows (result/hazard/decision < 24h old at the
- * capture instant) may store up to 900 chars per entry; everything else keeps
- * the 600-char scarcity cap. Reference time is the model's own `capturedAt`,
- * never the wall clock, so render and ledger-capture projections stay
- * byte-identical for the same model (deterministic).
+ * Audit-3 C7: per-entry SCARCITY cap by AGE TIER, layered on the audit-2 A22
+ * KIND gate. High-value rows (result/hazard/decision) carry the age-tired
+ * ladder — current life 900, previous 500, older 300 — with life boundaries
+ * from the life ledger (or the 24h age-window fallback). Other kinds
+ * (flow/discovery/question/...) keep the fixed 600 base cap: they could carry
+ * a huge ad-hoc body, so they never get an unbounded recent window, and an old
+ * small thought does not deserve shrinking below the ordinary body budget.
+ * Reference geometry is the model's own `capturedAt` plus the life ledger's
+ * known life-start instants (never the wall clock), so render and
+ * ledger-capture projections stay byte-identical (deterministic).
  */
 export const REBIRTH_PACKAGE_V6_COGNITION_RECENT_KIND_MAX_CHARS = 900;
 const COGNITION_RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Audit-3 C7: previous-life per-row cap (rows in the life before the current one). */
+const COGNITION_PREVIOUS_LIFE_MAX_CHARS = 500;
+/** Audit-3 C7: older-than-previous-life per-row cap. */
+const COGNITION_OLDER_LIFE_MAX_CHARS = 300;
+
+/**
+ * Newest-first known life-start instants from the model's life ledger
+ * (audit-3 C7). Known source times only (God Rule 8); a ledger without
+ * datable life units yields no boundaries and the age-window fallback binds.
+ */
+function cognitiveLifeBoundaryStarts(
+  model: Pick<RebirthPackageV6Model, 'lifeLedger'>,
+): readonly string[] {
+  return (model.lifeLedger?.units ?? [])
+    .filter((unit) => unit.kind === 'life')
+    .map((unit) => knownSourceTime(unit.sourceAt))
+    .filter((value): value is string => Boolean(value))
+    .sort((left, right) => right.localeCompare(left));
+}
 
 function cognitiveEntryCapChars(
   row: Pick<RebirthPackageV6CognitiveArtifact, 'kind' | 'sourceAt'>,
   referenceAt: string | null,
+  lifeBoundaryStarts: readonly string[] = [],
 ): number {
-  if (row.kind === 'result' || row.kind === 'hazard' || row.kind === 'decision') {
-    if (row.sourceAt && referenceAt) {
-      const ageMs = Date.parse(referenceAt) - Date.parse(row.sourceAt);
+  // Audit-2 A22 kind gate: only flagship register kinds (result/hazard/decision)
+  // qualify for an age-elevated cap; other rows (flow/discovery/question/...)
+  // stay at the fixed 600 base regardless of age so a non-flagship ad-hoc body
+  // never gets an unbounded window. Audit-3 C7 makes the flagship tier AGE
+  // dependent (current-life 900, previous 500, older 300) instead of the old
+  // flat kind+24h rule.
+  if (row.kind !== 'result' && row.kind !== 'hazard' && row.kind !== 'decision') {
+    return REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS;
+  }
+  if (row.sourceAt && referenceAt) {
+    const rowMs = Date.parse(row.sourceAt);
+    const referenceMs = Date.parse(referenceAt);
+    if (Number.isFinite(rowMs) && Number.isFinite(referenceMs)) {
+      if (lifeBoundaryStarts.length > 0) {
+        // Life tiers (audit-3 C7): count the newest-first life starts that are
+        // NEWER than the row — 0 = current life, 1 = previous life, ≥2 = older.
+        // The scan stops at the first life start at/before the row.
+        let newerLives = 0;
+        for (const start of lifeBoundaryStarts) {
+          if (Date.parse(start) > rowMs) newerLives += 1;
+          else break;
+        }
+        if (newerLives === 0) return REBIRTH_PACKAGE_V6_COGNITION_RECENT_KIND_MAX_CHARS;
+        if (newerLives === 1) return COGNITION_PREVIOUS_LIFE_MAX_CHARS;
+        return COGNITION_OLDER_LIFE_MAX_CHARS;
+      }
+      // No life ledger: fixed age-window fallback (24h current-life proxy,
+      // 24-48h previous-life proxy, older 300) keeps the rule deterministic
+      // for models that predate the lineage sections.
+      const ageMs = referenceMs - rowMs;
       if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < COGNITION_RECENT_WINDOW_MS) {
         return REBIRTH_PACKAGE_V6_COGNITION_RECENT_KIND_MAX_CHARS;
       }
+      if (Number.isFinite(ageMs) && ageMs >= COGNITION_RECENT_WINDOW_MS
+        && ageMs < 2 * COGNITION_RECENT_WINDOW_MS) {
+        return COGNITION_PREVIOUS_LIFE_MAX_CHARS;
+      }
+      return COGNITION_OLDER_LIFE_MAX_CHARS;
     }
   }
-  return REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS;
+  // Undatable flagship rows (unknown source time) never claim an age tier; they
+  // keep the ordinary flagship scarcity cap and quarantine under the
+  // unknown-time banner.
+  return REBIRTH_PACKAGE_V6_COGNITION_RECENT_KIND_MAX_CHARS;
 }
 
 /**
@@ -938,14 +1205,17 @@ function cognitiveEntryCapChars(
 function projectCognitiveRow(
   row: RebirthPackageV6CognitiveArtifact,
   referenceAt: string | null,
+  lifeBoundaryStarts: readonly string[] = [],
 ): RebirthPackageV6CognitiveArtifact {
   if (row.projection === 'truncated') return row;
-  const cap = cognitiveEntryCapChars(row, referenceAt);
+  const cap = cognitiveEntryCapChars(row, referenceAt, lifeBoundaryStarts);
   const sourceChars = row.text.length;
   if (sourceChars <= cap) return row;
-  const projected = row.text
-    .slice(0, cap)
-    .replace(/\s+$/u, '');
+  // Audit-3 C7: cut at the last word boundary at/before the cap so a projected
+  // row never ends mid-token. The retained prefix stays a byte-exact prefix of
+  // the source body (no ellipsis inside the stored bytes), preserving sha256
+  // attestation semantics; the projection receipt declares the truncation.
+  const projected = cutAtWordBoundary(row.text, cap).replace(/\s+$/u, '');
   return {
     ...row,
     text: projected,
@@ -1288,7 +1558,7 @@ export function isRebirthPackageV6Model(value: unknown): value is RebirthPackage
               && typeof row === 'object'
               && typeof row.provenanceId === 'string'
               && (row.sourceAt === null || typeof row.sourceAt === 'string')
-              && ['decision', 'discovery', 'hazard', 'question', 'result', 'flow'].includes(row.kind)
+              && ['decision', 'discovery', 'hazard', 'question', 'result', 'flow', 'active_request'].includes(row.kind)
               && typeof row.text === 'string'
               && typeof row.authority === 'string'
               && (row.supersededBy === null || typeof row.supersededBy === 'string')
@@ -1349,13 +1619,17 @@ function legacyCognitiveRows(text: string | undefined): RebirthPackageV6Cognitiv
   return text.split('\n').map((line, index) => {
     const trimmed = line.trim();
     const sourceAt = knownSourceTime(trimmed.match(/^\d{4}-\d{2}-\d{2}T\S+/u)?.[0]);
-    const kind: RebirthPackageV6CognitiveArtifact['kind'] = trimmed.includes('⚠')
-      ? 'hazard'
-      : trimmed.includes('❓')
-        ? 'question'
-        : trimmed.includes('🏁')
-          ? 'result'
-          : 'discovery';
+    // S5 (audit-3 B7): a 🧭 register claim is a continuity observation — map it
+    // to `active_request`, never to the old `decision` fall-through below.
+    const kind: RebirthPackageV6CognitiveArtifact['kind'] = trimmed.includes('🧭')
+      ? 'active_request'
+      : trimmed.includes('⚠')
+        ? 'hazard'
+        : trimmed.includes('❓')
+          ? 'question'
+          : trimmed.includes('🏁')
+            ? 'result'
+            : 'discovery';
     return {
       provenanceId: stableTextIdentity('legacy-cognition', `${index}\0${trimmed}`),
       sourceAt,
@@ -1939,6 +2213,73 @@ function formatSource(source: RebirthPackageV6SourceRef): string {
 }
 
 /**
+ * Audit-3 C5: compact DISPLAY rendering of a source instant for package
+ * stamps. The store, sort keys, recover handles, and ledger proofs keep the
+ * exact ms-precision ISO instant (God Rule 8 governs storage and ordering);
+ * the RENDERED stamp drops sub-second precision and — when the instant shares
+ * the capture year — the year itself, saving ~8-12 chars per stamp across the
+ * package's hundreds of stamps. Deterministic: the same (value, referenceAt)
+ * pair always renders the same bytes; an unparseable input renders 'unknown'
+ * so no display path fabricates a time.
+ */
+function formatDisplayStamp(value: string | null | undefined, referenceAt: string | null): string {
+  const iso = knownSourceTime(value);
+  if (!iso) return 'unknown';
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return 'unknown';
+  const date = new Date(parsed);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  const monthDay = `${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+  const clock = `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}Z`;
+  const referenceIso = knownSourceTime(referenceAt);
+  // TS strict-null: the const is not narrowed by `Boolean(x)` in an &&. Compare
+  // the iso directly; a null referenceIso simply falls through to sameYear=false
+  // (no year drop) which is the correct no-reference fallback.
+  const sameYear = referenceIso !== null && iso.slice(0, 4) === referenceIso.slice(0, 4);
+  return sameYear ? `${monthDay} ${clock}` : `${date.getUTCFullYear()}-${monthDay} ${clock}`;
+}
+
+/**
+ * Audit-3 C7/B12: cut text at the last word boundary at or before `maxChars`
+ * (append markers like '…' at call sites when the caller wants one). A cut
+ * landing mid-token reads as a corrupted row; cutting at a word boundary
+ * keeps the retained prefix a byte-exact prefix of the source body so ledger
+ * sha256 attestation semantics are preserved.
+ */
+function cutAtWordBoundary(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const cap = Math.max(0, Math.floor(maxChars));
+  if (cap <= 0) return '';
+  const head = text.slice(0, cap);
+  const boundary = head.search(/\s+\S*$/u);
+  return boundary > 0 ? head.slice(0, boundary) : head;
+}
+
+/**
+ * Audit-3 B12: display clip for harvested agent active-request claims. The
+ * model stores the whole message (attestation basis + cross-section dedupe
+ * comparisons); the boundary renders only the '🧭 Active request:' line plus
+ * at most one following sentence, bounded to 300 chars at a word boundary. A
+ * text without the 🧭 marker is not a claim and renders unchanged.
+ */
+function activeRequestClaimClip(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('🧭')) return trimmed;
+  const newline = trimmed.indexOf('\n');
+  const firstLine = newline < 0 ? trimmed : trimmed.slice(0, newline).trim();
+  const rest = newline < 0 ? '' : trimmed.slice(newline).trim();
+  let clipped = firstLine;
+  if (clipped.length < 300 && rest.length > 0) {
+    const sentenceMatch = rest.match(/^(.{1,280}?[.!?])(?:\s|$)/u);
+    if (sentenceMatch) {
+      const sentence = sentenceMatch[1]!.trim();
+      if (sentence.length <= 300 - clipped.length - 1) clipped = `${clipped} ${sentence}`;
+    }
+  }
+  return clipped.length <= 300 ? clipped : `${cutAtWordBoundary(clipped, 299)}…`;
+}
+
+/**
  * One site-scoped command for the source units whose content was not fully
  * present in this exact committed render. The package never lists unit ids
  * here: the filtered ledger rows carry those identities and their per-unit
@@ -1955,6 +2296,53 @@ function continuityLedgerOmissionHandle(
   return `continuity_ledger action="fetch" owner=${JSON.stringify(owner)}`
     + ` capture_id=${JSON.stringify(captureId)} section_id=${JSON.stringify(sectionId)}`
     + ' omitted_only=true include_unknown_source_time=true limit=200';
+}
+
+interface RebirthRecoveryReferenceCatalog {
+  readonly entries: readonly { readonly ref: string; readonly handle: string }[];
+  readonly refByHandle: ReadonlyMap<string, string>;
+}
+
+/**
+ * Audit-3 B3: deterministic, render-local handle dictionary.
+ *
+ * The protected Recovery Index owns every repeated full command exactly once;
+ * section receipts carry only a compact `R<n>` reference. The catalog is
+ * derived exclusively from the immutable model and canonical section order,
+ * so adaptive re-renders cannot renumber handles. Per-unit lineage handles
+ * remain inline when unique; this dictionary targets the duplicated package /
+ * section routes that dominated the audited specimen.
+ */
+function buildRecoveryReferenceCatalog(model: RebirthPackageV6Model): RebirthRecoveryReferenceCatalog {
+  const handles: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: string | null | undefined): void => {
+    const handle = value?.trim();
+    if (!handle || seen.has(handle)) return;
+    seen.add(handle);
+    handles.push(handle);
+  };
+  for (const entry of model.recoveryIndex) add(entry.handle);
+  for (const sectionId of REBIRTH_PACKAGE_V6_SECTION_IDS) {
+    add(continuityLedgerOmissionHandle(model, sectionId));
+  }
+  for (const section of [model.operatorVault, model.episodeChapterIndex, model.lifeLedger]) {
+    add(section?.rangeRecover);
+  }
+  const entries = handles.map((handle, index) => ({ ref: `R${index + 1}`, handle }));
+  return {
+    entries,
+    refByHandle: new Map(entries.map((entry) => [entry.handle, entry.ref])),
+  };
+}
+
+function recoveryReference(
+  catalog: RebirthRecoveryReferenceCatalog,
+  handle: string | null | undefined,
+): string | null {
+  const normalized = handle?.trim();
+  if (!normalized) return null;
+  return catalog.refByHandle.get(normalized) ?? normalized;
 }
 
 function omissionRecoveryClause(handle: string | null): string {
@@ -2016,63 +2404,118 @@ function boundedNewestText(
   authoritativeHistoryHandle: string | null,
 ): { readonly text: string; readonly complete: boolean } {
   if (text.length <= maxChars) return { text, complete: true };
-  const markerFor = (stored: number, omittedEntries = 0): string => authoritativeHistoryHandle
-    ? `[… older prefix omitted · stored newest ${stored} of ${text.length} chars${omittedEntries > 0 ? ` · entry boundary dropped ${omittedEntries} earlier entries` : ''} · recovery=authoritative-history ${authoritativeHistoryHandle} · byte-exact event replay=unavailable …]\n`
-    : `[… older prefix omitted · stored newest ${stored} of ${text.length} chars${omittedEntries > 0 ? ` · entry boundary dropped ${omittedEntries} earlier entries` : ''} · authoritative history recovery=unavailable · byte-exact event replay=unavailable …]\n`;
-  if (markerFor(0).length > maxChars) {
-    return { text: boundedProjectionFallback(text, maxChars, true), complete: false };
-  }
-  let keep = Math.max(0, maxChars - markerFor(0).length);
-  keep = Math.max(0, maxChars - markerFor(keep).length);
-  keep = Math.max(0, maxChars - markerFor(keep).length);
-  const windowStart = text.length - keep;
-  // Advance the cut FORWARD inside the fitted window to the first line-starting
-  // entry header. This only ever trims MORE from the front (never more retained
-  // than `keep`), so output stays <= maxChars and starts at a clean entry.
-  let alignedStart = windowStart;
-  const firstHeader = text.indexOf('\n[', windowStart);
-  if (firstHeader >= 0) alignedStart = firstHeader + 1;
-  const stored = text.length - alignedStart;
-  // ── honest omission accounting (audit-2 A3) ──
-  // The S11-era marker reported only the boundary-alignment sacrifice BETWEEN
-  // the budget-fitted window start and the aligned cut — `omitted-entries=1 ·
-  // omitted-chars=314` on a 135k text whose real omitted prefix was ~112k
-  // under-reported by two orders of magnitude. The marker now reports the TRUE
-  // omission (the whole `[0, alignedStart)` prefix: chars and whole entries)
-  // plus the alignment sacrifice made inside that prefix to reach a clean
-  // entry boundary.
+
+  // Count whole `[…]` entry headers whose line begins inside
+  // [startInclusive, endExclusive). A header is a line whose first char is '['.
   const countEntryHeaders = (startInclusive: number, endExclusive: number): number => {
     let count = 0;
-    let idx = text.indexOf('\n[', startInclusive);
-    while (idx >= 0 && idx < endExclusive) {
+    // If the body starts with a header at index 0, include it when in range.
+    if (startInclusive === 0 && text.startsWith('[')) count += 1;
+    let at = text.indexOf('\n[', startInclusive);
+    while (at >= 0 && at + 1 < endExclusive) {
       count += 1;
-      idx = text.indexOf('\n[', idx + 1);
+      at = text.indexOf('\n[', at + 1);
     }
     return count;
   };
-  const prefixChars = alignedStart;
-  const prefixEntries = prefixChars > 0
-    ? countEntryHeaders(0, alignedStart) + (text.startsWith('[') ? 1 : 0)
-    : 0;
-  const sacrificeChars = Math.max(0, alignedStart - windowStart);
-  const sacrificeEntries = sacrificeChars > 0 ? countEntryHeaders(windowStart, alignedStart) : 0;
-  let marker = markerFor(stored, 0);
-  // Prefer a marker that names the full omission accounting when EVERY appended
-  // byte is admission-checked: marker + retained body must fit the cap, never
-  // the marker alone (09-01 self-lint residual). The plain marker stays as the
-  // guaranteed-fit fallback so marker+body never exceeds the cap.
-  const detailedMarker = stored < text.length
-    ? `[… older prefix omitted · kept newest ${stored} of ${text.length} chars`
-      + ` · omitted-prefix=${prefixChars} (${prefixEntries} entries)`
-      + ` · alignment-sacrifice=${sacrificeChars}/${sacrificeEntries}`
-      + ` · recovery=authoritative-history ${authoritativeHistoryHandle ?? 'unavailable'}`
-      + ` · byte-exact event replay=unavailable …]\n`
-    : '';
-  if (detailedMarker && detailedMarker.length + stored <= maxChars) marker = detailedMarker;
-  if (marker.length > maxChars || stored < 0) {
+
+  // Build the AED omission marker + census for an exact retained body start.
+  // Marker only ever appended when (marker + retained body) fit the cap.
+  const buildMarker = (alignedStart: number): string => {
+    const stored = text.length - alignedStart;
+    const prefixEntries = countEntryHeaders(0, alignedStart);
+    const keptEntries = countEntryHeaders(alignedStart, text.length);
+    const totalEntries = prefixEntries + keptEntries;
+    const censusBasenames = countEntryBasenames(text, 0, alignedStart);
+    const census = censusBasenames.length > 0
+      ? `\nomitted prefix touched ${censusBasenames.length} path(s): ${censusBasenames.slice(0, 3).join(', ')}${censusBasenames.length > 3 ? `, +${censusBasenames.length - 3} more` : ''}`
+      : '';
+    // When the log has no `[` entry-header structure (unstructured prose cut by
+    // budget, e.g. a raw non-header body), the whole body is one unit: report
+    // kept=1 (we retained a non-empty tail) of total=1; omitted-entries=0 is
+    // honest because no whole entry was dropped, only chars. A body fully
+    // omitted reports kept=0 of total=1. This keeps `kept <= total` in the v2
+    // grammar for every shape. Structured logs report whole-entry counts only.
+    const unstructured = totalEntries === 0;
+    const kept = unstructured ? (stored > 0 ? 1 : 0) : keptEntries;
+    const total = unstructured ? 1 : totalEntries;
+    return `${formatOmissionMarkerV2({
+      entries: prefixEntries,
+      chars: alignedStart,
+      kept,
+      total,
+      recover: authoritativeHistoryHandle,
+    })}${census}\n`;
+  };
+
+  // Align a requested retained-byte count FORWARD to the next clean entry
+  // header (never truncates mid-entry), bounded to [0, text.length].
+  const align = (want: number): number => {
+    let start = Math.max(0, Math.min(text.length, text.length - Math.max(0, want)));
+    if (start > 0) {
+      const firstHeader = text.indexOf('\n[', start);
+      if (firstHeader >= 0) start = firstHeader + 1;
+    } else if (!text.startsWith('[')) {
+      // advancing into a body that begins without a header — keep from the top
+      const firstHeader = text.indexOf('\n[');
+      if (firstHeader >= 0) start = firstHeader + 1;
+    }
+    return Math.max(0, Math.min(text.length, start));
+  };
+
+  // Fit: find the LARGEST retained body whose aligned body + full marker fit.
+  // We search over retained byte counts monotonically and admission-check the
+  // real marker at each candidate (binary search converges fast and exactly).
+  let lo = 0;
+  let hi = Math.max(0, maxChars); // bytes of body we might retain
+  let chosen = align(0);
+  for (let step = 0; step < 60 && lo <= hi; step += 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    const aligned = align(mid);
+    const markerLen = buildMarker(aligned).length;
+    if (markerLen + (text.length - aligned) <= maxChars) {
+      chosen = aligned;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  // Final admission check — never ship over cap.
+  const finalMarker = buildMarker(chosen);
+  if (finalMarker.length + (text.length - chosen) > maxChars) {
     return { text: boundedProjectionFallback(text, maxChars, true), complete: false };
   }
-  return { text: `${marker}${text.slice(alignedStart)}`, complete: false };
+  return { text: `${finalMarker}${text.slice(chosen)}`, complete: false };
+}
+
+/** Basenames (deduped, bounded) of entry lines (`[…]` at line start) the AED
+ *  cut front-omits, for the C9 census line. Callers pass the line start of each
+ *  entry header (the `[` position). */
+function countEntryBasenames(text: string, startInclusive: number, endExclusive: number): string[] {
+  const seen = new Set<string>();
+  const basenames: string[] = [];
+  const consider = (lineStart: number): void => {
+    const lineEnd = text.indexOf('\n', lineStart);
+    const head = text.slice(
+      lineStart,
+      lineEnd < 0 || lineEnd > endExclusive ? endExclusive : lineEnd,
+    );
+    const m = /\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*(?:Edit|Write)\s*→\s*([^\s⟨]+)/u.exec(head);
+    if (!m || m[1].includes('⌖')) return;
+    const base = m[1].split('/').pop();
+    if (base && base.length && !seen.has(base)) {
+      seen.add(base);
+      basenames.push(base);
+    }
+  };
+  // Leading line may start at 0 without a preceding '\n'.
+  if (text.startsWith('[', startInclusive)) consider(startInclusive);
+  let idx = text.indexOf('\n[', startInclusive);
+  while (idx >= 0 && idx + 1 < endExclusive) {
+    consider(idx + 1);
+    idx = text.indexOf('\n[', idx + 1);
+  }
+  return basenames;
 }
 
 /**
@@ -2253,7 +2696,47 @@ function formatBuilderIdentityLine(builder: RebirthPackageV6BoundaryAndActiveTas
   const builtMs = typeof builder.builtMs === 'number' && Number.isFinite(builder.builtMs) && builder.builtMs >= 0
     ? ` · built=${Math.round(builder.builtMs)}ms`
     : '';
-  return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${packageBuildMs}${builtMs}`;
+  // Audit-3 B4/C3: repo HEAD of the building repo (git=<sha7|unknown>, bounded
+  // fail-open) plus both process boot instants — answers "did the relay/sidecar
+  // restart since commit X" from the artifact alone, never inferred.
+  const git = typeof builder.gitSha7 === 'string' && builder.gitSha7.trim()
+    ? ` · git=${builder.gitSha7.trim()}`
+    : ` · git=unknown`;
+  const sidecarBoot = typeof builder.sidecarBootedAt === 'string' && builder.sidecarBootedAt.trim()
+    ? ` · sidecar-boot=${builder.sidecarBootedAt.trim()}`
+    : '';
+  const relayBoot = typeof builder.relayBootedAt === 'string' && builder.relayBootedAt.trim()
+    ? ` · relay-boot=${builder.relayBootedAt.trim()}`
+    : '';
+  // Audit-3 B5: relay-side request-preparation stage decomposition. When the
+  // prep object is present render a stage list that names totalMs and each
+  // measured stage plus an explicit other= remainder so the list ALWAYS
+  // reconciles to its total (never a hidden gap). Parallel draws are reported
+  // once as their true timeline occupancy (parallelMaxMs), not double-counted.
+  let prepText = '';
+  if (builder.requestPrep && typeof builder.requestPrep === 'object') {
+    const prep = builder.requestPrep;
+    const parts: string[] = [`${Math.round(prep.totalMs)}ms`];
+    const add = (label: string, ms: number | null | undefined): void => {
+      if (typeof ms === 'number' && Number.isFinite(ms)) parts.push(`${label}=${Math.round(ms)}ms`);
+    };
+    add('snapshot', prep.snapshotMs);
+    add('frontier', prep.frontierMs);
+    add('src', prep.builderSourceMs);
+    add('exec', prep.executionStateMs);
+    add('atlas', prep.atlasLandedMs);
+    add('repo', prep.repoStateMs);
+    if (typeof prep.parallelMaxMs === 'number' && Number.isFinite(prep.parallelMaxMs)) {
+      parts.push(`parallelDraw=${Math.round(prep.parallelMaxMs)}ms`);
+    }
+    add('other', prep.otherMs);
+    prepText = ` · request-prep=[${parts.join(' ')}]`;
+  }
+  const requestToCapture = typeof builder.requestToCaptureMs === 'number'
+    && Number.isFinite(builder.requestToCaptureMs) && builder.requestToCaptureMs >= 0
+    ? ` · request→capture=${Math.round(builder.requestToCaptureMs)}ms`
+    : '';
+  return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${packageBuildMs}${builtMs}${git}${sidecarBoot}${relayBoot}${prepText}${requestToCapture}`;
 }
 
 function boundedRailAvailabilityReason(value: string | null | undefined): string {
@@ -2261,7 +2744,106 @@ function boundedRailAvailabilityReason(value: string | null | undefined): string
     || 'unspecified';
 }
 
-type RebirthPartialReasonClass = 'horizon' | 'cap' | 'store' | 'not-requested' | 'unknown';
+/**
+ * Audit-3 A2 owned-children/v1: reduce the owned-child statuses to one compact
+ * `live=<a> hibernated=<b> done=<c> teardown-pending=<a+b>` suffix when the
+ * capture stamped every child's runtime status. `teardown-pending` counts the
+ * recoverable-but-unterminated statuses (hibernated + done) that still owe an
+ * owner kill — the obligations surface B/C2 reads for the pending-obligations
+ * block. Deterministic; unknown/empty statuses never fabricate a count.
+ */
+function renderOwnedStatusCounts(
+  children: readonly { status?: string | null }[],
+): string {
+  const count = (value: string): number => children.reduce(
+    (acc, child) => acc + (child.status?.trim() === value ? 1 : 0), 0,
+  );
+  const live = count('working') + count('idle') + count('active') + count('in_progress');
+  const hibernated = count('hibernated');
+  const done = count('done') + count('archived') + count('stopped');
+  // Other statuses (error/blocked/…) don't collapse into a known bucket.
+  const other = children.length - live - hibernated - done;
+  const parts = [`live=${live}`, `hibernated=${hibernated}`, `done=${done}`];
+  if (other > 0) parts.push(`other=${other}`);
+  parts.push(`teardown-pending=${hibernated + done}`);
+  return parts.join(' ');
+}
+
+/** Read an additive optional string field on a repo row (Lane-B A6 headCommittedAt). */
+function readOptionalRepoString(
+  repo: RebirthPackageV6RepositoryState,
+  key: string,
+): string | null {
+  const value = (repo as unknown as Record<string, unknown>)[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * Omission-marker/v2 (audit-3 B9): ONE canonical grammar for section omission
+ * receipts, replacing the six dialects (stored-newest / partial= / omitted-N /
+ * ROLLUP / elided / omitted-entries) so a reader never re-learns markers per
+ * section. Sections that elide whole entries — conversation exchanges, vault
+ * eras, life rollups, AED newest-tail cuts, bounded-newest text — emit through
+ * this helper and keep their recover handle inside the single `recover:`
+ * clause. Exact shape (audit-3 lane contract):
+ *
+ *   [… omitted <n> entries · <chars> chars · kept newest <kept> of <total> · recover: <handle>]
+ *
+ * The `recover:` clause is present only when a handle exists; an elided body
+ * without one must never render an empty `recover:` token (schema layers
+ * reject bare tool-looking tokens, and an empty handle is a dead pointer).
+ */
+export interface RebirthOmissionMarkerV2 {
+  /** Number of whole entries omitted (rows, units, exchanges, lives). */
+  readonly entries: number;
+  /** Omitted characters (source chars of the omitted body, when measurable). */
+  readonly chars: number;
+  /** Number of entries retained (kept newest). */
+  readonly kept: number;
+  /** Total entries considered before omission (kept + omitted, known basis). */
+  readonly total: number;
+  /** Executable recovery handle for the omitted entries, when one exists. */
+  readonly recover?: string | null;
+  /** Optional singular count noun; absent preserves the legacy `entries`. */
+  readonly unit?: string;
+  /** Optional chronological tile for the omitted and first-retained units. */
+  readonly range?: {
+    readonly from?: string | null;
+    readonly to?: string | null;
+    readonly retainedFrom?: string | null;
+  };
+}
+
+export function formatOmissionMarkerV2(marker: RebirthOmissionMarkerV2): string {
+  const unit = marker.unit?.trim();
+  const omittedNoun = unit
+    ? `${unit}${marker.entries === 1 ? '' : 's'}`
+    : 'entries';
+  const keptNoun = unit
+    ? ` ${unit}${marker.kept === 1 ? '' : 's'}`
+    : '';
+  const from = marker.range?.from?.trim();
+  const to = marker.range?.to?.trim();
+  const retainedFrom = marker.range?.retainedFrom?.trim();
+  const range = from || to
+    ? ` · range=${from ?? 'unknown'}..${to ?? 'unknown'}`
+    : '';
+  const retained = retainedFrom ? ` · retained-from=${retainedFrom}` : '';
+  const recover = marker.recover && marker.recover.trim()
+    ? ` · recover: ${marker.recover.trim()}`
+    : '';
+  return `[… omitted ${marker.entries} ${omittedNoun} · ${marker.chars} chars`
+    + ` · kept newest ${marker.kept}${keptNoun} of ${marker.total}`
+    + `${range}${retained}${recover}]`;
+}
+
+/**
+ * Partial-class/v2 (audit-3 A8): adds `merge` to the audit-2 vocabulary so an
+ * EXPLAINED omission is never classified `unknown`. `merge` covers capture-side
+ * duplicate-claim fusion ("121 duplicate chapter claim(s) merged …") and any
+ * dedupe that deliberately collapses N rows into one survivor.
+ */
+type RebirthPartialReasonClass = 'horizon' | 'cap' | 'store' | 'merge' | 'not-requested' | 'unknown';
 
 function classifyPartialReason(reason: string | null | undefined): RebirthPartialReasonClass {
   const text = reason?.trim() ?? '';
@@ -2269,13 +2851,21 @@ function classifyPartialReason(reason: string | null | undefined): RebirthPartia
   if (REBIRTH_CAPTURE_GAP_REASON_RE.test(text)
     || /unavailable|unreadable|failed|failure|worker|transport|timeout|corrupt/u.test(text)) return 'store';
   if (/horizon|frontier|pre-horizon|capturedAt/u.test(text)) return 'horizon';
+  // Partial-class/v2: a duplicate-claim fusion is an explained omission class
+  // of its own ("121 duplicate chapter claim(s) merged into newest survivors")
+  // — never the audit-2 fall-through `unknown`.
+  if (/merge|merged|duplicate|dedup|coalesc/u.test(text)) return 'merge';
   if (/cap|ceiling|budget|truncat|omitt|selected|projection/u.test(text)) return 'cap';
   return 'unknown';
 }
 
 /**
  * Full partial-lane census is distinct from capture-degraded: horizon, cap,
- * and deliberately not-requested lanes are incomplete but not failed reads.
+ * store, merge, and deliberately not-requested lanes are incomplete but not
+ * failed reads. Legacy model-only form used by non-render surfaces (sidecar
+ * telemetry callers); the rendered Boundary derives its lanes from
+ * computeSectionCompleteness (audit-3 A8/S6) so header, section partial=,
+ * footer, and Recovery Index status= can never disagree.
  */
 function partialLaneCensus(model: RebirthPackageV6Model): string[] {
   const lanes: string[] = [];
@@ -2301,6 +2891,123 @@ function partialLaneCensus(model: RebirthPackageV6Model): string[] {
     lanes.push(`task-rail:${rail.status === 'none' ? 'not-requested' : classifyPartialReason(rail.reason)}`);
   }
   return [...new Set(lanes)];
+}
+
+/**
+ * Audit-3 A8/S6: ONE completeness census derived from the ACTUAL rendered
+ * section bodies, feeding the header `capture-partial-lanes=`, each section's
+ * `partial=` surface (same reason text ⇒ same class), the footer
+ * RENDER-INCOMPLETE list, and the Recovery Index `status=` of section rows.
+ * Classification rules:
+ *  - an explained capture-side omission classifies horizon|store|merge|cap|
+ *    not-requested from its own reason text — an EXPLAINED omission is never
+ *    `unknown`;
+ *  - a section whose admitted body lost content (render-incomplete, demoted or
+ *    rolled-up units) without a capture-side explanation classifies `cap`;
+ *  - a section with both renders `class+cap` (e.g. duplicate-claims merged AND
+ *    pressure rollup) so neither loss is hidden by the other.
+ */
+export interface RebirthSectionCompletenessEntry {
+  readonly id: RebirthPackageV6SectionId;
+  /** Primary class from the capture-side reason, when one exists. */
+  readonly class: RebirthPartialReasonClass | null;
+  /** The capture-side reason text (the same text `partial=` surfaces print). */
+  readonly reason: string | null;
+  /** True when the body render lost content (incomplete/demoted/rolled-up). */
+  readonly renderLoss: boolean;
+}
+
+export type RebirthSectionCompleteness = ReadonlyMap<
+  RebirthPackageV6SectionId,
+  RebirthSectionCompletenessEntry
+>;
+
+const SECTION_LANE_IDS: Readonly<Record<RebirthPackageV6SectionId, string>> = {
+  boundaryAndActiveTask: 'boundary',
+  brainMergeSynthesis: 'brain-merge-synthesis',
+  executionState: 'execution-state',
+  activeEditDelta: 'active-edit-delta',
+  cognitiveArtifacts: 'cognition',
+  recentConversation: 'recent-conversation',
+  operatorVault: 'operator-vault',
+  episodeChapterIndex: 'episode-chapter-index',
+  lifeLedger: 'life-ledger',
+  recoveryIndex: 'recovery-index',
+};
+
+function hasCollapseLoss(body: RenderedV6SectionBody): boolean {
+  const collapse = body.collapse;
+  if (!collapse) return false;
+  return collapse.placements.some((placement) => placement.tier !== 't0')
+    || (collapse.droppedToFloorRollup ?? 0) > 0;
+}
+
+/**
+ * Derives the census from rendered section bodies. Boundary/recovery are
+ * structural and never partial (their own completeness is not model truth);
+ * the remaining admitted sections classify per the doc above.
+ */
+export function computeSectionCompleteness(
+  model: RebirthPackageV6Model,
+  rendered: Readonly<Record<RebirthPackageV6SectionId, RenderedV6SectionBody>>,
+): RebirthSectionCompleteness {
+  const census = new Map<RebirthPackageV6SectionId, RebirthSectionCompletenessEntry>();
+  const sectionReason = (id: RebirthPackageV6SectionId): { reason: string | null; explained: boolean } => {
+    if (id === 'operatorVault' || id === 'episodeChapterIndex' || id === 'lifeLedger') {
+      const reason = model[id]?.partialReason ?? null;
+      return { reason, explained: Boolean(reason?.trim()) };
+    }
+    if (id === 'cognitiveArtifacts') {
+      const capture = model.cognitiveArtifactCapture;
+      if (capture && capture.status !== 'complete') {
+        const reason = capture.warnings.join(' ') || capture.missingFamilies.join(' ');
+        return { reason: reason || null, explained: Boolean(reason) };
+      }
+      return { reason: null, explained: false };
+    }
+    if (id === 'activeEditDelta' && model.activeEditDelta.state !== 'exact' && model.activeEditDelta.state !== 'none') {
+      const reason = model.activeEditDelta.reasons.join(' ');
+      return { reason: reason || null, explained: Boolean(reason) };
+    }
+    // recentConversation carries no typed capture-side partialReason: its
+    // omission marker (audit-3 B9/v2 helper) is render-side, so it classifies
+    // purely from render loss (cap) in the census.
+    return { reason: null, explained: false };
+  };
+  for (const id of REBIRTH_PACKAGE_V6_SECTION_IDS) {
+    if (id === 'boundaryAndActiveTask' || id === 'recoveryIndex') continue;
+    const body = rendered[id];
+    if (!body) continue;
+    const { reason, explained } = sectionReason(id);
+    const loss = !body.complete || hasCollapseLoss(body);
+    if (!explained && !loss) continue;
+    const cls: RebirthPartialReasonClass | null = explained
+      ? (id === 'cognitiveArtifacts' && classifyPartialReason(reason) === 'unknown'
+        // Cognitive capture warnings are store-family even when their wording
+        // misses the classifier vocabulary (legacy forced-store semantics).
+        ? 'store'
+        : classifyPartialReason(reason))
+      : null;
+    census.set(id, { id, class: cls, reason, renderLoss: loss });
+  }
+  return census;
+}
+
+/** Kebab lane label + optional multi-class (`merge+cap`) for header lines. */
+function censusLaneLabel(entry: RebirthSectionCompletenessEntry): string {
+  const classes: string[] = [];
+  if (entry.class) classes.push(entry.class);
+  if (entry.renderLoss && entry.class !== 'cap') classes.push('cap');
+  return `${SECTION_LANE_IDS[entry.id]}:${classes.join('+') || 'cap'}`;
+}
+
+function boundaryPartialLanes(census: RebirthSectionCompleteness): string[] {
+  const lanes: string[] = [];
+  for (const id of REBIRTH_PACKAGE_V6_SECTION_IDS) {
+    const entry = census.get(id);
+    if (entry) lanes.push(censusLaneLabel(entry));
+  }
+  return lanes;
 }
 
 /**
@@ -2332,18 +3039,70 @@ function omittedSectionList(model: RebirthPackageV6Model): string[] {
   return entries;
 }
 
-function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
+/**
+ * Audit-3 C8 hazards tri-state for the Boundary, derived from the blocker
+ * facts Execution State actually renders (assembler folds the continuity
+ * receipt's hazard/blocker rows into execution facts):
+ *  - `hazards=unknown` — execution-state is the vacuous "capture unavailable"
+ *    default (the receipt scan never ran);
+ *  - `hazards=none` — the scan produced zero blocker rows;
+ *  - `hazards=<n>` — the scan produced n blocker rows, rendered below;
+ *  - `hazards=elided (n)` — n rows were produced but the Execution State body
+ *    lost content under its budget, so the boundary cannot claim full render.
+ * Derived from the model's adapted facts only — never fabricated.
+ */
+function boundaryHazardsLine(
+  model: RebirthPackageV6Model,
+  completeness: RebirthSectionCompleteness | undefined,
+): string | null {
+  const facts = model.executionState?.facts ?? [];
+  const blockerFacts = facts.filter((fact) => fact.kind === 'blocker');
+  // The receipt scan surface exists whenever execution facts were folded into
+  // the model (the assembler adapts the receipt's hazards/blocks into facts).
+  // `unknown` is reserved for a model whose execution-state is the vacuous
+  // "capture unavailable" default (receipt scan never ran).
+  const captureUnavailable = model.executionState?.unknownReasons?.some(
+    (reason) => /capture unavailable/iu.test(reason),
+  ) === true
+    && facts.length === 0;
+  if (captureUnavailable) return 'hazards=unknown · receipt scan did not run';
+  if (blockerFacts.length === 0) return 'hazards=none';
+  const executionLost = completeness?.get('executionState')?.renderLoss === true;
+  return executionLost
+    ? `hazards=elided (${blockerFacts.length})`
+    : `hazards=${blockerFacts.length}`;
+}
+
+function renderBoundary(
+  model: RebirthPackageV6Model,
+  maxChars: number,
+  completeness?: RebirthSectionCompleteness,
+  references: RebirthRecoveryReferenceCatalog = buildRecoveryReferenceCatalog(model),
+): { text: string; complete: boolean } {
   const boundary = model.boundaryAndActiveTask;
-  // One canonical census: the rendered header and the exported helper are the
-  // same call, so sidecar telemetry and the package header can never drift.
+  // Capture-degraded (store failures) is distinct from the completeness census
+  // (audit-3 A8): both stay single-source, the header cannot drift from the
+  // section bodies it describes.
   const degradedLanes = computeRebirthCaptureDegradedLanes(model);
-  const partialLanes = partialLaneCensus(model);
+  const partialLanes = completeness
+    ? boundaryPartialLanes(completeness)
+    : partialLaneCensus(model);
+  const hazardsLine = boundaryHazardsLine(model, completeness);
   const lines = [
-    `schema=${model.version} · render=v6-sections · capture-naming=v2`,
+    // Audit-3 B8: ONE versions= line names every version-bearing vocabulary in
+    // the envelope; frame literals and the provenance envelope stay unchanged
+    // so stored-package parsers keep accepting legacy frames.
+    `versions=model:${model.version} · render:v6-sections · capture-id:naming-v2 · provenance:v1 · frame:rebirth-v6-section`,
     `lifecycle=${boundary.lifecycle} · ${boundary.lifecycleMeaning}`,
     `capture-artifact=${boundary.captureId} · captured-at=${boundary.capturedAt ?? 'unknown'} · frontier=${boundary.sourceFrontier ?? 'unknown'}`,
+    // Audit-3 C1: name the derived execution phase so a successor can read at a
+    // glance which section partition governed this render (rail-active keeps
+    // the generic defaults; rail-complete/no-rail ship the ratified dense
+    // partition). Derived from rail state already on the model — never a new
+    // capture.
+    `budget-phase=${deriveRebirthExecutionPhase(model)}`,
     ...(partialLanes.length > 0
-      ? [`capture-partial-lanes=${partialLanes.join(',')} · class-vocabulary=horizon|cap|store|not-requested|unknown`]
+      ? [`capture-partial-lanes=${partialLanes.join(',')} · class-vocabulary=horizon|cap|store|merge|not-requested|unknown`]
       : []),
     ...(degradedLanes.length > 0
       ? [`capture-degraded=${degradedLanes.join(',')} · status=partial · per-lane recovery truth renders in each affected section`]
@@ -2351,6 +3110,7 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
     ...(omittedSectionList(model).length > 0
       ? [`sections-omitted=${omittedSectionList(model).join(',')}`]
       : []),
+    ...(hazardsLine ? [hazardsLine] : []),
     `instance=${boundary.instanceName} (${boundary.instanceId}) · predecessor=${boundary.predecessorName ?? boundary.predecessorInstanceId ?? 'none'}`,
     `workspace=${boundary.workspace} · cwd=${boundary.cwd ?? 'unknown'}`,
   ];
@@ -2458,30 +3218,63 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
     lines.push(`lineage-chain=${chain}`);
   }
   if (now?.ops) {
-    const owned = now.ops.ownedLiveChildren.length > 0
-      ? now.ops.ownedLiveChildren.map((child) => `${child.name}(${child.id})`).join(',')
+    // Audit-3 A2/owned-children/v1: flat legacy `{id,name}` rows render the
+    // joined `name(id)` list only; when the capture supplies richer per-child
+    // status, the list is annotated with status counts so teardown obligations
+    // stay visible (hibernated + done children are still owned and pending
+    // teardown until killed).
+    const children = now.ops.ownedLiveChildren;
+    const owned = children.length > 0
+      ? children.map((child) => `${child.name}(${child.id})`).join(',')
       : 'none';
-    const rooms = now.ops.rooms.length > 0 ? now.ops.rooms.join(',') : 'none';
-    // Audit-2 A18: per-root repository captures render their measured branch/
-    // sha/dirty/staged facts; the legacy single-string disposition stays
-    // byte-identical when no per-root capture rode the model.
+    const statuses = children.map((child) => child.status?.trim()).filter(Boolean) as string[];
+    const statusCount = statuses.length === children.length && statuses.length > 0
+      ? renderOwnedStatusCounts(children)
+      : null;
+    const ownedLabel = statusCount
+      ? `owned-children=${owned} (${statusCount})`
+      : owned;
+    // Audit-3 A9/B16: rooms may be flat membership names or typed room entries.
+    // A flat entry renders its name; a typed entry renders name(id) and, when
+    // the snapshot marked it stale (>24h no activity), appends `[stale-since=…]`
+    // (B16) while its authoritative source time / observation stamp ride the
+    // coordination facts rather than being re-stamped here (A9).
+    const rooms = now.ops.rooms.length > 0
+      ? now.ops.rooms.map((room) => {
+        if (typeof room === 'string') return room;
+        const base = room.id ? `${room.name}(${room.id})` : room.name;
+        return room.staleSince ? `${base}[stale-since=${room.staleSince}]` : base;
+      }).join(',')
+      : 'none';
+    // Audit-2 A18 / audit-3 A6 (Lane B spec): per-root repo captures render the
+    // measured branch/sha/dirty/staged facts plus `head-committed=` when the
+    // row carried it and `as-of=` on both healthy and error rows; the legacy
+    // single-string disposition stays byte-identical when no capture rode it.
     const repos = now.ops.repositories ?? [];
     const git = repos.length > 0
       ? `git:${repos.map((repo) => {
+        // headCommittedAt is an additive Lane-B field on the repo row; read it
+        // gracefully so this render compiles before/after that model adds it.
+        const head = readOptionalRepoString(repo, 'headCommittedAt');
         const label = repo.error
-          ? `${repo.name}:error:${boundedRailAvailabilityReason(repo.error)}`
-          : `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7 ?? '…'} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'} as-of=${repo.capturedAt ?? 'unknown'}`;
+          ? `${repo.name}:error:${boundedRailAvailabilityReason(repo.error)} as-of=${repo.capturedAt ?? 'unknown'}`
+          : `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7 ?? '…'} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'}${head ? ` head-committed=${head}` : ''} as-of=${repo.capturedAt ?? 'unknown'}`;
         return label;
       }).join(' | ')}`
       : `git:${now.ops.repositoryState}${now.ops.repositoryReason ? `:${boundedRailAvailabilityReason(now.ops.repositoryReason)}` : ''}`;
     lines.push(
-      `ops=${git} · owned-live-children=${owned} · squad=${now.ops.squad ?? 'none'} · rooms=${rooms} · ${formatSource(now.ops.source)}`,
+      `ops=${git} · owned-live-children=${ownedLabel} · squad=${now.ops.squad ?? 'none'} · rooms=${rooms} · ${formatSource(now.ops.source)}`,
     );
   }
   if (boundary.lifeFacts) {
     const lf = boundary.lifeFacts;
     const parts: string[] = [];
+    // A12 (boundary-trigger/v1): `boundary-trigger=` is THIS capture's trigger
+    // (from the request when the builder forwarded it); the newest-LEDGER-life
+    // trigger is the separate `predecessor-boundary=` ancestor key — never
+    // conflated. Absent this-boundary renders unknown via boundaryTrigger null.
     if (lf.boundaryTrigger != null) parts.push(`boundary-trigger=${lf.boundaryTrigger}`);
+    if (lf.predecessorBoundary != null) parts.push(`predecessor-boundary=${lf.predecessorBoundary}`);
     if (lf.predecessorLifeId != null) parts.push(`predecessor-life=${lf.predecessorLifeId}`);
     if (lf.predecessorMaterialOutput != null) {
       parts.push(`predecessor-material-output=${lf.predecessorMaterialOutput}`);
@@ -2514,28 +3307,61 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
   }
   if (boundary.activeRequestClaims) {
     const claims = boundary.activeRequestClaims;
+    // God Rule 11 expiry attribution: an agent claim is expired only by a LATER
+    // genuine raw operator message — never by another agent claim, and never by
+    // the agent's own later interpretation. The newest operator message in the
+    // boundary is the EXACT ACTIVE REQUEST; when it postdates a claim it is the
+    // expirer to name (audit-3 B12). Absent a derivable expirer the label stays
+    // unnamed-but-honest rather than naming the wrong authority.
+    const expiringOperator = (claimSourceAt: string | null): {
+      provenanceId: string;
+      sourceAt: string | null;
+    } | null => {
+      if (!boundary.activeRequest?.source?.sourceAt || !claimSourceAt) return null;
+      const claimMs = Date.parse(claimSourceAt);
+      const operatorMs = Date.parse(boundary.activeRequest.source.sourceAt);
+      if (!Number.isFinite(claimMs) || !Number.isFinite(operatorMs) || operatorMs <= claimMs) return null;
+      return {
+        provenanceId: boundary.activeRequest.source.provenanceId,
+        sourceAt: boundary.activeRequest.source.sourceAt,
+      };
+    };
+    const expiryLabel = (claimSourceAt: string | null): string => {
+      const expirer = expiringOperator(claimSourceAt);
+      return expirer
+        ? `EXPIRED BY ${expirer.provenanceId}@${formatDisplayStamp(expirer.sourceAt, boundary.capturedAt)}`
+        : 'EXPIRED BY NEWER RAW OPERATOR REQUEST';
+    };
     const latestStatus = claims.latestStatus === 'current'
       ? 'CURRENT · non-authoritative · exact raw operator chronology wins'
       : claims.latestStatus === 'expired_by_newer_operator'
-        ? 'EXPIRED BY NEWER RAW OPERATOR REQUEST · do not execute'
+        ? `${expiryLabel(claims.latest.source.sourceAt)} · do not execute`
         : 'FALLBACK ONLY · operator frontier unknown · do not treat as instruction';
     lines.push(
       '',
       `[AGENT ACTIVE-REQUEST INTERPRETATION · ${latestStatus} · ${formatSource(claims.latest.source)}]`,
-      claims.latest.text,
+      // Audit-3 B12: display clips the harvested claim to its 🧭 line (+ at most
+      // one following sentence, ≤300 chars) so the boundary never reprints the
+      // whole message; the model keeps the full text for attestation/dedupe.
+      activeRequestClaimClip(claims.latest.text),
       '[/AGENT ACTIVE-REQUEST INTERPRETATION]',
     );
-    if (claims.previous) {
+    // Audit-3 B12: the predecessor claim renders only while the newest claim is
+    // NOT expired — an expired newest claim makes the stale predecessor noise.
+    if (claims.previous && claims.latestStatus !== 'expired_by_newer_operator') {
       lines.push(
         '',
-        `[PREVIOUS AGENT ACTIVE-REQUEST INTERPRETATION · EXPIRED BY ${claims.latest.source.provenanceId} · fallback context only · do not execute · ${formatSource(claims.previous.source)}]`,
-        claims.previous.text,
+        `[PREVIOUS AGENT ACTIVE-REQUEST INTERPRETATION · ${expiryLabel(claims.previous.source.sourceAt)} · fallback context only · do not execute · ${formatSource(claims.previous.source)}]`,
+        activeRequestClaimClip(claims.previous.text),
         '[/PREVIOUS AGENT ACTIVE-REQUEST INTERPRETATION]',
       );
     }
   }
   if (boundary.lastMaterialAssistant) {
-    const recovery = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
+    const recovery = recoveryReference(
+      references,
+      model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
+    );
     const assistantBudget = Math.max(512, maxChars - lines.join('\n').length - 320);
     const assistant = boundedText(boundary.lastMaterialAssistant.text, assistantBudget, recovery);
     lines.push(
@@ -2550,7 +3376,11 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
   return { text: lines.join('\n'), complete: true };
 }
 
-function renderExecution(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
+function renderExecution(
+  model: RebirthPackageV6Model,
+  maxChars: number,
+  references: RebirthRecoveryReferenceCatalog,
+): { text: string; complete: boolean } {
   // God Rule 8: unknown source time never participates in the chronology. Known-time
   // execution facts stream chronologically; unknown-time facts are quarantined under
   // an explicit banner (mirroring renderCognition) where they make no recency claim.
@@ -2578,7 +3408,11 @@ function renderExecution(model: RebirthPackageV6Model, maxChars: number): { text
     }
   }
   if (lines.length === 0) lines.push('- execution state captured as empty');
-  return boundedText(lines.join('\n'), maxChars, model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null);
+  return boundedText(
+    lines.join('\n'),
+    maxChars,
+    recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle),
+  );
 }
 
 function contributorSummary(contributors: readonly RebirthPackageV6EditContributor[]): string {
@@ -2662,11 +3496,24 @@ export function buildActiveEditCollapseUnits(model: RebirthPackageV6Model): read
   });
 }
 
-function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): RenderedV6SectionBody {
+function renderActiveEdits(
+  model: RebirthPackageV6Model,
+  maxChars: number,
+  references: RebirthRecoveryReferenceCatalog,
+): RenderedV6SectionBody {
   const delta = model.activeEditDelta;
-  const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'atlas-edit-capture')?.handle ?? null;
-  const historyRecoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'atlas-history')?.handle ?? null;
-  const omissionHandle = continuityLedgerOmissionHandle(model, 'activeEditDelta');
+  const recoveryHandle = recoveryReference(
+    references,
+    model.recoveryIndex.find((entry) => entry.id === 'atlas-edit-capture')?.handle,
+  );
+  const historyRecoveryHandle = recoveryReference(
+    references,
+    model.recoveryIndex.find((entry) => entry.id === 'atlas-history')?.handle,
+  );
+  const omissionHandle = recoveryReference(
+    references,
+    continuityLedgerOmissionHandle(model, 'activeEditDelta'),
+  );
   // Legacy bounded-edit-log mode: when the immutable Atlas capture was
   // unavailable, the adapter wraps the raw edit log in one synthetic file row
   // whose every field is honestly unknown. Rendering those fields sprays the
@@ -2688,7 +3535,16 @@ function renderActiveEdits(model: RebirthPackageV6Model, maxChars: number): Rend
       ? 'not-requested'
       : 'unavailable';
     const banner = `evidence=bounded edit log; immutable capture ${disposition}: ${reason}`;
-    const editLog = legacyLog.preview?.text ?? '';
+    // AUDIT-3 A1(e): the legacy layout appends a `Provenance: ⌖c…` line to the
+    // AED artifact for its coordinate-closet appendix, which the v6 renderer
+    // has no appendix for — strip that single generated trailing marker line so
+    // no session renders a dangling coordinate ref (substantive prose/source is
+    // never rewritten).
+    const rawEditLog = legacyLog.preview?.text ?? '';
+    const linesOfLog = rawEditLog.split('\n');
+    const lastLogLine = (linesOfLog[linesOfLog.length - 1] ?? '').trim();
+    if (/^Provenance:\s+⌖c[0-9]+/u.test(lastLogLine)) linesOfLog.pop();
+    const editLog = linesOfLog.join('\n').trimEnd();
     if (!editLog || maxChars <= banner.length + 1) {
       return boundedText(banner, maxChars, historyRecoveryHandle);
     }
@@ -2771,6 +3627,10 @@ const COGNITION_KIND_PRIORITY: Record<RebirthPackageV6CognitiveArtifact['kind'],
   decision: 88,
   hazard: 84,
   result: 82,
+  // S5 (audit-3 B7/B1): a 🧭 active-request row carries continuity intent and
+  // survives above ordinary discoveries/flow, but below terminal verdicts —
+  // it is an observation, never a decision (Decisions rank above it).
+  active_request: 80,
   discovery: 76,
   flow: 55,
 };
@@ -2797,17 +3657,23 @@ function compareCognitionAdmission(
   return left.provenanceId.localeCompare(right.provenanceId);
 }
 
-function cognitionRowBody(row: RebirthPackageV6CognitiveArtifact): string {
+function cognitionRowBody(
+  row: RebirthPackageV6CognitiveArtifact,
+  referenceAt: string | null,
+): string {
   const declared = row.projection === 'truncated'
     ? ` · projection=truncated stored=${row.storedChars ?? row.text.length}/${row.sourceChars ?? 'unknown'} chars`
     : '';
-  return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · authority=${row.authority}${declared}`;
+  const retention = row.retention ? ` · kept-by=${row.retention}` : '';
+  const stamp = row.sourceAt ? formatDisplayStamp(row.sourceAt, referenceAt) : 'unknown';
+  return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${retention}${declared}`;
 }
 
 function cognitionSuppressionHeader(
   total: number,
   shown: number,
   suppressed: readonly RebirthPackageV6CognitiveArtifact[],
+  boundaryDedupedCount: number,
   renderedTruncatedCount: number,
   incompleteCount: number,
   totalMatched: number | null,
@@ -2832,6 +3698,7 @@ function cognitionSuppressionHeader(
       .join(', ');
     parts.push(`suppressed{${counts}} dropped-whole by lowest budget priority`);
   }
+  if (boundaryDedupedCount > 0) parts.push(`dedupe{boundary:${boundaryDedupedCount}}`);
   if (renderedTruncatedCount > 0) {
     parts.push(`projected{rendered-truncated:${renderedTruncatedCount}}`);
   }
@@ -2889,12 +3756,33 @@ function cognitionSuppressionHeader(
  * deliberately (Atlas #40280); pressure therefore costs the oldest rows within
  * a priority band, which is the intended semantic.
  */
-function renderCognition(model: RebirthPackageV6Model, maxChars: number): RenderedV6SectionBody {
-  const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'cognition')?.handle ?? null;
-  const omissionHandle = continuityLedgerOmissionHandle(model, 'cognitiveArtifacts');
+function renderCognition(
+  model: RebirthPackageV6Model,
+  maxChars: number,
+  references: RebirthRecoveryReferenceCatalog,
+): RenderedV6SectionBody {
+  const recoveryHandle = recoveryReference(
+    references,
+    model.recoveryIndex.find((entry) => entry.id === 'cognition')?.handle,
+  );
+  const omissionHandle = recoveryReference(
+    references,
+    continuityLedgerOmissionHandle(model, 'cognitiveArtifacts'),
+  );
   const recovery = recoveryHandle ? `recover=${recoveryHandle}` : 'exact recovery unavailable';
   const capture = model.cognitiveArtifactCapture;
-  const sourceRows = model.cognitiveArtifacts;
+  const boundaryBodies = new Set<string>();
+  const addBoundaryBody = (value: string | null | undefined): void => {
+    const body = value?.trim();
+    if (body) boundaryBodies.add(body);
+  };
+  addBoundaryBody(model.boundaryAndActiveTask.activeRequest?.text);
+  addBoundaryBody(model.boundaryAndActiveTask.lastMaterialAssistant?.text);
+  addBoundaryBody(model.boundaryAndActiveTask.activeRequestClaims?.latest.text);
+  addBoundaryBody(model.boundaryAndActiveTask.activeRequestClaims?.previous?.text);
+  const allSourceRows = model.cognitiveArtifacts;
+  const sourceRows = allSourceRows.filter((row) => !boundaryBodies.has(row.text.trim()));
+  const boundaryDedupedCount = allSourceRows.length - sourceRows.length;
 
   // Protected tail. The capture receipt is what stops "few rows" from reading
   // as "this agent barely thought", so it survives pressure that rows do not.
@@ -2944,9 +3832,10 @@ function renderCognition(model: RebirthPackageV6Model, maxChars: number): Render
       const lines: string[] = [];
       lines.push(
         cognitionSuppressionHeader(
-          rows.length,
+          allSourceRows.length,
           keep.length,
           suppressed,
+          boundaryDedupedCount,
           renderedTruncatedCount,
           incompleteCount,
           capture?.totalMatched ?? null,
@@ -2961,10 +3850,11 @@ function renderCognition(model: RebirthPackageV6Model, maxChars: number): Render
         .sort((left, right) => right.sourceAt!.localeCompare(left.sourceAt!)
           || right.provenanceId.localeCompare(left.provenanceId));
       const unknown = keep.filter((row) => !row.sourceAt);
-      for (const row of known) lines.push(`${row.sourceAt} · ${cognitionRowBody(row)}`);
+      const referenceAt = model.boundaryAndActiveTask.capturedAt;
+      for (const row of known) lines.push(`${formatDisplayStamp(row.sourceAt, referenceAt)} · ${cognitionRowBody(row, referenceAt)}`);
       if (unknown.length > 0) {
         lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
-        for (const row of unknown) lines.push(`- ${cognitionRowBody(row)}`);
+        for (const row of unknown) lines.push(`- ${cognitionRowBody(row, referenceAt)}`);
       }
       if (keep.length === 0) {
         if (!capture) {
@@ -3031,10 +3921,15 @@ function renderCognition(model: RebirthPackageV6Model, maxChars: number): Render
   // instant is the model's own capturedAt (audit-2 A22), so a contended render
   // and its ledger capture agree byte-for-byte for the same model.
   const referenceAt = model.boundaryAndActiveTask.capturedAt;
-  return renderRows(sourceRows.map((row) => projectCognitiveRow(row, referenceAt)), false)!;
+  const lifeBoundaryStarts = cognitiveLifeBoundaryStarts(model);
+  return renderRows(sourceRows.map((row) => projectCognitiveRow(row, referenceAt, lifeBoundaryStarts)), false)!;
 }
 
-function conversationRowText(row: RebirthPackageV6ConversationRow): string {
+function conversationRowText(
+  row: RebirthPackageV6ConversationRow,
+  referenceAt: string | null,
+  recoveryHandle: string | null,
+): string {
   const baseProvenance = conversationRowBaseId(row.provenanceId);
   // Audit-2 A1: a coalesced message keeps one envelope on the base id and
   // renders visible `⟨segment-N⟩` seam markers at the recorded offsets. The
@@ -3043,10 +3938,19 @@ function conversationRowText(row: RebirthPackageV6ConversationRow): string {
     ? renderConversationSeams(row.text, row.segmentOffsets)
     : null;
   const text = seamMarkers ?? row.text;
+  const replyLimit = 600;
+  const projectedReply = row.role === 'assistant' && text.length > replyLimit;
+  const renderedText = projectedReply ? text.slice(0, replyLimit) : text;
+  const projection = projectedReply
+    ? `\n[projection=truncated stored=${replyLimit}/${text.length} chars`
+      + `${recoveryHandle ? ` · recover=${recoveryHandle}` : ' · exact recovery unavailable'}]`
+    : '';
   const segments = row.segmentOffsets?.length
     ? ` · segments=${row.segmentOffsets.length + 1}`
     : '';
-  return `[${row.role} · source=${baseProvenance}${segments} · source-time=${row.sourceAt ?? 'unknown'}]\n${text}`;
+  // Audit-3 C5: display stamp compaction; the store keeps exact ms.
+  const stamp = row.sourceAt ? formatDisplayStamp(row.sourceAt, referenceAt) : 'unknown';
+  return `[${row.role} · source=${baseProvenance}${segments} · source-time=${stamp}]\n${renderedText}${projection}`;
 }
 
 /** Render-only seam markers for a coalesced segmented message (audit-2 A1). */
@@ -3074,32 +3978,48 @@ function conversationOmissionMarker(args: {
   if (args.omittedKnown.length > 0) {
     const first = args.omittedKnown[0].sourceAt!;
     const last = args.omittedKnown.at(-1)!.sourceAt!;
-    // Audit-2 A23: name the bounded candidate window so the count never reads
-    // as the whole transcript — `N of W candidate rows omitted` — and carry
-    // the cut time on the recover handle (`after=`) so a successor can resume
-    // from the omission boundary.
-    const window = args.omittedKnown.length + args.retainedKnown.length;
-    parts.push(
-      args.omittedKnown.length === window
-        ? `all ${window} known-time candidate row${window === 1 ? '' : 's'} omitted`
-        : `${args.omittedKnown.length} of ${window} known-time candidate rows omitted`,
-      `source-time-range=${first}..${last}`,
+    const exchangeKey = (row: RebirthPackageV6ConversationRow): string => (
+      row.exchangeId ?? `${row.role}:${conversationRowBaseId(row.provenanceId)}`
     );
+    const countExchanges = (rows: readonly RebirthPackageV6ConversationRow[]): number => (
+      new Set(rows.map(exchangeKey)).size
+    );
+    const retainedKeys = new Set(args.retainedKnown.map(exchangeKey));
+    const omittedExchanges = new Set(
+      args.omittedKnown.map(exchangeKey).filter((key) => !retainedKeys.has(key)),
+    ).size;
+    const retainedExchanges = countExchanges(args.retainedKnown);
+    const omittedChars = args.omittedKnown.reduce((total, row) => total + row.text.length, 0);
+    const retainedFrom = args.retainedKnown[0]?.sourceAt ?? null;
+    const recover = args.recoveryHandle
+      ? `${args.recoveryHandle} after=${last}`
+      : null;
+    const marker = formatOmissionMarkerV2({
+      entries: omittedExchanges,
+      chars: omittedChars,
+      kept: retainedExchanges,
+      total: omittedExchanges + retainedExchanges,
+      unit: 'exchange',
+      range: { from: first, to: last, retainedFrom },
+      recover,
+    });
+    // S2's exchange receipt carries both selection units and physical rows.
+    // Keep B9's canonical helper as the grammar owner and add the row census at
+    // its stable chars seam rather than minting a second marker dialect.
+    parts.push(marker.replace(
+      ` · ${omittedChars} chars`,
+      ` · omitted-rows=${args.omittedKnown.length} · ${omittedChars} chars`,
+    ).slice(3, -1));
   }
   if (args.omittedUnknown.length > 0) {
     parts.push(
       `${args.omittedUnknown.length} unknown-time quarantine row${args.omittedUnknown.length === 1 ? '' : 's'} omitted`,
     );
   }
-  const retainedFrom = args.retainedKnown[0]?.sourceAt;
-  if (retainedFrom) parts.push(`retained-from=${retainedFrom}`);
   if (args.latestKnownTailOmitted) parts.push('latest-known-row-tail omitted');
-  const after = args.omittedKnown.at(-1)?.sourceAt;
-  parts.push(
-    args.recoveryHandle
-      ? `recover=${args.recoveryHandle}${after ? ` after=${after}` : ''}`
-      : 'exact recovery unavailable',
-  );
+  if (args.omittedKnown.length === 0) {
+    parts.push(args.recoveryHandle ? `recover: ${args.recoveryHandle}` : 'exact recovery unavailable');
+  }
   return `[… ${parts.join(' · ')} …]`;
 }
 
@@ -3162,25 +4082,56 @@ function conversationEndpointReceipt(model: RebirthPackageV6Model): string {
   ].join('\n');
 }
 
-function renderConversation(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
+function renderConversation(
+  model: RebirthPackageV6Model,
+  maxChars: number,
+  references: RebirthRecoveryReferenceCatalog,
+): RenderedV6SectionBody {
   // God Rule 8: unknown source time never participates in the chronology. Known-time
   // rows stream chronologically; unknown-time rows are quarantined under an explicit
   // banner (mirroring renderCognition and renderExecution) where they make no recency
   // claim and can never be mistaken for a continuous dialogue sequence.
   const known = model.recentConversation.filter((row) => row.sourceAt);
   const unknown = model.recentConversation.filter((row) => !row.sourceAt);
-  const lines = known.map(conversationRowText);
+  // Audit-3 C5: display stamps trim ms (and year when it matches capture); the
+  // reference instant is the model's own capturedAt for determinism.
+  const referenceAt = model.boundaryAndActiveTask.capturedAt;
+  const recoveryHandle = recoveryReference(
+    references,
+    model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
+  );
+  const renderRow = (row: RebirthPackageV6ConversationRow): string => (
+    conversationRowText(row, referenceAt, recoveryHandle)
+  );
+  const placementsFor = (
+    renderedRows: readonly RebirthPackageV6ConversationRow[],
+    projectedIds: ReadonlySet<string> = new Set(),
+  ): RebirthPackageV6UnitPlacement[] => {
+    const renderedIds = new Set(renderedRows.map((row) => conversationRowBaseId(row.provenanceId)));
+    return model.recentConversation.map((row) => {
+      const id = conversationRowBaseId(row.provenanceId);
+      return {
+        id,
+        placement: renderedIds.has(id) ? 'rendered' : 'elided',
+        projected: projectedIds.has(id)
+          || (row.role === 'assistant' && (row.segmentOffsets?.length ? renderConversationSeams(row.text, row.segmentOffsets).length : row.text.length) > 600),
+      };
+    });
+  };
+  const lines = known.map(renderRow);
   if (unknown.length > 0) {
     lines.push(
       '',
       'Unknown source time (quarantined; not part of the chronology):',
-      ...unknown.map(conversationRowText),
+      ...unknown.map(renderRow),
     );
   }
   const fullEndpointReceipt = conversationEndpointReceipt(model);
   const dialogueText = lines.join('\n\n');
   const fullText = [fullEndpointReceipt, dialogueText].filter(Boolean).join('\n\n');
-  if (fullText.length <= maxChars) return { text: fullText, complete: true };
+  if (fullText.length <= maxChars) {
+    return { text: fullText, complete: true, unitPlacements: placementsFor(model.recentConversation) };
+  }
 
   // Conversation is a chronological section, so overflow must retain its tail:
   // the newest known-source-time rows. Unknown-time rows are admitted only from
@@ -3190,7 +4141,6 @@ function renderConversation(model: RebirthPackageV6Model, maxChars: number): { t
   // Recent Conversation is admitted. Under pressure its full source-coordinate
   // detail yields to a compact pointer; the protected Boundary section carries
   // the exact endpoint identities, timestamps, and bytes.
-  const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
   const endpointReceipt = fullEndpointReceipt
     ? 'endpoint rows: rendered in Boundary (active request + last assistant)'
     : '';
@@ -3200,13 +4150,14 @@ function renderConversation(model: RebirthPackageV6Model, maxChars: number): { t
     [endpointReceipt, body].filter(Boolean).join('\n\n')
   );
   if (known.length === 0 && unknown.length === 0) {
-    return boundedText(fullEndpointReceipt, maxChars, recoveryHandle);
+    return { ...boundedText(fullEndpointReceipt, maxChars, recoveryHandle), unitPlacements: [] };
   }
   if (dialogueBudget === 0) {
-    return { text: boundedText(endpointReceipt, maxChars, recoveryHandle).text, complete: false };
+    return { text: boundedText(endpointReceipt, maxChars, recoveryHandle).text, complete: false, unitPlacements: placementsFor([]) };
   }
   let retainedKnown: RebirthPackageV6ConversationRow[] = [];
   let retainedUnknown: RebirthPackageV6ConversationRow[] = [];
+
   const compose = (
     selectedKnown: readonly RebirthPackageV6ConversationRow[],
     selectedUnknown: readonly RebirthPackageV6ConversationRow[],
@@ -3218,21 +4169,48 @@ function renderConversation(model: RebirthPackageV6Model, maxChars: number): { t
       omittedUnknown,
       retainedKnown: selectedKnown,
       recoveryHandle,
-    }), ...selectedKnown.map(conversationRowText)];
+    }), ...selectedKnown.map(renderRow)];
     if (selectedUnknown.length > 0) {
       blocks.push(
         'Unknown source time (quarantined; not part of the chronology):',
-        ...selectedUnknown.map(conversationRowText),
+        ...selectedUnknown.map(renderRow),
       );
     }
     return blocks.join('\n\n');
   };
 
-  for (let index = known.length - 1; index >= 0; index -= 1) {
-    const candidate = [known[index], ...retainedKnown];
-    if (compose(candidate, retainedUnknown).length > dialogueBudget) break;
-    retainedKnown = candidate;
+  // Audit-3 A5/C6: eviction must not strand an operator row's material replies.
+  // Partition known rows into EXCHANGE GROUPS — consecutive rows sharing the
+  // same `exchangeId` (an operator row + its material assistant replies), or,
+  // for untagged legacy rows, each row is its own group. Reverse iterating over
+  // groups (newest group first, in render/desc input order `known`) means the
+  // budget trims WHOLE exchanges oldest-first: a kept operator row always keeps
+  // whatever material reply was captured with it, so the 23-hour-hole defect can
+  // never reappear. Leading assistant rows before any operator row have no reply
+  // pairing and naturally stand alone (reviewer tolerance for absent-tag rows).
+  const exchangeGroupOf = (row: RebirthPackageV6ConversationRow): string => (
+    row.exchangeId ?? `${row.role}:${conversationRowBaseId(row.provenanceId)}`
+  );
+  const exchangeGroups: RebirthPackageV6ConversationRow[][] = [];
+  for (const row of known) {
+    const key = exchangeGroupOf(row);
+    const prev = exchangeGroups[exchangeGroups.length - 1];
+    if (prev && prev[0] && exchangeGroupOf(prev[0]) === key) prev.push(row);
+    else exchangeGroups.push([row]);
   }
+  const applyBudget = (groups: readonly RebirthPackageV6ConversationRow[][]): void => {
+    // Groups are in chronological (asc) order; the newest are at the tail.
+    // Keep the newest groups while the composed text fits.
+    let selected: RebirthPackageV6ConversationRow[] = [];
+    for (let i = groups.length - 1; i >= 0; i -= 1) {
+      const candidate = [...groups[i]!, ...selected];
+      if (compose(candidate, retainedUnknown).length > dialogueBudget) break;
+      selected = candidate;
+    }
+    retainedKnown = selected;
+  };
+  applyBudget(exchangeGroups);
+
   for (const row of unknown) {
     const candidate = [...retainedUnknown, row];
     if (compose(retainedKnown, candidate).length > dialogueBudget) break;
@@ -3250,7 +4228,7 @@ function renderConversation(model: RebirthPackageV6Model, maxChars: number): { t
       omittedUnknown: unknown,
       maxChars: dialogueBudget,
       recoveryHandle,
-    })), complete: false };
+    })), complete: false, unitPlacements: placementsFor([newest], new Set([conversationRowBaseId(newest.provenanceId)])) };
   }
   if (known.length === 0 && unknown.length > 0 && retainedUnknown.length === 0) {
     const firstUnknown = unknown[0];
@@ -3261,17 +4239,41 @@ function renderConversation(model: RebirthPackageV6Model, maxChars: number): { t
       recoveryHandle,
     });
     const prefix = `${marker}\n\nUnknown source time (quarantined; not part of the chronology):\n\n`;
-    const row = boundedText(conversationRowText(firstUnknown), Math.max(0, dialogueBudget - prefix.length), recoveryHandle);
+    const row = boundedText(renderRow(firstUnknown), Math.max(0, dialogueBudget - prefix.length), recoveryHandle);
     return {
       text: withEndpointReceipt(boundedText(`${prefix}${row.text}`, dialogueBudget, recoveryHandle).text),
       complete: false,
+      unitPlacements: placementsFor([firstUnknown], new Set([conversationRowBaseId(firstUnknown.provenanceId)])),
     };
   }
 
-  return { text: withEndpointReceipt(compose(retainedKnown, retainedUnknown)), complete: false };
+  return {
+    text: withEndpointReceipt(compose(retainedKnown, retainedUnknown)),
+    complete: false,
+    unitPlacements: placementsFor([...retainedKnown, ...retainedUnknown]),
+  };
 }
 
-function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
+/**
+ * Map a Recovery Index row id to the section it describes (audit-3 A8). Only
+ * rows that ARE rendered sections participate in the census override; storage
+ * lanes (transcript, atlas-history, ledger, identity, …) keep their own status.
+ */
+function recoveryRowSectionId(rowId: string): RebirthPackageV6SectionId | null {
+  const exact = rowId as RebirthPackageV6SectionId;
+  if ((REBIRTH_PACKAGE_V6_SECTION_IDS as readonly string[]).includes(rowId)) return exact;
+  const kebabToSection = Object.entries(SECTION_LANE_IDS).find(([, lane]) => lane === rowId);
+  if (kebabToSection) return kebabToSection[0] as RebirthPackageV6SectionId;
+  if (rowId === 'cognition') return 'cognitiveArtifacts';
+  return null;
+}
+
+function renderRecovery(
+  model: RebirthPackageV6Model,
+  maxChars: number,
+  completeness?: RebirthSectionCompleteness,
+  references: RebirthRecoveryReferenceCatalog = buildRecoveryReferenceCatalog(model),
+): { text: string; complete: boolean } {
   const entries = model.recoveryIndex;
   if (entries.length === 0) return { text: '- recovery index unavailable', complete: true };
   // Recovery Index is a protected package section: its own renderer must never
@@ -3285,23 +4287,43 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
   // evidence body — never emitting `unavailable` while the entry itself has an
   // exact Atlas/package handle.
   const packageHandle = entries.find((entry) => entry.id === 'rebirth-package')?.handle ?? null;
-  const lines: string[] = [];
+  const packageRef = recoveryReference(references, packageHandle);
+  const lines: string[] = references.entries.length > 0
+    ? [
+      'Recovery handle legend (expand R<n> before execution):',
+      ...references.entries.map((entry) => `- ${entry.ref} = ${entry.handle}`),
+      '',
+    ]
+    : [];
   let elided = false;
+  let renderedEntries = 0;
   for (const entry of entries) {
-    const reasonSuffix = entry.status !== 'available'
-      ? ` · reason=${entry.reason?.trim() || 'unspecified'}`
-      : '';
+    // Audit-3 A8: section rows take their status from the completeness census
+    // (partial whenever the section was explained-partial OR lost content), so
+    // the Recovery Index never reports `available` for a section whose body
+    // rolled up or merged under its cap. Storage/identity rows keep the
+    // entry-declared status.
+    const censusSection = recoveryRowSectionId(entry.id);
+    const censusEntry = censusSection ? completeness?.get(censusSection) : undefined;
+    const censusPartial = censusEntry !== undefined;
+    const reasonSuffix = censusPartial
+      ? ` · reason=${censusEntry?.reason?.trim()
+        || (censusEntry?.renderLoss ? 'render loss (demoted/rolled-up/truncated under budget)' : 'capture-side partiality; see section body')}`
+      : entry.status !== 'available'
+        ? ` · reason=${entry.reason?.trim() || 'unspecified'}`
+        : '';
     // Honest recovery disposition: a nonempty handle is rendered verbatim; an
     // empty handle on a not-requested lane is `not-requested`, and an empty
     // handle on any other non-available lane is `unavailable` — never a
     // contradictory fake handle for a capture that was never requested.
-    let recoverLabel = entry.handle || 'unavailable';
+    let recoverLabel = recoveryReference(references, entry.handle) || 'unavailable';
     if (!entry.handle && entry.status === 'not-requested') recoverLabel = 'not-requested';
     const countLabel = entry.id === 'task-rail' ? 'steps' : 'count';
     const frontier = entry.id === 'identity' && entry.frontier === null
       ? ''
       : ` · frontier=${entry.frontier ?? 'unknown'}`;
-    const line = `- ${entry.id} · ${entry.label} · status=${entry.status} · ${countLabel}=${entry.count ?? 'unknown'}${frontier}${reasonSuffix} · recover=${recoverLabel}`;
+    const rowStatus = censusPartial ? 'partial' : entry.status;
+    const line = `- ${entry.id} · ${entry.label} · status=${rowStatus} · ${countLabel}=${entry.count ?? 'unknown'}${frontier}${reasonSuffix} · recover=${recoverLabel}`;
     // Optional inline evidence (e.g. a captured Atlas handoff card body) rides
     // beneath its own handle line as a bounded indented snapshot. It never
     // overloads `label` (which stays a short title). If the evidence cannot fit
@@ -3311,12 +4333,13 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
     const evidence = entry.inlineEvidence?.trim();
     let evidenceBlock: string | null = null;
     if (evidence) {
-      const evidenceHeader = `  ${entry.id}.inline-evidence: root recovery=${entry.handle || packageHandle}`;
+      const evidenceRecovery = recoveryReference(references, entry.handle || packageHandle);
+      const evidenceHeader = `  ${entry.id}.inline-evidence: root recovery=${evidenceRecovery}`;
       const budget = Math.max(0, maxChars - evidenceHeader.length - 60);
       const ev = boundedText(
         evidence.split('\n').map((l) => `  ${l}`).join('\n'),
         budget,
-        entry.handle || packageHandle,
+        evidenceRecovery,
       );
       evidenceBlock = `${evidenceHeader}\n${ev.text}`;
       if (!ev.complete) elided = true;
@@ -3327,7 +4350,7 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
     // short and the entry body is elided separately. Only the full block (entry
     // + evidence) can overflow, and on that path we keep the entry line and the
     // exact handle rather than dropping the whole route to an `unavailable`.
-    const exactHandle = entry.handle || packageHandle;
+    const exactHandle = recoveryReference(references, entry.handle || packageHandle) || packageRef;
     if (projected.length > maxChars) {
       if (evidenceBlock) {
         lines.push(line);
@@ -3337,7 +4360,7 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
             : `  ${entry.id}.inline-evidence: elided for budget; exact recovery handle unavailable`,
         );
       } else {
-        const omitted = entries.length - lines.length;
+        const omitted = entries.length - renderedEntries;
         lines.push(
           exactHandle
             ? `- ${omitted} additional recovery entries elided for budget; recover the complete index from the exact handle: ${exactHandle}`
@@ -3349,6 +4372,7 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
     }
     lines.push(line);
     if (evidenceBlock) lines.push(evidenceBlock);
+    renderedEntries += 1;
   }
   // A partial section must not look complete to manifests/consumers: report
   // complete=false whenever any recovery entry (or inline evidence) was
@@ -3412,6 +4436,7 @@ function renderLineage(
   maxChars: number,
   fallbackRecover: string | null,
   omissionHandle: string | null,
+  references: RebirthRecoveryReferenceCatalog,
   recencyFloorK = 0,
   recencyFloorKind?: CollapseUnitKind,
   headerLines: readonly string[] = [],
@@ -3438,7 +4463,9 @@ function renderLineage(
     return { text: header.join('\n'), complete: !section.partialReason, collapse: null };
   }
   const headerText = header.length > 0 ? `${header.join('\n')}\n` : '';
-  const recover = omissionHandle ?? section.rangeRecover ?? fallbackRecover;
+  const recover = omissionHandle
+    ?? recoveryReference(references, section.rangeRecover)
+    ?? fallbackRecover;
   const body = collapseWithReceipt(
     section.units,
     maxChars - headerText.length,
@@ -3506,6 +4533,28 @@ function lineageSection(
   return section;
 }
 
+/** Render-only vault dedupe; the immutable model remains ledger-byte truth. */
+function operatorVaultWithConversationPointers(
+  section: RebirthPackageV7LineageSection,
+  renderedOperatorIds: ReadonlySet<string>,
+): RebirthPackageV7LineageSection {
+  if (renderedOperatorIds.size === 0) return section;
+  let changed = false;
+  const units = section.units.map((unit) => {
+    if (unit.kind !== 'operator' || !renderedOperatorIds.has(unit.id)) return unit;
+    changed = true;
+    const pointer = `[operator · source=${unit.id} · rendered-in=recentConversation]`;
+    const { projection: _projection, ...rest } = unit;
+    return {
+      ...rest,
+      verbatim: pointer,
+      digest: pointer,
+      claim: pointer,
+    };
+  });
+  return changed ? { ...section, units } : section;
+}
+
 /**
  * One rendered section body. `collapse` is populated only by the lineage
  * renderer: it is the final CollapseResult whose text actually shipped (or
@@ -3517,6 +4566,136 @@ interface RenderedV6SectionBody {
   readonly complete: boolean;
   readonly collapse?: CollapseResult | null;
   readonly unitPlacements?: readonly RebirthPackageV6UnitPlacement[];
+}
+
+/** Audit-3 B11: the newest K life rows stay verbatim through RLE. */
+export const LIFE_LEDGER_RLE_KEEP_NEWEST = 5;
+
+/**
+ * Audit-3 B11: run-length-encode an ENTIRELY-t0-verbatim Life Ledger body.
+ *
+ * The audited un-contended Life Ledger ships dozens of consecutive rows that
+ * differ only in life id/span/package size (the 41 identical
+ * `cli-hard-epoch/working` boundaries ~9.4k chars). This fuses runs of rows
+ * that are byte-close in the identity detail (boundary · prior-status ·
+ * runtime · by) into one RLE line, dropping their repeated keys to a single
+ * occurrence while preserving the full span and package-chars range.
+ *
+ * SAFETY PRECONDITION (caller guarantees): the caller invokes this ONLY when
+ * every collapse placement is tier t0 with kind 'life' — i.e. the section
+ * rendered ENTIRELY verbatim and `body.text` is precisely one full v3 `life …`
+ * row per line with NO digest/era/rollup demotion mixed in. Under that
+ * precondition a line-split + run-fuse cannot mis-fuse a demoted row (there
+ * are none). When any unit demoted (contended budget), this helper is skipped
+ * and the rendered text is byte-unchanged.
+ *
+ * - Rendering order is newest-first (desc). The newest
+ *   `LIFE_LEDGER_RLE_KEEP_NEWEST` rows are never fused (a successor still sees
+ *   the true recent lineage head per-row).
+ * - A run's identity key is `boundary · prior-status · runtime · by` + the
+ *   per-life package chars within ±500 (so a single capped-build drift does
+ *   not split a run).
+ * - The fused line keeps the run's FIRST id as its anchor and reports the
+ *   count, the outer span, and the shared keys once.
+ *
+ * This is a DISPLAY transform over the already-rendered verbatim text: each
+ * unit's `verbatim` (what the continuity ledger attests) and the collapse
+ * report/placements are untouched — ledger-safe by construction, complete and
+ * failure semantics preserved.
+ */
+export function applyLifeLedgerVerbatinRle(text: string): string {
+  // Operate on a full rendered Life Ledger section body (header lines first,
+  // then the collapse body, optionally a trailing [COLLAPSE …] footer). We fuse
+  // only the maximal CONTIGUOUS run of verbatim `life …` rows — the header
+  // (legend/cadence) may precede it and a collapse footer may follow; neither
+  // is a `life ` row so they are preserved untouched.
+  const lines = text.split('\n');
+  let lifeStart = -1;
+  let lifeEnd = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i]!.trim();
+    if (trimmed.startsWith('life ')) {
+      if (lifeStart < 0) lifeStart = i;
+      lifeEnd = i;
+    }
+  }
+  if (lifeStart < 0 || lifeEnd < lifeStart) return text; // no verbatim life rows
+  const fused = fuseConsecutiveVerbatinLifeLines(lines.slice(lifeStart, lifeEnd + 1));
+  return [...lines.slice(0, lifeStart), ...fused, ...lines.slice(lifeEnd + 1)].join('\n');
+}
+
+/** Fuse consecutive verbatim `life ` rows sharing identity detail (B11). */
+function fuseConsecutiveVerbatinLifeLines(lifeLines: readonly string[]): string[] {
+  interface Row { line: string; id: string; boundary: string; prior: string; runtime: string; by: string; spanStart: string; spanEnd: string; pkg: number | null; }
+  const parse = (line: string): Row | null => {
+    const m = line.trim().match(/^life\s+(\S+?)\s+·\s+span=(.*?)\.\.(.*?)(?=\s·\s|$)(.*)$/u);
+    if (!m) return null;
+    const after = m[4] ?? '';
+    const f = (re: RegExp): string => { const x = after.match(re); return x ? x[1]!.trim() : ''; };
+    const pkgS = f(/\b(?:package_chars|package-chars)=(\S+?)(?=\s·\s|$)/u);
+    const pkg = /^\d+$/u.test(pkgS) ? Number(pkgS) : null;
+    return {
+      line: line.trim(), id: m[1]!.trim(), spanStart: m[2]!.trim(), spanEnd: m[3]!.trim(),
+      boundary: f(/\bboundary=(\S+?)(?=\s·\s|$)/u), prior: f(/\bprior-status=(\S+?)(?=\s·\s|$)/u),
+      runtime: f(/\bruntime=(\S+?)(?=\s·\s|$)/u), by: f(/\bby=(\S+?)(?=\s·\s|$)/u), pkg,
+    };
+  };
+  // Rows render newest-first (desc). Parse every verbatim line; if any fails to
+  // parse cleanly, bail (leave the whole run verbatim) rather than corrupt.
+  const rows: Row[] = [];
+  for (const line of lifeLines) {
+    const p = parse(line);
+    if (!p) return [...lifeLines];
+    rows.push(p);
+  }
+  if (rows.length === 0) return [...lifeLines];
+
+  // Keep the newest K rows verbatim (they carry the true lineage head).
+  const kept = rows.slice(0, Math.min(LIFE_LEDGER_RLE_KEEP_NEWEST, rows.length));
+  const fusable = rows.slice(kept.length);
+
+  const keyOf = (r: Row): string => `${r.boundary}\u0000${r.prior}\u0000${r.runtime}\u0000${r.by}`;
+  const runs: Row[][] = [];
+  let current: Row[] = [];
+  for (const row of fusable) {
+    if (current.length > 0) {
+      const head = current[0]!;
+      const pkgClose = (head.pkg === null || row.pkg === null) || Math.abs((row.pkg - head.pkg)) <= 500;
+      if (keyOf(head) === keyOf(row) && pkgClose) { current.push(row); continue; }
+      runs.push(current); current = [row];
+    } else { current = [row]; }
+  }
+  if (current.length > 0) runs.push(current);
+
+  const out = kept.map((r) => r.line);
+  for (const run of runs) {
+    if (run.length === 1) { out.push(run[0]!.line); continue; }
+    const first = run[0]!;
+    const last = run[run.length - 1]!;
+    const starts = run.map((r) => r.spanStart).sort();
+    const ends = run.map((r) => r.spanEnd).sort();
+    const minChars = run.reduce<number | null>((acc, r) => (
+      r.pkg === null ? acc : (acc === null ? r.pkg : Math.min(acc, r.pkg))
+    ), null);
+    const maxChars = run.reduce<number | null>((acc, r) => (
+      r.pkg === null ? acc : (acc === null ? r.pkg : Math.max(acc, r.pkg))
+    ), null);
+    const pkgPart = minChars === null
+      ? ''
+      : ` · package-chars=${minChars}${maxChars !== null && minChars !== maxChars ? `..${maxChars}` : ''}`;
+    const fields = [
+      `life ${first.id}…${last.id}`,
+      `×${run.length}`,
+      `span=${starts[0]}..${ends[ends.length - 1]}`,
+    ];
+    if (last.boundary) fields.push(`boundary=${last.boundary}`);
+    if (last.prior) fields.push(`prior-status=${last.prior}`);
+    fields.push(`runtime=${last.runtime || 'unknown'}`);
+    if (last.by) fields.push(`by=${last.by}`);
+    if (pkgPart) fields.push(pkgPart.trim().replace(/^· /u, ''));
+    out.push(fields.join(' · '));
+  }
+  return out;
 }
 
 /**
@@ -3534,7 +4713,12 @@ function lifeLedgerHeaderLines(
   const units = section.units.filter((unit) => unit.kind === 'life');
   if (units.length === 0) return [];
   const lines: string[] = [
-    'legend: one line per life boundary · boundary=<trigger> · prior-status=<predecessor runtime status at the boundary> · runtime=<engine>/<model> · package-chars=<chars of the birth package>',
+    // Audit-3 A4 life-row/v3: the legend enumerates EXACTLY the keys the
+    // assembler emits per life row (span/by/runtime/boundary/prior-status/
+    // package-chars/prompt-chars/src) — legend and rows share one grammar, and
+    // the key-parity test pins that both directions hold. `src` is the builder
+    // source-tree SHA-256 prefix proving which code built the life's package.
+    'legend: one line per life boundary · life <id> · span=<startISO>..<endISO|unknown> · by=<instanceId> · runtime=<engine>/<model|unknown> · boundary=<trigger> · prior-status=<predecessor status> · package-chars=<delivered chars> · prompt-chars=<prompt chars|unknown> · src=<builder sha256 first 12|unknown>',
   ];
   const refAt = knownSourceTime(capturedAt);
   const refMs = refAt ? Date.parse(refAt) : Number.NaN;
@@ -3581,53 +4765,87 @@ function renderSectionBodies(
   limits: Record<RebirthPackageV6SectionId, number>,
   timing?: RebirthPackageV6SectionTimingAccumulator,
 ): Record<RebirthPackageV6SectionId, RenderedV6SectionBody> {
-  const transcriptHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle || null;
+  const references = buildRecoveryReferenceCatalog(model);
+  const transcriptHandle = recoveryReference(
+    references,
+    model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
+  );
+  const recentConversation = measureSectionRender(timing, 'recentConversation', () => (
+    renderConversation(model, limits.recentConversation, references)
+  ));
+  const renderedConversationIds = new Set(
+    (recentConversation.unitPlacements ?? [])
+      .filter((placement) => placement.placement === 'rendered')
+      .map((placement) => placement.id),
+  );
+  const renderedOperatorIds = new Set(
+    model.recentConversation
+      .filter((row) => row.role === 'user'
+        && renderedConversationIds.has(conversationRowBaseId(row.provenanceId)))
+      .map((row) => conversationRowBaseId(row.provenanceId)),
+  );
+  const operatorVault = operatorVaultWithConversationPointers(
+    lineageSection(model, 'operatorVault'),
+    renderedOperatorIds,
+  );
   return {
     boundaryAndActiveTask: measureSectionRender(timing, 'boundaryAndActiveTask', () => (
-      renderBoundary(model, limits.boundaryAndActiveTask)
+      renderBoundary(model, limits.boundaryAndActiveTask, undefined, references)
     )),
     brainMergeSynthesis: measureSectionRender(timing, 'brainMergeSynthesis', () => boundedText(
       model.brainMergeSynthesis ?? '',
       limits.brainMergeSynthesis,
-      model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle ?? null,
+      recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle),
     )),
     executionState: measureSectionRender(timing, 'executionState', () => (
-      renderExecution(model, limits.executionState)
+      renderExecution(model, limits.executionState, references)
     )),
     activeEditDelta: measureSectionRender(timing, 'activeEditDelta', () => (
-      renderActiveEdits(model, limits.activeEditDelta)
+      renderActiveEdits(model, limits.activeEditDelta, references)
     )),
     cognitiveArtifacts: measureSectionRender(timing, 'cognitiveArtifacts', () => (
-      renderCognition(model, limits.cognitiveArtifacts)
+      renderCognition(model, limits.cognitiveArtifacts, references)
     )),
-    recentConversation: measureSectionRender(timing, 'recentConversation', () => (
-      renderConversation(model, limits.recentConversation)
-    )),
+    recentConversation,
     operatorVault: measureSectionRender(timing, 'operatorVault', () => renderLineage(
-      lineageSection(model, 'operatorVault'),
+      operatorVault,
       limits.operatorVault,
       transcriptHandle,
-      continuityLedgerOmissionHandle(model, 'operatorVault'),
+      recoveryReference(references, continuityLedgerOmissionHandle(model, 'operatorVault')),
+      references,
     )),
     episodeChapterIndex: measureSectionRender(timing, 'episodeChapterIndex', () => renderLineage(
       lineageSection(model, 'episodeChapterIndex'),
       limits.episodeChapterIndex,
-      model.recoveryIndex.find((entry) => entry.id === 'context-warp-stores')?.handle || null,
-      continuityLedgerOmissionHandle(model, 'episodeChapterIndex'),
+      recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'context-warp-stores')?.handle),
+      recoveryReference(references, continuityLedgerOmissionHandle(model, 'episodeChapterIndex')),
+      references,
       EPISODE_CHAPTER_RECENCY_FLOOR_K,
       'episode',
     )),
-    lifeLedger: measureSectionRender(timing, 'lifeLedger', () => renderLineage(
-      lineageSection(model, 'lifeLedger'),
-      limits.lifeLedger,
-      model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle || null,
-      continuityLedgerOmissionHandle(model, 'lifeLedger'),
-      LIFE_LEDGER_RECENCY_FLOOR_K,
-      'life',
-      lifeLedgerHeaderLines(lineageSection(model, 'lifeLedger'), model.boundaryAndActiveTask.capturedAt),
-    )),
+    lifeLedger: measureSectionRender(timing, 'lifeLedger', () => {
+      const led = renderLineage(
+        lineageSection(model, 'lifeLedger'),
+        limits.lifeLedger,
+        recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle),
+        recoveryReference(references, continuityLedgerOmissionHandle(model, 'lifeLedger')),
+        references,
+        LIFE_LEDGER_RECENCY_FLOOR_K,
+        'life',
+        lifeLedgerHeaderLines(lineageSection(model, 'lifeLedger'), model.boundaryAndActiveTask.capturedAt),
+      );
+      // Audit-3 B11: the un-contended Life Ledger ships dozens of consecutive
+      // v3 rows differing only in life id/span/package size. Apply the display
+      // RLE to the rendered text. The helper fuses only a maximal contiguous
+      // run of FULL, parseable verbatim `life …` rows and bails (leaves the
+      // text unchanged) the moment any line is a demoted digest/era/rollup it
+      // cannot parse — so a contended (mixed-tier) render is never reshaped.
+      // Ledger-safe: per-life unit verbatims and the collapse report/placements
+      // are untouched; only the shipped section text is compacted.
+      return { ...led, text: applyLifeLedgerVerbatinRle(led.text) };
+    }),
     recoveryIndex: measureSectionRender(timing, 'recoveryIndex', () => (
-      renderRecovery(model, limits.recoveryIndex)
+      renderRecovery(model, limits.recoveryIndex, undefined, references)
     )),
   };
 }
@@ -3736,7 +4954,18 @@ function resolveAdaptiveSectionCapsInternal(
   options: RenderRebirthPackageV6Options,
   timing?: RebirthPackageV6SectionTimingAccumulator,
 ): Record<RebirthPackageV6SectionId, number> {
-  const limits = { ...DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, ...options.sectionMaxChars };
+  // Audit-3 C1: the section partition (and the adaptive-fill priority below)
+  // is a function of the derived execution phase. rail-active keeps the
+  // generic defaults; rail-complete / no-rail apply the ratified override
+  // table on top of the defaults and before any caller-supplied sectionMaxChars
+  // (an explicit caller cap still wins for the sections it names).
+  const phase = deriveRebirthExecutionPhase(model);
+  const phaseOverrides = sectionOverridesForPhase(phase);
+  const limits = {
+    ...DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS,
+    ...phaseOverrides,
+    ...options.sectionMaxChars,
+  };
   const budget = pushTargetChars(model, options);
   if (options.adaptiveBackfill === false || !Number.isFinite(budget) || budget <= 0) return limits;
   const envelopeChars = Number.isFinite(options.envelopeChars)
@@ -3764,9 +4993,10 @@ function resolveAdaptiveSectionCapsInternal(
   );
 
   const maxPasses = 4;
+  const fillPriority = backfillPriorityForPhase(phase);
   for (let pass = 0; pass < maxPasses && spare >= 1; pass += 1) {
     let passConsumedCapacity = false;
-    for (const id of REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY) {
+    for (const id of fillPriority) {
       if (spare < 1) break;
       if (!admitted.includes(id)) continue;
       if (explicitCaps.has(id)) continue;
@@ -3806,13 +5036,27 @@ function renderSectionsWithLimits(
   timing?: RebirthPackageV6SectionTimingAccumulator,
 ): readonly RenderedRebirthPackageV6Section[] {
   const rendered = renderSectionBodies(model, limits, timing);
-  // Audit-2 A13: a render-incomplete trailer on the Recovery Index names every
-  // admitted section whose body did not fully render at its FINAL cap (budget
-  // truncation, collapse demotion, elision). The trailer is admission-checked:
-  // if it cannot fit the Recovery Index's own cap it is omitted rather than
-  // pushing the section over budget.
+  // Audit-3 A8/S6: ONE completeness census derived from the actual rendered
+  // bodies. The Boundary re-renders once WITH the census so its
+  // capture-partial-lanes header, each section's partial= surface, the
+  // RENDER-INCOMPLETE trailer, and the Recovery Index status= can never
+  // disagree — one structure feeds all four.
+  const completeness = computeSectionCompleteness(model, rendered);
+  rendered.boundaryAndActiveTask = measureSectionRender(timing, 'boundaryAndActiveTask', () => (
+    renderBoundary(model, limits.boundaryAndActiveTask, completeness)
+  ));
+  // Recovery section rows for rendered sections take the census status too
+  // (fourth surface of the A8/S6 agreement), so it re-renders with the census.
+  rendered.recoveryIndex = measureSectionRender(timing, 'recoveryIndex', () => (
+    renderRecovery(model, limits.recoveryIndex, completeness)
+  ));
   const admitted = admittedSectionIds(model);
-  const incomplete = admitted.filter((id) => !rendered[id].complete);
+  // Render-loss sections in canonical order: the census's renderLoss flag is
+  // the single basis for the trailer (was: admitted bodies with complete=false
+  // — same outcome, now one structure with the header).
+  const incomplete = REBIRTH_PACKAGE_V6_SECTION_IDS.filter((id) => (
+    completeness.get(id)?.renderLoss === true
+  ));
   if (incomplete.length > 0 && admitted.includes('recoveryIndex')) {
     const trailer = `\n[RENDER-INCOMPLETE sections: ${incomplete.join(',')}]`;
     const recovery = rendered.recoveryIndex;
@@ -3883,6 +5127,13 @@ export interface RebirthPackageV7EvictionTelemetry {
   readonly unitsSectionElided: number;
   readonly sectionsElided: number;
   readonly evictionEnvelopes: number;
+  /**
+   * Audit-3 A3: present when the post-admission cap enforcement trimmed
+   * optional section bodies to keep delivered chars within the declared
+   * budget. `capEnforcedChars` is the enforced budget value.
+   */
+  readonly capEnforcedChars?: number;
+  readonly trimmedSectionIds?: readonly RebirthPackageV6SectionId[];
 }
 
 export interface RenderedRebirthPackageV6WithReport {
@@ -4120,6 +5371,7 @@ export function renderRebirthPackageV6WithReport(
   // declaration must ride INSIDE the budget math, never appended beyond it.
   const lane = redactContinuityModel(model);
   model = lane.model;
+  const references = buildRecoveryReferenceCatalog(model);
   const declaration = lane.declaration;
   const budget = packageBudgetChars(model, options);
   const pushTarget = pushTargetChars(model, options);
@@ -4157,6 +5409,10 @@ export function renderRebirthPackageV6WithReport(
   const finish = (
     text: string,
     omittedSectionIds: readonly RebirthPackageV6SectionId[],
+    // Audit-3 A3: section bodies trimmed by the post-admission cap enforcement
+    // (lowest-priority optional sections demoted to framed elision receipts so
+    // delivered chars never exceed the declared budget).
+    trimmedSectionIds: readonly RebirthPackageV6SectionId[] = [],
   ): RenderedRebirthPackageV6WithReport => {
     const citizens = sections.filter((section): section is RenderedRebirthPackageV6Section & { collapse: CollapseResult } => (
       section.collapse != null
@@ -4187,6 +5443,12 @@ export function renderRebirthPackageV6WithReport(
       hardOverrunChars: Number.isFinite(budget) && budget > 0
         ? Math.max(0, finalTotalChars - Math.floor(budget))
         : 0,
+      ...(trimmedSectionIds.length > 0 && Number.isFinite(budget) && budget > 0
+        ? {
+          capEnforcedChars: Math.max(0, Math.floor(budget)),
+          trimmedSectionIds,
+        }
+        : {}),
       shrinkRenders: shrink.shrinkRenders,
       sectionsShrunk: shrink.sectionsShrunk,
       capReductionChars: shrink.capReductionChars,
@@ -4237,7 +5499,10 @@ export function renderRebirthPackageV6WithReport(
     'recoveryIndex',
   ]);
   const optional = sections.filter((section) => !protectedIds.has(section.id));
-  const recover = model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle || 'unavailable';
+  const recover = recoveryReference(
+    references,
+    model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle,
+  ) || 'unavailable';
   const citizenUnits = (id: RebirthPackageV6SectionId): readonly CollapseUnit[] => {
     if (id === 'activeEditDelta') return buildActiveEditCollapseUnits(model);
     if ((REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id)) {
@@ -4256,17 +5521,26 @@ export function renderRebirthPackageV6WithReport(
       body = buildSectionEvictionEnvelope({
         sectionId: section.id as RebirthPackageV7CollapseSectionId,
         units,
-        omissionHandle: continuityLedgerOmissionHandle(model, section.id),
+        omissionHandle: recoveryReference(
+          references,
+          continuityLedgerOmissionHandle(model, section.id),
+        ),
         includeCensus: !compactReceipt,
       });
     } else if (section.id === 'cognitiveArtifacts' && model.cognitiveArtifacts.length > 0) {
-      const omissionHandle = continuityLedgerOmissionHandle(model, 'cognitiveArtifacts');
+      const omissionHandle = recoveryReference(
+        references,
+        continuityLedgerOmissionHandle(model, 'cognitiveArtifacts'),
+      );
       body = `[EVICTED section=cognitiveArtifacts units=${model.cognitiveArtifacts.length}`
         + `${omissionHandle ? ` recover=${omissionHandle}` : ''}]`
         + (omissionHandle ? '' : '\nCognitive artifacts evicted; ledger unreachable');
     } else if (section.id === 'recentConversation'
       && (model.recentConversation.length > 0 || conversationEndpointReceipt(model).length > 0)) {
-      const transcriptHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
+      const transcriptHandle = recoveryReference(
+        references,
+        model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
+      );
       const endpointBodies = Number(Boolean(model.boundaryAndActiveTask.activeRequest))
         + Number(Boolean(model.boundaryAndActiveTask.lastMaterialAssistant));
       body = `[EVICTED section=recentConversation rows=${model.recentConversation.length}`
@@ -4288,6 +5562,7 @@ export function renderRebirthPackageV6WithReport(
     includedOptional: ReadonlySet<RebirthPackageV6SectionId>,
     compactElisionReceipts = false,
     protectedOverrun = false,
+    capNote = '',
   ): string => {
     const bodyElided = optional
       .filter((section) => !includedOptional.has(section.id))
@@ -4300,6 +5575,7 @@ export function renderRebirthPackageV6WithReport(
           + ` envelope-chars=${envelopeChars}`
           + ` elided-section-bodies=${bodyElided.join(',') || 'none'}`
           + ` protected-overrun=${protectedOverrun || envelopeOverrun}`
+          + capNote
           + ` recover=${recover}]`,
         );
       }
@@ -4353,6 +5629,11 @@ export function renderRebirthPackageV6WithReport(
   };
 
   for (const section of optional) {
+    // A vault pointer is valid only while the referenced Recent Conversation
+    // body is admitted. Reverse-priority trimming drops operatorVault before
+    // recentConversation below; this admission guard covers the other shape
+    // (conversation could not fit, a compact pointer-only vault could).
+    if (section.id === 'operatorVault' && !included.has('recentConversation')) continue;
     const candidate = new Set(included).add(section.id);
     if (compose(sections, candidate, compactElisionReceipts).length <= sectionBudget) {
       included.add(section.id);
@@ -4377,10 +5658,55 @@ export function renderRebirthPackageV6WithReport(
       probeCap = Math.floor(probeCap / 2);
     }
   }
-  return finish(
-    compose(sections, included, compactElisionReceipts),
-    optional.filter((section) => !included.has(section.id)).map((section) => section.id),
+  // Audit-3 A3: the cap is on DELIVERED chars. Sections the admission loop
+  // could not fit are NOT dropped silently — each optional body demoted to a
+  // framed elision receipt is named on the receipt line itself via
+  // `cap-enforced=<budget> trimmed=<ids>`, so a successor sees exactly what
+  // budget pressure trimmed and why. Defense in depth: if the final compose
+  // still exceeds the section budget (only possible through future admission
+  // drift — every current path checks before including), drop included
+  // optional bodies lowest-priority-first until it fits; the protected-minimum
+  // overrun (envelope or frames alone exceed the budget) is the one case that
+  // ships over, always recorded by hardOverrunChars, never silent.
+  const budgetFloorNote = Number.isFinite(budget) ? String(Math.floor(budget)) : 'unbounded';
+  const exclusionNote = (excluded: readonly RebirthPackageV6SectionId[]): string => (
+    excluded.length > 0
+      ? ` cap-enforced=${budgetFloorNote} trimmed=${excluded.join(',')}`
+      : ''
   );
+  const excludedIds = optional
+    .filter((section) => !included.has(section.id))
+    .map((section) => section.id);
+  let finalIncluded = included;
+  let finalExcluded = excludedIds;
+  let finalText = compose(
+    sections,
+    finalIncluded,
+    compactElisionReceipts,
+    false,
+    exclusionNote(finalExcluded),
+  );
+  if (finalText.length > sectionBudget) {
+    const droppable = optional
+      .filter((section) => finalIncluded.has(section.id))
+      .reverse();
+    for (const section of droppable) {
+      finalIncluded = new Set(finalIncluded);
+      finalIncluded.delete(section.id);
+      finalExcluded = optional
+        .filter((candidate) => !finalIncluded.has(candidate.id))
+        .map((candidate) => candidate.id);
+      finalText = compose(
+        sections,
+        finalIncluded,
+        compactElisionReceipts,
+        false,
+        exclusionNote(finalExcluded),
+      );
+      if (finalText.length <= sectionBudget) break;
+    }
+  }
+  return finish(finalText, finalExcluded, finalExcluded);
 }
 
 export function renderRebirthPackageV6(
@@ -4651,8 +5977,12 @@ function buildCognitiveLedgerUnits(model: RebirthPackageV6Model): readonly Colla
     // stored projection or the entirety of real source bytes, never an
     // undeclared slice. Both call sites share the model's capturedAt as the
     // projection reference instant (audit-2 A22).
-    const row = projectCognitiveRow(sourceRow, model.boundaryAndActiveTask.capturedAt);
-    const verbatim = cognitionRowBody(row);
+    const row = projectCognitiveRow(
+      sourceRow,
+      model.boundaryAndActiveTask.capturedAt,
+      cognitiveLifeBoundaryStarts(model),
+    );
+    const verbatim = cognitionRowBody(row, model.boundaryAndActiveTask.capturedAt);
     const projection = row.projection === 'truncated'
       && row.storedChars !== undefined
       && row.storedBytes !== undefined

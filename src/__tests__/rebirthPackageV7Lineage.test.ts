@@ -559,9 +559,12 @@ describe('Rebirth Package v7 — eviction envelopes and edit citizenship', () =>
     });
     expect(text).toContain('[REBIRTH-V6-SECTION id=operatorVault');
     expect(text).toContain(`[EVICTED section=operatorVault units=40 span=2026-07-`);
+    const recoveryRef = /\[EVICTED section=operatorVault units=40 span=[^\]]+ recover=(R\d+)\]/u
+      .exec(text)?.[1];
+    expect(recoveryRef).toBeTruthy();
     expect(text).toContain(
-      'recover=continuity_ledger action="fetch" owner="instance-a" capture_id="capture-v7"'
-      + ' section_id="operatorVault" omitted_only=true include_unknown_source_time=true limit=200]',
+      `- ${recoveryRef} = continuity_ledger action="fetch" owner="instance-a" capture_id="capture-v7"`
+      + ' section_id="operatorVault" omitted_only=true include_unknown_source_time=true limit=200',
     );
     expect(text).toContain('· era=');
     expect(text).not.toContain('ledger unreachable');
