@@ -229,7 +229,8 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(text).toContain('protected-overrun=false');
     expect(text).not.toContain('omitted-sections=');
     for (const id of REBIRTH_PACKAGE_V6_SECTION_IDS) {
-      const frames = text.match(new RegExp(`\\[REBIRTH-V6-SECTION id=${id} chars=`, 'gu')) ?? [];
+      const order = REBIRTH_PACKAGE_V6_SECTION_IDS.indexOf(id) + 1;
+      const frames = text.match(new RegExp(`\\[REBIRTH-V6-SECTION id=${id} order=${order} chars=`, 'gu')) ?? [];
       expect(frames, `${id} must retain exactly one protected frame`).toHaveLength(1);
     }
     for (const id of collapse.omittedSectionIds) {

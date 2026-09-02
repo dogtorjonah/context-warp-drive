@@ -154,18 +154,20 @@ export interface RebirthPackageV6NowCard {
     readonly instanceName: string | null;
     readonly sourceAt: string | null;
     readonly sourceEndAt?: string | null;
-    readonly archived: boolean;
+    /** Null means the captured inputs did not carry an authoritative runtime state. */
+    readonly archived: boolean | null;
   }[];
   /**
-   * Optional "commits active since boot" truth line (plan feature 4, S16): how
-   * many of THIS instance's commits to relay/src|shared/src are activated in the
-   * current relay boot vs pending activation. Supplied by the assembler/feeder
-   * (git log ∩ instance ∩ relay|shared paths ∩ boot watermark). Rendered as a
-   * Now-card line when present; absent means no commit-activity data supplied.
+   * Captured operator-facing process facts. Repository cleanliness remains
+   * explicitly unknown until a worker probe supplies it; registry-derived
+   * child/squad/room facts are still useful and source-stamped at capture.
    */
-  readonly commitActivity?: {
-    readonly activated: number;
-    readonly pending: number;
+  readonly ops?: {
+    readonly repositoryState: 'clean' | 'dirty' | 'unknown';
+    readonly repositoryReason: string | null;
+    readonly ownedLiveChildren: readonly { readonly id: string; readonly name: string }[];
+    readonly squad: string | null;
+    readonly rooms: readonly string[];
     readonly source: RebirthPackageV6SourceRef;
   };
 }
@@ -506,6 +508,11 @@ export interface RebirthPackageV6LegacyShape {
   readonly continuityReceipt?: ContinuityReceipt;
 }
 
+export interface RebirthPackageV6ActiveEditCaptureDisposition {
+  readonly status: 'not-requested' | 'attempted-failed';
+  readonly reason: string;
+}
+
 export interface AdaptLegacyRebirthPackageV6Options {
   readonly predecessorName?: string;
   readonly instanceId?: string;
@@ -513,6 +520,8 @@ export interface AdaptLegacyRebirthPackageV6Options {
   readonly workspace?: string;
   readonly cwd?: string;
   readonly activeEditDelta?: RebirthPackageV6ActiveEditDelta;
+  /** Explicit truth for an absent immutable Active Edit capture. */
+  readonly activeEditCaptureDisposition?: RebirthPackageV6ActiveEditCaptureDisposition;
   readonly cognitiveArtifacts?: readonly RebirthPackageV6CognitiveArtifact[];
   readonly recentConversation?: readonly RebirthPackageV6ConversationRow[];
   readonly operatorVault?: RebirthPackageV7LineageSection;
@@ -637,9 +646,10 @@ export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
   // buys section budget by spending amputation headroom: a 24k oversubscription
   // that used to shrink starts eliding whole sections instead.
   operatorVault: 20_000,
-  // Episodes are the most re-derivable lineage section (fold_recall recovers
-  // every band), so they fund the B7 life-ledger recency increase: episode
-  // 10k->5k pays for lifeLedger 5k->10k (operator default: 10k ledger cap,
+  // Episodes are the most re-derivable lineage section (the canonical
+  // transcript re-derives every band), so they fund the B7 life-ledger
+  // recency increase: episode 10k->5k pays for lifeLedger 5k->10k (operator
+  // default: 10k ledger cap,
   // 5k spent from the lineage shrinkable reserve). The envelope total stays
   // 150k under the fixed budget.
   episodeChapterIndex: 5_000,
@@ -1207,18 +1217,21 @@ function defaultRecoveryHandles(args: {
     },
     {
       id: 'current-continuity-pov',
-      label: 'current live rebirth/fold POV (not the complete episode or vault stores)',
+      label: 'current continuity summary (not the complete transcript, episode, or vault stores)',
       handle: hasIdentity
-        ? `tap_instance_messages action="ghost" target_instance_id=${quotedId}`
+        ? `tap_instance_messages action="summary" target_instance_id=${quotedId}`
         : '',
       status: hasIdentity ? 'partial' : 'unavailable',
       count: args.currentPovCount,
       frontier: args.sourceFrontier,
+      reason: hasIdentity
+        ? 'summary-only; exact rebirth artifacts and raw chronology are separately indexed'
+        : 'stable instance identity unavailable',
     },
     {
       id: 'context-warp-stores',
-      label: 'Context Warp episodes/bands (fold_recall); User Message Vault source rows use transcript recovery',
-      handle: hasIdentity ? 'fold_recall op="range" start_event=0' : '',
+      label: 'Context Warp episodes/bands (ambient recall; re-derived from the raw transcript); User Message Vault source rows use transcript recovery',
+      handle: hasIdentity ? `tap_instance_messages action="recent" target_instance_id=${quotedId}` : '',
       status: hasIdentity ? 'partial' : 'unavailable',
       count: null,
       frontier: args.sourceFrontier,
@@ -1393,6 +1406,8 @@ export function adaptLegacyRebirthPackageToV6(
   const assistantText = pendingAssistantAction?.text
     ?? extractLegacyAssistant(legacy.lastUserAiMessages);
   const requestSource = receipt?.liveState?.request?.source;
+  const captureDispositionReason = nonEmpty(options.activeEditCaptureDisposition?.reason);
+  const receiptEditDelta = adaptReceiptEditDelta(receipt);
   const activeEditDelta = options.activeEditDelta ?? (nonEmpty(legacy.activeEditDelta)
     ? {
         captureId: null,
@@ -1425,9 +1440,25 @@ export function adaptLegacyRebirthPackageToV6(
         }],
         omittedFiles: 0,
         truncated: true,
-        reasons: ['legacy Active Edit Delta adapted without an immutable Atlas capture'],
+        reasons: [captureDispositionReason ?? 'legacy Active Edit Delta adapted without an immutable Atlas capture'],
       }
-    : adaptReceiptEditDelta(receipt));
+    : receiptEditDelta
+      ? (captureDispositionReason
+          ? { ...receiptEditDelta, reasons: [captureDispositionReason] }
+          : receiptEditDelta)
+      : options.activeEditCaptureDisposition?.status === 'attempted-failed'
+        ? {
+            captureId: null,
+            state: 'unknown' as const,
+            capturedSourceAt: null,
+            completedObservedAt: null,
+            inheritedCaptureIds: [],
+            files: [],
+            omittedFiles: 0,
+            truncated: false,
+            reasons: [captureDispositionReason ?? 'immutable Atlas edit capture attempted but failed'],
+          }
+        : undefined);
   const executionFacts: RebirthPackageV6ExecutionFact[] = [];
   // Capsule authority order: a later genuine operator message outranks live
   // rail direction. The package cannot judge whether rail text AGREES with the
@@ -1853,8 +1884,6 @@ export function computeRebirthCaptureDegradedLanes(model: RebirthCaptureDegraded
     aed
     && aed.state !== undefined
     && aed.state !== 'exact'
-    && Array.isArray(aed.files)
-    && aed.files.length > 0
     && Array.isArray(aed.reasons)
     && aed.reasons.some((reason) => {
       if (typeof reason !== 'string') return false;
@@ -1963,15 +1992,61 @@ function boundedRailAvailabilityReason(value: string | null | undefined): string
     || 'unspecified';
 }
 
+type RebirthPartialReasonClass = 'horizon' | 'cap' | 'store' | 'not-requested' | 'unknown';
+
+function classifyPartialReason(reason: string | null | undefined): RebirthPartialReasonClass {
+  const text = reason?.trim() ?? '';
+  if (REBIRTH_ACTIVE_EDIT_NOT_REQUESTED_REASON_RE.test(text)) return 'not-requested';
+  if (REBIRTH_CAPTURE_GAP_REASON_RE.test(text)
+    || /unavailable|unreadable|failed|failure|worker|transport|timeout|corrupt/u.test(text)) return 'store';
+  if (/horizon|frontier|pre-horizon|capturedAt/u.test(text)) return 'horizon';
+  if (/cap|ceiling|budget|truncat|omitt|selected|projection/u.test(text)) return 'cap';
+  return 'unknown';
+}
+
+/**
+ * Full partial-lane census is distinct from capture-degraded: horizon, cap,
+ * and deliberately not-requested lanes are incomplete but not failed reads.
+ */
+function partialLaneCensus(model: RebirthPackageV6Model): string[] {
+  const lanes: string[] = [];
+  const lineage = [
+    ['operator-vault', model.operatorVault?.partialReason],
+    ['episode-chapter-index', model.episodeChapterIndex?.partialReason],
+    ['life-ledger', model.lifeLedger?.partialReason],
+  ] as const;
+  for (const [id, reason] of lineage) {
+    if (reason?.trim()) lanes.push(`${id}:${classifyPartialReason(reason)}`);
+  }
+  const cognition = model.cognitiveArtifactCapture;
+  if (cognition && cognition.status !== 'complete') {
+    const reason = cognition.warnings.join(' ') || cognition.missingFamilies.join(' ');
+    lanes.push(`cognition:${classifyPartialReason(reason) === 'unknown' ? 'store' : classifyPartialReason(reason)}`);
+  }
+  if (model.activeEditDelta.state !== 'exact' && model.activeEditDelta.state !== 'none') {
+    const reason = model.activeEditDelta.reasons.join(' ');
+    lanes.push(`active-edit-delta:${classifyPartialReason(reason)}`);
+  }
+  const rail = model.boundaryAndActiveTask.nowCard?.currentRailAvailability;
+  if (rail && rail.status !== 'current') {
+    lanes.push(`task-rail:${rail.status === 'none' ? 'not-requested' : classifyPartialReason(rail.reason)}`);
+  }
+  return [...new Set(lanes)];
+}
+
 function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text: string; complete: boolean } {
   const boundary = model.boundaryAndActiveTask;
   // One canonical census: the rendered header and the exported helper are the
   // same call, so sidecar telemetry and the package header can never drift.
   const degradedLanes = computeRebirthCaptureDegradedLanes(model);
+  const partialLanes = partialLaneCensus(model);
   const lines = [
-    `contract=${model.version}`,
+    `schema=${model.version} · render=v6-sections · capture-naming=v2`,
     `lifecycle=${boundary.lifecycle} · ${boundary.lifecycleMeaning}`,
     `capture-artifact=${boundary.captureId} · captured-at=${boundary.capturedAt ?? 'unknown'} · frontier=${boundary.sourceFrontier ?? 'unknown'}`,
+    ...(partialLanes.length > 0
+      ? [`partial-lanes=${partialLanes.join(',')} · classes=horizon|cap|store|not-requested|unknown`]
+      : []),
     ...(degradedLanes.length > 0
       ? [`capture-degraded=${degradedLanes.join(',')} · status=partial · per-lane recovery truth renders in each affected section`]
       : []),
@@ -2067,17 +2142,30 @@ function renderBoundary(model: RebirthPackageV6Model, maxChars: number): { text:
         const span = hop.sourceAt
           ? `${hop.sourceAt.slice(0, 10)}→${hop.sourceEndAt?.slice(0, 10) ?? 'now'}`
           : 'span=unknown';
-        return `${label} · ${span}${hop.archived ? ' · archived' : ''}`;
+        const runtimeState = hop.archived === true
+          ? 'archived'
+          : hop.archived === false ? 'live-at-capture' : 'state=unknown';
+        return `${label} · ${span} · ${runtimeState}`;
       })
       .join(' → ');
     lines.push(`lineage-chain=${chain}`);
   }
-  if (now?.commitActivity) {
-    // Plan feature 4 (S16): this instance's relay|shared commits activated in
-    // the current boot vs pending, replacing the bare "N unactivated commit(s)".
+  if (now?.ops) {
+    const owned = now.ops.ownedLiveChildren.length > 0
+      ? now.ops.ownedLiveChildren.map((child) => `${child.name}(${child.id})`).join(',')
+      : 'none';
+    const rooms = now.ops.rooms.length > 0 ? now.ops.rooms.join(',') : 'none';
     lines.push(
-      `commits=since-boot ${now.commitActivity.activated} activated · ${now.commitActivity.pending} pending · ${formatSource(now.commitActivity.source)}`,
+      `ops=git:${now.ops.repositoryState}${now.ops.repositoryReason ? `:${boundedRailAvailabilityReason(now.ops.repositoryReason)}` : ''}`
+      + ` · owned-live-children=${owned} · squad=${now.ops.squad ?? 'none'} · rooms=${rooms} · ${formatSource(now.ops.source)}`,
     );
+  }
+  const vaultNewest = model.operatorVault?.units
+    .flatMap((unit) => knownSourceTime(unit.sourceAt) ? [knownSourceTime(unit.sourceAt)!] : [])
+    .sort()
+    .at(-1) ?? null;
+  if (vaultNewest || boundary.activeRequest?.source.sourceAt) {
+    lines.push(`vault-newest=${vaultNewest ?? 'unknown'} · active-request=${boundary.activeRequest?.source.sourceAt ?? 'unknown'}`);
   }
   lines.push('[/FACTUAL NOW CARD]');
   if (boundary.activeRequest) {
@@ -2134,14 +2222,17 @@ function renderExecution(model: RebirthPackageV6Model, maxChars: number): { text
   // an explicit banner (mirroring renderCognition) where they make no recency claim.
   const known = model.executionState.facts.filter((fact) => fact.sourceAt);
   const unknown = model.executionState.facts.filter((fact) => !fact.sourceAt);
+  const factPrefix = (fact: RebirthPackageV6ExecutionFact): string => (
+    fact.kind === 'review' ? `review-demand=${fact.text}` : `${fact.kind} · ${fact.text}`
+  );
   const lines = known.map((fact) => (
-    `- ${fact.kind} · ${fact.text} · source=${fact.provenanceId} · source-time=${fact.sourceAt} · status=${fact.status}${fact.predatesActiveRequest ? ' · authority=predates-active-request' : ''}`
+    `- ${factPrefix(fact)} · source=${fact.provenanceId} · source-time=${fact.sourceAt} · status=${fact.status}${fact.predatesActiveRequest ? ' · authority=predates-active-request' : ''}`
   ));
   for (const reason of model.executionState.unknownReasons) lines.push(`- unknown: ${reason}`);
   if (unknown.length > 0) {
     lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
     for (const fact of unknown) {
-      lines.push(`- ${fact.kind} · ${fact.text} · source=${fact.provenanceId} · status=${fact.status}`);
+      lines.push(`- ${factPrefix(fact)} · source=${fact.provenanceId} · status=${fact.status}`);
     }
   }
   if (lines.length === 0) lines.push('- execution state captured as empty');
@@ -2641,6 +2732,7 @@ function renderTruncatedLatestKnownRow(args: {
     latestKnownTailOmitted: true,
   });
   const compactMarker = `[… earlier-known=${args.omittedKnown.length} · unknown-time=${args.omittedUnknown.length} · latest-tail=omitted …]`;
+  const minimalMarker = '[… latest-tail=omitted …]';
   const minimumBodyChars = Math.min(16, args.row.text.length);
 
   // Under a very small caller override, provenance plus the full omission
@@ -2651,6 +2743,7 @@ function renderTruncatedLatestKnownRow(args: {
     [fullHeader, fullMarker],
     [compactHeader, compactMarker],
     ['', compactMarker],
+    ['', minimalMarker],
   ] as const) {
     const bodyChars = args.maxChars - header.length - marker.length - 2;
     if (bodyChars < minimumBodyChars) continue;
@@ -2711,7 +2804,7 @@ function renderConversation(model: RebirthPackageV6Model, maxChars: number): { t
   // the exact endpoint identities, timestamps, and bytes.
   const recoveryHandle = model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle ?? null;
   const endpointReceipt = fullEndpointReceipt
-    ? 'Endpoint messages: Boundary.'
+    ? 'endpoint rows: rendered in Boundary (active request + last assistant)'
     : '';
   const endpointSeparatorChars = endpointReceipt && dialogueText ? 2 : 0;
   const dialogueBudget = Math.max(0, maxChars - endpointReceipt.length - endpointSeparatorChars);
@@ -2807,8 +2900,8 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
   const lines: string[] = [];
   let elided = false;
   for (const entry of entries) {
-    const reasonSuffix = entry.status !== 'available' && entry.reason?.trim()
-      ? ` · reason=${entry.reason.trim()}`
+    const reasonSuffix = entry.status !== 'available'
+      ? ` · reason=${entry.reason?.trim() || 'unspecified'}`
       : '';
     // Honest recovery disposition: a nonempty handle is rendered verbatim; an
     // empty handle on a not-requested lane is `not-requested`, and an empty
@@ -2816,7 +2909,11 @@ function renderRecovery(model: RebirthPackageV6Model, maxChars: number): { text:
     // contradictory fake handle for a capture that was never requested.
     let recoverLabel = entry.handle || 'unavailable';
     if (!entry.handle && entry.status === 'not-requested') recoverLabel = 'not-requested';
-    const line = `- ${entry.id} · ${entry.label} · status=${entry.status} · count=${entry.count ?? 'unknown'} · frontier=${entry.frontier ?? 'unknown'}${reasonSuffix} · recover=${recoverLabel}`;
+    const countLabel = entry.id === 'task-rail' ? 'steps' : 'count';
+    const frontier = entry.id === 'identity' && entry.frontier === null
+      ? ''
+      : ` · frontier=${entry.frontier ?? 'unknown'}`;
+    const line = `- ${entry.id} · ${entry.label} · status=${entry.status} · ${countLabel}=${entry.count ?? 'unknown'}${frontier}${reasonSuffix} · recover=${recoverLabel}`;
     // Optional inline evidence (e.g. a captured Atlas handoff card body) rides
     // beneath its own handle line as a bounded indented snapshot. It never
     // overloads `label` (which stays a short title). If the evidence cannot fit
@@ -2965,9 +3062,10 @@ function renderLineage(
 }
 
 function frameSection(id: RebirthPackageV6SectionId, body: string): string {
+  const order = REBIRTH_PACKAGE_V6_SECTION_IDS.indexOf(id) + 1;
   return [
     `── ${SECTION_TITLES[id]} ──`,
-    `${V6_SECTION_OPEN_PREFIX} id=${id} chars=${body.length}]`,
+    `${V6_SECTION_OPEN_PREFIX} id=${id} order=${order} chars=${body.length}]`,
     body,
     V6_SECTION_CLOSE,
   ].join('\n');
@@ -4362,7 +4460,7 @@ export function buildContinuityLedgerCaptureFromFoldEpoch(
       sha256: sha256ContinuityLedgerVerbatim(verbatim),
       origin: null,
       recover: input.recover?.(sourceIndex, message)
-        ?? `fold_recall op="range" start_event=${sourceIndex} end_event_exclusive=${sourceIndex + 1}`,
+        ?? `tap_instance_messages action="recent" target_instance_id=${JSON.stringify(ownerInstanceId)} (unit is canonical event ${sourceIndex} in that transcript)`,
       workspace,
     };
   });

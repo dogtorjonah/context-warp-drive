@@ -350,19 +350,19 @@ describe('FoldSession marathon pressure folding', () => {
     // Closet forensic section): the hard-epoch package renders the fixed six-frame
     // model in canonical order — boundary/task, execution, active edits, cognition,
     // conditional conversation, recovery. Assert each frame opens with its
-    // `[REBIRTH-V6-SECTION id=<id> chars=` marker and that the frames appear in
+    // `[REBIRTH-V6-SECTION id=<id> order=<n> chars=` marker and that the frames appear in
     // canonical order (boundary before recovery), while the old v4 Closet header
     // is gone from the rendered package.
-    const v6FrameIds = [
-      'boundaryAndActiveTask',
-      'executionState',
-      'activeEditDelta',
-      'cognitiveArtifacts',
-      'recentConversation',
-      'recoveryIndex',
-    ];
-    for (const frameId of v6FrameIds) {
-      expect(preparedText).toContain(`[REBIRTH-V6-SECTION id=${frameId} chars=`);
+    const v6Frames = [
+      ['boundaryAndActiveTask', 1],
+      ['executionState', 3],
+      ['activeEditDelta', 4],
+      ['cognitiveArtifacts', 5],
+      ['recentConversation', 6],
+      ['recoveryIndex', 10],
+    ] as const;
+    for (const [frameId, order] of v6Frames) {
+      expect(preparedText).toContain(`[REBIRTH-V6-SECTION id=${frameId} order=${order} chars=`);
     }
     expect(preparedText.indexOf('[REBIRTH-V6-SECTION id=boundaryAndActiveTask'))
       .toBeLessThan(preparedText.indexOf('[REBIRTH-V6-SECTION id=recoveryIndex'));

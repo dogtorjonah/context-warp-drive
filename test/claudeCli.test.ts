@@ -282,7 +282,7 @@ describe('buildClaudeCliHardEpochChain — pressure-ceiling live-turn preservati
     // The default seed now uses buildRawHardEpochSeed (rich rebirth package),
     // not the old static DEFAULT_CLAUDE_CLI_HARD_EPOCH_SEED_PROMPT.
     expect(seed).toContain('[CONTEXT REBIRTH]');
-    expect(seed).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(seed).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask order=1 chars=');
     expect(seed).toContain('[EXACT ACTIVE REQUEST');
     expect(seed).toContain('LIVE-MARKER-9931'); // live turn never silently trimmed
   });

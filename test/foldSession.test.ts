@@ -202,16 +202,16 @@ describe('FoldSession E10 sawtooth eviction', () => {
     expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     // Canonical v6 hard epochs use the fixed six-frame package instead of the
     // retired flat Raw Trace Coordinate Closet.
-    const v6FrameIds = [
-      'boundaryAndActiveTask',
-      'executionState',
-      'activeEditDelta',
-      'cognitiveArtifacts',
-      'recentConversation',
-      'recoveryIndex',
-    ];
-    for (const frameId of v6FrameIds) {
-      expect(preparedText).toContain(`[REBIRTH-V6-SECTION id=${frameId} chars=`);
+    const v6Frames = [
+      ['boundaryAndActiveTask', 1],
+      ['executionState', 3],
+      ['activeEditDelta', 4],
+      ['cognitiveArtifacts', 5],
+      ['recentConversation', 6],
+      ['recoveryIndex', 10],
+    ] as const;
+    for (const [frameId, order] of v6Frames) {
+      expect(preparedText).toContain(`[REBIRTH-V6-SECTION id=${frameId} order=${order} chars=`);
     }
     expect(preparedText.indexOf('[REBIRTH-V6-SECTION id=boundaryAndActiveTask'))
       .toBeLessThan(preparedText.indexOf('[REBIRTH-V6-SECTION id=recoveryIndex'));
@@ -451,7 +451,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body.split(HARD_EPOCH_CONTINUITY_DIRECTIVE)).toHaveLength(2);
     expect(body).toContain('RAW_PRIOR_TRACE_MARKER');
     expect(body).not.toContain(HARD_EPOCH_LIVE_TURN_HEADER);
-    expect(body).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(body).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask order=1 chars=');
     expect(body).not.toContain('👤 LAST USER MESSAGE (active request):');
     expect(body).toContain('LIVE_TRIGGER_MARKER current request');
     expect(body.match(/LIVE_TRIGGER_MARKER/g)).toHaveLength(1);
@@ -517,7 +517,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body).toContain(HARD_EPOCH_CONTINUITY_DIRECTIVE);
     expect(body.split(HARD_EPOCH_CONTINUITY_DIRECTIVE)).toHaveLength(2);
     expect(body).toContain('RAW_PRIOR_TRACE_MARKER');
-    expect(body).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
+    expect(body).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask order=1 chars=');
     expect(body).not.toContain('TOOL_RESULT_MARKER non-string trailing user payload');
     expect(body.match(/LIVE_TRIGGER_MARKER/g)).toHaveLength(1);
   });

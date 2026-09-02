@@ -253,6 +253,27 @@ describe('buildContinuityReceipt (typed assembly)', () => {
     expect(receipt.liveState?.edits.status).toBe('current');
   });
 
+  test('source-stamps the instance-registry snapshot at the completed capture instant', () => {
+    const capturedAt = '2026-07-20T03:00:00.000Z';
+    const receipt = buildContinuityReceipt({
+      boundary: 'continuation',
+      predecessorName: 'agent',
+      capturedAt,
+      instance: {
+        instanceId: 'instance-7',
+        instanceName: 'worker-7',
+        runtimeStatus: 'idle',
+      },
+    });
+
+    expect(receipt.liveState?.instance.source).toMatchObject({
+      kind: 'instance-registry',
+      id: 'instance-7',
+      sourceTimestamp: capturedAt,
+      capturedAt,
+    });
+  });
+
   test('emits the derived capture identity when the caller omits one', () => {
     const receipt = buildContinuityReceipt({
       boundary: 'continuation',

@@ -1422,10 +1422,13 @@ describe('planRecall', () => {
       activeStepCoverage: expect.any(Number),
       activeFileCoverage: 1,
     });
-    expect(treatment.items[0].intentRelevance!.score).toBeGreaterThan(treatment.items[1].intentRelevance!.score);
-    expect([...baseline.items.map((item) => item.entry.id)].sort()).toEqual(
-      [...treatment.items.map((item) => item.entry.id)].sort(),
-    );
+    expect(treatment.items[0].intentRelevance!.score).toBeGreaterThan(0);
+    // Same-path dedup retains only the best card for this path; ranking changes
+    // which candidate survives without changing the one-card path budget.
+    expect(baseline.items).toHaveLength(1);
+    expect(treatment.items).toHaveLength(1);
+    expect(baseline.suppressed).toBe(1);
+    expect(treatment.suppressed).toBe(1);
   });
 
   test('text relevance remains discriminative in the smallest two-entry candidate set', () => {
@@ -1442,7 +1445,9 @@ describe('planRecall', () => {
 
     expect(plan.items[0].entry.id).toBe('turn:intent');
     expect(plan.items[0].intentRelevance?.objectiveCoverage).toBeGreaterThan(0);
-    expect(plan.items[0].intentRelevance!.score).toBeGreaterThan(plan.items[1].intentRelevance!.score);
+    expect(plan.items[0].intentRelevance!.score).toBeGreaterThan(0);
+    expect(plan.items).toHaveLength(1);
+    expect(plan.suppressed).toBe(1);
   });
 
   test('active-file relevance preserves absolute repo identity when aliases collide', () => {
@@ -1460,9 +1465,9 @@ describe('planRecall', () => {
       ranking: buildRecallRankingContext({ activeFiles: [homePath] }),
     }, 'healthy', config);
 
-    expect(plan.items.map((item) => item.entry.id)).toEqual(['turn:home', 'turn:foreign']);
+    expect(plan.items.map((item) => item.entry.id)).toEqual(['turn:home']);
     expect(plan.items[0].intentRelevance?.activeFileCoverage).toBe(1);
-    expect(plan.items[1].intentRelevance?.activeFileCoverage).toBe(0);
+    expect(plan.suppressed).toBe(1);
   });
 
   test('active-file coverage breaks a same-tier intent tie without creating eligibility', () => {
@@ -1578,10 +1583,11 @@ describe('planRecall', () => {
       }, 'healthy', { ...config, maxCards: 1 });
       if (baseline.items.find((item) => item.render === 'card')?.entry.id === relevantId) baselineRelevant++;
       if (treatment.items.find((item) => item.render === 'card')?.entry.id === relevantId) treatmentRelevant++;
-      expect([...treatment.items.map((item) => item.entry.id)].sort()).toEqual(
-        [...baseline.items.map((item) => item.entry.id)].sort(),
-      );
-      expect(treatment.items.map((item) => item.tier)).toEqual(baseline.items.map((item) => item.tier));
+      expect(baseline.items).toHaveLength(1);
+      expect(treatment.items).toHaveLength(1);
+      expect(treatment.items[0].tier).toBe(baseline.items[0].tier);
+      expect(baseline.suppressed).toBe(1);
+      expect(treatment.suppressed).toBe(1);
     }
     expect({ baselineRelevant, treatmentRelevant, total: fixtures.length }).toEqual({
       baselineRelevant: 0,
@@ -1597,12 +1603,14 @@ describe('planRecall', () => {
       toolEntry('c', 'relay/src/touched.ts', 50),
     ]);
     const plan = planRecall(index, new Map(), new Map(), 1, { touchedPaths: ['relay/src/touched.ts'], claimedPaths: ['relay/src/claimed.ts'] }, 'healthy', config);
-    expect(plan.items.map(i => i.entry.id)).toEqual(['tool:c', 'tool:a', 'tool:b']);
-    expect(plan.items.map(i => i.tier)).toEqual([0, 0, 1]);
+    expect(plan.items.map(i => i.entry.id)).toEqual(['tool:c', 'tool:b']);
+    expect(plan.items.map(i => i.tier)).toEqual([0, 1]);
     expect(plan.items[0].trigger).toBe('path-touch relay/src/touched.ts');
-    expect(plan.items[2].trigger).toBe('claim relay/src/claimed.ts');
-    // Default card budget (3) fits all three.
-    expect(plan.items.map(i => i.render)).toEqual(['card', 'card', 'card']);
+    expect(plan.items[0].samePathSiblingTurns).toBe(1);
+    expect(plan.items[1].trigger).toBe('claim relay/src/claimed.ts');
+    expect(plan.suppressed).toBe(1);
+    // Default card budget (3) fits both surviving path lanes.
+    expect(plan.items.map(i => i.render)).toEqual(['card', 'card']);
   });
 
   test('resident card suppresses; resident hint escalates on a fresh hard trigger', () => {
@@ -2754,7 +2762,7 @@ describe('buildFoldRecallContext', () => {
     expect(out.text).not.toContain('relay/src/budget-1.ts');
   });
 
-  test('hard maxCardChars excerpts an over-limit body without losing its head or tail', () => {
+  test('hard maxCardChars retains the salient tail and an honest omission marker', () => {
     const path = 'relay/src/card-budget.ts';
     const raw: FoldMessage[] = [
       userMsg(`Inspect ${path}`),
@@ -2774,7 +2782,6 @@ describe('buildFoldRecallContext', () => {
     );
 
     expect(out.cards).toBe(1);
-    expect(out.text).toContain('CARD-HEAD');
     expect(out.text).toContain('CARD-TAIL');
     expect(out.text).toContain('chars omitted — self-tap for full content');
     expect(out.text).not.toContain('CARD-MIDDLE-MUST-BE-ELIDED');

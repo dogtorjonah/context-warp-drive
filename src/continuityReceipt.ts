@@ -614,7 +614,11 @@ function buildReceiptLiveState(args: {
     capturedAt,
     instance: {
       status: railConflictsWithRuntime ? 'conflicting' : parts.instance ? 'current' : 'unknown',
-      source: captureSource('instance-registry', instanceId),
+      // The typed instance value is a point-in-time registry snapshot. Its
+      // authoritative instant is the completed capture watermark, not an
+      // unknown runtime-transition time; keep that source time distinct from
+      // the identical capture/observation field carried by liveSource.
+      source: captureSource('instance-registry', instanceId, { sourceTimestamp: capturedAt }),
       ...(parts.instance ? { value: parts.instance } : {}),
       ...(!parts.instance ? { note: 'typed instance snapshot not supplied' } : {}),
     },

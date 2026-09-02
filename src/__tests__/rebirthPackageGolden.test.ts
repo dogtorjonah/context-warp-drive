@@ -12,15 +12,14 @@ import {
 import { type CollapseUnit } from '../generationalCollapse.ts';
 
 /**
- * Golden-package fixture (plan feature 12, W0).
+ * Synthetic golden-package fixture (plan feature 12, W0).
  *
- * Freezes a deterministic representative of the audited capture
- * `rebirth-v2-31366e584b627269-1788294508233`'s v6 model (all sections
- * populated, real provenance-labelled prose, full recovery-index with the
- * honest status/reason contract) and snapshot-tests the FULL render by its
- * SHA-256. Any formatting, ordering, or honesty-label regression changes the
- * hash and fails byte-exactly — without embedding ~145k literal chars in
- * source. Same model feeds the S2 self-lint scaffold checks.
+ * Freezes a deterministic, hand-authored v6 model with all sections populated,
+ * provenance-shaped prose, and the full recovery-index status/reason contract.
+ * It is a renderer benchmark, not a captured lifecycle artifact. The FULL
+ * render is snapshot-tested by SHA-256, so formatting, ordering, or honesty-
+ * label regressions fail byte-exactly without embedding ~145k literal chars in
+ * source. The same model feeds the S2 self-lint scaffold checks.
  */
 
 function unit(overrides: Partial<CollapseUnit> = {}): CollapseUnit {
@@ -44,7 +43,7 @@ function lineage(units: readonly CollapseUnit[], partialReason: string | null = 
   return { units, rangeRecover: 'continuity_ledger action="fetch" owner="bxuaLHT0"', partialReason };
 }
 
-/** Deterministic, fully-populated v6 model mirroring the audited capture. */
+/** Deterministic, fully-populated synthetic v6 renderer model. */
 function benchmarkModel(): RebirthPackageV6Model {
   return buildRebirthPackageV6Model({
     boundaryAndActiveTask: {
@@ -208,7 +207,7 @@ function benchmarkModel(): RebirthPackageV6Model {
   });
 }
 
-describe('rebirth package golden fixture (audited capture model)', () => {
+describe('rebirth package golden fixture (synthetic renderer model)', () => {
   it('renders deterministically; full-render SHA-256 is frozen', () => {
     const model = benchmarkModel();
     // Determinism: identical input must produce identical output.
@@ -219,7 +218,7 @@ describe('rebirth package golden fixture (audited capture model)', () => {
     const hash = createHash('sha256').update(first.text, 'utf8').digest('hex');
     // Frozen byte-exact hash of the full render. Update deliberately only when
     // the renderer's formatting/honesty output intentionally changes.
-    expect(hash).toBe('c3d2af7cbd8e82c3bb0fb8d6384a7e2b634e9303425b994475e70dbbef6c2320');
+    expect(hash).toBe('51197657ae5030389e096c2adb2791c2c18b78cb6f9bacc982348bc319c409d6');
   });
 
   it('renders every section into the framed output', () => {
@@ -231,11 +230,58 @@ describe('rebirth package golden fixture (audited capture model)', () => {
       '── Cognitive Artifacts ──',
       '── Recent Conversation ──',
       '── Operator Vault ──',
+      '── Episode Chapter Index ──',
       '── Life Ledger ──',
       '── Recovery Index ──',
     ]) {
       expect(text, `section ${marker}`).toContain(marker);
     }
+    expect([...text.matchAll(/\[REBIRTH-V6-SECTION id=([A-Za-z]+) order=(\d+) chars=\d+\]/gu)]
+      .map((match) => `${match[1]}:${match[2]}`)).toEqual([
+      'boundaryAndActiveTask:1',
+      'executionState:3',
+      'activeEditDelta:4',
+      'cognitiveArtifacts:5',
+      'recentConversation:6',
+      'operatorVault:7',
+      'episodeChapterIndex:8',
+      'lifeLedger:9',
+      'recoveryIndex:10',
+    ]);
+  });
+
+  it('renders literal boundary, partial-lane, vault, review-demand, and endpoint truth rows', () => {
+    const base = benchmarkModel();
+    const withReviewDemand = buildRebirthPackageV6Model({
+      boundaryAndActiveTask: base.boundaryAndActiveTask,
+      executionState: {
+        facts: [
+          ...base.executionState.facts,
+          {
+            provenanceId: 'review:bench',
+            sourceAt: '2026-09-01T21:19:40.000Z',
+            status: 'exact',
+            kind: 'review',
+            text: 'independent correction review pending',
+          },
+        ],
+        unknownReasons: base.executionState.unknownReasons,
+      },
+      activeEditDelta: base.activeEditDelta,
+      cognitiveArtifacts: base.cognitiveArtifacts,
+      recentConversation: base.recentConversation,
+      recoveryIndex: base.recoveryIndex,
+      operatorVault: base.operatorVault,
+      episodeChapterIndex: base.episodeChapterIndex,
+      lifeLedger: base.lifeLedger,
+    });
+    const { text } = renderRebirthPackageV6WithReport(withReviewDemand, { packageBudget: 150_000 });
+    expect(text).toContain('schema=rebirth-package-v7/v1 · render=v6-sections · capture-naming=v2');
+    expect(text).toContain('partial-lanes=active-edit-delta:not-requested · classes=horizon|cap|store|not-requested|unknown');
+    expect(text).toContain('vault-newest=2026-09-01T20:47:52.476Z · active-request=2026-09-01T20:47:52.476Z');
+    expect(text).toContain('- review-demand=independent correction review pending · source=review:bench');
+    expect(text).toContain('[EXACT ACTIVE REQUEST · 48 chars · source=msg_active · source-time=2026-09-01T20:47:52.476Z · status=exact]');
+    expect(text).toContain('[LAST MATERIAL ASSISTANT · 24 chars · source=msg_last · source-time=2026-09-01T20:48:13.307Z · status=exact]');
   });
 
   it('renders honest not-requested recovery lanes with their reason (S4/S6 contract)', () => {
@@ -250,7 +296,7 @@ describe('rebirth package golden fixture (audited capture model)', () => {
     expect(text).not.toContain('capture-degraded=active-edit-delta');
   });
 
-  it('renders the S16 lineage-chain and commit-activity Now-card lines when supplied', () => {
+  it('renders the producer-fed lineage-chain and honest ops Now-card lines when supplied', () => {
     const base = benchmarkModel();
     const chained = buildRebirthPackageV6Model({
       boundaryAndActiveTask: {
@@ -264,10 +310,13 @@ describe('rebirth package golden fixture (audited capture model)', () => {
             { instanceId: 'inst-root', instanceName: 'root', sourceAt: '2026-08-24T04:44:23.040Z', sourceEndAt: '2026-08-31T23:59:00.000Z', archived: true },
             { instanceId: 'inst-a', instanceName: 'worker-a', sourceAt: '2026-09-01T21:17:27.184Z', sourceEndAt: null, archived: false },
           ],
-          commitActivity: {
-            activated: 2,
-            pending: 1,
-            source: { provenanceId: 'git:boot', sourceAt: '2026-09-01T19:19:53.996Z', status: 'exact' as const },
+          ops: {
+            repositoryState: 'unknown',
+            repositoryReason: 'worker git status not captured',
+            ownedLiveChildren: [{ id: 'child-1', name: 'continuity-scout' }],
+            squad: 'squad-rebirth',
+            rooms: ['rebirth-package-levelup'],
+            source: { provenanceId: 'rebirth-capture:ops', sourceAt: '2026-09-01T19:19:53.996Z', status: 'exact' as const },
           },
         },
       },
@@ -282,8 +331,10 @@ describe('rebirth package golden fixture (audited capture model)', () => {
     });
     const { text } = renderRebirthPackageV6WithReport(chained, { packageBudget: 150_000 });
     expect(text).toContain('lineage-chain=root (inst-root) · 2026-08-24→2026-08-31 · archived');
-    expect(text).toContain('worker-a (inst-a) · 2026-09-01→now');
-    expect(text).toContain('commits=since-boot 2 activated · 1 pending');
+    expect(text).toContain('worker-a (inst-a) · 2026-09-01→now · live-at-capture');
+    expect(text).toContain('ops=git:unknown:worker-git-status-not-captured');
+    expect(text).toContain('owned-live-children=continuity-scout(child-1)');
+    expect(text).toContain('squad=squad-rebirth · rooms=rebirth-package-levelup');
   });
 
   it('renders the legacy Runtime Model parity block when runtime-model context is supplied (integration gate)', () => {
@@ -375,8 +426,10 @@ describe('rebirth package golden fixture (audited capture model)', () => {
     expect(lintPackageSelfChecks(over, 'probe').length).toBeGreaterThan(0);
     const budget = 230_000;
     const { text, collapse } = renderRebirthPackageV6WithReport(over, { packageBudget: budget });
-    // The self-check diagnostics rendered inside the budget...
-    expect(text).toContain('self-check');
+    // The adversarial renderer fixture emits the two expected diagnostics from
+    // the real final render, not only from a direct lint helper invocation.
+    expect(text).toContain('self-check: cognition lists missing families glyph,atlas while matched=5000');
+    expect(text).toContain('self-check: recovery lane dangling labels "(inline body below)" but carries no inline evidence');
     // ...and final text + envelope never exceed the declared budget.
     expect(text.length).toBeLessThanOrEqual(budget);
     expect(collapse.telemetry.hardOverrunChars).toBe(0);

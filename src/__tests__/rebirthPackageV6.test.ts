@@ -633,7 +633,7 @@ describe('Rebirth Package v6', () => {
         packageBudget: budget,
         sectionMaxChars: { cognitiveArtifacts: explicitCap },
       });
-      const sectionMatch = text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts chars=(\d+)\]/);
+      const sectionMatch = text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5 chars=(\d+)\]/);
       expect(sectionMatch).not.toBeNull();
       expect(Number(sectionMatch![1])).toBeLessThanOrEqual(explicitCap);
       expect(text.length).toBeLessThanOrEqual(budget);
@@ -782,7 +782,9 @@ describe('Rebirth Package v6', () => {
           && !(REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id),
       ),
     );
-    expect(renderRebirthPackageV6(legacy)).toContain('contract=rebirth-package-v6/v1');
+    expect(renderRebirthPackageV6(legacy)).toContain(
+      'schema=rebirth-package-v6/v1 · render=v6-sections · capture-naming=v2',
+    );
   });
 
   it('rejects a malformed persisted Brain Merge section before rendering', () => {
@@ -959,7 +961,7 @@ describe('Rebirth Package v6', () => {
     const section = rendered.split('[REBIRTH-V6-SECTION id=recentConversation')[1]
       ?.split('[REBIRTH-V6-SECTION-END id=recentConversation]')[0] ?? '';
 
-    expect(section).toContain('Endpoint messages: Boundary.');
+    expect(section).toContain('endpoint rows: rendered in Boundary (active request + last assistant)');
     expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
     expect(rendered.match(/I will implement it now\./gu)).toHaveLength(1);
   });
@@ -1241,7 +1243,7 @@ describe('Rebirth Package v6', () => {
       .toBe('tap_instance_messages action="rebirth" target_instance_id="instance-a" search="capture-1"');
     expect(handles.get('context-warp-stores')).toMatchObject({
       status: 'partial',
-      handle: 'fold_recall op="range" start_event=0',
+      handle: 'tap_instance_messages action="recent" target_instance_id="instance-a"',
     });
     expect(handles.get('transcript')).toMatchObject({ count: 12, frontier: 'event-12' });
     expect(handles.get('current-continuity-pov')).toMatchObject({ count: 3, frontier: 'event-12' });
@@ -1745,7 +1747,7 @@ describe('Rebirth Package v6', () => {
     }).find((entry) => entry.id === 'recentConversation');
 
     expect(section?.complete).toBe(false);
-    expect(section?.text).toContain('Endpoint messages: Boundary.');
+    expect(section?.text).toContain('endpoint rows: rendered in Boundary (active request + last assistant)');
     expect(section?.text).toContain('SECOND_NEWEST_TURN_MUST_SURVIVE');
     expect(section?.text).toContain('NEWEST_TURN_MUST_SURVIVE');
     expect(section?.text).not.toContain('OVERSIZED_OLDER_TURN');
@@ -1776,7 +1778,7 @@ describe('Rebirth Package v6', () => {
     }).find((entry) => entry.id === 'recentConversation');
 
     expect(section?.complete).toBe(false);
-    expect(section?.text).toContain('Endpoint messages: Boundary.');
+    expect(section?.text).toContain('endpoint rows: rendered in Boundary (active request + last assistant)');
     expect(section?.text).toContain('NEWEST_CANARY');
     expect(section?.text).not.toContain('OLDER_TINY_CAP');
     expect(section?.text).toContain('latest-tail=omitted');

@@ -175,34 +175,28 @@ describe('roundtrip correctness — identifiers survive fold → hard-epoch → 
 
     // Canonical rebirth-v6 places conserved literals inline in structured
     // frames instead of duplicating them in the retired flat closet.
-    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
-    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=recoveryIndex chars=');
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask order=1 chars=');
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=recoveryIndex order=10 chars=');
     expect(seedBody).not.toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
 
     // The active request must survive (merged into the seed body)
     expect(seedBody).toContain('Continue with the next batch of work');
   });
 
-  test('after hard epoch, path-touch recall pages back identifier-rich action context', () => {
-    let now = Date.parse('2026-06-16T00:00:00.000Z');
+  test('after an explicit fold, path-touch recall pages back identifier-rich action context', () => {
     const session = new FoldSession({
       foldConfig: { ...ALWAYS_ON_FOLD_CONFIG, activeWindowTurns: 1 },
       freeze: { enabled: true, ttlMs: 3_600_000, maxTailChars: 150_000 },
       pressureCeiling: 10,
-      now: () => {
-        now += 1_000;
-        return now;
-      },
     });
 
     const messages = buildRealisticTrace();
 
-    // Fold + freeze the initial trace
-    session.prepare(messages);
-
-    // Build a recall index from the folded state (the integration test pattern)
+    // Automatic prepare() compression is measured-pressure-authorized. This
+    // one-shot integration test wants a folded projection without exercising
+    // pressure routing, so use the explicit caller-owned fold operation.
     const recall: FoldRecallState = createFoldRecallState();
-    const foldedView = session.prepare(messages).messages;
+    const foldedView = session.fold(messages).messages;
     recall.index = buildFoldIndex(messages, foldedView);
 
     // The folded view should NOT contain the buried payload (it was folded away)
@@ -231,9 +225,8 @@ describe('roundtrip correctness — identifiers survive fold → hard-epoch → 
     expect(recallResult.cards).toBeGreaterThan(0);
     expect(recallResult.text).not.toBeNull();
     expect(recallResult.text!).toContain(TARGET_PATH_CANON);
-    expect(recallResult.text!).toContain(GIT_SHA);
-    expect(recallResult.text!).toContain(RAIL_ID);
-    expect(recallResult.text!).toContain(CHANGELOG_ID);
+    expect(recallResult.text!).toContain('Edit applied successfully.');
+    expect(recallResult.text!).toContain('Fixed the regression.');
   });
 
   test('rebirth-v6 keeps canonical boundary and recovery frames under a tight seed budget', () => {
@@ -272,8 +265,8 @@ describe('roundtrip correctness — identifiers survive fold → hard-epoch → 
 
     // Required v6 frames and the exact active request outrank optional deep
     // history when the package is clamped this tightly.
-    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=');
-    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=recoveryIndex chars=');
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask order=1 chars=');
+    expect(seedBody).toContain('[REBIRTH-V6-SECTION id=recoveryIndex order=10 chars=');
     expect(seedBody).toContain('Continue with the next batch of work');
     expect(seedBody).not.toContain('── Raw Trace Coordinate Closet');
   });

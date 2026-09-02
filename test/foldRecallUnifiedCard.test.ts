@@ -806,9 +806,8 @@ describe('fold recall Phase B — tier-0 ranking, sibling hints, content-hash re
     );
     // One card per tier-0 path per pass: exactly one devlog card, never two.
     expect(out.cards).toBe(1);
-    // The winner carries the suppressed same-path sibling recovery pointer.
+    // The winner carries the suppressed same-path sibling note.
     expect(out.text).toContain('+1 more folded turn touch');
-    expect(out.text).toContain('fold_recall path=');
   });
 
   test('b-res: content-hash residency suppresses a byte-identical repeat card', () => {

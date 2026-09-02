@@ -2645,12 +2645,12 @@ function formatSiblingClue(
     siblings.push(key);
     if (siblings.length >= SIBLING_CLUE_MAX_PATHS) break;
   }
-  // Same-path sibling turns suppressed by tier-0 dedup get a recovery
-  // pointer so the agent knows more folded turns exist for this exact path.
-  // The other paths in the zone are genuinely different files — "related",
-  // not siblings of the anchor.
+  // Same-path sibling turns suppressed by tier-0 dedup get a note so the
+  // agent knows more folded turns exist for this exact path; touching the
+  // path again re-arms the ambient page-in. The other paths in the zone are
+  // genuinely different files — "related", not siblings of the anchor.
   const samePathNote = samePathSiblingTurns > 0
-    ? ` | +${samePathSiblingTurns} more folded turn${samePathSiblingTurns === 1 ? '' : 's'} touch this path → fold_recall path=${normalizeToolPath(matchedPath)}`
+    ? ` | +${samePathSiblingTurns} more folded turn${samePathSiblingTurns === 1 ? '' : 's'} touch this path`
     : '';
   if (siblings.length === 0) return samePathNote;
   return ` | related: ${siblings.join(', ')}${samePathNote}`;
@@ -3059,15 +3059,18 @@ export function planRecall(
     return a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
   });
 
-  // Tier-0 same-path dedup: one card per tier-0 path per pass.
+  // Tier-0 same-path dedup: one ordinary card per tier-0 path per pass.
   // matched[] is sorted best-first (tier, intent, recency), so the FIRST item
   // per normalized path is the winner; losers are counted as suppressed
   // same-path siblings and surfaced on the winner as a recovery pointer.
+  // Structural supersession corrections are pointer-only safety hints, not
+  // competing card bodies. Keep every correction so same-path dedup cannot
+  // reintroduce the starvation that the correction lane explicitly prevents.
   // Tiers 1/2 are untouched — claims and term hits keep their own lanes.
   const tier0SeenPaths = new Map<string, number>();
   const deduped: RecallPlanItem[] = [];
   for (const item of matched) {
-    if (item.tier !== 0) {
+    if (item.tier !== 0 || (item.supersessions?.length ?? 0) > 0) {
       deduped.push(item);
       continue;
     }

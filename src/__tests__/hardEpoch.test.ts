@@ -203,7 +203,7 @@ describe('FoldSession hard-epoch consume', () => {
     expect(content).toContain('old question one');
     // v6 raw hard-epoch: the v4 `── Continuity Boundary (RECOVERY COORDINATES) ──`
     // header retired; assert the canonical v6 boundary frame marker exactly once.
-    expect(content.match(/\[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=/gu)).toHaveLength(1);
+    expect(content.match(/\[REBIRTH-V6-SECTION id=boundaryAndActiveTask order=1 chars=/gu)).toHaveLength(1);
     // The live question is carried only by the canonical exact-request block.
     // The provider merge must recognize it and avoid appending a second trailer.
     expect(content).toContain('LIVE CURRENT QUESTION');
@@ -249,7 +249,7 @@ describe('FoldSession hard-epoch consume', () => {
     // frame. Assert the frame marker preserving the exact starred decision and
     // source-time/source-id provenance (assertions below), and that the retired
     // header is absent.
-    expect(content).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts chars=');
+    expect(content).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5 chars=');
     expect(content).toContain('⭐ [decision] Freeze intentional waypoints into raw hard epochs.');
     expect(content).toContain(
       'source-time=2026-07-18T20:29:00.000Z · source-id=call_hard_epoch_star',
