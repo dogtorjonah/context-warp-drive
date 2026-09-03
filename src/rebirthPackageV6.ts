@@ -5421,7 +5421,6 @@ function shrinkCollapseSectionsToTarget(args: {
   initialText: string;
   targetChars: number;
   timing?: RebirthPackageV6SectionTimingAccumulator;
-  references?: MutableRecoveryReferenceCatalog;
 }): RebirthPackageV7ShrinkOutcome {
   let limits = { ...args.initialLimits };
   let sections = args.initialSections;
@@ -5434,12 +5433,18 @@ function shrinkCollapseSectionsToTarget(args: {
     cap: number,
   ): { limits: Record<RebirthPackageV6SectionId, number>; sections: readonly RenderedRebirthPackageV6Section[]; text: string } => {
     const candidateLimits = { ...limits, [id]: cap };
-    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits, args.timing, args.references);
+    // Every probe gets a render-local recovery-reference ledger. A rejected
+    // probe must not make later candidates pay for handles that will never
+    // ship in their text.
+    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits, args.timing);
     shrinkRenders += 1;
     return {
       limits: candidateLimits,
       sections: candidateSections,
-      text: joinRenderedSections(candidateSections, args.declaration),
+      // Admission is based on the exact bytes the final funnel can deliver.
+      // Unreferenced legend rows are removed there, so retaining them for size
+      // comparisons would over-shrink real continuity content.
+      text: pruneRecoveryLegendRows(joinRenderedSections(candidateSections, args.declaration)),
     };
   };
 
@@ -5530,9 +5535,9 @@ export function renderRebirthPackageV6WithReport(
   // declaration must ride INSIDE the budget math, never appended beyond it.
   const lane = redactContinuityModel(model);
   model = lane.model;
-  // Audit-4 S7: one catalog shared by the initial render, every shrink probe,
-  // and every eviction envelope — usage marking must converge on a single
-  // legend, and refs must stay stable across adaptive re-renders.
+  // Reference numbers come from immutable model order. This catalog belongs to
+  // the accepted composition only; speculative shrink probes build their own
+  // usage ledgers so rejected candidates cannot contaminate later sizing.
   const references = buildRecoveryReferenceCatalog(model);
   const declaration = lane.declaration;
   const budget = packageBudgetChars(model, options);
@@ -5543,7 +5548,9 @@ export function renderRebirthPackageV6WithReport(
   const sectionTiming = createSectionTimingAccumulator(options);
   const initialLimits = resolveAdaptiveSectionCapsInternal(model, options, sectionTiming);
   const initialSections = renderSectionsWithLimits(model, initialLimits, sectionTiming, references);
-  const initialRendered = joinRenderedSections(initialSections, declaration);
+  // The final funnel always prunes unreferenced Recovery legend rows. Make
+  // every earlier budget decision against that same deliverable byte shape.
+  const initialRendered = pruneRecoveryLegendRows(joinRenderedSections(initialSections, declaration));
   const targetSectionChars = Number.isFinite(pushTarget) && pushTarget > 0
     ? Math.max(0, Math.floor(pushTarget) - envelopeChars)
     : Number.POSITIVE_INFINITY;
@@ -5556,7 +5563,6 @@ export function renderRebirthPackageV6WithReport(
       initialText: initialRendered,
       targetChars: targetSectionChars,
       timing: sectionTiming,
-      references,
     })
     : {
       sections: initialSections,
@@ -5759,7 +5765,10 @@ export function renderRebirthPackageV6WithReport(
       // of the protected minimum package and can never disappear.
       blocks.push(framedElisionSection(section, compactElisionReceipts || protectedOverrun));
     }
-    return blocks.join('\n\n');
+    // This is the exact pre-lint text finish() will deliver. Candidate
+    // admission must not reject a section based on legend rows that the final
+    // deterministic prune removes moments later.
+    return pruneRecoveryLegendRows(blocks.join('\n\n'));
   };
 
   const included = new Set<RebirthPackageV6SectionId>();

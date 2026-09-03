@@ -584,6 +584,52 @@ describe('Rebirth Package v6', () => {
         .toHaveLength(renderedIds.length);
     });
 
+    it('sizes reduced-cap admission against post-prune bytes instead of eliding cognition with most of the budget unused', () => {
+      // Audit-4 residual: 40 long recovery handles made the speculative
+      // candidate exceed 8k before unused legend rows were pruned. The final
+      // package then shipped at only 2,874 chars with every cognitive result
+      // evicted. Admission must measure the same pruned bytes finish() emits.
+      const base = model();
+      const recoveryIndex = [
+        ...base.recoveryIndex,
+        ...Array.from({ length: 40 }, (_, index) => ({
+          id: `dummy-${index}`,
+          label: `dummy ${index}`,
+          handle: `continuity_ledger action="fetch" owner="instance-a" section_id="dummy-${index}" payload="${'X'.repeat(220)}"`,
+          status: 'available' as const,
+          count: 1,
+          frontier: 'capture-1',
+        })),
+      ];
+      const value = model({
+        activeEditDelta: exactDelta({ files: [] }),
+        cognitiveArtifacts: Array.from({ length: 8 }, (_, index) => artifact({
+          provenanceId: `post-prune:${index}`,
+          kind: 'result',
+          text: `VALUABLE-CONTINUITY-${index}-${'C'.repeat(500)}`,
+          sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+        })),
+        recentConversation: [],
+        recoveryIndex,
+      });
+
+      const first = renderRebirthPackageV6WithReport(value, {
+        packageBudget: 8_000,
+        adaptiveBackfill: false,
+      });
+      const second = renderRebirthPackageV6WithReport(value, {
+        packageBudget: 8_000,
+        adaptiveBackfill: false,
+      });
+
+      expect(first.text.length).toBeLessThanOrEqual(8_000);
+      expect(first.text.length).toBeGreaterThan(5_000);
+      expect(first.text).toContain('VALUABLE-CONTINUITY-7');
+      expect(first.collapse.omittedSectionIds).not.toContain('cognitiveArtifacts');
+      // Probe-local recovery ledgers keep the whole render deterministic.
+      expect(second).toEqual(first);
+    });
+
     it('keeps the cognitive section frame when no single cognitive unit fits', () => {
       const rows = Array.from({ length: 8 }, (_, index) => artifact({
         provenanceId: `unfittable:${index}`,
