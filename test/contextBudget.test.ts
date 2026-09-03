@@ -152,6 +152,13 @@ describe('resolveContextBudget', () => {
     expect(budget.evictionPolicy).toBe('hard-epoch-on-prefix-saturation');
   });
 
+  it('uses Grok 4.5\'s documented 500,000-token CLI window', () => {
+    const budget = resolveContextBudget({ engine: 'grok-cli', model: 'grok-4.5' });
+
+    expect(budget.contextWindowTokens).toBe(500_000);
+    expect(budget.limitSource).toBe('model-or-engine-table');
+  });
+
   it('shrinks tiny-window models aggressively enough that the band cannot exceed the wall', () => {
     const budget = resolveContextBudget({ engine: 'glm', model: 'glm-5' });
 

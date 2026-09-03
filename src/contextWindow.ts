@@ -128,6 +128,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 
   // ── Grok (xAI) models ──
   'grok-4.6': 500_000,
+  'grok-4.5': 500_000,
   'grok-4.3': 1_000_000,
   'grok-4-1-fast-reasoning': 2_000_000,
   'grok-4-1-fast-non-reasoning': 2_000_000,
