@@ -834,7 +834,10 @@ export function isNarrationVerdictText(text: string): boolean {
 // Leading list/heading/status decorations stripped before the verdict gate
 // ("- ✅ Fixed ..." → "Fixed ..."). Includes the eligible message-register
 // glyphs 🏁/⚠️ so stored declared lines do not retain transport decoration.
-const NARRATION_DECORATION_RE = /^[\s#>*\-•·–—\d.)✓✗✅❌🎯⚠️🏁]+/u;
+// A leading NUMBER is stripped only as an ordinal list marker (`1.` / `2)`):
+// a bare `\d` in the class ate the numerator of "28/28 tests pass" and stored
+// "/28 tests pass" as the chapter summary (audit-4 F1).
+const NARRATION_DECORATION_RE = /^(?:[\s#>*\-•·–—✓✗✅❌🎯⚠️🏁]|\d{1,3}[.)](?=\s))+/u;
 
 // Card-grammar glyphs: a line opening with one is QUOTED memory (a recalled
 // card's voice/pointer/delta line), never fresh narration — reject outright.

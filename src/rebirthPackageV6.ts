@@ -2299,12 +2299,13 @@ function continuityLedgerOmissionHandle(
 }
 
 interface RebirthRecoveryReferenceCatalog {
-  readonly entries: readonly { readonly ref: string; readonly handle: string }[];
+  readonly entries: readonly { readonly ref: string; handle: string }[];
   readonly refByHandle: ReadonlyMap<string, string>;
 }
 
 /**
- * Audit-3 B3: deterministic, render-local handle dictionary.
+ * Audit-3 B3 + audit-4 S7: deterministic, render-local handle dictionary with
+ * usage tracking.
  *
  * The protected Recovery Index owns every repeated full command exactly once;
  * section receipts carry only a compact `R<n>` reference. The catalog is
@@ -2312,8 +2313,19 @@ interface RebirthRecoveryReferenceCatalog {
  * so adaptive re-renders cannot renumber handles. Per-unit lineage handles
  * remain inline when unique; this dictionary targets the duplicated package /
  * section routes that dominated the audited specimen.
+ *
+ * Audit-4 S7: the audited specimen minted 20 legend rows of which 8 were never
+ * cited by any section — handles are now REF'd only on first actual use
+ * (`recoveryReference`), and the legend lists exactly the used set. Refs are
+ * still assigned in deterministic catalog order, so a handle keeps its number
+ * whether or not earlier handles went unused; `usedHandles` freezes the set
+ * the legend will print.
  */
-function buildRecoveryReferenceCatalog(model: RebirthPackageV6Model): RebirthRecoveryReferenceCatalog {
+interface MutableRecoveryReferenceCatalog extends RebirthRecoveryReferenceCatalog {
+  usedHandles: Set<string>;
+}
+
+function buildRecoveryReferenceCatalog(model: RebirthPackageV6Model): MutableRecoveryReferenceCatalog {
   const handles: string[] = [];
   const seen = new Set<string>();
   const add = (value: string | null | undefined): void => {
@@ -2333,6 +2345,7 @@ function buildRecoveryReferenceCatalog(model: RebirthPackageV6Model): RebirthRec
   return {
     entries,
     refByHandle: new Map(entries.map((entry) => [entry.handle, entry.ref])),
+    usedHandles: new Set<string>(),
   };
 }
 
@@ -2342,7 +2355,11 @@ function recoveryReference(
 ): string | null {
   const normalized = handle?.trim();
   if (!normalized) return null;
-  return catalog.refByHandle.get(normalized) ?? normalized;
+  const ref = catalog.refByHandle.get(normalized);
+  if (ref && 'usedHandles' in catalog) {
+    (catalog as MutableRecoveryReferenceCatalog).usedHandles.add(normalized);
+  }
+  return ref ?? normalized;
 }
 
 function omissionRecoveryClause(handle: string | null): string {
@@ -2736,7 +2753,29 @@ function formatBuilderIdentityLine(builder: RebirthPackageV6BoundaryAndActiveTas
     && Number.isFinite(builder.requestToCaptureMs) && builder.requestToCaptureMs >= 0
     ? ` · request→capture=${Math.round(builder.requestToCaptureMs)}ms`
     : '';
-  return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${packageBuildMs}${builtMs}${git}${sidecarBoot}${relayBoot}${prepText}${requestToCapture}`;
+  // Audit-4 S7: when both the prep decomposition AND the total wall are known,
+  // name the un-attributed remainder explicitly instead of leaving a silent
+  // gap a reader must reconstruct by subtraction (the audited specimen had
+  // 2.2s between prep+build and request→capture with no term for it).
+  const prepTotalMs = typeof builder.requestPrep?.totalMs === 'number'
+    && Number.isFinite(builder.requestPrep.totalMs)
+    ? Math.round(builder.requestPrep.totalMs)
+    : null;
+  const buildMsValue = typeof builder.packageBuildMs === 'number'
+    && Number.isFinite(builder.packageBuildMs)
+    ? Math.round(builder.packageBuildMs)
+    : null;
+  const totalWallMs = typeof builder.requestToCaptureMs === 'number'
+    && Number.isFinite(builder.requestToCaptureMs) && builder.requestToCaptureMs >= 0
+    ? Math.round(builder.requestToCaptureMs)
+    : null;
+  const unaccountedMs = prepTotalMs !== null && totalWallMs !== null
+    ? Math.max(0, totalWallMs - prepTotalMs - (buildMsValue ?? 0))
+    : null;
+  const unaccountedText = unaccountedMs !== null
+    ? ` · unaccounted=${unaccountedMs}ms (ledger-commit/cognition-capture/transport)`
+    : '';
+  return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${packageBuildMs}${builtMs}${git}${sidecarBoot}${relayBoot}${prepText}${requestToCapture}${unaccountedText}`;
 }
 
 function boundedRailAvailabilityReason(value: string | null | undefined): string {
@@ -3252,15 +3291,45 @@ function renderBoundary(
     // single-string disposition stays byte-identical when no capture rode it.
     const repos = now.ops.repositories ?? [];
     const git = repos.length > 0
-      ? `git:${repos.map((repo) => {
-        // headCommittedAt is an additive Lane-B field on the repo row; read it
-        // gracefully so this render compiles before/after that model adds it.
-        const head = readOptionalRepoString(repo, 'headCommittedAt');
-        const label = repo.error
-          ? `${repo.name}:error:${boundedRailAvailabilityReason(repo.error)} as-of=${repo.capturedAt ?? 'unknown'}`
-          : `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7 ?? '…'} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'}${head ? ` head-committed=${head}` : ''} as-of=${repo.capturedAt ?? 'unknown'}`;
-        return label;
-      }).join(' | ')}`
+      ? `git:${(() => {
+        // Audit-4 S7: one shared submit deadline fails every root with the
+        // same elapsed figure — 26 identical `timed-out-Nms` rows carried one
+        // bit of information and ~3K chars. The roll-up keys on the ERROR
+        // SIGNATURE (bounded reason + as-of), because per-root labels embed
+        // the repo name and never compare equal: identical-signature error
+        // runs collapse to `<count>x <first-repo>:error:<reason> (+N more
+        // roots)`, healthy rows stay per-root.
+        const labelFor = (repo: typeof repos[number]): string => {
+          const head = readOptionalRepoString(repo, 'headCommittedAt');
+          return repo.error
+            ? `${repo.name}:error:${boundedRailAvailabilityReason(repo.error)} as-of=${repo.capturedAt ?? 'unknown'}`
+            : `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7 ?? '…'} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'}${head ? ` head-committed=${head}` : ''} as-of=${repo.capturedAt ?? 'unknown'}`;
+        };
+        const errorSignature = (repo: typeof repos[number]): string | null => (
+          repo.error
+            ? `${boundedRailAvailabilityReason(repo.error)}\u0000${repo.capturedAt ?? 'unknown'}`
+            : null
+        );
+        const rolled: string[] = [];
+        let index = 0;
+        while (index < repos.length) {
+          const signature = errorSignature(repos[index]!);
+          if (signature === null) {
+            rolled.push(labelFor(repos[index]!));
+            index += 1;
+            continue;
+          }
+          let run = 1;
+          while (
+            index + run < repos.length
+            && errorSignature(repos[index + run]!) === signature
+          ) run += 1;
+          const first = labelFor(repos[index]!);
+          rolled.push(run > 1 ? `${first} (+${run - 1} more roots with the same error)` : first);
+          index += run;
+        }
+        return rolled.join(' | ');
+      })()}`
       : `git:${now.ops.repositoryState}${now.ops.repositoryReason ? `:${boundedRailAvailabilityReason(now.ops.repositoryReason)}` : ''}`;
     lines.push(
       `ops=${git} · owned-live-children=${ownedLabel} · squad=${now.ops.squad ?? 'none'} · rooms=${rooms} · ${formatSource(now.ops.source)}`,
@@ -3635,18 +3704,46 @@ const COGNITION_KIND_PRIORITY: Record<RebirthPackageV6CognitiveArtifact['kind'],
   flow: 55,
 };
 
+/** Age demotion: two points per 12 h of age since capture, capped at 24, so a
+ *  week-old decision (88 − 24 = 64) yields to a fresh discovery (76) and a
+ *  two-day-old decision (80) to a fresh result (82). Kind still leads inside
+ *  one age band. Without a capture reference no demotion applies (no recency
+ *  claim can be made against an unknown clock — GOD RULE 8). */
+const COGNITION_AGE_DEMOTION_STEP_MS = 12 * 60 * 60 * 1000;
+const COGNITION_AGE_DEMOTION_PER_STEP = 2;
+const COGNITION_AGE_DEMOTION_CAP = 24;
+/** Floor-protected rows (`retention=lineage-floor`) are admitted ahead of
+ *  every unprotected row: the selector kept them alive deliberately, and a
+ *  render-stage budget pass dropping them whole silently defeated that floor
+ *  (audit-4 C1: zero `kept-by=` rows survived a 63-row render). */
+const COGNITION_RETENTION_ADMISSION_BONUS = 1_000;
+
+function cognitionAdmissionScore(
+  row: RebirthPackageV6CognitiveArtifact,
+  referenceMs: number,
+): number {
+  const base = COGNITION_KIND_PRIORITY[row.kind];
+  if (row.retention) return base + COGNITION_RETENTION_ADMISSION_BONUS;
+  const sourceMs = row.sourceAt ? Date.parse(row.sourceAt) : Number.NaN;
+  if (!Number.isFinite(referenceMs) || !Number.isFinite(sourceMs) || referenceMs <= sourceMs) return base;
+  const steps = Math.floor((referenceMs - sourceMs) / COGNITION_AGE_DEMOTION_STEP_MS);
+  return base - Math.min(COGNITION_AGE_DEMOTION_CAP, steps * COGNITION_AGE_DEMOTION_PER_STEP);
+}
+
 /**
- * Admission order under pressure: priority, then newest-first source time,
- * then provenance id. Unknown-time rows sort after known-time peers of the
- * same priority — not because they are less valuable, but because they make no
- * recency claim, so preferring a dated peer is the only defensible tie-break
- * (GOD RULE 8). Total and pure, so two identical builds admit an identical set.
+ * Admission order under pressure: retention floor, then age-demoted kind
+ * priority, then newest-first source time, then provenance id. Unknown-time
+ * rows sort after known-time peers of the same score — not because they are
+ * less valuable, but because they make no recency claim, so preferring a dated
+ * peer is the only defensible tie-break (GOD RULE 8). Total and pure, so two
+ * identical builds admit an identical set.
  */
 function compareCognitionAdmission(
   left: RebirthPackageV6CognitiveArtifact,
   right: RebirthPackageV6CognitiveArtifact,
+  referenceMs: number = Number.NaN,
 ): number {
-  const byPriority = COGNITION_KIND_PRIORITY[right.kind] - COGNITION_KIND_PRIORITY[left.kind];
+  const byPriority = cognitionAdmissionScore(right, referenceMs) - cognitionAdmissionScore(left, referenceMs);
   if (byPriority !== 0) return byPriority;
   const leftMs = left.sourceAt ? Date.parse(left.sourceAt) : Number.NaN;
   const rightMs = right.sourceAt ? Date.parse(right.sourceAt) : Number.NaN;
@@ -3874,7 +3971,8 @@ function renderCognition(
     // Drop whole units, lowest admission priority first. The header shrinks as
     // counts change, so the fit is re-evaluated against the real assembled text
     // rather than an estimate that could overshoot the cap.
-    let keep = [...rows].sort(compareCognitionAdmission);
+    const admissionReferenceMs = Date.parse(model.boundaryAndActiveTask.capturedAt ?? '');
+    let keep = [...rows].sort((left, right) => compareCognitionAdmission(left, right, admissionReferenceMs));
     let text = assemble(keep);
     // A demand probe claims full fidelity only when EVERY row ships whole; any
     // overflow abandons the probe instead of silently degrading inside it.
@@ -4288,10 +4386,21 @@ function renderRecovery(
   // exact Atlas/package handle.
   const packageHandle = entries.find((entry) => entry.id === 'rebirth-package')?.handle ?? null;
   const packageRef = recoveryReference(references, packageHandle);
-  const lines: string[] = references.entries.length > 0
+  // Audit-4 S7: every recovery row cites its own handle on its line, so those
+  // references are inherently used; mark them before freezing the legend set.
+  // The legend then lists ONLY handles some section actually cites — the
+  // audited specimen carried 8 never-cited legend rows (empty ledger-fetch
+  // handles for omitted sections) that cost budget and reader attention.
+  for (const entry of entries) {
+    if (entry.handle) recoveryReference(references, entry.handle);
+  }
+  const usedEntries = references.entries.filter((entry) => (
+    'usedHandles' in references && (references as MutableRecoveryReferenceCatalog).usedHandles.has(entry.handle)
+  ));
+  const lines: string[] = usedEntries.length > 0
     ? [
       'Recovery handle legend (expand R<n> before execution):',
-      ...references.entries.map((entry) => `- ${entry.ref} = ${entry.handle}`),
+      ...usedEntries.map((entry) => `- ${entry.ref} = ${entry.handle}`),
       '',
     ]
     : [];
@@ -4443,9 +4552,13 @@ function renderLineage(
 ): RenderedV6SectionBody {
   const header: string[] = [...headerLines];
   if (section.partialReason) {
+    // Audit-4 S7: the partial line names the exact ledger omission handle
+    // (R<n>), not just "ledger-addressable" — the audited specimen's vault
+    // partial line pointed nowhere while R17 existed unused in the legend.
+    const omissionRef = recoveryReference(references, omissionHandle);
     header.push(
-      omissionHandle
-        ? `partial=${section.partialReason} · omitted units are ledger-addressable`
+      omissionRef
+        ? `partial=${section.partialReason} · omitted units are ledger-addressable · recover=${omissionRef}`
         : `partial=${section.partialReason} · omitted-units=unknown · omitted units are ledger-unreachable`,
     );
   }
@@ -4455,7 +4568,7 @@ function renderLineage(
     const sourceChars = projected.reduce((total, unit) => total + (unit.projection?.sourceChars ?? 0), 0);
     header.push(
       `projected-units=${projected.length} · stored=${storedChars} of ${sourceChars} chars · `
-      + omissionRecoveryClause(omissionHandle),
+      + omissionRecoveryClause(recoveryReference(references, omissionHandle)),
     );
   }
   if (section.units.length === 0) {
@@ -4463,7 +4576,9 @@ function renderLineage(
     return { text: header.join('\n'), complete: !section.partialReason, collapse: null };
   }
   const headerText = header.length > 0 ? `${header.join('\n')}\n` : '';
-  const recover = omissionHandle
+  // Audit-4 S7: resolve to an R<n> ref HERE (emit point) so usage marking
+  // reflects a handle this section's shipped text actually cites.
+  const recover = recoveryReference(references, omissionHandle)
     ?? recoveryReference(references, section.rangeRecover)
     ?? fallbackRecover;
   const body = collapseWithReceipt(
@@ -4539,11 +4654,18 @@ function operatorVaultWithConversationPointers(
   renderedOperatorIds: ReadonlySet<string>,
 ): RebirthPackageV7LineageSection {
   if (renderedOperatorIds.size === 0) return section;
+  // Audit-4 S7: the first pointed unit carries the full explanatory pointer;
+  // the remaining run collapses to a bare source id (~50 chars saved per row,
+  // ~4.6K on the audited specimen) while every id stays addressable.
+  let firstPointerEmitted = false;
   let changed = false;
   const units = section.units.map((unit) => {
     if (unit.kind !== 'operator' || !renderedOperatorIds.has(unit.id)) return unit;
     changed = true;
-    const pointer = `[operator · source=${unit.id} · rendered-in=recentConversation]`;
+    const pointer = firstPointerEmitted
+      ? `[operator · source=${unit.id}]`
+      : `[operator · source=${unit.id} · rendered-in=recentConversation (each bare row below is also rendered there; ids remain tap-recoverable)]`;
+    firstPointerEmitted = true;
     const { projection: _projection, ...rest } = unit;
     return {
       ...rest,
@@ -4713,12 +4835,14 @@ function lifeLedgerHeaderLines(
   const units = section.units.filter((unit) => unit.kind === 'life');
   if (units.length === 0) return [];
   const lines: string[] = [
-    // Audit-3 A4 life-row/v3: the legend enumerates EXACTLY the keys the
-    // assembler emits per life row (span/by/runtime/boundary/prior-status/
-    // package-chars/prompt-chars/src) — legend and rows share one grammar, and
-    // the key-parity test pins that both directions hold. `src` is the builder
-    // source-tree SHA-256 prefix proving which code built the life's package.
-    'legend: one line per life boundary · life <id> · span=<startISO>..<endISO|unknown> · by=<instanceId> · runtime=<engine>/<model|unknown> · boundary=<trigger> · prior-status=<predecessor status> · package-chars=<delivered chars> · prompt-chars=<prompt chars|unknown> · src=<builder sha256 first 12|unknown>',
+    // Audit-3 A4 life-row/v3 + audit-4 S6: the legend enumerates EXACTLY the
+    // keys the assembler emits per life row (span/by/runtime/boundary/
+    // prior-status/package-chars/prompt-chars/build-ms/src) — legend and rows
+    // share one grammar, and the key-parity test pins that both directions
+    // hold. `src` is the builder source-tree SHA-256 prefix proving which code
+    // built the life's package; `build-ms` is the request→capture wall the
+    // artifact writer stamped (omitted when the row predates it).
+    'legend: one line per life boundary · life <id> · span=<startISO>..<endISO|unknown> · by=<instanceId> · runtime=<engine>/<model|unknown> · boundary=<trigger> · prior-status=<predecessor status> · package-chars=<delivered chars> · prompt-chars=<prompt chars|unknown> · build-ms=<request→capture ms|omitted> · src=<builder sha256 first 12|unknown>',
   ];
   const refAt = knownSourceTime(capturedAt);
   const refMs = refAt ? Date.parse(refAt) : Number.NaN;
@@ -4764,8 +4888,12 @@ function renderSectionBodies(
   model: RebirthPackageV6Model,
   limits: Record<RebirthPackageV6SectionId, number>,
   timing?: RebirthPackageV6SectionTimingAccumulator,
+  sharedReferences?: MutableRecoveryReferenceCatalog,
 ): Record<RebirthPackageV6SectionId, RenderedV6SectionBody> {
-  const references = buildRecoveryReferenceCatalog(model);
+  // Audit-4 S7: ONE catalog per whole render pass — callers that re-render
+  // sections (adaptive backfill, shrink probes) pass the same mutable catalog
+  // so usage marking and legend numbering stay consistent across passes.
+  const references = sharedReferences ?? buildRecoveryReferenceCatalog(model);
   const transcriptHandle = recoveryReference(
     references,
     model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
@@ -4811,14 +4939,17 @@ function renderSectionBodies(
       operatorVault,
       limits.operatorVault,
       transcriptHandle,
-      recoveryReference(references, continuityLedgerOmissionHandle(model, 'operatorVault')),
+      // Audit-4 S7: pass RAW handles — resolving here would mark every ledger
+      // omission handle "used" even when no row ever cites it; renderLineage
+      // resolves at its emit points only.
+      continuityLedgerOmissionHandle(model, 'operatorVault'),
       references,
     )),
     episodeChapterIndex: measureSectionRender(timing, 'episodeChapterIndex', () => renderLineage(
       lineageSection(model, 'episodeChapterIndex'),
       limits.episodeChapterIndex,
-      recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'context-warp-stores')?.handle),
-      recoveryReference(references, continuityLedgerOmissionHandle(model, 'episodeChapterIndex')),
+      model.recoveryIndex.find((entry) => entry.id === 'context-warp-stores')?.handle ?? null,
+      continuityLedgerOmissionHandle(model, 'episodeChapterIndex'),
       references,
       EPISODE_CHAPTER_RECENCY_FLOOR_K,
       'episode',
@@ -4827,8 +4958,8 @@ function renderSectionBodies(
       const led = renderLineage(
         lineageSection(model, 'lifeLedger'),
         limits.lifeLedger,
-        recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle),
-        recoveryReference(references, continuityLedgerOmissionHandle(model, 'lifeLedger')),
+        model.recoveryIndex.find((entry) => entry.id === 'rebirth-package')?.handle ?? null,
+        continuityLedgerOmissionHandle(model, 'lifeLedger'),
         references,
         LIFE_LEDGER_RECENCY_FLOOR_K,
         'life',
@@ -5034,8 +5165,10 @@ function renderSectionsWithLimits(
   model: RebirthPackageV6Model,
   limits: Record<RebirthPackageV6SectionId, number>,
   timing?: RebirthPackageV6SectionTimingAccumulator,
+  sharedReferences?: MutableRecoveryReferenceCatalog,
 ): readonly RenderedRebirthPackageV6Section[] {
-  const rendered = renderSectionBodies(model, limits, timing);
+  const references = sharedReferences ?? buildRecoveryReferenceCatalog(model);
+  const rendered = renderSectionBodies(model, limits, timing, references);
   // Audit-3 A8/S6: ONE completeness census derived from the actual rendered
   // bodies. The Boundary re-renders once WITH the census so its
   // capture-partial-lanes header, each section's partial= surface, the
@@ -5043,12 +5176,12 @@ function renderSectionsWithLimits(
   // disagree — one structure feeds all four.
   const completeness = computeSectionCompleteness(model, rendered);
   rendered.boundaryAndActiveTask = measureSectionRender(timing, 'boundaryAndActiveTask', () => (
-    renderBoundary(model, limits.boundaryAndActiveTask, completeness)
+    renderBoundary(model, limits.boundaryAndActiveTask, completeness, references)
   ));
   // Recovery section rows for rendered sections take the census status too
   // (fourth surface of the A8/S6 agreement), so it re-renders with the census.
   rendered.recoveryIndex = measureSectionRender(timing, 'recoveryIndex', () => (
-    renderRecovery(model, limits.recoveryIndex, completeness)
+    renderRecovery(model, limits.recoveryIndex, completeness, references)
   ));
   const admitted = admittedSectionIds(model);
   // Render-loss sections in canonical order: the census's renderLoss flag is
@@ -5288,6 +5421,7 @@ function shrinkCollapseSectionsToTarget(args: {
   initialText: string;
   targetChars: number;
   timing?: RebirthPackageV6SectionTimingAccumulator;
+  references?: MutableRecoveryReferenceCatalog;
 }): RebirthPackageV7ShrinkOutcome {
   let limits = { ...args.initialLimits };
   let sections = args.initialSections;
@@ -5300,7 +5434,7 @@ function shrinkCollapseSectionsToTarget(args: {
     cap: number,
   ): { limits: Record<RebirthPackageV6SectionId, number>; sections: readonly RenderedRebirthPackageV6Section[]; text: string } => {
     const candidateLimits = { ...limits, [id]: cap };
-    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits, args.timing);
+    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits, args.timing, args.references);
     shrinkRenders += 1;
     return {
       limits: candidateLimits,
@@ -5362,6 +5496,31 @@ function shrinkCollapseSectionsToTarget(args: {
   };
 }
 
+/**
+ * Audit-4 S7: prune Recovery-Index legend rows whose R<n> ref no section body
+ * cites. Text-level and order-preserving: surviving rows keep their exact
+ * numbers, and removing lines can only shrink the package. A ref counts as
+ * cited when it appears on any NON-legend line (recovery rows' `recover=R<n>`,
+ * eviction envelopes, partial-line citations, inline-evidence headers).
+ */
+function pruneRecoveryLegendRows(text: string): string {
+  const legendRowRe = /^- (R\d+) = /u;
+  const citeRe = /\b(R\d+)\b/gu;
+  const lines = text.split('\n');
+  const cited = new Set<string>();
+  for (const line of lines) {
+    if (legendRowRe.test(line)) continue;
+    for (const match of line.matchAll(citeRe)) cited.add(match[1]!);
+  }
+  const hasLegend = lines.some((line) => legendRowRe.test(line));
+  if (!hasLegend) return text;
+  const kept = lines.filter((line) => {
+    const ref = legendRowRe.exec(line)?.[1];
+    return ref === undefined || cited.has(ref);
+  });
+  return kept.join('\n');
+}
+
 export function renderRebirthPackageV6WithReport(
   model: RebirthPackageV6Model,
   options: RenderRebirthPackageV6Options = {},
@@ -5371,6 +5530,9 @@ export function renderRebirthPackageV6WithReport(
   // declaration must ride INSIDE the budget math, never appended beyond it.
   const lane = redactContinuityModel(model);
   model = lane.model;
+  // Audit-4 S7: one catalog shared by the initial render, every shrink probe,
+  // and every eviction envelope — usage marking must converge on a single
+  // legend, and refs must stay stable across adaptive re-renders.
   const references = buildRecoveryReferenceCatalog(model);
   const declaration = lane.declaration;
   const budget = packageBudgetChars(model, options);
@@ -5380,7 +5542,7 @@ export function renderRebirthPackageV6WithReport(
     : 0;
   const sectionTiming = createSectionTimingAccumulator(options);
   const initialLimits = resolveAdaptiveSectionCapsInternal(model, options, sectionTiming);
-  const initialSections = renderSectionsWithLimits(model, initialLimits, sectionTiming);
+  const initialSections = renderSectionsWithLimits(model, initialLimits, sectionTiming, references);
   const initialRendered = joinRenderedSections(initialSections, declaration);
   const targetSectionChars = Number.isFinite(pushTarget) && pushTarget > 0
     ? Math.max(0, Math.floor(pushTarget) - envelopeChars)
@@ -5394,6 +5556,7 @@ export function renderRebirthPackageV6WithReport(
       initialText: initialRendered,
       targetChars: targetSectionChars,
       timing: sectionTiming,
+      references,
     })
     : {
       sections: initialSections,
@@ -5414,6 +5577,15 @@ export function renderRebirthPackageV6WithReport(
     // delivered chars never exceed the declared budget).
     trimmedSectionIds: readonly RebirthPackageV6SectionId[] = [],
   ): RenderedRebirthPackageV6WithReport => {
+    // Audit-4 S7 legend prune: runs on the FINAL composed text at the single
+    // funnel every render path (early fits, shrink, admission, eviction)
+    // returns through. A legend row survives iff its R<n> ref is cited on a
+    // NON-legend line somewhere in the package — the audited specimen carried
+    // 8 never-cited legend rows that cost budget and reader attention. The
+    // prune is text-level so it can never renumber refs (absent rows simply
+    // disappear; remaining rows keep their numbers) and never regrows the
+    // package (pruning only removes lines).
+    const prunedLegendText = pruneRecoveryLegendRows(text);
     const citizens = sections.filter((section): section is RenderedRebirthPackageV6Section & { collapse: CollapseResult } => (
       section.collapse != null
     ));
@@ -5422,9 +5594,9 @@ export function renderRebirthPackageV6WithReport(
     // before `text + envelope` reaches the declared budget so lint never pushes
     // the final package past its cap, and telemetry sees the true total.
     const budgetFloor = Number.isFinite(budget)
-      ? Math.max(0, Math.floor(budget) - envelopeChars - text.length)
-      : text.length * 2;
-    const linted = withSelfLint(model, text, budgetFloor);
+      ? Math.max(0, Math.floor(budget) - envelopeChars - prunedLegendText.length)
+      : prunedLegendText.length * 2;
+    const linted = withSelfLint(model, prunedLegendText, budgetFloor);
     const finalText = linted.text;
     const finalTotalChars = finalText.length + envelopeChars;
     const initialTotalChars = initialRendered.length + envelopeChars;
@@ -5706,6 +5878,9 @@ export function renderRebirthPackageV6WithReport(
       if (finalText.length <= sectionBudget) break;
     }
   }
+  // Audit-4 S7: the legend prune now lives inside finish() — the single funnel
+  // every render path returns through (early fit, shrink, admission, and
+  // eviction alike) — so the composed finalText ships directly here.
   return finish(finalText, finalExcluded, finalExcluded);
 }
 

@@ -218,7 +218,7 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     const hash = createHash('sha256').update(first.text, 'utf8').digest('hex');
     // Frozen byte-exact hash of the full render. Update deliberately only when
     // the renderer's formatting/honesty output intentionally changes.
-    expect(hash).toBe('c88407e7747e8f0bb9c82948261b35e32b0c01b241f00fb93ce1b8e4b078af11');
+    expect(hash).toBe('325abe57801362414be50d9c485fbc02408f5b9fc06b3ebe3e08f08cf26215f3');
   });
 
   it('renders every section into the framed output', () => {

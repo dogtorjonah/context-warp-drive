@@ -466,10 +466,12 @@ describe('Rebirth Package v6', () => {
       expect(text).toContain(`projected{rendered-truncated:${renderedTruncated.length}}`);
       expect(Number(declared![1])).toBe(suppressedWhole.length + renderedTruncated.length);
       const command = 'continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1" section_id="cognitiveArtifacts" omitted_only=true include_unknown_source_time=true limit=200';
+      // Audit-4 S7: the command rides the Recovery Index legend exactly once
+      // as an R<n> entry; section receipts cite the compact ref.
       expect(text.match(new RegExp(command.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'gu'))).toHaveLength(1);
+      expect(text).toMatch(/recover=R\d+\b/u);
       expect(text).not.toContain('unit_ids=');
     });
-
     it('ledgers selector budget evictions as explicit cap-overflow elisions', () => {
       const dropped = [
         artifact({ provenanceId: 'selector-drop:1', text: 'first selector omission' }),
@@ -533,11 +535,12 @@ describe('Rebirth Package v6', () => {
       expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
       expect(text).toContain('[EVICTED section=cognitiveArtifacts units=3');
       expect(text).toMatch(/\[EVICTED section=cognitiveArtifacts units=3 recover=R\d+\]/u);
+      // Audit-4 S7: the exact ledger-fetch command ships once in the Recovery
+      // legend; the eviction envelope cites its R<n> ref.
       expect(text).toContain(
         'continuity_ledger action="fetch" owner="instance-a" capture_id="capture-1"'
         + ' section_id="cognitiveArtifacts" omitted_only=true include_unknown_source_time=true limit=200',
-      );
-    });
+      );    });
 
     it('re-admits cognition at the largest fitting cap when residual capacity survives the protected sections', () => {
       // Specimen #38 shape: the package is over budget at cognition's current
@@ -753,8 +756,12 @@ describe('Rebirth Package v6', () => {
     expect(rendered.match(/I will implement it now\./gu)).toHaveLength(1);
     expect(rendered).toContain('Keep Atlas semantics stable.');
     for (let index = 1; index < sections.length; index += 1) {
-      expect(rendered.indexOf(sections[index - 1].text))
-        .toBeLessThan(rendered.indexOf(sections[index].text));
+      // Audit-4 S7: the final render prunes never-cited legend rows from the
+      // recovery section, so a section body may differ from the pre-prune
+      // sections snapshot. Order is asserted on the section FRAME anchor
+      // (`[REBIRTH-V6-SECTION id=…`) which survives pruning verbatim.
+      expect(rendered.indexOf(`[REBIRTH-V6-SECTION id=${sections[index - 1].id}`))
+        .toBeLessThan(rendered.indexOf(`[REBIRTH-V6-SECTION id=${sections[index].id}`));
     }
   });
 
@@ -2699,6 +2706,220 @@ describe('audit-3 A: S5 cognitive-kind model (A model seam)', () => {
   });
 });
 
+describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
+  it('admits a retention=lineage-floor flow row ahead of higher-priority unprotected kinds under budget pressure', () => {
+    // The audited specimen rendered ZERO kept-by rows: the floor was honored
+    // at selection then dropped whole by the render-stage budget pass. The
+    // admission score must put floor-protected rows first.
+    const rows = [
+      { provenanceId: 'floor:flow', sourceAt: '2026-08-01T17:00:00.000Z', kind: 'flow' as const, text: 'FLOOR-PROTECTED-FLOW-ROW old but structurally retained', authority: 'evidence' as const, supersededBy: null, retention: 'lineage-floor' as const },
+      ...Array.from({ length: 12 }, (_, index) => ({
+        provenanceId: `decision:${index}`,
+        sourceAt: `2026-08-02T17:${String(index).padStart(2, '0')}:00.000Z`,
+        kind: 'decision' as const,
+        text: `decision-${index}-${'D'.repeat(400)}`,
+        authority: 'evidence' as const,
+        supersededBy: null,
+      })),
+    ];
+    const value = model({
+      cognitiveArtifacts: rows,
+      cognitiveArtifactCapture: { status: 'complete' as const, capturedAt: '2026-08-02T18:00:00.000Z', totalMatched: rows.length, overlayCount: 0, missingFamilies: [], warnings: [] },
+    });
+    const rendered = renderRebirthPackageV6Sections(value, {
+      adaptiveBackfill: false,
+      sectionMaxChars: { cognitiveArtifacts: 3_000 },
+    }).find((section) => section.id === 'cognitiveArtifacts')?.text ?? '';
+    expect(rendered).toContain('FLOOR-PROTECTED-FLOW-ROW');
+    expect(rendered).toContain('kept-by=lineage-floor');
+  });
+
+  it('a fresh result outranks a week-old decision under the same budget pressure', () => {
+    const rows = [
+      { provenanceId: 'old:decision', sourceAt: '2026-07-25T17:00:00.000Z', kind: 'decision' as const, text: `WEEK-OLD-DECISION-ROW ${'D'.repeat(500)}`, authority: 'evidence' as const, supersededBy: null },
+      { provenanceId: 'fresh:result', sourceAt: '2026-08-02T17:59:00.000Z', kind: 'result' as const, text: `FRESH-RESULT-ROW ${'R'.repeat(500)}`, authority: 'evidence' as const, supersededBy: null },
+    ];
+    const value = model({
+      cognitiveArtifacts: rows,
+      cognitiveArtifactCapture: { status: 'complete' as const, capturedAt: '2026-08-02T18:00:00.000Z', totalMatched: rows.length, overlayCount: 0, missingFamilies: [], warnings: [] },
+    });
+    // Cap fits the fresh result (82) but not both rows: the week-old decision
+    // (88 - 24 age demotion = 64) must yield first.
+    const rendered = renderRebirthPackageV6Sections(value, {
+      adaptiveBackfill: false,
+      sectionMaxChars: { cognitiveArtifacts: 1_000 },
+    }).find((section) => section.id === 'cognitiveArtifacts')?.text ?? '';
+    expect(rendered).toContain('FRESH-RESULT-ROW');
+    expect(rendered).not.toContain('WEEK-OLD-DECISION-ROW');
+  });
+
+  it('rolls up identical repo error rows into one counted row (audit-4 S7)', () => {
+    const repos = Array.from({ length: 26 }, (_, index) => ({
+      name: `repo-${index}`,
+      branch: null,
+      sha7: null,
+      dirtyCount: null,
+      stagedCount: null,
+      capturedAt: '2026-09-02T23:48:45.712Z',
+      headCommittedAt: null,
+      elapsedMs: null,
+      error: 'repository-state capture did not return (worker submit deadline after 2674ms; per-root budget 1500ms; 26 root(s) in one submit)',
+    }));
+    const base = model();
+    const value = model({
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          ...(base.boundaryAndActiveTask.nowCard ?? {} as never),
+          ops: {
+            repositoryState: 'unknown',
+            repositoryReason: null,
+            repositories: repos,
+            ownedLiveChildren: [],
+            squad: null,
+            rooms: [],
+            source: { provenanceId: 'test:ops', sourceAt: '2026-09-02T23:48:45.712Z', status: 'exact' },
+          },
+        },
+      },
+    });
+    const rendered = renderRebirthPackageV6Sections(value)
+      .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+    expect(rendered).toContain('repo-0:error:');
+    expect(rendered).toContain('(+25 more roots with the same error)');
+    // Exactly ONE repo label instance — the roll-up, not 26 rows.
+    expect(rendered.match(/repo-\d+:error:/gu)).toHaveLength(1);
+  });
+
+  it('renders owned-children status counts including hibernated teardown-pending (audit-4 S6)', () => {
+    const base = model();
+    const value = model({
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          ...(base.boundaryAndActiveTask.nowCard ?? {} as never),
+          ops: {
+            repositoryState: 'unknown',
+            repositoryReason: null,
+            ownedLiveChildren: [
+              { id: 'inst-live', name: 'live-child', status: 'working' },
+              { id: 'inst-hib', name: 'hibernated-child', status: 'hibernated' },
+            ],
+            squad: null,
+            rooms: [],
+            source: { provenanceId: 'test:ops', sourceAt: '2026-09-02T23:48:45.712Z', status: 'exact' },
+          },
+        },
+      },
+    });
+    const rendered = renderRebirthPackageV6Sections(value)
+      .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+    expect(rendered).toContain('owned-children=live-child(inst-live),hibernated-child(inst-hib) (live=1 hibernated=1 done=0 teardown-pending=1)');
+  });
+
+  it('compacts vault pointer runs to one explanatory pointer plus bare back-references (audit-4 S7)', () => {
+    // Three user rows beyond the relocated endpoints render in conversation,
+    // so the vault run has three pointed units.
+    const rows = [
+      { provenanceId: 'message:user-older', sourceAt: '2026-08-02T17:55:00.000Z', role: 'user' as const, text: 'Keep Atlas semantics stable.' },
+      { provenanceId: 'message:user-mid', sourceAt: '2026-08-02T17:56:00.000Z', role: 'user' as const, text: 'Second rendered operator row.' },
+      { provenanceId: 'message:user-new', sourceAt: '2026-08-02T17:57:00.000Z', role: 'user' as const, text: 'Third rendered operator row.' },
+    ];
+    const vault = {
+      units: rows.map((row) => ({
+        id: row.provenanceId,
+        sourceAt: row.sourceAt,
+        sourceEndAt: null as string | null,
+        kind: 'operator' as const,
+        verbatim: `vault body ${row.provenanceId}`,
+        digest: `vault digest ${row.provenanceId}`,
+        claim: `vault claim ${row.provenanceId}`,
+        eraKey: '2026-08-02',
+        recover: 'tap_instance_messages action="canonical" target_instance_id="instance-a"',
+      })),
+      rangeRecover: null as string | null,
+      partialReason: null as string | null,
+    };
+    const value = model({ recentConversation: rows, operatorVault: vault });
+    const rendered = renderRebirthPackageV6Sections(value)
+      .find((section) => section.id === 'operatorVault')?.text ?? '';
+    // One full pointer for the first pointed unit, bare pointers for the rest.
+    expect(rendered.match(/rendered-in=recentConversation/gu)).toHaveLength(1);
+    const barePointers = rendered.match(/\[operator · source=message:user[^\]]*\]/gu) ?? [];
+    expect(barePointers.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('prunes unreferenced recovery-legend handles: only cited handles earn legend rows (audit-4 S7)', () => {
+    // The model carries 4 recovery entries plus 10 potential ledger-omission
+    // handles; only refs actually cited by a section body (or a recovery row)
+    // may appear in the legend. The pruned legend rides the WithReport path
+    // where the final reconciliation pass runs.
+    const value = model();
+    const { text } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
+    const legendRows = text.match(/^- R\d+ = /gmu) ?? [];
+    expect(legendRows.length).toBeGreaterThan(0);
+    // Every legend handle is genuinely referenced by SOME section text.
+    for (const row of legendRows) {
+      const ref = row.match(/^- (R\d+) = /u)?.[1];
+      expect(ref).toBeTruthy();
+      // The ref is used somewhere outside its own legend definition line.
+      const occurrences = text.split(`- ${ref} = `).length - 1;
+      const usedElsewhere = occurrences > 1
+        || new RegExp(`recover=${ref}\\b`, 'u').test(text)
+        || new RegExp(`recovery=${ref}\\b`, 'u').test(text);
+      expect(usedElsewhere).toBe(true);
+    }
+    // And the audited defect shape is gone: a bare-model render cites at most
+    // the entry handles — no more 8 never-cited rows.
+    expect(legendRows.length).toBeLessThanOrEqual(8);
+  });
+
+  it('names the unaccounted request→capture remainder explicitly (audit-4 S7)', () => {
+    const base = model();
+    const value = model({
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        builder: {
+          ...(base.boundaryAndActiveTask.builder ?? {} as never),
+          requestPrep: { totalMs: 7_642, snapshotMs: 3_896, frontierMs: 7_642, otherMs: 0 },
+          packageBuildMs: 1_075,
+          requestToCaptureMs: 10_905,
+        },
+      },
+    });
+    const rendered = renderRebirthPackageV6Sections(value)
+      .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+    expect(rendered).toContain('request→capture=10905ms');
+    expect(rendered).toContain('unaccounted=2188ms');
+  });
+
+  it('life ledger legend stays in key parity with the life row grammar (audit-4 S6)', () => {
+    const value = model({
+      lifeLedger: {
+        units: [{
+          id: 'rebirth:test-life-1',
+          sourceAt: '2026-09-02T22:23:44.481Z',
+          sourceEndAt: '2026-09-02T23:58:18.224Z',
+          kind: 'life',
+          verbatim: 'life rebirth:test-life-1 · span=2026-09-02T22:23:44.481Z..2026-09-02T23:58:18.224Z · by=inst-a · runtime=glm/glm-5.3 · boundary=cli-hard-epoch · prior-status=working · package-chars=145837 · prompt-chars=unknown · build-ms=13333',
+          digest: 'life row',
+          claim: 'life row',
+          eraKey: '2026-09-02',
+          recover: 'tap_instance_messages action="rebirth" target_instance_id="instance-a"',
+        }],
+        rangeRecover: null as string | null,
+        partialReason: null as string | null,
+      },
+    });
+    const rendered = renderRebirthPackageV6Sections(value)
+      .find((section) => section.id === 'lifeLedger')?.text ?? '';
+    for (const key of ['span=', 'by=', 'runtime=', 'boundary=', 'prior-status=', 'package-chars=', 'prompt-chars=', 'build-ms=', 'src=']) {
+      expect(rendered).toContain(`legend: one line per life boundary`);
+      expect(rendered).toContain(key);
+    }
+  });
+});
+
 describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps + display stamp', () => {
   function boundaryText(value: RebirthPackageV6Model): string {
     return renderRebirthPackageV6Sections(value)
@@ -3022,7 +3243,9 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
       },
     });
     const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
-    expect(text).toContain('[operator · source=message:user-older · rendered-in=recentConversation]');
+    // Audit-4 S7: the single pointed unit renders the full explanatory
+    // pointer (previously every row carried the full ~70-char form).
+    expect(text).toContain('[operator · source=message:user-older · rendered-in=recentConversation');
     expect(text).not.toContain(original);
 
     const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
