@@ -53,6 +53,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // of room in the model's context window" (2026-06-14). 258K = guaranteed
   // effective input floor so CONTEXT_THRESHOLDS trip below the real wall
   // (AUTO_COMPACT 0.93 → ~240K). GPT-5.x CLI flagship tiers share the catalog.
+  'gpt-6-astra': 1_050_000, // Astra publishes a 1.05M context window on both API and CLI-routed surfaces
   'codex-5.6': 258_000,
   'codex-5.6-sol': 258_000,
   'codex-5.6-terra': 258_000,
