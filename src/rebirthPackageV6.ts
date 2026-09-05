@@ -607,6 +607,8 @@ export interface RebirthPackageV6ConversationRow {
    * are grouped by provenance fallback (single-row base), never mis-tagged.
    */
   readonly exchangeId?: string;
+  /** Sparse capture did not hydrate the surrounding proposal/reply exchange. */
+  readonly exchangeRecovery?: string;
 }
 
 export interface RebirthPackageV6RecoveryHandle {
@@ -614,6 +616,8 @@ export interface RebirthPackageV6RecoveryHandle {
   readonly label: string;
   /** Exact tool command or durable URI. */
   readonly handle: string;
+  /** What the route returns; absent legacy declarations are classified conservatively. */
+  readonly recoveryScope?: 'exact-full' | 'exact-omitted-subset' | 'discovery';
   readonly status: 'available' | 'partial' | 'unavailable' | 'not-requested';
   readonly count: number | null;
   readonly frontier: string | null;
@@ -921,9 +925,9 @@ export const RAIL_COMPLETE_BACKFILL_PRIORITY: readonly RebirthPackageV6SectionId
   'executionState',
   'operatorVault',
   'recentConversation',
+  'cognitiveArtifacts',
   'lifeLedger',
   'episodeChapterIndex',
-  'cognitiveArtifacts',
   'activeEditDelta',
 ] as const;
 
@@ -2770,10 +2774,10 @@ function formatBuilderIdentityLine(builder: RebirthPackageV6BoundaryAndActiveTas
     ? Math.round(builder.requestToCaptureMs)
     : null;
   const unaccountedMs = prepTotalMs !== null && totalWallMs !== null
-    ? Math.max(0, totalWallMs - prepTotalMs - (buildMsValue ?? 0))
+    ? totalWallMs - prepTotalMs - (buildMsValue ?? 0)
     : null;
   const unaccountedText = unaccountedMs !== null
-    ? ` · unaccounted=${unaccountedMs}ms (ledger-commit/cognition-capture/transport)`
+    ? ` · unaccounted=${unaccountedMs}ms (cause unknown${unaccountedMs < 0 ? '; inconsistent measured spans' : ''}; capture only, not delivery/readiness)`
     : '';
   return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${packageBuildMs}${builtMs}${git}${sidecarBoot}${relayBoot}${prepText}${requestToCapture}${unaccountedText}`;
 }
@@ -3104,12 +3108,12 @@ function boundaryHazardsLine(
     (reason) => /capture unavailable/iu.test(reason),
   ) === true
     && facts.length === 0;
-  if (captureUnavailable) return 'hazards=unknown · receipt scan did not run';
-  if (blockerFacts.length === 0) return 'hazards=none';
+  if (captureUnavailable) return 'execution-blockers=unknown · receipt scan did not run';
+  if (blockerFacts.length === 0) return 'execution-blockers=none · capture/index/render health reported separately';
   const executionLost = completeness?.get('executionState')?.renderLoss === true;
   return executionLost
-    ? `hazards=elided (${blockerFacts.length})`
-    : `hazards=${blockerFacts.length}`;
+    ? `execution-blockers=elided (${blockerFacts.length})`
+    : `execution-blockers=${blockerFacts.length}`;
 }
 
 function renderBoundary(
@@ -3603,7 +3607,7 @@ function renderActiveEdits(
     const disposition = REBIRTH_ACTIVE_EDIT_NOT_REQUESTED_REASON_RE.test(reason)
       ? 'not-requested'
       : 'unavailable';
-    const banner = `evidence=bounded edit log; immutable capture ${disposition}: ${reason}`;
+    const banner = `current-attributable-edits=unknown · immutable capture=${disposition}: ${reason}\nevidence=bounded historical edit log; paths below are historical touches, not current ownership or pending work. Shared checkout counts are separate repository observations.`;
     // AUDIT-3 A1(e): the legacy layout appends a `Provenance: ⌖c…` line to the
     // AED artifact for its coordinate-closet appendix, which the v6 renderer
     // has no appendix for — strip that single generated trailing marker line so
@@ -3757,13 +3761,31 @@ function compareCognitionAdmission(
 function cognitionRowBody(
   row: RebirthPackageV6CognitiveArtifact,
   referenceAt: string | null,
+  sourceText?: string,
+  recovery?: string | null,
 ): string {
   const declared = row.projection === 'truncated'
     ? ` · projection=truncated stored=${row.storedChars ?? row.text.length}/${row.sourceChars ?? 'unknown'} chars`
     : '';
   const retention = row.retention ? ` · kept-by=${row.retention}` : '';
   const stamp = row.sourceAt ? formatDisplayStamp(row.sourceAt, referenceAt) : 'unknown';
-  return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${retention}${declared}`;
+  let excerpt = '';
+  if (row.projection === 'truncated' && sourceText?.startsWith(row.text)
+    && ['decision', 'hazard', 'result', 'question'].includes(row.kind)) {
+    // Supplement the legacy attested prefix with an explicitly separate,
+    // exact-source closing paragraph. Never pass this display supplement off
+    // as the ledger's stored prefix or as a generated historical conclusion.
+    const lower = Math.max(row.text.length, sourceText.length - 900);
+    const paragraph = sourceText.indexOf('\n\n', lower);
+    const start = paragraph >= lower && paragraph + 2 < sourceText.length
+      ? paragraph + 2 : sourceText.indexOf(' ', lower) + 1;
+    if (start > row.text.length && start < sourceText.length) {
+      const tail = sourceText.slice(start);
+      const hash = createHash('sha256').update(tail).digest('hex');
+      excerpt = `\n[exact-source-excerpt/v1 · source=${row.provenanceId} · utf16-range=${start}..${sourceText.length} · sha256=${hash} · recover=${recovery ?? 'unavailable'}]\n${tail}\n[/exact-source-excerpt]`;
+    }
+  }
+  return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${retention}${declared}${excerpt}`;
 }
 
 function cognitionSuppressionHeader(
@@ -3879,6 +3901,7 @@ function renderCognition(
   addBoundaryBody(model.boundaryAndActiveTask.activeRequestClaims?.previous?.text);
   const allSourceRows = model.cognitiveArtifacts;
   const sourceRows = allSourceRows.filter((row) => !boundaryBodies.has(row.text.trim()));
+  const fullTextById = new Map(sourceRows.filter((row) => row.projection !== 'truncated').map((row) => [row.provenanceId, row.text]));
   const boundaryDedupedCount = allSourceRows.length - sourceRows.length;
 
   // Protected tail. The capture receipt is what stops "few rows" from reading
@@ -3921,6 +3944,9 @@ function renderCognition(
     rows: readonly RebirthPackageV6CognitiveArtifact[],
     demandProbe: boolean,
   ): RenderedV6SectionBody | null => {
+    const referenceAt = model.boundaryAndActiveTask.capturedAt;
+    const rowBodies = new Map(rows.map((row) => [row.provenanceId,
+      cognitionRowBody(row, referenceAt, fullTextById.get(row.provenanceId), recoveryHandle)]));
     const assemble = (keep: readonly RebirthPackageV6CognitiveArtifact[]): string => {
       const kept = new Set(keep.map((row) => row.provenanceId));
       const suppressed = rows.filter((row) => !kept.has(row.provenanceId));
@@ -3948,10 +3974,10 @@ function renderCognition(
           || right.provenanceId.localeCompare(left.provenanceId));
       const unknown = keep.filter((row) => !row.sourceAt);
       const referenceAt = model.boundaryAndActiveTask.capturedAt;
-      for (const row of known) lines.push(`${formatDisplayStamp(row.sourceAt, referenceAt)} · ${cognitionRowBody(row, referenceAt)}`);
+      for (const row of known) lines.push(`${formatDisplayStamp(row.sourceAt, referenceAt)} · ${rowBodies.get(row.provenanceId)}`);
       if (unknown.length > 0) {
         lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
-        for (const row of unknown) lines.push(`- ${cognitionRowBody(row, referenceAt)}`);
+        for (const row of unknown) lines.push(`- ${rowBodies.get(row.provenanceId)}`);
       }
       if (keep.length === 0) {
         if (!capture) {
@@ -4048,7 +4074,10 @@ function conversationRowText(
     : '';
   // Audit-3 C5: display stamp compaction; the store keeps exact ms.
   const stamp = row.sourceAt ? formatDisplayStamp(row.sourceAt, referenceAt) : 'unknown';
-  return `[${row.role} · source=${baseProvenance}${segments} · source-time=${stamp}]\n${renderedText}${projection}`;
+  const exchangeGap = row.exchangeRecovery
+    ? `\n[exchange=partial: surrounding proposal/replies were not hydrated; recover=${row.exchangeRecovery}]`
+    : '';
+  return `[${row.role} · source=${baseProvenance}${segments} · source-time=${stamp}]\n${renderedText}${projection}${exchangeGap}`;
 }
 
 /** Render-only seam markers for a coalesced segmented message (audit-2 A1). */
@@ -4432,7 +4461,14 @@ function renderRecovery(
       ? ''
       : ` · frontier=${entry.frontier ?? 'unknown'}`;
     const rowStatus = censusPartial ? 'partial' : entry.status;
-    const line = `- ${entry.id} · ${entry.label} · status=${rowStatus} · ${countLabel}=${entry.count ?? 'unknown'}${frontier}${reasonSuffix} · recover=${recoverLabel}`;
+    const recoveryScope = entry.recoveryScope ?? (
+      entry.handle.startsWith('continuity_ledger ') && /\bomitted_only=true\b/u.test(entry.handle)
+        ? 'exact-omitted-subset'
+        : entry.id === 'rebirth-package' && /\bsearch=/u.test(entry.handle)
+          ? 'exact-full'
+          : 'discovery'
+    );
+    const line = `- ${entry.id} · ${entry.label} · status=${rowStatus} · ${countLabel}=${entry.count ?? 'unknown'}${frontier}${reasonSuffix} · scope=${recoveryScope} · recover=${recoverLabel}`;
     // Optional inline evidence (e.g. a captured Atlas handoff card body) rides
     // beneath its own handle line as a bounded indented snapshot. It never
     // overloads `label` (which stays a short title). If the evidence cannot fit
@@ -4442,7 +4478,7 @@ function renderRecovery(
     const evidence = entry.inlineEvidence?.trim();
     let evidenceBlock: string | null = null;
     if (evidence) {
-      const evidenceRecovery = recoveryReference(references, entry.handle || packageHandle);
+      const evidenceRecovery = recoveryReference(references, packageHandle || entry.handle);
       const evidenceHeader = `  ${entry.id}.inline-evidence: root recovery=${evidenceRecovery}`;
       const budget = Math.max(0, maxChars - evidenceHeader.length - 60);
       const ev = boundedText(
@@ -4459,7 +4495,7 @@ function renderRecovery(
     // short and the entry body is elided separately. Only the full block (entry
     // + evidence) can overflow, and on that path we keep the entry line and the
     // exact handle rather than dropping the whole route to an `unavailable`.
-    const exactHandle = recoveryReference(references, entry.handle || packageHandle) || packageRef;
+    const exactHandle = recoveryReference(references, packageHandle || entry.handle) || packageRef;
     if (projected.length > maxChars) {
       if (evidenceBlock) {
         lines.push(line);
@@ -4654,18 +4690,13 @@ function operatorVaultWithConversationPointers(
   renderedOperatorIds: ReadonlySet<string>,
 ): RebirthPackageV7LineageSection {
   if (renderedOperatorIds.size === 0) return section;
-  // Audit-4 S7: the first pointed unit carries the full explanatory pointer;
-  // the remaining run collapses to a bare source id (~50 chars saved per row,
-  // ~4.6K on the audited specimen) while every id stays addressable.
-  let firstPointerEmitted = false;
+  // The section header explains relocation before any rows, independently of
+  // source order or tier demotion. Keep immutable model units untouched.
   let changed = false;
   const units = section.units.map((unit) => {
     if (unit.kind !== 'operator' || !renderedOperatorIds.has(unit.id)) return unit;
     changed = true;
-    const pointer = firstPointerEmitted
-      ? `[operator · source=${unit.id}]`
-      : `[operator · source=${unit.id} · rendered-in=recentConversation (each bare row below is also rendered there; ids remain tap-recoverable)]`;
-    firstPointerEmitted = true;
+    const pointer = `[operator · source=${unit.id}]`;
     const { projection: _projection, ...rest } = unit;
     return {
       ...rest,
@@ -4865,7 +4896,8 @@ function lifeLedgerHeaderLines(
     if (!start || !end) return [];
     const startMs = Date.parse(start);
     const endMs = Date.parse(end);
-    return Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs ? [endMs - startMs] : [];
+    return Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs
+      && (!Number.isFinite(refMs) || endMs <= refMs) ? [endMs - startMs] : [];
   });
   if (durationsMs.length > 0) {
     const sorted = [...durationsMs].sort((a, b) => a - b);
@@ -4873,9 +4905,7 @@ function lifeLedgerHeaderLines(
       ? sorted[(sorted.length - 1) / 2]!
       : (sorted[sorted.length / 2 - 1]! + sorted[sorted.length / 2]!) / 2;
     const minutes = Math.round(median / 60000);
-    const suffix = durationsMs.length === units.length
-      ? ''
-      : ` (over ${durationsMs.length} of ${units.length} known spans)`;
+    const suffix = ` (all captured lineage; ${durationsMs.length}/${units.length} valid spans; includes inactive time; reference=${refAt ?? 'unknown'})`;
     cadenceParts.push(`median-life=${minutes}m${suffix}`);
   } else {
     cadenceParts.push('median-life=unknown (no life spans with known start+end)');
@@ -4944,6 +4974,11 @@ function renderSectionBodies(
       // resolves at its emit points only.
       continuityLedgerOmissionHandle(model, 'operatorVault'),
       references,
+      undefined,
+      undefined,
+      renderedOperatorIds.size > 0
+        ? ['Relocation: bare operator IDs are rendered-in=recentConversation; exact request/answer endpoints live in Boundary and Active Task. Vault frontier describes retained vault units, separately from the active request.']
+        : [],
     )),
     episodeChapterIndex: measureSectionRender(timing, 'episodeChapterIndex', () => renderLineage(
       lineageSection(model, 'episodeChapterIndex'),
@@ -5932,7 +5967,7 @@ export function lintPackageSelfChecks(model: RebirthPackageV6Model, renderedText
   // predicate matches the bounded phrase with or without its parentheses
   // (audit-2 A29-2: it previously required the literal `(inline body below)`).
   for (const entry of model.recoveryIndex) {
-    if (/inline\s*body\s+below/iu.test(entry.label.trim()) && !entry.inlineEvidence?.trim()) {
+    if (/(?:inline\s*body\s+below|bounded\s+inline\s+evidence)/iu.test(entry.label.trim()) && !entry.inlineEvidence?.trim()) {
       checks.push(
         `⚠ self-check: recovery lane ${entry.id} labels "inline body below" but carries no inline evidence — dangling label.`,
       );

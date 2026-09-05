@@ -1160,7 +1160,7 @@ describe('Rebirth Package v6', () => {
       .find((candidate) => candidate.id === 'activeEditDelta');
     expect(section).toBeTruthy();
     expect(section!.text).toContain(
-      'evidence=bounded edit log; immutable capture not-requested: legacy Active Edit Delta adapted without an immutable Atlas capture',
+      'current-attributable-edits=unknown · immutable capture=not-requested: legacy Active Edit Delta adapted without an immutable Atlas capture',
     );
     // The timestamped edit log is real evidence and survives untouched.
     expect(section!.text).toContain('[06:51 PM UTC] Edit → relay/src/example.ts');
@@ -1191,7 +1191,7 @@ describe('Rebirth Package v6', () => {
     const section = renderRebirthPackageV6Sections(legacy, {
       sectionMaxChars: { activeEditDelta: 520 },
     }).find((candidate) => candidate.id === 'activeEditDelta');
-    const banner = 'evidence=bounded edit log; immutable capture not-requested: legacy Active Edit Delta adapted without an immutable Atlas capture';
+    const banner = 'current-attributable-edits=unknown · immutable capture=not-requested: legacy Active Edit Delta adapted without an immutable Atlas capture\nevidence=bounded historical edit log; paths below are historical touches, not current ownership or pending work. Shared checkout counts are separate repository observations.';
 
     expect(section?.text).toContain(banner);
     expect(section?.text).toContain('NEWEST_OPERATIONAL_EDIT');
@@ -2076,13 +2076,42 @@ describe('Rebirth Package v6', () => {
     // though the `rebirth-package` artifact handle is not the first to elide.
     expect(rendered).not.toContain('exact recovery unavailable');
     expect(rendered).toContain('elided for budget; recover the complete index');
-    expect(rendered).toContain('tap_instance_messages action="canonical" target_instance_id="instance-a"');
+    expect(rendered).toContain('tap_instance_messages action="rebirth" target_instance_id="instance-a" search="capture-1"');
     // A partial section must not report itself complete to manifests/consumers.
     const sections = renderRebirthPackageV6Sections(value, {
       sectionMaxChars: { recoveryIndex: 90 },
     });
     const recoverySection = sections.find((section) => section.id === 'recoveryIndex');
     expect(recoverySection?.complete).toBe(false);
+  });
+
+  it('preserves a late ruling as a separately attested exact excerpt under pressure', () => {
+    const ruling = 'Decision: retain the worker boundary. Residual: activation awaits restart.';
+    const source = 'Context and evidence. '.repeat(250) + '\n\n' + ruling;
+    const value = model({ cognitiveArtifacts: [{
+      provenanceId: 'decision:late', sourceAt: '2026-08-02T17:59:40.000Z',
+      kind: 'decision', text: source, authority: 'historical_observation', supersededBy: null,
+    }] });
+    const rendered = renderRebirthPackageV6(value, {
+      adaptiveBackfill: false, sectionMaxChars: { cognitiveArtifacts: 2500 },
+    });
+    expect(rendered).toContain(ruling);
+    expect(rendered).toContain('exact-source-excerpt/v1');
+    expect(rendered).toContain(`utf16-range=${source.indexOf(ruling)}..${source.length}`);
+    expect(rendered).toContain(`sha256=${sha256ContinuityLedgerVerbatim(ruling)}`);
+  });
+
+  it('labels the cadence population and excludes future and reversed spans', () => {
+    const units = [
+      ['valid', '2026-08-02T17:00:00.000Z', '2026-08-02T18:00:00.000Z'],
+      ['future', '2026-08-02T17:00:00.000Z', '2026-08-03T18:00:00.000Z'],
+      ['reverse', '2026-08-02T17:00:00.000Z', '2026-08-02T16:00:00.000Z'],
+    ].map(([id, sourceAt, sourceEndAt]) => ({
+      id, sourceAt, sourceEndAt, kind: 'life' as const,
+      verbatim: `life ${id}`, digest: `life ${id}`, claim: `life ${id}`, eraKey: '2026-08-02', recover: 'life-recovery',
+    }));
+    const rendered = renderRebirthPackageV6(model({ lifeLedger: { units, rangeRecover: 'life-recovery' } }));
+    expect(rendered).toContain('median-life=60m (all captured lineage; 1/3 valid spans; includes inactive time; reference=2026-08-02T18:00:00.000Z)');
   });
 
   it('preserves the exact inline-evidence handle on elision with no rebirth-package handle', () => {
@@ -2891,6 +2920,8 @@ describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
       .find((section) => section.id === 'operatorVault')?.text ?? '';
     // One full pointer for the first pointed unit, bare pointers for the rest.
     expect(rendered.match(/rendered-in=recentConversation/gu)).toHaveLength(1);
+    expect(rendered.indexOf('Relocation:')).toBeLessThan(rendered.indexOf('[operator · source='));
+    expect(rendered).not.toContain('each bare row below');
     const barePointers = rendered.match(/\[operator · source=message:user[^\]]*\]/gu) ?? [];
     expect(barePointers.length).toBeGreaterThanOrEqual(2);
   });
@@ -2937,6 +2968,14 @@ describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     expect(rendered).toContain('request→capture=10905ms');
     expect(rendered).toContain('unaccounted=2188ms');
+    expect(rendered).toContain('cause unknown');
+    expect(rendered).not.toContain('ledger-commit/cognition-capture/transport');
+    const inconsistent = renderRebirthPackageV6Sections({
+      ...value, boundaryAndActiveTask: { ...value.boundaryAndActiveTask,
+        builder: { ...value.boundaryAndActiveTask.builder!, requestToCaptureMs: 1000 } },
+    }).find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+    expect(inconsistent).toContain('unaccounted=-7717ms');
+    expect(inconsistent).toContain('inconsistent measured spans');
   });
 
   it('life ledger legend stays in key parity with the life row grammar (audit-4 S6)', () => {
@@ -3291,7 +3330,8 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
     const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
     // Audit-4 S7: the single pointed unit renders the full explanatory
     // pointer (previously every row carried the full ~70-char form).
-    expect(text).toContain('[operator · source=message:user-older · rendered-in=recentConversation');
+    expect(text).toContain('[operator · source=message:user-older]');
+    expect(text).toContain('exact request/answer endpoints live in Boundary and Active Task');
     expect(text).not.toContain(original);
 
     const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;

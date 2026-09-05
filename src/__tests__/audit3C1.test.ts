@@ -212,7 +212,8 @@ describe('audit-3 C1: hazards tri-state (C8)', () => {
   it('renders hazards=none/unknown/<n>/elided deterministically from execution blocker facts', () => {
     // No blocker facts: healthy empty receipt scan.
     const empty = renderRebirthPackageV6WithReport({ ...mergeModel(), executionState: { facts: [], unknownReasons: [] } });
-    expect(empty.text).toContain('hazards=none');
+    expect(empty.text).toContain('execution-blockers=none');
+    expect(empty.text).toContain('capture/index/render health reported separately');
   });
 });
 
