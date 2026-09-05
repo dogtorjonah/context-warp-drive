@@ -12,6 +12,21 @@ const voice = (second: number, text: string, kind: EpisodeAnnotation['kind'] = '
   ({ ts: time(second), kind, text });
 
 describe('push continuity evidence selection', () => {
+  it('preserves a later explicit correction across register priorities beside the hazard', () => {
+    const hazard = voice(1, 'Keep the shutdown invariant.', 'narration:hazard');
+    const old = voice(2, 'The old decision.', 'star:decision');
+    const correction = voice(3, 'Correction: publication must finish first.', 'narration');
+    expect(selectVoiceInlays([hazard, old, correction], 2)).toEqual([hazard, correction]);
+    expect(selectVoiceInlays([hazard, old, correction], 1)).toEqual([correction]);
+    expect(selectVoiceInlays([hazard, correction], 1)).toEqual([hazard]);
+  });
+
+  it('pairs a durable decision with its later rationale across categories', () => {
+    const decision = voice(2, 'Use acknowledgement before deletion.', 'star:decision');
+    const old = voice(1, 'An older status.', 'star:result');
+    const rationale = voice(3, 'Chose acknowledgement because retries must retain records.', 'narration');
+    expect(selectVoiceInlays([decision, old, rationale], 2)).toEqual([decision, rationale]);
+  });
   it('pushes the latest conclusion under a one-line budget without mutating history', () => {
     const before = voice(1, 'Confirmed the queue drained without waiting for publication.');
     const correction = voice(3, 'Confirmed publication must finish before the queue is drained.');

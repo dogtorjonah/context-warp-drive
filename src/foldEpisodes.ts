@@ -1643,6 +1643,19 @@ export function selectVoiceInlays(
 ): EpisodeAnnotation[] {
   const ranked = [...annotations].sort(compareRecallAnnotationPriority);
   const chosen = ranked.slice(0, Math.max(0, max));
+  // Explicit corrections are evidence worth seeing even when their register is
+  // lower-ranked. Preserve hazards and source chronology; do not mark the older
+  // statement superseded merely because the agent wrote a correction.
+  const correction = ranked.filter((annotation) => !annotationIsRetired(annotation)
+    && /\b(?:correction:|(?:i retract|we retract|previous (?:claim|conclusion|assessment) was (?:wrong|incorrect))\b)/i.test(annotation.text)
+    && Number.isFinite(Date.parse(annotation.artifact?.sourceTime ?? annotation.ts ?? '')))
+    .sort((a, b) => Date.parse(b.artifact?.sourceTime ?? b.ts!) - Date.parse(a.artifact?.sourceTime ?? a.ts!))[0];
+  if (correction && !chosen.includes(correction)) {
+    const reverseIndex = [...chosen].reverse().findIndex((annotation) => !/hazard|gotcha/.test(annotation.kind)
+      && Date.parse(annotation.artifact?.sourceTime ?? annotation.ts ?? '')
+        <= Date.parse(correction.artifact?.sourceTime ?? correction.ts!));
+    if (reverseIndex >= 0) chosen[chosen.length - 1 - reverseIndex] = correction;
+  }
   // Two repeated conclusions should not consume the only slots for WHAT and
   // WHY. Preserve hazard/category priority; pair a conclusion only with later
   // or same-source-time closing rationale, never an undated earlier hypothesis.
@@ -1650,8 +1663,9 @@ export function selectVoiceInlays(
   const last = chosen.at(-1);
   const conclusionMs = Date.parse(conclusion?.artifact?.sourceTime ?? conclusion?.ts ?? '');
   if (chosen.length >= 2 && conclusion && last
-    && (conclusion.kind === 'narration:verdict' || (conclusion.kind === 'narration' && isNarrationVerdictText(conclusion.text)))
-    && last.kind === conclusion.kind && Number.isFinite(conclusionMs)) {
+    && (conclusion.kind === 'star:decision' || conclusion.kind === 'star:result'
+      || conclusion.kind === 'narration:verdict' || (conclusion.kind === 'narration' && isNarrationVerdictText(conclusion.text)))
+    && !/hazard|gotcha/.test(last.kind) && last !== correction && Number.isFinite(conclusionMs)) {
     const rationale = ranked.find((annotation) => {
       const sourceMs = Date.parse(annotation.artifact?.sourceTime ?? annotation.ts ?? '');
       return annotation.kind === 'narration' && !annotationIsRetired(annotation)
@@ -2988,7 +3002,7 @@ export interface EpisodicStashRateGateOptions {
  *   HELD in place, not consumed — its own boundary TTL keeps aging it honestly
  *   (pressure-pause precedent), and a fresher fire overwrites it anyway. At or
  *   above the rate the stash is consumed, provider-visible duplicates are
- *   removed, and AT MOST ONE novel card serves (worker card order is
+ *   removed, and AT MOST THREE novel cards serve (worker card order is
  *   strongest-tier-first). The counter resets only when an injectable card
  *   survives, so an open boundary that finds an empty, stale, or wholly
  *   duplicate stash keeps the accrued allowance.
@@ -3013,9 +3027,9 @@ export function consumeEpisodicStashRateGated(
   );
   if (!cards || cards.length === 0) return cards ? [...cards] : null;
   state.episodicGatedBoundariesSinceServe = 0;
-  if (cards.length > 1) {
-    state.episodicRateTrimmed += cards.length - 1;
-    return [cards[0]];
+  if (cards.length > 3) {
+    state.episodicRateTrimmed += cards.length - 3;
+    return cards.slice(0, 3);
   }
   return cards;
 }
