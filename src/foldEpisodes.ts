@@ -678,8 +678,8 @@ function joinConclusionSentences(selected: readonly { sentence: string; index: n
  * decision — trade-offs, alternatives considered, why one approach was chosen
  * over another. These lines don't match NARRATION_VERDICT_RE (they're not
  * "Found/Fixed/Confirmed" verdicts) but carry the "why" that verdict-shaped
- * mining drops. extractRationaleLines runs as the pass-3 backstop after
- * narration pass 1 (deliberate glyphs) and pass 2 (verdict shape) both fail.
+ * mining drops. Capture adds these lines alongside verdicts within the
+ * closing work interval, before the next genuine operator request.
  *
  * The pattern matches the agent's own decision-reasoning vocabulary — NOT
  * conclusions or outcomes (those are narration), but the reasoning that led
@@ -703,8 +703,8 @@ export const RATIONALE_MAX_LINES = 2;
  * voice rejection, length bounds, truncation. Zero LLM, byte-identical for
  * identical inputs.
  *
- * Used as the pass-3 backstop in mineNarrationForGap: runs ONLY when both the
- * deliberate glyph pass (1) and the verdict-shape pass (2) found nothing.
+ * Used additively by mineNarrationForGap; a verdict never prevents its
+ * accompanying rationale from entering durable memory.
  */
 export function extractRationaleLines(
   text: string,
@@ -1565,12 +1565,14 @@ export function deriveEpisodeSummary(
   },
   capChars = SUMMARY_CAP_CHARS,
 ): string {
-  const changelogs = (input.annotations ?? []).filter((a) => a.kind === 'changelog');
+  const annotations = [...(input.annotations ?? [])].sort(compareRecallAnnotationPriority);
+  const current = annotations.filter((a) => !annotationIsRetired(a));
+  const changelogs = current.filter((a) => a.kind === 'changelog');
   if (changelogs.length > 0) {
     const head = changelogs[0].text.split('\n')[0].trim();
     if (head.length > 0) return truncateVerbatim(head, capChars);
   }
-  const starResults = (input.annotations ?? []).filter((a) => a.kind === 'star:result' || a.kind === 'star:decision');
+  const starResults = current.filter((a) => a.kind === 'star:result' || a.kind === 'star:decision');
   if (starResults.length > 0) {
     const head = starResults[0].text.split('\n')[0].trim();
     if (head.length > 0) return truncateVerbatim(head, capChars);
@@ -1578,16 +1580,14 @@ export function deriveEpisodeSummary(
   if (input.railTitle && input.railTitle.trim().length > 0) {
     return truncateVerbatim(input.railTitle.trim(), capChars);
   }
-  const proseLines = (input.annotations ?? []).filter(
+  const proseLines = current.filter(
     (a) => a.kind.startsWith('narration') || a.kind.startsWith('process:'),
   );
   if (proseLines.length > 0) {
     // Prefer the DECLARED line (hazard/verdict outrank untagged in
     // ANNOTATION_PRIORITY) so a commentary-only episode's headline is the
     // agent's declared conclusion, not whichever prose line happened first.
-    const best = [...proseLines].sort(
-      (a, b) => ANNOTATION_PRIORITY[a.kind] - ANNOTATION_PRIORITY[b.kind],
-    )[0];
+    const best = proseLines[0];
     const head = best.text.split('\n')[0].trim();
     if (head.length > 0) return truncateVerbatim(head, capChars);
   }
@@ -1608,23 +1608,61 @@ export function deriveEpisodeSummary(
 /**
  * Pick ≤max voice inlays for card rendering. Priority: gotcha (the landmine
  * map) > decision > pivot > result > discovery > handoff > changelog > chat
- * > narration; ties break chronologically. Display order is chronological.
+ * > narration. Retired evidence follows usable evidence; equal categories
+ * prefer recent source time so an early conclusion cannot crowd out its later
+ * correction. This selects evidence, never infers semantic supersession.
+ * Display order remains chronological.
  */
+function annotationIsRetired(annotation: EpisodeAnnotation): boolean {
+  return annotation.artifact?.currentStatus === 'superseded'
+    || annotation.artifact?.driftStatus === 'modified_since_record'
+    || annotation.artifact?.driftStatus === 'missing';
+}
+
+function compareRecallAnnotationPriority(a: EpisodeAnnotation, b: EpisodeAnnotation): number {
+  const lifecycle = Number(annotationIsRetired(a)) - Number(annotationIsRetired(b));
+  if (lifecycle) return lifecycle;
+  const priority = ANNOTATION_PRIORITY[a.kind] - ANNOTATION_PRIORITY[b.kind];
+  if (priority) return priority;
+  if (a.kind === 'narration' && b.kind === 'narration') {
+    const conclusion = Number(isNarrationVerdictText(b.text)) - Number(isNarrationVerdictText(a.text));
+    if (conclusion) return conclusion;
+  }
+  const aTime = Date.parse(a.artifact?.sourceTime ?? a.ts ?? '');
+  const bTime = Date.parse(b.artifact?.sourceTime ?? b.ts ?? '');
+  const aKnown = Number.isFinite(aTime);
+  const bKnown = Number.isFinite(bTime);
+  if (aKnown !== bKnown) return aKnown ? -1 : 1;
+  if (aKnown && bKnown && aTime !== bTime) return bTime - aTime;
+  return a.text < b.text ? -1 : a.text > b.text ? 1 : 0;
+}
+
 export function selectVoiceInlays(
   annotations: readonly EpisodeAnnotation[],
   max = 2,
 ): EpisodeAnnotation[] {
-  const chosen = [...annotations]
-    .sort(
-      (a, b) =>
-        ANNOTATION_PRIORITY[a.kind] - ANNOTATION_PRIORITY[b.kind]
-        || compareEpisodeTimeAscending(a.ts ?? UNKNOWN_EPISODE_TIME, b.ts ?? UNKNOWN_EPISODE_TIME)
-        || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0),
-    )
-    .slice(0, Math.max(0, max));
+  const ranked = [...annotations].sort(compareRecallAnnotationPriority);
+  const chosen = ranked.slice(0, Math.max(0, max));
+  // Two repeated conclusions should not consume the only slots for WHAT and
+  // WHY. Preserve hazard/category priority; pair a conclusion only with later
+  // or same-source-time closing rationale, never an undated earlier hypothesis.
+  const conclusion = chosen[0];
+  const last = chosen.at(-1);
+  const conclusionMs = Date.parse(conclusion?.artifact?.sourceTime ?? conclusion?.ts ?? '');
+  if (chosen.length >= 2 && conclusion && last
+    && (conclusion.kind === 'narration:verdict' || (conclusion.kind === 'narration' && isNarrationVerdictText(conclusion.text)))
+    && last.kind === conclusion.kind && Number.isFinite(conclusionMs)) {
+    const rationale = ranked.find((annotation) => {
+      const sourceMs = Date.parse(annotation.artifact?.sourceTime ?? annotation.ts ?? '');
+      return annotation.kind === 'narration' && !annotationIsRetired(annotation)
+        && !isNarrationVerdictText(annotation.text) && RATIONALE_RE.test(annotation.text)
+        && Number.isFinite(sourceMs) && sourceMs >= conclusionMs && !chosen.includes(annotation);
+    });
+    if (rationale) chosen[chosen.length - 1] = rationale;
+  }
   chosen.sort((a, b) => compareEpisodeTimeAscending(
-    a.ts ?? UNKNOWN_EPISODE_TIME,
-    b.ts ?? UNKNOWN_EPISODE_TIME,
+    a.artifact?.sourceTime ?? a.ts ?? UNKNOWN_EPISODE_TIME,
+    b.artifact?.sourceTime ?? b.ts ?? UNKNOWN_EPISODE_TIME,
   ));
   return chosen;
 }
@@ -2368,7 +2406,8 @@ function nonDegenerateGist(chapter: Episode): string {
   if (summary && !isDegenerateGist(summary)) return summary;
   const best = chapter.annotations
     .filter((a) => typeof a.text === 'string' && a.text.trim().length > 0 && !isDegenerateGist(a.text))
-    .sort((a, b) => ANNOTATION_PRIORITY[a.kind] - ANNOTATION_PRIORITY[b.kind])[0];
+    .filter((a) => !annotationIsRetired(a))
+    .sort(compareRecallAnnotationPriority)[0];
   if (best) return best.text.trim();
   return summary || '(no summary)';
 }

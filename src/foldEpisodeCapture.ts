@@ -77,14 +77,6 @@ const RESULT_SCAN_AHEAD_MESSAGES = 6;
 const RESULT_HEAD_SCAN_CHARS = 1_600;
 const RESULT_DETAIL_CAP_CHARS = 120;
 const COMMIT_DETAIL_CAP_CHARS = 40;
-/**
- * Narration mining scans at most this many non-empty assistant texts per
- * burst-seal gap, FORWARD from the burst's last touch: the reply that closes
- * a work stretch sits immediately after its final tool results. Later gap
- * texts drift toward the next task's openers — bounded out, and the verdict
- * gate rejects opener shapes anyway.
- */
-const NARRATION_SCAN_MAX_MESSAGES = 3;
 
 function validSourceTimestamp(value: unknown): string | undefined {
   if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return undefined;
@@ -834,37 +826,11 @@ function glyphArtifactForMessage(
 }
 
 /**
- * Tier-B narration mining for one sealed burst. Two passes over
- * [scanStart, gapEndExclusive), where scanStart is the burst's FIRST touch and
- * burstFinalTouch is its LAST touch (INCLUSIVE) — see the call site.
- *
- * PASS 1 — DELIBERATE REGISTER (the all-in harvest). 🏁 verdict / ⚠️ hazard is
- * an explicit "resurface this" act by the agent (SOP P23): the GLYPH is the
- * trust signal, so POSITION is irrelevant. Capture EVERY eligible 🏁/⚠️ in
- * position across the WHOLE burst, not merely the closer — a hazard declared
- * mid-run is no longer dropped just because it was not the burst's last word.
- * Identical lines are de-duped within the burst (pure hygiene; no information
- * lost). There is deliberately NO count cap: selectVoiceInlays bounds what ever
- * reaches a rendered card by ANNOTATION_PRIORITY at READ time, so the STORE
- * stays complete and a hazard that ranks top in some later recall context is
- * never pre-discarded at write time. 🔍/▶/❓ self-exclude (isNarrationEligibleGlyph)
- * so confidently-wrong mid-burst hypotheses never enter. Per-burst windows stay
- * disjoint (burst i scans [start(i), start(i+1)) — see call site), so a
- * boundary declaration lands on exactly one chapter. If pass 1 captured any
- * deliberate voice, that IS the burst's narration — return it.
- *
- * PASS 2 — UNTAGGED BACKSTOP (unchanged fallback, original behavior verbatim).
- * Runs ONLY when pass 1 found no surviving declared voice, mining the raw
- * closing thought: scan the CLOSING region [burstFinalTouch, gapEnd) FORWARD
- * through at most NARRATION_SCAN_MAX_MESSAGES non-empty assistant texts; the
- * first message yielding verdict-shaped lines wins (the closing user-facing
- * reply is the densest curated prose an untagged agent produces). Representation
- * bridge: a live FC turn glues the closing prose into the burst-final tool touch
- * ([{type:'text'},{type:'tool_use'}]) so the scan STARTS at that touch (exempt
- * from the scan budget — keeps full forward reach); the SPLIT rep
- * (canonical/tests/rebuild) has a tool_use-only final touch, assistantTextOf()
- * === '' and it is skipped for free. Whole-message + per-line synthetic guards
- * keep recalled cards from laundering themselves into new memory.
+ * Capture declared voice throughout the burst and closing verdict/rationale
+ * through the next genuine operator request. Display budgets belong to recall:
+ * an early conclusion must not stop capture before its correction or reasoning.
+ * Synthetic text, transient registers, code and quoted memory remain excluded.
+ * Windows stay disjoint and the scan is linear in the supplied message window.
  */
 function mineNarrationForGap(
   messages: readonly FoldMessage[],
@@ -876,146 +842,47 @@ function mineNarrationForGap(
 ): { eventIndex: number; annotation: EpisodeAnnotation }[] {
   const start = Math.max(0, scanStart);
   const end = Math.min(messages.length, gapEndExclusive);
-
-  // PASS 1 — every deliberate 🏁/⚠️ in position across the burst, de-duped,
-  // UNCAPPED (selectVoiceInlays bounds display at render, not capture). The
-  // declared glyph is the lexical trust signal here, so keep safety gates but do
-  // not require a "Fixed/Turns out/Confirmed" opener.
-  const deliberate: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
-  const seen = new Set<string>();
+  const captured: { eventIndex: number; annotation: EpisodeAnnotation }[] = [];
+  const capturedIdentities = new Set<string>();
+  const isSynthetic = (candidate: string) => isSyntheticContextText(candidate, syntheticContext);
   for (let i = start; i < end; i++) {
-    const text = assistantTextOf(messages[i]);
-    if (text.length === 0) continue;
+    const message = messages[i];
+    if (i > burstFinalTouch && message.role === 'user'
+      && isEpisodeIntentCandidate(extractUserText([message], syntheticContext).trim(), syntheticContext)) break;
+    const text = assistantTextOf(message);
+    if (!text || isSynthetic(text)) continue;
     const glyph = classifyMessageGlyph(text);
-    if (!isNarrationEligibleGlyph(glyph)) continue; // 🔍/▶/❓ self-exclude
+    if (!isNarrationEligibleGlyph(glyph)) continue;
     const kind = narrationKindForGlyph(glyph);
-    if (kind === 'narration') continue;             // untagged → pass 2 only
-    const isSynthetic = (candidate: string) => isSyntheticContextText(candidate, syntheticContext);
-    if (isSynthetic(text)) continue;
-    const lines = extractNarrationLines(
-      text,
-      isSynthetic,
-      NARRATION_MAX_LINES_TAGGED,
-      { requireVerdictShape: false },
-    );
+    const declared = kind !== 'narration';
+    if (!declared && i < burstFinalTouch) continue;
     const ts = timestampAt(i);
-    const artifact = glyphArtifactForMessage(messages[i], ts);
-    for (const line of lines) {
+    const artifact = glyphArtifactForMessage(message, ts);
+    // Deduplicate only within a source message: repeated conclusions at later
+    // source times are separate evidence, and must retain their chronology.
+    const seen = new Set<string>();
+    const add = (line: string, annotationKind: EpisodeAnnotationKind) => {
       const key = line.trim().toLowerCase();
-      if (seen.has(key)) continue; // within-burst exact-text dedup (hygiene, not a cap)
+      if (seen.has(key)) return;
       seen.add(key);
-      deliberate.push({
-        eventIndex: i,
-        annotation: {
-          ...(ts !== undefined ? { ts } : {}),
-          kind,
-          text: line,
-          ...(artifact ? { artifact } : {}),
-        },
-      });
+      const identity = `${annotationKind}\u0000${artifact?.artifactId ?? ts ?? 'unknown'}\u0000${key}`;
+      if (capturedIdentities.has(identity)) return;
+      capturedIdentities.add(identity);
+      captured.push({ eventIndex: i, annotation: {
+        ...(ts !== undefined ? { ts } : {}),
+        kind: annotationKind,
+        text: line,
+        ...(artifact ? { artifact } : {}),
+      } });
+    };
+    for (const line of extractNarrationLines(text, isSynthetic,
+      declared ? NARRATION_MAX_LINES_TAGGED : NARRATION_MAX_LINES,
+      { requireVerdictShape: !declared })) add(line, kind);
+    if (i >= burstFinalTouch) {
+      for (const line of extractRationaleLines(text, isSynthetic)) add(line, 'narration');
     }
   }
-  // Rationale (the "why") is captured ADDITIVELY below, so a burst that BOTH
-  // states a verdict AND explains its reasoning keeps both. Pass 1's old early
-  // return dropped the reasoning in exactly that (common) case. Priority is
-  // preserved: deliberate 🏁/⚠️ > verdict-shaped narration > standalone rationale;
-  // rationale only ever rides ALONGSIDE the primary voice (appended last, never
-  // displacing it, deduped against voice already taken).
-
-  // PASS 2 + PASS 3 — one bounded closing-prose scan capturing the FIRST
-  // verdict-shaped narration AND the FIRST decision-rationale line. The scan
-  // budget (NARRATION_SCAN_MAX_MESSAGES) and the burst-final-touch exemption are
-  // unchanged. Verdict extraction is skipped once pass 1 already produced
-  // deliberate voice (rationale still rides alongside it). Narration is mined
-  // AFTER grouping (see deriveEpisodesFromMessages), so adding rationale here
-  // cannot change episode count.
-  let verdictResult: { eventIndex: number; annotation: EpisodeAnnotation }[] | null = null;
-  let rationale: { eventIndex: number; annotation: EpisodeAnnotation } | null = null;
-  let scanned = 0;
-  const touchIndex = Math.max(start, burstFinalTouch);
-  for (let i = touchIndex; i < end; i++) {
-    const text = assistantTextOf(messages[i]);
-    if (text.length === 0) continue;
-    const isBurstFinalTouch = i === burstFinalTouch;
-    const glyph = classifyMessageGlyph(text);
-    if (!isNarrationEligibleGlyph(glyph)) {
-      // Declared 🔍 in-progress / ▶ executing / ❓ blocked: source-side self-exclusion.
-      // Consumes the scan window (except at the burst-final touch) so exclusion
-      // never extends reach deeper into next-task territory.
-      if (!isBurstFinalTouch) {
-        scanned += 1;
-        if (scanned >= NARRATION_SCAN_MAX_MESSAGES) break;
-      }
-      continue;
-    }
-    const isSynthetic = (candidate: string) => isSyntheticContextText(candidate, syntheticContext);
-    if (!isSynthetic(text)) {
-      // Verdict-shaped narration — only needed when pass 1 found no declared voice.
-      if (deliberate.length === 0 && !verdictResult) {
-        const kind = narrationKindForGlyph(glyph);
-        const cap = kind === 'narration' ? NARRATION_MAX_LINES : NARRATION_MAX_LINES_TAGGED;
-        const lines = extractNarrationLines(text, isSynthetic, cap);
-        if (lines.length > 0) {
-          const ts = timestampAt(i);
-          const artifact = glyphArtifactForMessage(messages[i], ts);
-          verdictResult = lines.map((line) => ({
-            eventIndex: i,
-            annotation: {
-              ...(ts !== undefined ? { ts } : {}),
-              kind,
-              text: line,
-              ...(artifact ? { artifact } : {}),
-            },
-          }));
-        }
-      }
-      // Decision reasoning ("chose X over Y because…", "the trade-off was…") the
-      // verdict gate drops — the lowest-priority backstop, capped at one line and
-      // deduped against deliberate voice already taken in pass 1.
-      if (!rationale) {
-        const rationaleLines = extractRationaleLines(text, isSynthetic, 1);
-        const pick = rationaleLines.find((line) => !seen.has(line.trim().toLowerCase()));
-        if (pick) {
-          const ts = timestampAt(i);
-          const artifact = glyphArtifactForMessage(messages[i], ts);
-          rationale = {
-            eventIndex: i,
-            annotation: {
-              ...(ts !== undefined ? { ts } : {}),
-              kind: 'narration',
-              text: pick,
-              ...(artifact ? { artifact } : {}),
-            },
-          };
-        }
-      }
-      // Both surfaces filled (or deliberate already holds the primary): stop.
-      if ((deliberate.length > 0 || verdictResult) && rationale) break;
-    }
-    // Eligible register but nothing taken yet (or synthetic): spend a scan unit —
-    // except at the burst-final touch, which is free so the gap keeps its full
-    // forward reach (see isBurstFinalTouch note above).
-    if (!isBurstFinalTouch) {
-      scanned += 1;
-      if (scanned >= NARRATION_SCAN_MAX_MESSAGES) break;
-    }
-  }
-
-  // Combine. assignAnnotationsToBursts re-sorts by eventIndex, so append order
-  // here only needs to be dedup-correct, not chronological.
-  const appendRationale = (
-    primary: { eventIndex: number; annotation: EpisodeAnnotation }[],
-  ): { eventIndex: number; annotation: EpisodeAnnotation }[] => {
-    if (!rationale) return primary;
-    const key = rationale.annotation.text.trim().toLowerCase();
-    if (primary.some((r) => r.annotation.text.trim().toLowerCase() === key)) return primary;
-    return [...primary, rationale];
-  };
-
-  if (deliberate.length > 0) return appendRationale(deliberate);
-  if (verdictResult) return appendRationale(verdictResult);
-  if (rationale) return [rationale];
-  return [];
+  return captured;
 }
 
 /**
