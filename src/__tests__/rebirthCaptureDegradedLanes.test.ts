@@ -288,7 +288,7 @@ describe('boundary builder-identity stamp', () => {
     }));
     const line = rendered.split('\n').find((row) => row.startsWith('built-by='));
     expect(line).toBe(
-      'built-by=sidecar-worker-pool @ 127.0.0.1:3201 · src=aaaaaaaaaaaa… · files=123 · built=8123ms',
+      'built-by=sidecar-worker-pool @ 127.0.0.1:3201 · src=aaaaaaaaaaaa… · files=123 · built=8123ms · git=unknown',
     );
   });
 

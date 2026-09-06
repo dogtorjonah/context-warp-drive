@@ -3340,3 +3340,269 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
     expect(unit.sha256).toBe(sha256ContinuityLedgerVerbatim(original));
   });
 });
+
+describe('structured last assistant and pending operation (raw hard-epoch path)', () => {
+  const structured: RebirthPackageV6ExactMessage = {
+    text: '🏁 Tests are green; committing next.',
+    chars: 35,
+    source: { provenanceId: 'message:assistant-8', sourceAt: '2026-09-06T17:58:00.000Z', status: 'exact' },
+  };
+
+  it('prefers a structured assistant prose row over legacy extraction and the pending-action text', () => {
+    const value = adaptLegacyRebirthPackageToV6({
+      lifecycleBoundary: 'same_instance_hard_epoch',
+      lastUserAiMessages: '🤖 LAST AI MESSAGE [message 9]:\nrole:assistant\ncontent:\n⟨tool Bash {"command":"npm test"}⟩',
+    }, {
+      lastMaterialAssistant: structured,
+      pendingOperation: {
+        text: '⟨tool Bash {"command":"npm test"}⟩',
+        status: 'in-flight',
+        sourceId: 'message:tool-9',
+        sourceAt: '2026-09-06T17:58:10.000Z',
+      },
+    });
+    expect(value.boundaryAndActiveTask.lastMaterialAssistant).toEqual({
+      text: structured.text,
+      chars: structured.text.length,
+      source: structured.source,
+    });
+    const fact = value.executionState.facts.find((entry) => entry.kind === 'pending_operation');
+    expect(fact).toMatchObject({
+      provenanceId: 'message:tool-9',
+      sourceAt: '2026-09-06T17:58:10.000Z',
+      status: 'exact',
+      text: '⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight',
+    });
+    const rendered = renderRebirthPackageV6(value);
+    expect(rendered).toContain(
+      `[LAST MATERIAL ASSISTANT · ${structured.text.length} chars · source=message:assistant-8 · source-time=2026-09-06T17:58:00.000Z · status=exact]\n${structured.text}`,
+    );
+    expect(rendered).toContain(
+      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-9 · source-time=2026-09-06T17:58:10.000Z · status=exact',
+    );
+  });
+
+  it('stops legacy last-assistant extraction at the interrupted-operation block', () => {
+    const value = adaptLegacyRebirthPackageToV6({
+      lifecycleBoundary: 'same_instance_hard_epoch',
+      lastUserAiMessages: '🤖 LAST AI MESSAGE [message 8]:\nI will run the suite now.\n\n⏸ INTERRUPTED OPERATION [message 9] (tool call after the last assistant prose with no observed result — verify before repeating):\n⟨tool Bash {"command":"npm test"}⟩',
+    });
+    expect(value.boundaryAndActiveTask.lastMaterialAssistant?.text).toBe('I will run the suite now.');
+  });
+
+  it('mints a partial derived identity for a pending operation without a persisted source row', () => {
+    const value = adaptLegacyRebirthPackageToV6({ lifecycleBoundary: 'continuation' }, {
+      pendingOperation: { text: 'tool_calls: [{"name":"Read"}]', status: 'result-received' },
+    });
+    const fact = value.executionState.facts.find((entry) => entry.kind === 'pending_operation');
+    expect(fact).toMatchObject({
+      status: 'partial',
+      sourceAt: null,
+      text: 'tool_calls: [{"name":"Read"}] · operation=result-received',
+    });
+    expect(fact?.provenanceId).toMatch(/^pending-operation:[0-9a-f]{8}$/u);
+    expect(renderRebirthPackageV6(value)).toContain(
+      'Unknown source time (quarantined; not part of the chronology):\n- pending_operation · tool_calls: [{"name":"Read"}] · operation=result-received · source=pending-operation:',
+    );
+  });
+
+  it('forwards a caller capture receipt for trace-derived cognition', () => {
+    const value = adaptLegacyRebirthPackageToV6({ lifecycleBoundary: 'same_instance_hard_epoch' }, {
+      cognitiveArtifacts: [{
+        provenanceId: 'message:assistant-3',
+        sourceAt: '2026-09-06T17:50:00.000Z',
+        kind: 'result',
+        text: 'Suite is green.',
+        authority: 'historical_observation',
+        supersededBy: null,
+      }],
+      cognitiveArtifactCapture: {
+        status: 'partial',
+        capturedAt: null,
+        totalMatched: 1,
+        selectedCount: 1,
+        overlayCount: 0,
+        missingFamilies: [],
+        warnings: ['derived from the retained provider trace only'],
+      },
+    });
+    expect(value.cognitiveArtifactCapture?.status).toBe('partial');
+    const rendered = renderRebirthPackageV6(value);
+    expect(rendered).toContain('Capture receipt: status=partial');
+    expect(rendered).toContain('- derived from the retained provider trace only');
+  });
+});
+
+describe('continuation record (boundary)', () => {
+  const record = (rendered: string): string => {
+    const start = rendered.indexOf('[CONTINUATION RECORD');
+    const end = rendered.indexOf('[/CONTINUATION RECORD]');
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    return rendered.slice(start, end);
+  };
+
+  it('renders a source-linked continuation record from captured facts on the rich path', () => {
+    const rendered = renderRebirthPackageV6(model());
+    const text = record(rendered);
+    // The request body is rendered once, in EXACT ACTIVE REQUEST below; the
+    // record points at it with its size and source instead of repeating it.
+    expect(text).toContain('active-request=[same bytes as EXACT ACTIVE REQUEST below] · 33 chars · source=message:user-1 · source-time=');
+    expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
+    expect(text).toContain('checkpoint=none-captured');
+    expect(text).toContain('latest-validation=none-captured');
+    expect(text).toContain('owned-paths=src/example.ts (open)');
+    expect(text).toContain('next-action=rail-one · model step active · source=rail:one · source-time=');
+    expect(text).toContain('latest-decision=');
+    expect(text).toContain('· source=decision:one · source-time=');
+    expect(text).toContain('recover: transcript=R');
+    // The record sits between the factual NOW card and the exact request so a
+    // successor reads the digest before the verbatim bodies.
+    expect(rendered.indexOf('[/FACTUAL NOW CARD]')).toBeLessThan(rendered.indexOf('[CONTINUATION RECORD'));
+    expect(rendered.indexOf('[/CONTINUATION RECORD]')).toBeLessThan(rendered.indexOf('[EXACT ACTIVE REQUEST'));
+  });
+
+  it('renders honest unknowns when the model carries no facts, edits, or cognition', () => {
+    const text = record(renderRebirthPackageV6(adaptLegacyRebirthPackageToV6({ lifecycleBoundary: 'continuation' })));
+    expect(text).toContain('active-request=unknown');
+    expect(text).toContain('checkpoint=none-captured');
+    expect(text).toContain('latest-validation=none-captured');
+    expect(text).toContain('latest-decision=none-captured');
+    expect(text).toContain('unresolved-blockers=none-captured');
+    expect(text).toContain('owned-paths=none-captured');
+    expect(text).toContain('pending-operation=none-captured');
+    expect(text).toContain('next-action=unknown');
+  });
+
+  it('carries the pending operation, blockers, checkpoint, and claims into the record with their sources', () => {
+    const value = model({
+      executionState: {
+        facts: [
+          {
+            provenanceId: 'message:tool-9',
+            sourceAt: '2026-08-02T17:59:50.000Z',
+            status: 'exact',
+            kind: 'pending_operation',
+            text: '⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight',
+          },
+          {
+            provenanceId: 'blocker:one',
+            sourceAt: '2026-08-02T17:59:45.000Z',
+            status: 'exact',
+            kind: 'blocker',
+            text: 'Typecheck fails in src/example.ts',
+          },
+          {
+            provenanceId: 'blocker:unknown-time',
+            sourceAt: null,
+            status: 'partial',
+            kind: 'blocker',
+            text: 'An older unknown-time blocker',
+          },
+          {
+            provenanceId: 'validation:one',
+            sourceAt: '2026-08-02T17:59:40.000Z',
+            status: 'exact',
+            kind: 'validation',
+            text: 'vitest 12/12 passed',
+          },
+          {
+            provenanceId: 'claim:one',
+            sourceAt: '2026-08-02T17:59:30.000Z',
+            status: 'exact',
+            kind: 'claim',
+            text: 'src/example.ts:20-45',
+          },
+        ],
+        unknownReasons: [],
+      },
+    });
+    const text = record(renderRebirthPackageV6(value));
+    expect(text).toContain('pending-operation=⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-9 · source-time=');
+    // Count covers every blocker; "newest" is chosen among known-time rows only.
+    expect(text).toContain('unresolved-blockers=2 · newest: Typecheck fails in src/example.ts · source=blocker:one · source-time=');
+    expect(text).toContain('latest-validation=vitest 12/12 passed · source=validation:one · source-time=');
+    expect(text).toContain('owned-paths=src/example.ts (open) · src/example.ts:20-45');
+    expect(text).toContain('next-action=unknown');
+  });
+
+  it('renders the record on the raw hard-epoch path with the trailing operation', () => {
+    const rendered = buildRawHardEpochSeed([{
+      role: 'user',
+      content: 'Finish the fallback.',
+      sourceIdentity: 'message:user-1',
+      tsMs: Date.parse('2026-08-02T17:57:00.000Z'),
+    }, {
+      role: 'assistant',
+      content: '🏁 Fallback is wired; running the suite.',
+      sourceIdentity: 'message:assistant-1',
+      tsMs: Date.parse('2026-08-02T17:58:00.000Z'),
+    }, {
+      role: 'assistant',
+      content: '⟨tool Bash {"command":"npm test"}⟩',
+      sourceIdentity: 'message:tool-1',
+      tsMs: Date.parse('2026-08-02T17:58:10.000Z'),
+    }, {
+      role: 'user',
+      content: 'Also mirror it.',
+      sourceIdentity: 'message:user-2',
+      tsMs: Date.parse('2026-08-02T18:00:00.000Z'),
+    }], {
+      predecessorName: 'worker-a',
+      instanceId: 'instance-a',
+      capturedAt: '2026-08-02T18:00:01.000Z',
+    });
+    const text = record(rendered);
+    // The newest trailing operator row's exact persisted identity is the
+    // request's source on the raw path — never the literal `unknown`.
+    expect(text).toContain('active-request=[same bytes as EXACT ACTIVE REQUEST below] · 15 chars · source=message:user-2 · source-time=');
+    expect(rendered).toContain('[EXACT ACTIVE REQUEST · 15 chars · source=message:user-2 · source-time=2026-08-02T18:00:00.000Z · status=exact]');
+    expect(rendered.match(/Also mirror it\./gu)).toHaveLength(1);
+    expect(text).toContain('pending-operation=⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-1 · source-time=');
+    expect(text).toContain('recover: transcript=R');
+  });
+
+  it('renders the git checkpoint from the NOW card repository probe and skips errored or sha-less roots', () => {
+    const base = model();
+    const value = model({
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          ...(base.boundaryAndActiveTask.nowCard ?? {} as never),
+          ops: {
+            repositoryState: 'dirty',
+            repositoryReason: null,
+            repositories: [
+              { name: 'voxxo-swarm', branch: 'main', sha7: '22a4cf5', dirtyCount: 19, stagedCount: 1, capturedAt: '2026-08-02T17:59:59.000Z', error: null },
+              { name: 'context-warp-drive', branch: null, sha7: null, dirtyCount: null, stagedCount: null, capturedAt: null, error: 'probe timed out' },
+            ],
+            ownedLiveChildren: [],
+            squad: null,
+            rooms: [],
+            source: { provenanceId: 'test:ops', sourceAt: '2026-08-02T17:59:59.000Z', status: 'exact' },
+          },
+        },
+      },
+    });
+    const text = record(renderRebirthPackageV6(value));
+    expect(text).toContain('checkpoint=voxxo-swarm:main@22a4cf5 dirty=19 staged=1 · source=test:ops · source-time=');
+    expect(text).not.toContain('context-warp-drive');
+  });
+
+  it('never stamps a receipt that could not name the request row as an exact source', () => {
+    const value = adaptLegacyRebirthPackageToV6({
+      lifecycleBoundary: 'same_instance_hard_epoch',
+      continuityReceipt: buildContinuityReceipt({
+        boundary: 'same_instance_hard_epoch',
+        predecessorName: 'worker-a',
+        capturedAt: '2026-08-02T18:00:01.000Z',
+        captureSourceId: 'raw-hard-epoch:worker-a:message#4',
+        activeRequestText: 'Also mirror it.',
+        activeRequestSourceId: 'unknown',
+      }),
+    });
+    const request = value.boundaryAndActiveTask.activeRequest;
+    expect(request?.source.status).toBe('partial');
+    expect(request?.source.provenanceId).toMatch(/^active-request:[0-9a-f]{8}$/u);
+  });
+});

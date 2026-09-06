@@ -46,6 +46,8 @@ import {
 import {
   extractCognitiveArtifacts,
   formatCognitiveArtifactProvenance,
+  type CognitiveArtifact,
+  type TapStarCategory,
 } from './cognitiveArtifacts.ts';
 import {
   isGenuineRebirthOperatorMessage,
@@ -57,8 +59,13 @@ import {
   buildContinuityLedgerCaptureFromV6Render,
   isRebirthPackageV6Model,
   renderRebirthPackageV6WithReport,
+  stableTextIdentity,
   type ContinuityLedgerCaptureRecord,
+  type RebirthPackageV6CognitiveArtifact,
+  type RebirthPackageV6CognitiveArtifactCapture,
+  type RebirthPackageV6ConversationRow,
   type RebirthPackageV6Model,
+  type RebirthPackageV6PendingOperation,
   type RebirthPackageV7CollapseReport,
 } from './rebirthPackageV6.ts';
 import {
@@ -2915,14 +2922,18 @@ function buildActivityLogFromMessages(
 // unchanged for every existing consumer of this module's public surface.
 export { isPortableGenuineOperatorMessage } from './rebirthDialogue.ts';
 
-function isPortableGenuineOperatorFoldMessage(message: FoldMessage): boolean {
-  if (message.role !== 'user') return false;
-  if (Array.isArray(message.content) && message.content.some((block) => (
+function foldMessageCarriesToolResultBlock(message: FoldMessage): boolean {
+  return Array.isArray(message.content) && message.content.some((block) => (
     block !== null
     && typeof block === 'object'
     && 'type' in block
     && block.type === 'tool_result'
-  ))) return false;
+  ));
+}
+
+function isPortableGenuineOperatorFoldMessage(message: FoldMessage): boolean {
+  if (message.role !== 'user') return false;
+  if (foldMessageCarriesToolResultBlock(message)) return false;
   return isPortableGenuineOperatorMessage(messageContentAndPartsToText(message));
 }
 
@@ -2967,6 +2978,327 @@ function isRawAssistantTailFragment(message: FoldMessage | undefined): boolean {
     && RAW_ASSISTANT_FRAGMENT_OPENING_RE.test(speech);
 }
 
+// ── Structured trace rows for the canonical v6 fallback ────────────────────
+//
+// The prose sections above render every trace row through its provider
+// envelope, so a hard-epoch package built from them promoted `⟨tool …⟩`
+// transport echoes as the "last assistant message", stamped every Recent
+// Conversation row `legacy-conversation`/unknown-time, and left Cognition
+// empty. These helpers read the SAME trace rows and emit the v6 model's
+// structured rows directly: exact source identity + time per row, assistant
+// PROSE only as speech, the newest trailing tool operation as its own fact,
+// and register/tap_star waypoints as source-stamped cognition.
+
+/** One compact `⟨tool …⟩` / `⟨tool result …⟩` block emitted by transcript hydration. */
+const COMPACT_TOOL_TRACE_BLOCK_RE = /^⟨tool\b[\s\S]*⟩$/u;
+const COMPACT_TOOL_RESULT_BLOCK_RE = /^⟨tool result\b/u;
+const RAW_PENDING_OPERATION_MAX_CHARS = 400;
+const RAW_PENDING_OPERATION_LABELS = {
+  'in-flight': [
+    '⏸ INTERRUPTED OPERATION',
+    'tool call after the last assistant prose with no observed result — verify before repeating',
+  ],
+  'result-received': [
+    '⏸ TRAILING TOOL OPERATION',
+    'tool result arrived after the last assistant prose and was never interpreted',
+  ],
+} as const;
+
+interface RawAssistantSpeechSplit {
+  /** Provider speech with compact tool-trace blocks removed. */
+  readonly speech: string;
+  /** Compact tool-trace blocks in row order. */
+  readonly toolBlocks: readonly string[];
+}
+
+/**
+ * Split an assistant/model row into provider SPEECH and compact tool-trace
+ * blocks. A tool-result carrier row (`tool_call_id`) is transport only.
+ */
+function splitRawAssistantSpeech(message: FoldMessage): RawAssistantSpeechSplit {
+  if (message.role !== 'assistant' && message.role !== 'model') return { speech: '', toolBlocks: [] };
+  if (message.tool_call_id !== undefined) return { speech: '', toolBlocks: [] };
+  const speech: string[] = [];
+  const toolBlocks: string[] = [];
+  for (const block of messageContentAndPartsToText(message).split(/\n{2,}/u)) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+    if (COMPACT_TOOL_TRACE_BLOCK_RE.test(trimmed)) toolBlocks.push(trimmed);
+    else speech.push(trimmed);
+  }
+  return { speech: speech.join('\n\n'), toolBlocks };
+}
+
+function exactFoldMessageSourceIdentity(message: FoldMessage): string | undefined {
+  const identity = message.sourceIdentity?.trim();
+  return identity && message.sourceIdentityAuthority !== 'synthetic-position' ? identity : undefined;
+}
+
+/** Exact persisted identity/time when the row carries them; a partial content identity otherwise. */
+function rawTraceSourceRef(
+  message: FoldMessage,
+  sourceIndex: number,
+  prefix: string,
+  text: string,
+): { provenanceId: string; sourceAt: string | null; status: 'exact' | 'partial' } {
+  const exact = exactFoldMessageSourceIdentity(message);
+  return {
+    provenanceId: exact ?? stableTextIdentity(prefix, `${sourceIndex}\0${text}`),
+    sourceAt: foldMessageSourceTimestamp(message) ?? null,
+    status: exact ? 'exact' : 'partial',
+  };
+}
+
+interface RawTraceToolActivity {
+  readonly sourceIndex: number;
+  readonly message: FoldMessage;
+  readonly text: string;
+  readonly isResult: boolean;
+}
+
+function compactToolActivityText(text: string): string {
+  return truncateMiddle(text.replace(/\s+/gu, ' ').trim(), RAW_PENDING_OPERATION_MAX_CHARS)
+    .replace(/\s+/gu, ' ');
+}
+
+/** Tool calls/results carried by one trace row, in row order. */
+function rawTraceToolActivity(message: FoldMessage, sourceIndex: number): RawTraceToolActivity[] {
+  if (message.role === 'tool'
+    || message.tool_call_id !== undefined
+    || (message.role === 'user' && foldMessageCarriesToolResultBlock(message))) {
+    const text = messageContentAndPartsToText(message).trim();
+    return text
+      ? [{ sourceIndex, message, text: `⟨tool result: ${compactToolActivityText(text)}⟩`, isResult: true }]
+      : [];
+  }
+  if (message.role !== 'assistant' && message.role !== 'model') return [];
+  const activity: RawTraceToolActivity[] = splitRawAssistantSpeech(message).toolBlocks.map((block) => ({
+    sourceIndex,
+    message,
+    text: compactToolActivityText(block),
+    isResult: COMPACT_TOOL_RESULT_BLOCK_RE.test(block),
+  }));
+  if (message.tool_calls !== undefined) {
+    const calls = messageValueToText(message.tool_calls);
+    if (calls.trim()) {
+      activity.push({ sourceIndex, message, text: `tool_calls: ${compactToolActivityText(calls)}`, isResult: false });
+    }
+  }
+  return activity;
+}
+
+interface RawLastMaterialAssistant {
+  readonly sourceIndex: number;
+  readonly tailIndex: number;
+  readonly message: FoldMessage;
+  readonly text: string;
+}
+
+interface RawTracePendingOperation extends RawTraceToolActivity {
+  readonly status: RebirthPackageV6PendingOperation['status'];
+}
+
+interface RawTraceContinuationFacts {
+  readonly lastMaterialAssistant: RawLastMaterialAssistant | null;
+  readonly pendingOperation: RawTracePendingOperation | null;
+}
+
+/**
+ * Newest assistant PROSE row (split streamed fragments rejoined exactly as the
+ * READ FIRST block does) plus the newest tool operation observed after it.
+ * Tool activity is transport: it never becomes speech, and speech never hides
+ * an in-flight call.
+ */
+function selectRawTraceContinuationFacts(
+  messages: readonly FoldMessage[],
+  traceEnd: number,
+  excludedMessageIndexes: ReadonlySet<number>,
+): RawTraceContinuationFacts {
+  let last: RawLastMaterialAssistant | null = null;
+  for (let i = 0; i < traceEnd; i += 1) {
+    if (excludedMessageIndexes.has(i)) continue;
+    const message = messages[i];
+    if (!message) continue;
+    const { speech } = splitRawAssistantSpeech(message);
+    if (!speech) continue;
+    if (last
+      && i === last.tailIndex + 1
+      && isRawAssistantTailFragment(message)
+      && rawAssistantSpeechFragment(messages[i - 1]).trim().length > 0) {
+      last = {
+        sourceIndex: last.sourceIndex,
+        tailIndex: i,
+        message: last.message,
+        text: last.text + rawAssistantSpeechFragment(message),
+      };
+      continue;
+    }
+    last = { sourceIndex: i, tailIndex: i, message, text: speech };
+  }
+  const trailing: RawTraceToolActivity[] = [];
+  for (let i = (last?.tailIndex ?? -1) + 1; i < traceEnd; i += 1) {
+    if (excludedMessageIndexes.has(i)) continue;
+    const message = messages[i];
+    if (!message) continue;
+    trailing.push(...rawTraceToolActivity(message, i));
+  }
+  let pendingOperation: RawTracePendingOperation | null = null;
+  let newestCall: RawTraceToolActivity | undefined;
+  let newestCallIndex = -1;
+  for (let index = trailing.length - 1; index >= 0; index -= 1) {
+    const entry = trailing[index];
+    if (entry && !entry.isResult) {
+      newestCall = entry;
+      newestCallIndex = index;
+      break;
+    }
+  }
+  const newestTrailing = trailing[trailing.length - 1];
+  if (newestCall) {
+    const resultFollowed = trailing.slice(newestCallIndex + 1).some((entry) => entry.isResult);
+    pendingOperation = { ...newestCall, status: resultFollowed ? 'result-received' : 'in-flight' };
+  } else if (newestTrailing) {
+    pendingOperation = { ...newestTrailing, status: 'result-received' };
+  }
+  return { lastMaterialAssistant: last, pendingOperation };
+}
+
+/**
+ * Genuine operator rows and assistant PROSE rows as v6 conversation rows with
+ * exact source identity/time and exchange tags. Tool traces, digest frames,
+ * and system reminders stay out; the Activity Log keeps the full chronology.
+ */
+function buildStructuredConversationRowsFromMessages(
+  messages: readonly FoldMessage[],
+  traceEnd: number,
+  excludedMessageIndexes: ReadonlySet<number>,
+  messageLimit: number,
+): RebirthPackageV6ConversationRow[] {
+  const rows: RebirthPackageV6ConversationRow[] = [];
+  let exchangeId: string | undefined;
+  for (let i = 0; i < traceEnd; i += 1) {
+    if (excludedMessageIndexes.has(i)) continue;
+    const message = messages[i];
+    if (!message) continue;
+    let role: RebirthPackageV6ConversationRow['role'];
+    let text: string;
+    if (message.role === 'user') {
+      if (!isPortableGenuineOperatorFoldMessage(message)) continue;
+      role = 'user';
+      text = messageContentAndPartsToText(message).trim();
+    } else if (message.role === 'assistant' || message.role === 'model') {
+      role = 'assistant';
+      text = splitRawAssistantSpeech(message).speech;
+    } else {
+      continue;
+    }
+    if (!text) continue;
+    const source = rawTraceSourceRef(message, i, 'raw-trace-conversation', text);
+    if (role === 'user') exchangeId = source.provenanceId;
+    rows.push({
+      provenanceId: source.provenanceId,
+      sourceAt: source.sourceAt,
+      role,
+      text,
+      ...(exchangeId ? { exchangeId } : {}),
+    });
+  }
+  // Newest-first retention over WHOLE exchanges (an operator row never
+  // survives without the replies captured with it), hard-capped at twice the
+  // limit so an assistant-only trace stays bounded.
+  const limit = Math.max(1, Math.floor(messageLimit));
+  let cut = Math.max(0, rows.length - limit);
+  while (cut > 0 && rows[cut]?.role !== 'user' && rows.length - cut < limit * 2) cut -= 1;
+  return rows.slice(cut);
+}
+
+const TRACE_COGNITION_KIND_BY_REGISTER: Readonly<Record<string, RebirthPackageV6CognitiveArtifact['kind']>> = {
+  verdict: 'result',
+  hazard: 'hazard',
+  blocked: 'question',
+  active_request: 'active_request',
+  executing: 'discovery',
+  in_progress: 'discovery',
+};
+
+const TRACE_COGNITION_KIND_BY_STAR: Readonly<Record<TapStarCategory, RebirthPackageV6CognitiveArtifact['kind']>> = {
+  decision: 'decision',
+  discovery: 'discovery',
+  pivot: 'decision',
+  handoff: 'discovery',
+  gotcha: 'hazard',
+  result: 'result',
+};
+
+function traceCognitionIdentity(artifact: CognitiveArtifact): string {
+  return artifact.sourceIdentityAuthority === 'exact'
+    ? artifact.sourceIdentity
+    : stableTextIdentity('raw-trace-cognition', `${artifact.messageIndex}\0${artifact.register}\0${artifact.headline}`);
+}
+
+interface RawTraceCognition {
+  readonly rows: RebirthPackageV6CognitiveArtifact[];
+  readonly capture: RebirthPackageV6CognitiveArtifactCapture;
+}
+
+/**
+ * Register glyph rows (🏁/⚠️/❓/🧭 durable; 🔍/▶ flow) and categorized tap_star
+ * waypoints from the retained trace, as v6 cognition with per-row source
+ * provenance. Glyphless narration and 💭 thought fallbacks stay out; a flow
+ * note that a later durable waypoint superseded carries that pointer so the
+ * model drops it instead of re-presenting stale narration.
+ */
+function buildTraceCognitionFromMessages(
+  messages: readonly FoldMessage[],
+  traceEnd: number,
+  excludedMessageIndexes: ReadonlySet<number>,
+): RawTraceCognition {
+  const artifacts = extractCognitiveArtifacts(messages.slice(0, traceEnd), { includeFlowNotes: true })
+    .filter((artifact) => !excludedMessageIndexes.has(artifact.messageIndex));
+  const durableIdentityByIndex = new Map<number, string>();
+  for (const artifact of artifacts) {
+    if (artifact.trust === 'durable') durableIdentityByIndex.set(artifact.messageIndex, traceCognitionIdentity(artifact));
+  }
+  const rows = artifacts.flatMap((artifact): RebirthPackageV6CognitiveArtifact[] => {
+    if (artifact.register === 'untagged' && artifact.trust !== 'diagnosis') return [];
+    const category = artifact.register === 'tap_star' ? artifact.tapStarCategory : undefined;
+    const kind = artifact.register === 'tap_star'
+      ? (category ? TRACE_COGNITION_KIND_BY_STAR[category] : 'discovery')
+      : artifact.register === 'untagged'
+        ? 'discovery'
+        : TRACE_COGNITION_KIND_BY_REGISTER[artifact.register];
+    if (!kind) return [];
+    const text = category === 'pivot' || category === 'handoff'
+      ? `[${category}] ${artifact.headline}`
+      : artifact.headline;
+    const supersededBy = (artifact.supersededByMessageIndex !== undefined
+      ? durableIdentityByIndex.get(artifact.supersededByMessageIndex)
+      : undefined)
+      ?? artifact.supersededByIdentity
+      ?? null;
+    return [{
+      provenanceId: traceCognitionIdentity(artifact),
+      sourceAt: artifact.sourceTimestamp ?? null,
+      kind,
+      text,
+      authority: artifact.authorityClass,
+      supersededBy,
+    }];
+  });
+  return {
+    rows,
+    capture: {
+      status: 'partial',
+      capturedAt: null,
+      totalMatched: rows.length,
+      selectedCount: rows.length,
+      overlayCount: 0,
+      missingFamilies: [],
+      warnings: ['derived from the retained provider trace only; indexed glyph/star/atlas/rail/chat stores were not consulted'],
+    },
+  };
+}
+
 function buildLastUserAiMessagesFromMessages(
   messages: readonly FoldMessage[],
   traceEnd: number,
@@ -2992,6 +3324,11 @@ function buildLastUserAiMessagesFromMessages(
       }
     }
     if (message.role === 'assistant' || message.role === 'model') {
+      // Prose-first: a row that is only compact ⟨tool …⟩ trace, structured
+      // tool_calls, or a tool-result carrier is transport activity, never the
+      // LAST AI MESSAGE. The newest trailing operation renders as its own ⏸
+      // block below instead of impersonating speech.
+      if (!splitRawAssistantSpeech(message).speech) continue;
       const text = providerMessageToTraceText(message);
       if (text) {
         const predecessor = messages[i - 1];
@@ -3028,9 +3365,14 @@ function buildLastUserAiMessagesFromMessages(
     : markersEnabled && lastUserIndex >= 0 ? ` [message ${lastUserIndex}]` : '';
   const aiMarker = markersEnabled && lastAssistantIndex >= 0 ? ` [message ${lastAssistantIndex}]` : '';
   const renderedAssistant = lastAssistant;
+  const pending = selectRawTraceContinuationFacts(messages, traceEnd, excludedMessageIndexes).pendingOperation;
+  const pendingMarker = markersEnabled && pending ? ` [message ${pending.sourceIndex}]` : '';
   return [
     lastUser ? `👤 LAST USER MESSAGE${userMarker}:\n${lastUser}` : '',
     renderedAssistant ? `🤖 LAST AI MESSAGE${aiMarker}:\n${renderedAssistant}` : '',
+    pending
+      ? `${RAW_PENDING_OPERATION_LABELS[pending.status][0]}${pendingMarker} (${RAW_PENDING_OPERATION_LABELS[pending.status][1]}):\n${pending.text}`
+      : '',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -3199,6 +3541,14 @@ export function buildRawRebirthSeedFromMessages(
     const activeRequestText = tracedActiveRequestText ?? suppliedActiveRequestText;
     const activeRequestSourceTimestamp = [...activeRequestMessages].reverse()
       .find((message) => typeof message.tsMs === 'number' && Number.isFinite(message.tsMs))?.tsMs;
+    // The newest trailing operator row's exact persisted identity names the
+    // request's source (the coordinate below still spans the whole run); a
+    // synthetic-position coordinate never becomes provenance.
+    const tracedActiveRequestSourceId = tracedActiveRequestText
+      ? [...activeRequestMessages].reverse()
+          .map((message) => exactFoldMessageSourceIdentity(message))
+          .find((identity) => identity !== undefined)
+      : undefined;
     const suppliedRequestSource = !tracedActiveRequestText && suppliedActiveRequestText
       ? options.triggeringUserMessageSource
       : undefined;
@@ -3286,7 +3636,8 @@ export function buildRawRebirthSeedFromMessages(
         ? { hazardSourceDescriptors: rawRuntimeErrorMarkedSources }
         : {}),
       activeRequestText,
-      activeRequestSourceId: suppliedRequestSource?.sourceId?.trim() || 'unknown',
+      activeRequestSourceId: tracedActiveRequestSourceId
+        ?? (suppliedRequestSource?.sourceId?.trim() || 'unknown'),
       activeRequestSourceCoordinate: tracedActiveRequestText
         ? `message#${trailingStart}..message#${messages.length - 1}`
         : suppliedRequestSource?.sourceCoordinate?.trim() || undefined,
@@ -3350,6 +3701,15 @@ export function buildRawRebirthSeedFromMessages(
   };
   if (!options.canonicalV6Fallback) return renderRawRebirthSeed(rawInput);
 
+  // Structured v6 rows straight from the trace: exact source identity/time
+  // per conversation row, assistant PROSE as the last material assistant, the
+  // trailing tool operation as its own fact, and register/tap_star waypoints
+  // as cognition. The legacy prose fields still feed the receipt and the
+  // rail/edit sections.
+  const continuation = selectRawTraceContinuationFacts(visibleMessages, traceEnd, excluded);
+  const traceCognition = buildTraceCognitionFromMessages(visibleMessages, traceEnd, excluded);
+  const lastMaterialAssistant = continuation.lastMaterialAssistant;
+  const pendingOperation = continuation.pendingOperation;
   const rebirthV6 = adaptLegacyRebirthPackageToV6({
     predecessorName,
     lifecycleBoundary: options.lifecycleBoundary,
@@ -3366,6 +3726,38 @@ export function buildRawRebirthSeedFromMessages(
   }, {
     predecessorName,
     ...(options.instanceId?.trim() ? { instanceId: options.instanceId.trim() } : {}),
+    recentConversation: buildStructuredConversationRowsFromMessages(
+      visibleMessages,
+      traceEnd,
+      excluded,
+      Math.max(1, Math.floor(options.currentThreadMessageLimit ?? 30)),
+    ),
+    cognitiveArtifacts: traceCognition.rows,
+    cognitiveArtifactCapture: traceCognition.capture,
+    ...(lastMaterialAssistant
+      ? {
+          lastMaterialAssistant: {
+            text: lastMaterialAssistant.text,
+            chars: lastMaterialAssistant.text.length,
+            source: rawTraceSourceRef(
+              lastMaterialAssistant.message,
+              lastMaterialAssistant.sourceIndex,
+              'raw-trace-assistant',
+              lastMaterialAssistant.text,
+            ),
+          },
+        }
+      : {}),
+    ...(pendingOperation
+      ? {
+          pendingOperation: {
+            text: pendingOperation.text,
+            status: pendingOperation.status,
+            sourceId: exactFoldMessageSourceIdentity(pendingOperation.message) ?? null,
+            sourceAt: foldMessageSourceTimestamp(pendingOperation.message) ?? null,
+          },
+        }
+      : {}),
   });
   return renderRawRebirthSeed({ ...rawInput, rebirthV6 });
 }

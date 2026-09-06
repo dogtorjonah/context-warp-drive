@@ -412,7 +412,13 @@ export interface RebirthPackageV6ExecutionFact {
     | 'review'
     | 'life'
     | 'runtime'
-    | 'coordination';
+    | 'coordination'
+    /**
+     * Newest tool operation observed after the last assistant PROSE row: the
+     * call a successor must neither silently repeat nor forget. Additive;
+     * persisted models predating this kind stay valid.
+     */
+    | 'pending_operation';
   readonly text: string;
   /**
    * Snapshot-time stamp (audit-2 A21): coordination/membership facts whose row
@@ -729,12 +735,42 @@ export interface RebirthPackageV6ActiveEditCaptureDisposition {
   readonly reason: string;
 }
 
+/**
+ * Newest tool operation observed after the last assistant PROSE row. Rendered
+ * as a `pending_operation` Execution State fact so an interrupted call is
+ * neither silently repeated nor mistaken for the agent's last words.
+ */
+export interface RebirthPackageV6PendingOperation {
+  /** Bounded operation text (compact `⟨tool …⟩` trace or a structured call summary). */
+  readonly text: string;
+  /**
+   * `in-flight` = no result observed after the call; `result-received` = the
+   * result arrived but no assistant prose interpreted it before the boundary.
+   */
+  readonly status: 'in-flight' | 'result-received';
+  /** Exact persisted identity of the source row; absent/null yields a partial derived id. */
+  readonly sourceId?: string | null;
+  /** Authoritative source time of the source row; absent/null stays unknown. */
+  readonly sourceAt?: string | null;
+}
+
 export interface AdaptLegacyRebirthPackageV6Options {
   readonly predecessorName?: string;
   readonly instanceId?: string;
   readonly instanceName?: string;
   readonly workspace?: string;
   readonly cwd?: string;
+  /**
+   * Structured newest assistant PROSE row (never a compact tool trace) with
+   * its exact source identity/time. When supplied it outranks the legacy
+   * `🤖 LAST AI MESSAGE` prose extraction and the pending assistant-action
+   * text, which remains an Execution State fact of its own.
+   */
+  readonly lastMaterialAssistant?: RebirthPackageV6ExactMessage;
+  /** Newest tool operation after the last assistant prose row. */
+  readonly pendingOperation?: RebirthPackageV6PendingOperation;
+  /** Capture receipt for caller-derived cognition (e.g. trace-only derivation). */
+  readonly cognitiveArtifactCapture?: RebirthPackageV6CognitiveArtifactCapture;
   readonly activeEditDelta?: RebirthPackageV6ActiveEditDelta;
   /** Explicit truth for an absent immutable Active Edit capture. */
   readonly activeEditCaptureDisposition?: RebirthPackageV6ActiveEditCaptureDisposition;
@@ -1052,7 +1088,12 @@ function knownSourceTime(value: string | null | undefined): string | null {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
 }
 
-function stableTextIdentity(prefix: string, value: string): string {
+/**
+ * Deterministic content identity for a row that carries no persisted source
+ * id (FNV-1a over the caller's disambiguated text). Shared with the raw seed's
+ * trace-derived rows so both producers mint the same identity family.
+ */
+export function stableTextIdentity(prefix: string, value: string): string {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {
     hash ^= value.charCodeAt(index);
@@ -1594,7 +1635,9 @@ function extractLegacyAssistant(text: string | undefined): string | null {
   if (marker < 0) return null;
   const body: string[] = [];
   for (let index = marker + 1; index < lines.length; index += 1) {
-    if (/^\s*(?:👤|🤖|⚠️)\s/u.test(lines[index])) break;
+    // A `⏸ INTERRUPTED/TRAILING OPERATION` block is tool activity, never
+    // assistant prose: stop there so the boundary carries speech only.
+    if (/^\s*(?:👤|🤖|⚠️|⏸)\s/u.test(lines[index])) break;
     body.push(lines[index]);
   }
   return nonEmpty(body.join('\n'));
@@ -1895,9 +1938,23 @@ export function adaptLegacyRebirthPackageToV6(
   const pendingAssistantAction = receipt?.pendingAssistantAction?.status === 'unresolved'
     ? receipt.pendingAssistantAction
     : undefined;
-  const assistantText = pendingAssistantAction?.text
+  // A structured newest assistant PROSE row (raw hard-epoch path) outranks
+  // both the legacy `🤖 LAST AI MESSAGE` prose extraction and the pending
+  // assistant-action text: the pending action stays an Execution State fact,
+  // while the boundary shows the newest thing the agent actually SAID.
+  const structuredAssistant = options.lastMaterialAssistant && nonEmpty(options.lastMaterialAssistant.text)
+    ? options.lastMaterialAssistant
+    : undefined;
+  const assistantText = structuredAssistant?.text
+    ?? pendingAssistantAction?.text
     ?? extractLegacyAssistant(legacy.lastUserAiMessages);
   const requestSource = receipt?.liveState?.request?.source;
+  // A receipt that could not name the request's row stamps the literal
+  // `unknown`; that is an absent identity, never an exact one.
+  const receiptRequestId = nonEmpty(requestSource?.id);
+  const activeRequestSourceId = receiptRequestId && receiptRequestId !== 'unknown'
+    ? receiptRequestId
+    : undefined;
   const captureDispositionReason = nonEmpty(options.activeEditCaptureDisposition?.reason);
   const receiptEditDelta = adaptReceiptEditDelta(receipt);
   const activeEditDelta = options.activeEditDelta ?? (nonEmpty(legacy.activeEditDelta)
@@ -1982,6 +2039,20 @@ export function adaptLegacyRebirthPackageToV6(
         pendingAssistantAction.text,
         receipt?.liveState?.assistantAction?.source,
       ),
+    });
+  }
+  const pendingOperation = options.pendingOperation && nonEmpty(options.pendingOperation.text)
+    ? options.pendingOperation
+    : undefined;
+  if (pendingOperation) {
+    const operationSourceId = nonEmpty(pendingOperation.sourceId);
+    const operationText = `${pendingOperation.text.trim()} · operation=${pendingOperation.status}`;
+    executionFacts.push({
+      provenanceId: operationSourceId ?? stableTextIdentity('pending-operation', operationText),
+      sourceAt: knownSourceTime(pendingOperation.sourceAt),
+      status: operationSourceId ? 'exact' : 'partial',
+      kind: 'pending_operation',
+      text: operationText,
     });
   }
   if (receipt?.rail) {
@@ -2173,12 +2244,23 @@ export function adaptLegacyRebirthPackageToV6(
         text: activeRequestText,
         chars: activeRequestText.length,
         source: {
-          provenanceId: requestSource?.id ?? stableTextIdentity('active-request', activeRequestText),
+          provenanceId: activeRequestSourceId ?? stableTextIdentity('active-request', activeRequestText),
           sourceAt: knownSourceTime(requestSource?.sourceTimestamp),
-          status: requestSource?.id ? 'exact' : 'partial',
+          status: activeRequestSourceId ? 'exact' : 'partial',
         },
       } : null,
-      lastMaterialAssistant: assistantText ? {
+      lastMaterialAssistant: structuredAssistant
+        ? {
+            text: structuredAssistant.text,
+            chars: structuredAssistant.text.length,
+            source: {
+              provenanceId: nonEmpty(structuredAssistant.source.provenanceId)
+                ?? stableTextIdentity('last-assistant', structuredAssistant.text),
+              sourceAt: knownSourceTime(structuredAssistant.source.sourceAt),
+              status: structuredAssistant.source.status,
+            },
+          }
+        : assistantText ? {
         text: assistantText,
         chars: assistantText.length,
         source: {
@@ -2204,6 +2286,9 @@ export function adaptLegacyRebirthPackageToV6(
     },
     activeEditDelta,
     cognitiveArtifacts: cognition,
+    ...(options.cognitiveArtifactCapture
+      ? { cognitiveArtifactCapture: options.cognitiveArtifactCapture }
+      : {}),
     recentConversation: conversation,
     ...(options.operatorVault ? { operatorVault: options.operatorVault } : {}),
     ...(options.episodeChapterIndex ? { episodeChapterIndex: options.episodeChapterIndex } : {}),
@@ -3094,6 +3179,127 @@ function omittedSectionList(model: RebirthPackageV6Model): string[] {
  *    lost content under its budget, so the boundary cannot claim full render.
  * Derived from the model's adapted facts only — never fabricated.
  */
+/**
+ * CONTINUATION RECORD: the compact working-state digest a successor most
+ * often had to rebuild by hand (folding assessment, 2026-09-06): active
+ * request → latest verified checkpoint → latest decision → unresolved
+ * blockers → owned paths → pending operation → next action → recovery
+ * handles. Every line is DERIVED from facts already captured on the model and
+ * names its source; an absent fact renders `unknown` / `none-captured`, never
+ * a guess, and `none-captured` deliberately does not claim the thing is
+ * absent in the world. Additive: a persisted model renders it from whatever
+ * facts it carries.
+ */
+function renderContinuationRecord(
+  model: RebirthPackageV6Model,
+  references: RebirthRecoveryReferenceCatalog,
+): string[] {
+  const boundary = model.boundaryAndActiveTask;
+  const referenceAt = boundary.capturedAt;
+  const facts = model.executionState?.facts ?? [];
+  const clip = (text: string, max = 160): string => {
+    const flat = text.replace(/\s+/gu, ' ').trim();
+    return flat.length <= max ? flat : `${cutAtWordBoundary(flat, max - 1)}…`;
+  };
+  const stamp = (source: { readonly provenanceId: string; readonly sourceAt: string | null }): string => (
+    `source=${source.provenanceId} · source-time=${formatDisplayStamp(source.sourceAt, referenceAt)}`
+  );
+  // God Rule 8: "newest" is meaningful only among known-time rows; an
+  // unknown-time row is used solely when no known-time row exists, and it is
+  // stamped unknown rather than ordered.
+  const newest = <T extends { readonly provenanceId: string; readonly sourceAt: string | null }>(
+    rows: readonly T[],
+  ): T | null => {
+    const known = rows.filter((row) => knownSourceTime(row.sourceAt)).sort(compareSourceRows);
+    return known[known.length - 1] ?? rows[0] ?? null;
+  };
+  const byKind = (kind: RebirthPackageV6ExecutionFact['kind']): RebirthPackageV6ExecutionFact[] => (
+    facts.filter((fact) => fact.kind === kind)
+  );
+  const lines: string[] = [
+    '[CONTINUATION RECORD · derived from captured facts · each line names its source · unknown/none-captured = not captured, never absent]',
+  ];
+  // The request body renders verbatim a few lines below (EXACT ACTIVE REQUEST);
+  // the record points at it instead of repeating it, so promoted dialogue stays
+  // single-sourced (the boundary de-dup invariant) and a long request is never
+  // paid for twice.
+  lines.push(boundary.activeRequest
+    ? `active-request=[same bytes as EXACT ACTIVE REQUEST below] · ${boundary.activeRequest.chars} chars · ${stamp(boundary.activeRequest.source)}`
+    : 'active-request=unknown');
+  // Git checkpoint at capture, from the NOW card's per-root repository probe
+  // (never a synthesized sha); an errored or sha-less probe contributes nothing.
+  const ops = boundary.nowCard?.ops;
+  const repos = ops?.repositories ?? [];
+  const repoCheckpoints = repos.flatMap((repo) => (repo.error || !repo.sha7 ? [] : [
+    `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'}`,
+  ]));
+  lines.push(repoCheckpoints.length > 0 && ops
+    ? `checkpoint=${repoCheckpoints.join(' · ')} · ${stamp(ops.source)}`
+    : 'checkpoint=none-captured');
+  // Newest validation fact as captured — its own text carries the outcome
+  // (a completed call with an unknown outcome is still only a validation call).
+  const validation = newest(byKind('validation'));
+  lines.push(validation
+    ? `latest-validation=${clip(validation.text)} · ${stamp(validation)}`
+    : 'latest-validation=none-captured');
+  const decision = newest(model.cognitiveArtifacts.filter((row) => row.kind === 'decision'));
+  lines.push(decision
+    ? `latest-decision=${clip(decision.text)} · ${stamp(decision)}`
+    : 'latest-decision=none-captured');
+  const blockers = byKind('blocker');
+  const newestBlocker = newest(blockers);
+  lines.push(newestBlocker
+    ? `unresolved-blockers=${blockers.length} · newest: ${clip(newestBlocker.text)} · ${stamp(newestBlocker)}`
+    : 'unresolved-blockers=none-captured');
+  const ownedPaths: string[] = [];
+  const seenPaths = new Set<string>();
+  const addPath = (label: string): void => {
+    if (seenPaths.has(label)) return;
+    seenPaths.add(label);
+    ownedPaths.push(label);
+  };
+  for (const file of model.activeEditDelta.files) {
+    if (file.ownership === 'mine') addPath(`${file.filePath} (${file.closureState})`);
+  }
+  for (const claim of byKind('claim')) addPath(clip(claim.text, 120));
+  const ownedShown = ownedPaths.slice(0, 6);
+  lines.push(ownedPaths.length > 0
+    ? `owned-paths=${ownedShown.join(' · ')}${ownedPaths.length > ownedShown.length ? ` (+${ownedPaths.length - ownedShown.length} more)` : ''}`
+    : 'owned-paths=none-captured');
+  const operation = newest(byKind('pending_operation'));
+  const assistantAction = newest(byKind('pending_assistant_action'));
+  lines.push(operation
+    ? `pending-operation=${clip(operation.text)} · ${stamp(operation)}`
+    : assistantAction
+      ? `pending-operation=none-captured · pending-assistant-action=${clip(assistantAction.text)} · ${stamp(assistantAction)}`
+      : 'pending-operation=none-captured');
+  const nextAction = newest(byKind('next_action'));
+  const rail = boundary.nowCard?.currentRail;
+  const railFact = newest(byKind('rail'));
+  lines.push(nextAction
+    ? `next-action=${clip(nextAction.text)}${nextAction.predatesActiveRequest ? ' · authority=predates-active-request' : ''} · ${stamp(nextAction)}`
+    : rail
+      ? `next-action=rail ${rail.railId} · step=${rail.activeStepId ?? 'none'} (${rail.activeStepId ? (rail.activeStepStatus ?? 'unknown') : 'n/a'}) · state=${rail.state} · ${stamp(rail.source)}`
+      : railFact
+        ? `next-action=${clip(railFact.text)}${railFact.predatesActiveRequest ? ' · authority=predates-active-request' : ''} · ${stamp(railFact)}`
+        : 'next-action=unknown');
+  const recoveryRefs = ([
+    ['transcript', 'transcript'],
+    ['task-rail', 'task-rail'],
+    ['edits', 'atlas-edit-capture'],
+    ['cognition', 'cognition'],
+  ] as const).flatMap(([label, id]) => {
+    const entry = model.recoveryIndex.find((candidate) => candidate.id === id);
+    const ref = entry && entry.status !== 'unavailable' && entry.status !== 'not-requested'
+      ? recoveryReference(references, entry.handle)
+      : null;
+    return ref ? [`${label}=${ref}`] : [];
+  });
+  lines.push(recoveryRefs.length > 0 ? `recover: ${recoveryRefs.join(' · ')}` : 'recover: no exact route advertised');
+  lines.push('[/CONTINUATION RECORD]');
+  return lines;
+}
+
 function boundaryHazardsLine(
   model: RebirthPackageV6Model,
   completeness: RebirthSectionCompleteness | undefined,
@@ -3368,6 +3574,7 @@ function renderBoundary(
     lines.push(`vault-newest=${vaultNewest ?? 'unknown'} · active-request=${boundary.activeRequest?.source.sourceAt ?? 'unknown'}`);
   }
   lines.push('[/FACTUAL NOW CARD]');
+  lines.push('', ...renderContinuationRecord(model, references));
   if (boundary.activeRequest) {
     lines.push(
       '',

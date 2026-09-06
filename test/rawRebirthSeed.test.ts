@@ -1607,3 +1607,86 @@ describe('findAnchoredProviderRuntimeErrorLine (raw A6 anchored-marker guard)', 
     expect(findAnchoredProviderRuntimeErrorLine(null)).toBeUndefined();
   });
 });
+
+describe('structured v6 rows from the raw hard-epoch trace', () => {
+  const at = (iso: string): number => Date.parse(iso);
+  const prose = '🏁 The migration order is already additive; no rewrite needed.';
+  const trace: FoldMessage[] = [
+    { role: 'user', content: '[17:57] Keep the migration additive.', sourceIdentity: 'message:user-1', tsMs: at('2026-09-06T17:57:00.000Z') },
+    { role: 'assistant', content: '🔍 Checking the migration order first.', sourceIdentity: 'message:assistant-1', tsMs: at('2026-09-06T17:57:30.000Z') },
+    { role: 'assistant', content: '⟨tool Read {"file_path":"src/migrate.ts"}⟩', sourceIdentity: 'message:tool-1', tsMs: at('2026-09-06T17:57:40.000Z') },
+    { role: 'assistant', content: '⟨tool result Read: export const order = 2;⟩', sourceIdentity: 'message:tool-result-1', tsMs: at('2026-09-06T17:57:41.000Z') },
+    { role: 'assistant', content: '⟨tool tap_star {"category":"decision","note":"Keep the migration additive; no rewrite."}⟩', sourceIdentity: 'message:star-1', tsMs: at('2026-09-06T17:57:50.000Z') },
+    { role: 'assistant', content: prose, sourceIdentity: 'message:assistant-2', tsMs: at('2026-09-06T17:58:00.000Z') },
+    { role: 'assistant', content: '⟨tool Bash {"command":"npm test"}⟩', sourceIdentity: 'message:tool-2', tsMs: at('2026-09-06T17:58:10.000Z') },
+    { role: 'user', content: '[17:59] Now finish the fallback.', sourceIdentity: 'message:user-2', tsMs: at('2026-09-06T17:59:00.000Z') },
+  ];
+  const v6Options = {
+    predecessorName: 'worker-a',
+    instanceId: 'instance-a',
+    canonicalV6Fallback: true,
+    lifecycleBoundary: 'same_instance_hard_epoch' as const,
+    capturedAt: '2026-09-06T17:59:01.000Z',
+  };
+  const section = (rendered: string, title: string): string => {
+    const start = rendered.indexOf(`── ${title} ──`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const next = rendered.indexOf('\n── ', start + 1);
+    return next >= 0 ? rendered.slice(start, next) : rendered.slice(start);
+  };
+
+  test('promotes the newest assistant PROSE row as LAST MATERIAL ASSISTANT, never a compact tool trace', () => {
+    const rendered = buildRawRebirthSeedFromMessages(trace, v6Options);
+    expect(rendered).toContain(
+      `[LAST MATERIAL ASSISTANT · ${prose.length} chars · source=message:assistant-2 · source-time=2026-09-06T17:58:00.000Z · status=exact]\n${prose}\n[/LAST MATERIAL ASSISTANT]`,
+    );
+    expect(rendered).not.toMatch(/\[LAST MATERIAL ASSISTANT[^\n]*\]\n⟨tool/u);
+  });
+
+  test('surfaces the trailing tool call as a pending_operation fact with exact source instead of as speech', () => {
+    const rendered = buildRawRebirthSeedFromMessages(trace, v6Options);
+    expect(section(rendered, 'Execution State')).toContain(
+      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-2 · source-time=2026-09-06T17:58:10.000Z · status=exact',
+    );
+    expect(rendered).not.toContain('source=message:tool-1');
+  });
+
+  test('marks a trailing tool result that no prose interpreted as result-received', () => {
+    const rendered = buildRawRebirthSeedFromMessages([
+      ...trace.slice(0, 7),
+      { role: 'assistant', content: '⟨tool result Bash: 12 passed⟩', sourceIdentity: 'message:tool-result-2', tsMs: at('2026-09-06T17:58:20.000Z') },
+    ], v6Options);
+    expect(section(rendered, 'Execution State')).toContain(
+      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=result-received · source=message:tool-2 ·',
+    );
+  });
+
+  test('renders Recent Conversation rows with exact source identity and time instead of legacy-conversation/unknown', () => {
+    const conversation = section(buildRawRebirthSeedFromMessages(trace, v6Options), 'Recent Conversation');
+    expect(conversation).toContain('[user · source=message:user-1 · source-time=');
+    expect(conversation).toContain('[assistant · source=message:assistant-1 · source-time=');
+    expect(conversation).toContain('Checking the migration order first.');
+    expect(conversation).not.toContain('legacy-conversation');
+    expect(conversation).not.toContain('source-time=unknown');
+    expect(conversation).not.toContain('⟨tool');
+  });
+
+  test('derives Cognitive Artifacts from register glyph rows and tap_star waypoints with source provenance', () => {
+    const cognition = section(buildRawRebirthSeedFromMessages(trace, v6Options), 'Cognitive Artifacts');
+    expect(cognition).toContain('· result · The migration order is already additive; no rewrite needed. · source=message:assistant-2 · source-time=');
+    expect(cognition).toContain('· decision · Keep the migration additive; no rewrite. · source=message:star-1 · source-time=');
+    expect(cognition).toContain('authority=pointer');
+    expect(cognition).toContain('derived from the retained provider trace only');
+    expect(cognition).not.toContain('⟨tool');
+  });
+
+  test('renders the interrupted operation as its own ⏸ block in the legacy READ FIRST layout', () => {
+    // Legacy sections ride historical payload records; decode before matching.
+    const rendered = decodedHistoricalText(buildRawRebirthSeedFromMessages(trace, { predecessorName: 'worker-a' }));
+    expect(rendered).toContain('🤖 LAST AI MESSAGE [message 5]:');
+    expect(rendered).not.toContain('🤖 LAST AI MESSAGE [message 6]:');
+    expect(rendered).toContain(
+      '⏸ INTERRUPTED OPERATION [message 6] (tool call after the last assistant prose with no observed result — verify before repeating):\n⟨tool Bash {"command":"npm test"}⟩',
+    );
+  });
+});

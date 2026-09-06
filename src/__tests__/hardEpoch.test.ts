@@ -250,10 +250,13 @@ describe('FoldSession hard-epoch consume', () => {
     // source-time/source-id provenance (assertions below), and that the retired
     // header is absent.
     expect(content).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5 dir=desc chars=');
-    expect(content).toContain('⭐ [decision] Freeze intentional waypoints into raw hard epochs.');
-    expect(content).toContain(
-      'source-time=2026-07-18T20:29:00.000Z · source-id=call_hard_epoch_star',
+    // Structured trace cognition: the waypoint is a v6 row whose kind is its
+    // category, whose source is the exact tool-call id, and whose authority
+    // is pointer — never a re-rendered legacy ⭐ prose line.
+    expect(content).toMatch(
+      /· decision · Freeze intentional waypoints into raw hard epochs\. · source=call_hard_epoch_star · source-time=[^·]*20:29:00/u,
     );
+    expect(content).toContain('authority=pointer');
     expect(content).not.toContain('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
     expect(content).toContain('LIVE STARRED QUESTION');
   });
