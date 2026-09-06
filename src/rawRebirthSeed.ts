@@ -398,6 +398,12 @@ export interface RawRebirthSeedInput {
 export interface RawRebirthSeedFromMessagesOptions {
   readonly predecessorName?: string;
   /**
+   * Stable id of the instance whose trace this is. On a same-instance hard
+   * epoch it is the resetting instance itself; with it the continuity receipt
+   * and the v6 recovery index carry exact handles instead of `unknown`.
+   */
+  readonly instanceId?: string;
+  /**
    * Render the host-unavailable lifecycle boundary through the canonical v6
    * contract. Fold-window micro-seeds deliberately leave this false because
    * they are internal band artifacts rather than successor handoffs.
@@ -3265,7 +3271,7 @@ export function buildRawRebirthSeedFromMessages(
       capturedAt: options.capturedAt ?? 'unknown',
       captureSourceId: `raw-hard-epoch:${predecessorName}:message#${traceEnd}`,
       instance: {
-        instanceId: 'unknown',
+        instanceId: options.instanceId?.trim() || 'unknown',
         instanceName: predecessorName,
         runtimeStatus: options.predecessorStatus ?? 'unknown',
       },
@@ -3359,6 +3365,7 @@ export function buildRawRebirthSeedFromMessages(
     continuityReceipt,
   }, {
     predecessorName,
+    ...(options.instanceId?.trim() ? { instanceId: options.instanceId.trim() } : {}),
   });
   return renderRawRebirthSeed({ ...rawInput, rebirthV6 });
 }

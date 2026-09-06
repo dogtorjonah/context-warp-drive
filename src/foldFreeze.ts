@@ -611,6 +611,14 @@ export interface RawHardEpochSeedOptions {
   readonly episodicCrossRef?: string;
   /** Lineage glyph log — chronological verdict/hazard register trail (portable-mode memory section). */
   readonly lineageGlyphLog?: string;
+  /**
+   * Stable id of the instance whose context is resetting. With it the seed's
+   * recovery index advertises exact tap/rolodex/ledger/rail handles; without it
+   * every route honestly declares itself unavailable.
+   */
+  readonly instanceId?: string;
+  /** Workspace/cwd identity for the seed's boundary line (structurally a RawRebirthWorkspaceContext). */
+  readonly workspaceContext?: { readonly currentWorkspace: string; readonly currentCwd: string } | string;
 }
 
 /**
@@ -682,6 +690,8 @@ export function buildRawHardEpochSeed(
     userMessageTriggered,
     episodicCrossRef: options.episodicCrossRef,
     lineageGlyphLog: options.lineageGlyphLog,
+    ...(options.instanceId?.trim() ? { instanceId: options.instanceId.trim() } : {}),
+    ...(options.workspaceContext !== undefined ? { workspaceContext: options.workspaceContext } : {}),
     capturedAt: options.capturedAt,
     lifecycleBoundary: 'same_instance_hard_epoch',
   });
