@@ -89,6 +89,7 @@ import {
 } from './rollingFold.ts';
 import { foldProvenanceDigest } from './foldProvenance.ts';
 import {
+  RAW_REBIRTH_LIVE_REQUEST_HEADER,
   buildRawRebirthSeedFromMessages,
   DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS,
   DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS,
@@ -711,6 +712,15 @@ export function buildRawHardEpochSeed(
  * section carries that continuity. The old raw transcript remains as recall
  * backing, so omitted detail is recoverable.
  */
+/**
+ * Stable markers for the package's promoted active request. Only the opening
+ * TOKEN is matched — never its separator or trailing metadata — so a renderer
+ * that changes the header's shape cannot silently disable the dedup guard in
+ * buildHardEpochSeedView. The closing tag carries no metadata and is exact.
+ */
+const EXACT_ACTIVE_REQUEST_OPEN = '[EXACT ACTIVE REQUEST';
+const EXACT_ACTIVE_REQUEST_CLOSE = '[/EXACT ACTIVE REQUEST]';
+
 export function buildHardEpochSeedView(
   messages: readonly FoldMessage[],
   seedPrompt: string,
@@ -730,19 +740,26 @@ export function buildHardEpochSeedView(
   const normalizedAuthorityText = authoritativeLiveRequest?.text?.trim() || undefined;
   const liveTurnText = (tracedLiveTurnText && tracedLiveTurnText.trim()) || normalizedAuthorityText || undefined;
   const seedBody = ensureHardEpochContinuityDirective(seedPrompt);
-  const readFirstStart = seedBody.indexOf('── Last User + AI Messages (READ FIRST) ──');
+  // Both scans below must key on the STABLE part of each marker. They used to
+  // pin the full opening literal including its separator, which silently went
+  // dead the moment the package's density pass re-rendered the header as
+  // `[EXACT ACTIVE REQUEST ⟨anchor⟩]` instead of `[EXACT ACTIVE REQUEST · N
+  // chars · …]`. A dead guard here is not inert: it appends the operator's
+  // request a second time under the live-turn header, so the same bytes reach
+  // the successor twice in two different authority framings.
+  const readFirstStart = seedBody.indexOf(RAW_REBIRTH_LIVE_REQUEST_HEADER);
   const readFirstEnd = readFirstStart >= 0
     ? seedBody.indexOf('\n── ', readFirstStart + 1)
     : -1;
   const readFirstBlock = readFirstStart >= 0
     ? seedBody.slice(readFirstStart, readFirstEnd >= 0 ? readFirstEnd : undefined)
     : '';
-  const exactRequestStart = seedBody.indexOf('[EXACT ACTIVE REQUEST ·');
+  const exactRequestStart = seedBody.indexOf(EXACT_ACTIVE_REQUEST_OPEN);
   const exactRequestEnd = exactRequestStart >= 0
-    ? seedBody.indexOf('[/EXACT ACTIVE REQUEST]', exactRequestStart)
+    ? seedBody.indexOf(EXACT_ACTIVE_REQUEST_CLOSE, exactRequestStart)
     : -1;
   const exactRequestBlock = exactRequestStart >= 0 && exactRequestEnd >= 0
-    ? seedBody.slice(exactRequestStart, exactRequestEnd + '[/EXACT ACTIVE REQUEST]'.length)
+    ? seedBody.slice(exactRequestStart, exactRequestEnd + EXACT_ACTIVE_REQUEST_CLOSE.length)
     : '';
   const liveRequestAlreadyBundled = typeof liveTurnText === 'string'
     && (exactRequestBlock.includes(liveTurnText)

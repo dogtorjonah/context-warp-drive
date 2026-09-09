@@ -1016,11 +1016,20 @@ export function createUserMessageVaultCore(
     const maxChars = options?.editSnippetSurface === 'rebirth'
       ? resolveUserMessageVaultRebirthMaxChars(process.env)
       : resolveUserMessageVaultMaxChars(process.env);
-    return renderVaultRowsBlockWithMaxChars(
+    const interleaved = renderVaultRowsBlockWithMaxChars(
       selectVaultRows(entries, assistantEntries, editEntries, options),
       'full',
       maxChars,
     );
+    if (interleaved) return interleaved;
+    // Operator floor. The interleaved grammar carries a wider header than the
+    // operator-only one, so a cap that fits no interleaved block at all used to
+    // return the empty string — silently dropping every operator word purely
+    // because an assistant/edit row happened to exist. Assistant and edit rows
+    // are the eviction ladder's first victims by design; operator wording is
+    // the last thing to go, never the first. Degrade to the operator-only
+    // render (which has its own minimal-header ladder) instead of to nothing.
+    return renderOperatorOnlyVault(entries, options);
   };
 
   return {

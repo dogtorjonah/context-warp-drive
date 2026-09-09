@@ -117,6 +117,10 @@ function model(
     activeEditDelta: exactDelta(),
     cognitiveArtifacts: [{
       provenanceId: 'decision:one',
+      // Self-authored: the continuation record promotes a decision only when the
+      // row's own source instance matches this boundary's instance, so the rich
+      // fixture has to state its authorship or it is (correctly) not promoted.
+      sourceInstanceId: 'instance-a',
       sourceAt: '2026-08-02T17:59:40.000Z',
       kind: 'decision',
       text: 'Use one immutable model.',
@@ -174,7 +178,7 @@ function model(
 
 describe('Rebirth Package v6', () => {
   it('labels the package capture as an artifact without changing its provenance id', () => {
-    const boundary = renderRebirthPackageV6Sections(model())
+    const boundary = renderRebirthPackageV6Sections(model(), { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
 
     expect(boundary).toContain('capture-artifact=capture-1');
@@ -442,7 +446,7 @@ describe('Rebirth Package v6', () => {
         cognitiveArtifacts: rows,
         cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
       });
-      const { text, collapse } = renderRebirthPackageV6WithReport(value, {
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { diagnostic: true,
         adaptiveBackfill: false,
         sectionMaxChars: { cognitiveArtifacts: 1_500 },
       });
@@ -490,7 +494,7 @@ describe('Rebirth Package v6', () => {
           },
         },
       });
-      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { diagnostic: true, packageBudget: 200_000 });
       const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
       const droppedRows = record.units.filter((unit) => unit.unitId.startsWith('selector-drop:'));
 
@@ -517,7 +521,7 @@ describe('Rebirth Package v6', () => {
         cognitiveArtifacts: rows,
         cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
       });
-      const { text, collapse } = renderRebirthPackageV6WithReport(value, {
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { diagnostic: true,
         packageBudget: 1,
       });
       const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
@@ -532,8 +536,9 @@ describe('Rebirth Package v6', () => {
       expect(cognitive).toHaveLength(rows.length);
       expect(cognitive.map((unit) => unit.unitId).sort()).toEqual(rows.map((row) => row.provenanceId).sort());
       expect(cognitive.every((unit) => unit.placement === 'elided' && unit.tierBasis === 'section-elision')).toBe(true);
-      expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
+      expect(text).toContain('── Timeline ──');
       expect(text).toContain('[EVICTED section=cognitiveArtifacts units=3');
+      expect(text).not.toMatch(/cognition: rendered=[1-9]/u);
       expect(text).toMatch(/\[EVICTED section=cognitiveArtifacts units=3 recover=R\d+\]/u);
       // Audit-4 S7: the exact ledger-fetch command ships once in the Recovery
       // legend; the eviction envelope cites its R<n> ref.
@@ -561,13 +566,13 @@ describe('Rebirth Package v6', () => {
         cognitiveArtifactCapture: { ...receipt, totalMatched: rows.length },
       });
       const budget = 40_000;
-      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { diagnostic: true, packageBudget: budget });
       const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
       const cognitive = record.units.filter((unit) => unit.sectionId === 'cognitiveArtifacts');
       const renderedIds = cognitive.filter((unit) => unit.placement === 'rendered').map((unit) => unit.unitId);
 
       expect(text.length).toBeLessThanOrEqual(budget);
-      expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
+      expect(text).toContain('── Timeline ──');
       expect(text).not.toContain('[EVICTED section=cognitiveArtifacts');
       expect(text).toContain('NEWEST-KEPT-ROW-BODY');
       expect(collapse.omittedSectionIds).not.toContain('cognitiveArtifacts');
@@ -613,11 +618,11 @@ describe('Rebirth Package v6', () => {
         recoveryIndex,
       });
 
-      const first = renderRebirthPackageV6WithReport(value, {
+      const first = renderRebirthPackageV6WithReport(value, { diagnostic: true,
         packageBudget: 8_000,
         adaptiveBackfill: false,
       });
-      const second = renderRebirthPackageV6WithReport(value, {
+      const second = renderRebirthPackageV6WithReport(value, { diagnostic: true,
         packageBudget: 8_000,
         adaptiveBackfill: false,
       });
@@ -655,12 +660,12 @@ describe('Rebirth Package v6', () => {
       // single whole unit can be admitted the section yields to an explicit
       // eviction envelope (covered deterministically by the budget-1 fixture).
       const budget = 10_800;
-      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { diagnostic: true, packageBudget: budget });
       const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
       const cognitive = record.units.filter((unit) => unit.sectionId === 'cognitiveArtifacts');
 
       expect(text.length).toBeLessThanOrEqual(budget);
-      expect(text).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
+      expect(text).toContain('── Timeline ──');
       // Either the whole demand fit (complete) or the section evicted/routed
       // with an explicit frame — never a mid-render sliver that reads as full
       // content.
@@ -687,7 +692,7 @@ describe('Rebirth Package v6', () => {
         recentConversation: [...model().recentConversation, ...rows],
       });
       const budget = 20_000;
-      const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: budget });
+      const { text, collapse } = renderRebirthPackageV6WithReport(value, { diagnostic: true, packageBudget: budget });
 
       expect(text.length).toBeLessThanOrEqual(budget);
       expect(text).toContain('[REBIRTH-V6-SECTION id=recentConversation');
@@ -711,12 +716,15 @@ describe('Rebirth Package v6', () => {
       });
       const explicitCap = 30_000;
       const budget = 40_000;
-      const { text } = renderRebirthPackageV6WithReport(value, {
+      const options = {
         packageBudget: budget,
         sectionMaxChars: { cognitiveArtifacts: explicitCap },
-      });
+      };
+      const { text } = renderRebirthPackageV6WithReport(value, options, { diagnostic: true });
+      const cognitiveSection = renderRebirthPackageV6Sections(value, options, { diagnostic: true })
+        .find((section) => section.id === 'cognitiveArtifacts')!;
       // `dir=` (audit-2 A27) may or may not follow `order=N` on the frame.
-      const sectionMatch = text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5[^\]]*chars=(\d+)\]/);
+      const sectionMatch = cognitiveSection.text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5[^\]]*chars=(\d+)\]/);
       expect(sectionMatch).not.toBeNull();
       expect(Number(sectionMatch![1])).toBeLessThanOrEqual(explicitCap);
       expect(text.length).toBeLessThanOrEqual(budget);
@@ -754,7 +762,7 @@ describe('Rebirth Package v6', () => {
         episodeChapterIndex: { units: [lineageRow('ep:1', '2026-08-02T17:54:00.000Z', 'episode', 'episode chapter', 'episode: chapter')], rangeRecover: null },
         lifeLedger: { units: [lineageRow('life:1', '2026-08-02T17:53:00.000Z', 'life', 'life ledger row', 'life: row')], rangeRecover: null },
       });
-      const { collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
+      const { collapse } = renderRebirthPackageV6WithReport(value, { diagnostic: true, packageBudget: 200_000 });
       const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
       const expectedIds = new Set([
         'edit-file:one',
@@ -801,18 +809,20 @@ describe('Rebirth Package v6', () => {
     expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
     expect(rendered.match(/I will implement it now\./gu)).toHaveLength(1);
     expect(rendered).toContain('Keep Atlas semantics stable.');
-    for (let index = 1; index < sections.length; index += 1) {
+    const visibleSections = sections.filter((section) => section.id !== 'cognitiveArtifacts');
+    expect(rendered.match(/── Timeline ──/gu)).toHaveLength(1);
+    for (let index = 1; index < visibleSections.length; index += 1) {
       // Audit-4 S7: the final render prunes never-cited legend rows from the
       // recovery section, so a section body may differ from the pre-prune
       // sections snapshot. Order is asserted on the section FRAME anchor
       // (`[REBIRTH-V6-SECTION id=…`) which survives pruning verbatim.
-      expect(rendered.indexOf(`[REBIRTH-V6-SECTION id=${sections[index - 1].id}`))
-        .toBeLessThan(rendered.indexOf(`[REBIRTH-V6-SECTION id=${sections[index].id}`));
+      expect(rendered.indexOf(`[REBIRTH-V6-SECTION id=${visibleSections[index - 1].id}`))
+        .toBeLessThan(rendered.indexOf(`[REBIRTH-V6-SECTION id=${visibleSections[index].id}`));
     }
   });
 
   it('suppresses an inapplicable fork-purpose row and renders remaining absent Now-card facts as unknowns', () => {
-    const boundary = renderRebirthPackageV6Sections(model())
+    const boundary = renderRebirthPackageV6Sections(model(), { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     const card = boundary.split('[FACTUAL NOW CARD · descriptive boundary facts]')[1]
       ?.split('[/FACTUAL NOW CARD]')[0] ?? '';
@@ -839,7 +849,7 @@ describe('Rebirth Package v6', () => {
             currentRailAvailability: { status, reason, source },
           },
         },
-      })).find((section) => section.id === 'boundaryAndActiveTask')?.text ?? ''
+      }), { diagnostic: true }).find((section) => section.id === 'boundaryAndActiveTask')?.text ?? ''
     );
 
     const none = renderWith('none', null);
@@ -862,7 +872,7 @@ describe('Rebirth Package v6', () => {
     expect(isRebirthPackageV6Model(persisted)).toBe(true);
 
     const legacy = persisted as unknown as RebirthPackageV6Model;
-    const sections = renderRebirthPackageV6Sections(legacy);
+    const sections = renderRebirthPackageV6Sections(legacy, { diagnostic: true });
     expect(sections.map((section) => section.id)).toEqual(
       REBIRTH_PACKAGE_V6_SECTION_IDS.filter(
         (id) => id !== 'brainMergeSynthesis'
@@ -871,7 +881,7 @@ describe('Rebirth Package v6', () => {
     );
     // Audit-3 B8: the version soup became ONE versions= line (model/render/
     // capture-id/provenance/frame) instead of the old schema=/render= line.
-    expect(renderRebirthPackageV6(legacy)).toContain(
+    expect(renderRebirthPackageV6(legacy, { diagnostic: true })).toContain(
       'versions=model:rebirth-package-v6/v1 · render:v6-sections',
     );
   });
@@ -1069,7 +1079,7 @@ describe('Rebirth Package v6', () => {
     const section = rendered.split('[REBIRTH-V6-SECTION id=recentConversation')[1]
       ?.split('[REBIRTH-V6-SECTION-END id=recentConversation]')[0] ?? '';
 
-    expect(section).toContain('endpoint rows: rendered in Boundary (active request + last assistant)');
+    expect(section).toContain('retained dialogue 7');
     expect(rendered.match(/Implement the frozen v6 contract\./gu)).toHaveLength(1);
     expect(rendered.match(/I will implement it now\./gu)).toHaveLength(1);
   });
@@ -1445,8 +1455,11 @@ describe('Rebirth Package v6', () => {
       expect.objectContaining({ kind: 'validation', text: 'canonical adapter regression passed' }),
       expect.objectContaining({ kind: 'blocker', text: 'receipt hazard survives' }),
       expect.objectContaining({ kind: 'review', text: 'needs_review' }),
-      expect.objectContaining({ kind: 'coordination', text: 'room=fix-rebirth' }),
-      expect.objectContaining({ kind: 'coordination', text: 'subscription=mention:worker-a' }),
+      // D2(e): membership is one capture-instant observation, so rooms and
+      // subscriptions each collapse into a single counted fact that still names
+      // every member.
+      expect.objectContaining({ kind: 'coordination', text: 'rooms=1: fix-rebirth' }),
+      expect.objectContaining({ kind: 'coordination', text: 'subscriptions=1: mention:worker-a' }),
     ]));
     expect(value.executionState.unknownReasons).toContain('typed disagreement survives');
     expect(value.activeEditDelta.files).toEqual([
@@ -1506,7 +1519,7 @@ describe('Rebirth Package v6', () => {
     });
     const value = adaptLegacyRebirthPackageToV6({ continuityReceipt });
     expect(value.executionState.facts).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: 'coordination', text: 'room=fix-rebirth' }),
+      expect.objectContaining({ kind: 'coordination', text: 'rooms=1: fix-rebirth' }),
     ]));
     expect(value.executionState.facts.some((fact) => fact.text.includes('scope='))).toBe(false);
   });
@@ -1562,7 +1575,7 @@ describe('Rebirth Package v6', () => {
         },
       },
     });
-    const boundary = renderRebirthPackageV6Sections(value)
+    const boundary = renderRebirthPackageV6Sections(value, { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     const card = boundary.split('[FACTUAL NOW CARD · descriptive boundary facts]')[1]
       ?.split('[/FACTUAL NOW CARD]')[0] ?? '';
@@ -1588,7 +1601,7 @@ describe('Rebirth Package v6', () => {
         },
       },
     });
-    const unknownCard = (renderRebirthPackageV6Sections(unknown)
+    const unknownCard = (renderRebirthPackageV6Sections(unknown, { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '')
       .split('[FACTUAL NOW CARD · descriptive boundary facts]')[1]
       ?.split('[/FACTUAL NOW CARD]')[0] ?? '';
@@ -1752,11 +1765,11 @@ describe('Rebirth Package v6', () => {
     expect(byKind.get('next_action')?.predatesActiveRequest).toBeUndefined();
     expect(byKind.get('pending_assistant_action')?.predatesActiveRequest).toBeUndefined();
 
-    const rendered = renderRebirthPackageV6(value);
-    expect(rendered).toMatch(/- rail · rail-58fc5e71[^\n]* · authority=predates-active-request/);
-    expect(rendered).toMatch(/- next_action · its ok fold bug hunt is on it\. · source=message:operator-pivot:[^\n]* · source-time=2026-08-14T17:18:50.158Z · status=exact/);
-    expect(rendered).not.toMatch(/- next_action ·[^\n]*authority=predates-active-request/);
-    expect(rendered).not.toMatch(/- pending_assistant_action ·[^\n]*authority=predates-active-request/);
+    const rendered = renderRebirthPackageV6(value, { diagnostic: true });
+    expect(rendered).toMatch(/- rail · rail-58fc5e71[^\n]* \[predates-active-request\]/);
+    expect(rendered).toMatch(/- next_action · \[EXACT ACTIVE REQUEST · source=message:operator-pivot\] ⟨message:operator-pivot:[^\n⟩]* @[^⟩]*17:18:50Z⟩/);
+    expect(rendered).not.toMatch(/- next_action ·[^\n]*\[predates-active-request\]/);
+    expect(rendered).not.toMatch(/- pending_assistant_action ·[^\n]*\[predates-active-request\]/);
 
     // A receipt whose nextAction is genuinely rail-derived still keeps the
     // older step source and the measured staleness marker.
@@ -2110,7 +2123,7 @@ describe('Rebirth Package v6', () => {
       id, sourceAt, sourceEndAt, kind: 'life' as const,
       verbatim: `life ${id}`, digest: `life ${id}`, claim: `life ${id}`, eraKey: '2026-08-02', recover: 'life-recovery',
     }));
-    const rendered = renderRebirthPackageV6(model({ lifeLedger: { units, rangeRecover: 'life-recovery' } }));
+    const rendered = renderRebirthPackageV6(model({ lifeLedger: { units, rangeRecover: 'life-recovery' } }), { sectionMaxChars: { lifeLedger: 4000 } });
     expect(rendered).toContain('median-life=60m (all captured lineage; 1/3 valid spans; includes inactive time; reference=2026-08-02T18:00:00.000Z)');
   });
 
@@ -2138,7 +2151,7 @@ describe('Rebirth Package v6', () => {
         frontier: 'event-9',
       }],
     });
-    const sections = renderRebirthPackageV6Sections(value, {
+    const sections = renderRebirthPackageV6Sections(value, { diagnostic: true,
       sectionMaxChars: { recoveryIndex: 80 },
     });
     const recoverySection = sections.find((section) => section.id === 'recoveryIndex');
@@ -2203,7 +2216,7 @@ describe('Rebirth Package v6', () => {
     });
     const rendered = renderRebirthPackageV6(value);
     // Fresh-fork lifecycle: inherited evidence is carried from the predecessor.
-    expect(rendered).toContain('fresh_fork · new instance identity; predecessor evidence is inherited');
+    expect(rendered).toContain('fresh_fork: new instance identity; predecessor evidence is inherited');
     expect(rendered).toContain('inherited-captures=atlas-edit-capture:v1:parent');
     // Inherited ownership is labeled; shared contributors render a chronology
     // with the later contributor distinct from the inherited owner.
@@ -2276,9 +2289,8 @@ describe('Rebirth Package v6', () => {
     expect(Object.keys(measured.sectionTimingsMs ?? {}).sort())
       .toEqual([...REBIRTH_PACKAGE_V6_SECTION_IDS].sort());
     for (const sectionId of REBIRTH_PACKAGE_V6_SECTION_IDS) {
-      // One adaptive-cap render plus the final admission render proves the
-      // accumulator covers repeated passes instead of timing a cheap final pass.
-      expect(measured.sectionTimingsMs?.[sectionId]).toBeGreaterThanOrEqual(2);
+      // Binding phase caps need no speculative backfill render.
+      expect(measured.sectionTimingsMs?.[sectionId]).toBeGreaterThanOrEqual(1);
     }
   });
 
@@ -2307,8 +2319,7 @@ describe('Rebirth Package v6', () => {
       'Boundary and Active Task',
       'Execution State',
       'Active Edit Delta',
-      'Cognitive Artifacts',
-      'Recent Conversation',
+      'Timeline',
       'Recovery Index',
     ];
     for (let index = 1; index < titles.length; index += 1) {
@@ -2323,7 +2334,7 @@ describe('Rebirth Package v6', () => {
     expect(rendered).toContain('Lifecycle boundary: same_instance_hard_epoch');
     expect(rendered).toContain('Continue silently; do not produce wake-up commentary.');
     expect(rendered).toContain('[Chronological Provenance v1]');
-    expect(rendered).toContain('lifecycle=same_instance_hard_epoch');
+    expect(rendered).toContain('· same_instance_hard_epoch:');
     expect(rendered.match(/Finish the canonical hard-epoch fallback\./gu)).toHaveLength(1);
     expect(rendered).toContain('Active edit state is unknown; absence of evidence is not rendered as none.');
     expect(rendered).not.toContain('Coordinate Closet');
@@ -2377,7 +2388,7 @@ describe('audit-2 Lane A render regressions', () => {
       cognitiveArtifacts: [{ provenanceId: 'c:1', sourceAt: '2026-08-02T17:00:00.000Z', kind: 'result', text: 'r', authority: 'a', supersededBy: null }],
     });
     const text = renderRebirthPackageV6(value);
-    expect(text).toMatch(/id=cognitiveArtifacts order=5 dir=desc chars=/u); // newest-first
+    expect(text).toMatch(/id=recentConversation order=6 dir=asc chars=/u); // interleaved source chronology
     expect(text).toMatch(/id=activeEditDelta order=4 dir=asc chars=/u);     // oldest-first
     expect(text).toMatch(/id=recoveryIndex order=10 dir=asc chars=/u);      // directory order
     expect(text).toMatch(/id=boundaryAndActiveTask order=1(?! dir=) chars=/u); // no dir (head content)
@@ -2681,7 +2692,7 @@ describe('audit-3 C1: partial-class/v2 four-surface agreement (A8)', () => {
   });
 
   it('classifies an explained duplicate-merge as `merge`, never `unknown`', () => {
-    const boundaryBody = renderRebirthPackageV6Sections(partialModel())
+    const boundaryBody = renderRebirthPackageV6Sections(partialModel(), { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     expect(boundaryBody).toContain('operator-vault:merge');
     expect(boundaryBody).not.toContain('operator-vault:unknown');
@@ -2690,7 +2701,7 @@ describe('audit-3 C1: partial-class/v2 four-surface agreement (A8)', () => {
 
 describe('audit-3 C1: single versions= line (B8)', () => {
   it('renders one versions= line and drops the old schema=/render= line', () => {
-    const boundaryBody = renderRebirthPackageV6Sections(model())
+    const boundaryBody = renderRebirthPackageV6Sections(model(), { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     const versionLines = boundaryBody.split('\n').filter((line) => line.startsWith('versions='));
     expect(versionLines).toHaveLength(1);
@@ -2858,7 +2869,7 @@ describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
         },
       },
     });
-    const rendered = renderRebirthPackageV6Sections(value)
+    const rendered = renderRebirthPackageV6Sections(value, { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     expect(rendered).toContain('repo-0:error:');
     expect(rendered).toContain('(+25 more roots with the same error)');
@@ -2887,7 +2898,7 @@ describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
         },
       },
     });
-    const rendered = renderRebirthPackageV6Sections(value)
+    const rendered = renderRebirthPackageV6Sections(value, { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     expect(rendered).toContain('owned-children=live-child(inst-live),hibernated-child(inst-hib) (live=1 hibernated=1 done=0 teardown-pending=1)');
   });
@@ -2919,11 +2930,10 @@ describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
     const rendered = renderRebirthPackageV6Sections(value)
       .find((section) => section.id === 'operatorVault')?.text ?? '';
     // One full pointer for the first pointed unit, bare pointers for the rest.
-    expect(rendered.match(/rendered-in=recentConversation/gu)).toHaveLength(1);
-    expect(rendered.indexOf('Relocation:')).toBeLessThan(rendered.indexOf('[operator · source='));
+    expect(rendered).toBe('');
     expect(rendered).not.toContain('each bare row below');
     const barePointers = rendered.match(/\[operator · source=message:user[^\]]*\]/gu) ?? [];
-    expect(barePointers.length).toBeGreaterThanOrEqual(2);
+    expect(barePointers).toHaveLength(0);
   });
 
   it('prunes unreferenced recovery-legend handles: only cited handles earn legend rows (audit-4 S7)', () => {
@@ -2964,16 +2974,21 @@ describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
         },
       },
     });
-    const rendered = renderRebirthPackageV6Sections(value)
+    const rendered = renderRebirthPackageV6Sections(value, { diagnostic: true })
       .find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     expect(rendered).toContain('request→capture=10905ms');
     expect(rendered).toContain('unaccounted=2188ms');
-    expect(rendered).toContain('cause unknown');
+    // S1: the remainder now names the UNINSTRUMENTED stages that can live in it
+    // instead of the bare 'cause unknown' it used to print. That is a statement
+    // about what is not measured, never an attribution: the audit-4 rejection
+    // of a stage list still stands, so no share may be assigned to any name.
+    expect(rendered).toContain('uninstrumented: worker queue wait, request/response transport, capture persistence');
+    expect(rendered).not.toMatch(/(?:queue wait|transport|persistence)=\d/u);
     expect(rendered).not.toContain('ledger-commit/cognition-capture/transport');
     const inconsistent = renderRebirthPackageV6Sections({
       ...value, boundaryAndActiveTask: { ...value.boundaryAndActiveTask,
         builder: { ...value.boundaryAndActiveTask.builder!, requestToCaptureMs: 1000 } },
-    }).find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
+    }, { diagnostic: true }).find((section) => section.id === 'boundaryAndActiveTask')?.text ?? '';
     expect(inconsistent).toContain('unaccounted=-7717ms');
     expect(inconsistent).toContain('inconsistent measured spans');
   });
@@ -2996,7 +3011,7 @@ describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
         partialReason: null as string | null,
       },
     });
-    const rendered = renderRebirthPackageV6Sections(value)
+    const rendered = renderRebirthPackageV6Sections(value, { sectionMaxChars: { lifeLedger: 4000 } })
       .find((section) => section.id === 'lifeLedger')?.text ?? '';
     for (const key of ['span=', 'by=', 'runtime=', 'boundary=', 'prior-status=', 'package-chars=', 'prompt-chars=', 'build-ms=', 'src=']) {
       expect(rendered).toContain(`legend: one line per life boundary`);
@@ -3052,10 +3067,10 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
     // Expirer is the OPERATOR message that expired the claim, never the agent's
     // own claim id (God Rule 11). The stamp is compact (C5: no year when it
     // shares the capture year), so the assertion carries the year-dropped form.
-    expect(text).toContain('EXPIRED BY message:user-latest@08-02 17:59:00Z');
-    expect(text).not.toContain('EXPIRED BY message:agent-latest');
+    expect(text).toMatch(/EXPIRED \(superseded by ⟨message:user-latest @[^⟩]*17:59:00Z⟩\) — do not execute/u);
+    expect(text).not.toMatch(/superseded by ⟨[^⟩]*message:agent-latest/u);
     // Predecessor does not render when the newest claim is expired.
-    expect(text).not.toContain('PREVIOUS AGENT ACTIVE-REQUEST INTERPRETATION');
+    expect(text).not.toContain('EXPIRED/FALLBACK:');
     expect(text).not.toContain('design glyph continuity');
     // 🧭 clip: the 🧭 line renders, but the display continues only through the
     // first sentence (≤300) — the whole message body is not reprinted.
@@ -3089,10 +3104,10 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
     const text = boundaryText(value);
     // The operator request (17:40) does NOT postdate the claim (17:49), so no
     // operator expirer is derivable — the label stays unnamed-but-honest.
-    expect(text).toContain('CURRENT · non-authoritative · exact raw operator chronology wins');
+    expect(text).toContain('AGENT CLAIM (non-authoritative; exact raw operator chronology wins)');
     // The CURRENT newest claim still shows its predecessor (God Rule 11
     // permits a rendered precedent when the newest claim is live).
-    expect(text).toContain('PREVIOUS AGENT ACTIVE-REQUEST INTERPRETATION');
+    expect(text).toContain('EXPIRED/FALLBACK:');
     expect(text).toContain('previous stale claim');
     expect(text).not.toContain('do not execute · fallback context only · do not execute');
   });
@@ -3247,7 +3262,7 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
     expect(text).toContain('recover: R1 after=2026-09-02T08:01:00.000Z');
   });
 
-  it('S2: assistant reply display bodies cap at 600 chars with explicit recovery', () => {
+  it('preserves assistant replies shorter than the 1,500-character display cap', () => {
     const value = model({
       recentConversation: [{
         provenanceId: 'long-reply',
@@ -3261,9 +3276,8 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
       adaptiveBackfill: false,
       sectionMaxChars: { recentConversation: 5_000 },
     }).find((section) => section.id === 'recentConversation')?.text ?? '';
-    expect(text).toContain('z'.repeat(600));
-    expect(text).not.toContain('z'.repeat(601));
-    expect(text).toContain('projection=truncated stored=600/800 chars · recover=R1');
+    expect(text).toContain('z'.repeat(800));
+    expect(text).not.toContain('projection=truncated');
   });
 
   it('B3: cognition suppresses exact Boundary bodies and declares the cross-section dedupe', () => {
@@ -3330,8 +3344,7 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
     const { text, collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
     // Audit-4 S7: the single pointed unit renders the full explanatory
     // pointer (previously every row carried the full ~70-char form).
-    expect(text).toContain('[operator · source=message:user-older]');
-    expect(text).toContain('exact request/answer endpoints live in Boundary and Active Task');
+    expect(text).not.toContain('[operator · source=message:user-older]');
     expect(text).not.toContain(original);
 
     const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
@@ -3373,12 +3386,12 @@ describe('structured last assistant and pending operation (raw hard-epoch path)'
       status: 'exact',
       text: '⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight',
     });
-    const rendered = renderRebirthPackageV6(value);
+    const rendered = renderRebirthPackageV6(value, { diagnostic: true });
     expect(rendered).toContain(
       `[LAST MATERIAL ASSISTANT · ${structured.text.length} chars · source=message:assistant-8 · source-time=2026-09-06T17:58:00.000Z · status=exact]\n${structured.text}`,
     );
-    expect(rendered).toContain(
-      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-9 · source-time=2026-09-06T17:58:10.000Z · status=exact',
+    expect(rendered).toMatch(
+      /- pending_operation · ⟨tool Bash \{"command":"npm test"\}⟩ · operation=in-flight ⟨message:tool-9 @[^⟩]*17:58:10Z⟩/u,
     );
   });
 
@@ -3401,8 +3414,8 @@ describe('structured last assistant and pending operation (raw hard-epoch path)'
       text: 'tool_calls: [{"name":"Read"}] · operation=result-received',
     });
     expect(fact?.provenanceId).toMatch(/^pending-operation:[0-9a-f]{8}$/u);
-    expect(renderRebirthPackageV6(value)).toContain(
-      'Unknown source time (quarantined; not part of the chronology):\n- pending_operation · tool_calls: [{"name":"Read"}] · operation=result-received · source=pending-operation:',
+    expect(renderRebirthPackageV6(value, { diagnostic: true })).toMatch(
+      /Unknown source time \(quarantined; not part of the chronology\):\n- pending_operation · tool_calls: \[\{"name":"Read"\}\] · operation=result-received \[partial\] ⟨pending-operation:[0-9a-f]{8} @unknown⟩/u,
     );
   });
 
@@ -3427,7 +3440,7 @@ describe('structured last assistant and pending operation (raw hard-epoch path)'
       },
     });
     expect(value.cognitiveArtifactCapture?.status).toBe('partial');
-    const rendered = renderRebirthPackageV6(value);
+    const rendered = renderRebirthPackageV6(value, { diagnostic: true });
     expect(rendered).toContain('Capture receipt: status=partial');
     expect(rendered).toContain('- derived from the retained provider trace only');
   });
@@ -3443,7 +3456,7 @@ describe('continuation record (boundary)', () => {
   };
 
   it('renders a source-linked continuation record from captured facts on the rich path', () => {
-    const rendered = renderRebirthPackageV6(model());
+    const rendered = renderRebirthPackageV6(model(), { diagnostic: true });
     const text = record(rendered);
     // The request body is rendered once, in EXACT ACTIVE REQUEST below; the
     // record points at it with its size and source instead of repeating it.
@@ -3463,7 +3476,7 @@ describe('continuation record (boundary)', () => {
   });
 
   it('renders honest unknowns when the model carries no facts, edits, or cognition', () => {
-    const text = record(renderRebirthPackageV6(adaptLegacyRebirthPackageToV6({ lifecycleBoundary: 'continuation' })));
+    const text = record(renderRebirthPackageV6(adaptLegacyRebirthPackageToV6({ lifecycleBoundary: 'continuation' }), { diagnostic: true }));
     expect(text).toContain('active-request=unknown');
     expect(text).toContain('checkpoint=none-captured');
     expect(text).toContain('latest-validation=none-captured');
@@ -3517,7 +3530,7 @@ describe('continuation record (boundary)', () => {
         unknownReasons: [],
       },
     });
-    const text = record(renderRebirthPackageV6(value));
+    const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
     expect(text).toContain('pending-operation=⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-9 · source-time=');
     // Count covers every blocker; "newest" is chosen among known-time rows only.
     expect(text).toContain('unresolved-blockers=2 · newest: Typecheck fails in src/example.ts · source=blocker:one · source-time=');
@@ -3552,14 +3565,16 @@ describe('continuation record (boundary)', () => {
       instanceId: 'instance-a',
       capturedAt: '2026-08-02T18:00:01.000Z',
     });
-    const text = record(rendered);
-    // The newest trailing operator row's exact persisted identity is the
-    // request's source on the raw path — never the literal `unknown`.
-    expect(text).toContain('active-request=[same bytes as EXACT ACTIVE REQUEST below] · 15 chars · source=message:user-2 · source-time=');
-    expect(rendered).toContain('[EXACT ACTIVE REQUEST · 15 chars · source=message:user-2 · source-time=2026-08-02T18:00:00.000Z · status=exact]');
+    // The raw fallback delivers the compact boundary, so these facts render as
+    // boundary prose rather than a CONTINUATION RECORD block. The invariants are
+    // unchanged: the newest trailing operator row's exact persisted identity is
+    // the request's source (never the literal `unknown`), the request body is
+    // rendered exactly once, and the trailing operation keeps its own source.
+    expect(rendered).not.toContain('[CONTINUATION RECORD');
+    expect(rendered).toMatch(/\[EXACT ACTIVE REQUEST ⟨message:user-2 @[^⟩]*18:00:00Z⟩\]/u);
+    expect(rendered).not.toMatch(/\[EXACT ACTIVE REQUEST ⟨unknown /u);
     expect(rendered.match(/Also mirror it\./gu)).toHaveLength(1);
-    expect(text).toContain('pending-operation=⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-1 · source-time=');
-    expect(text).toContain('recover: transcript=R');
+    expect(rendered).toMatch(/Pending operation: ⟨tool Bash \{"command":"npm test"\}⟩ · operation=in-flight ⟨message:tool-1 @[^⟩]*17:58:10Z⟩/u);
   });
 
   it('renders the git checkpoint from the NOW card repository probe and skips errored or sha-less roots', () => {
@@ -3584,7 +3599,7 @@ describe('continuation record (boundary)', () => {
         },
       },
     });
-    const text = record(renderRebirthPackageV6(value));
+    const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
     expect(text).toContain('checkpoint=voxxo-swarm:main@22a4cf5 dirty=19 staged=1 · source=test:ops · source-time=');
     expect(text).not.toContain('context-warp-drive');
   });

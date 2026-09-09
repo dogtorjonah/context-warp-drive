@@ -207,47 +207,91 @@ function benchmarkModel(): RebirthPackageV6Model {
   });
 }
 
+/**
+ * Two rendered modes, two goldens (rail-72adf723 S17).
+ *
+ * DELIVERY is what an agent actually wakes up reading: one interleaved
+ * Timeline, compact `⟨source @time⟩` anchors, life/episode/vault detail
+ * relocated to the continuity ledger. DIAGNOSTIC is the explicit operator
+ * audit view that still carries the long `key=value` provenance rows.
+ *
+ * Both are frozen. The delivery golden is the contract a successor reads; the
+ * diagnostic golden is what keeps the compaction honest, because every fact
+ * the compact view shortens must still be provable in full somewhere. A fact
+ * that vanishes from BOTH is a regression, not a density win.
+ */
+const DELIVERY = { packageBudget: 150_000 } as const;
+const AUDIT = { packageBudget: 150_000, diagnostic: true } as const;
+
 describe('rebirth package golden fixture (synthetic renderer model)', () => {
-  it('renders deterministically; full-render SHA-256 is frozen', () => {
+  it('renders deterministically; full-render SHA-256 is frozen in both modes', () => {
     const model = benchmarkModel();
     // Determinism: identical input must produce identical output.
-    const first = renderRebirthPackageV6WithReport(model, { packageBudget: 150_000 });
-    const second = renderRebirthPackageV6WithReport(model, { packageBudget: 150_000 });
+    const first = renderRebirthPackageV6WithReport(model, DELIVERY);
+    const second = renderRebirthPackageV6WithReport(model, DELIVERY);
     expect(second.text).toBe(first.text);
 
-    const hash = createHash('sha256').update(first.text, 'utf8').digest('hex');
-    // Frozen byte-exact hash of the full render. Update deliberately only when
-    // the renderer's formatting/honesty output intentionally changes.
-    expect(hash).toBe('9eed91840f20465357dac781893ee20e74700af8bd4be75caf6e514e7efb08cf');
+    const audit = renderRebirthPackageV6WithReport(model, AUDIT);
+    expect(renderRebirthPackageV6WithReport(model, AUDIT).text).toBe(audit.text);
+    // The two modes must not silently converge: a diagnostic view identical to
+    // the delivered one would mean the compaction never happened.
+    expect(audit.text).not.toBe(first.text);
+
+    const sha = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
+    // Frozen byte-exact hashes. Update deliberately only when the renderer's
+    // formatting/honesty output intentionally changes.
+    expect(sha(first.text)).toBe('54b480cad522b19b2a74c0dbb96470ea53e5c0afc20524895b21de950a3b365a');
+    expect(sha(audit.text)).toBe('6b26bcca0d7b08ad26e11a5d4701e9041fc6a59dc21c4c1fb18ae761dcfdfd64');
   });
 
-  it('renders every section into the framed output', () => {
-    const { text } = renderRebirthPackageV6WithReport(benchmarkModel(), { packageBudget: 150_000 });
-    for (const marker of [
-      '── Boundary and Active Task ──',
-      '── Execution State ──',
-      '── Active Edit Delta ──',
-      '── Cognitive Artifacts ──',
-      '── Recent Conversation ──',
-      '── Operator Vault ──',
-      '── Episode Chapter Index ──',
-      '── Life Ledger ──',
-      '── Recovery Index ──',
-    ]) {
-      expect(text, `section ${marker}`).toContain(marker);
-    }
-    expect([...text.matchAll(/\[REBIRTH-V6-SECTION id=([A-Za-z]+) order=(\d+)(?: dir=\w+)? chars=\d+\]/gu)]
-      .map((match) => `${match[1]}:${match[2]}`)).toEqual([
-      'boundaryAndActiveTask:1',
-      'executionState:3',
-      'activeEditDelta:4',
-      'cognitiveArtifacts:5',
-      'recentConversation:6',
-      'operatorVault:7',
-      'episodeChapterIndex:8',
-      'lifeLedger:9',
-      'recoveryIndex:10',
-    ]);
+  const sectionIds = (text: string): string[] => [
+    ...text.matchAll(/\[REBIRTH-V6-SECTION id=([A-Za-z]+) order=(\d+)(?: dir=\w+)? chars=\d+\]/gu),
+  ].map((match) => `${match[1]}:${match[2]}`);
+
+  const SHARED_SECTIONS = [
+    '── Boundary and Active Task ──',
+    '── Execution State ──',
+    '── Active Edit Delta ──',
+    '── Timeline ──',
+    '── Recovery Index ──',
+  ] as const;
+
+  // Cognition and conversation are ONE chronological section now; splitting
+  // them is what let a single artifact render twice under two authorities. The
+  // vault/episode/life sections are relocated to the continuity ledger. This is
+  // structure, not presentation, so BOTH modes share it — `diagnostic` is a
+  // verbosity flag, never a legacy-layout escape hatch.
+  const RETIRED_SECTIONS = [
+    '── Cognitive Artifacts ──',
+    '── Recent Conversation ──',
+    '── Operator Vault ──',
+    '── Episode Chapter Index ──',
+    '── Life Ledger ──',
+  ] as const;
+
+  it.each([['delivery', DELIVERY], ['diagnostic', AUDIT]] as const)(
+    'renders one interleaved Timeline and no retired sections (%s)',
+    (_mode, options) => {
+      const { text } = renderRebirthPackageV6WithReport(benchmarkModel(), options);
+      for (const marker of SHARED_SECTIONS) expect(text, `section ${marker}`).toContain(marker);
+      for (const retired of RETIRED_SECTIONS) expect(text, `retired ${retired}`).not.toContain(retired);
+      expect(sectionIds(text)).toEqual([
+        'boundaryAndActiveTask:1',
+        'executionState:3',
+        'activeEditDelta:4',
+        'recentConversation:6',
+        'recoveryIndex:10',
+      ]);
+    },
+  );
+
+  it('states the relocated life/episode/vault census rather than dropping it', () => {
+    const { text } = renderRebirthPackageV6WithReport(benchmarkModel(), DELIVERY);
+    // Retired sections' units are relocated, not deleted: the delivered package
+    // still says how many exist and that the stores retain them.
+    expect(text).toMatch(/History census: \d+ lives;/u);
+    expect(text).toMatch(/\d+ episodes/u);
+    expect(text).toMatch(/\d+ vault units retained in stores/u);
   });
 
   it('renders literal boundary, partial-lane, vault, review-demand, and endpoint truth rows', () => {
@@ -275,25 +319,52 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
       episodeChapterIndex: base.episodeChapterIndex,
       lifeLedger: base.lifeLedger,
     });
-    const { text } = renderRebirthPackageV6WithReport(withReviewDemand, { packageBudget: 150_000 });
+    const { text } = renderRebirthPackageV6WithReport(withReviewDemand, AUDIT);
     expect(text).toContain('versions=model:rebirth-package-v7/v1 · render:v6-sections · capture-id:naming-v2 · provenance:v1 · frame:rebirth-v6-section');
-    expect(text).toContain('capture-partial-lanes=active-edit-delta:not-requested · class-vocabulary=horizon|cap|store|merge|not-requested|unknown');
+    // A lane nobody requested is not a partially-captured lane, so it no
+    // longer inflates the partial-lane census; its own row still says so.
+    // A lane nobody requested is not a partially-captured one, and a section
+    // D2 relocated to the ledger is not a truncated one. Both distinctions live
+    // in this single header; collapsing either into `cap` sends a successor
+    // hunting for bytes that were never lost.
+    expect(text).toContain('capture-partial-lanes=active-edit-delta:not-requested,operator-vault:relocated,episode-chapter-index:relocated,life-ledger:relocated · class-vocabulary=horizon|cap|store|merge|relocated|not-requested|unknown');
+    expect(text).toContain('status=not-requested');
     expect(text).toContain('vault-newest=2026-09-01T20:47:52.476Z · active-request=2026-09-01T20:47:52.476Z');
-    expect(text).toContain('- rail-review-state=independent correction review pending · source=review:bench');
+    // Execution-state rows carry the shared ⟨source @time⟩ anchor in both
+    // modes; the diagnostic view is verbose in the Boundary, not everywhere.
+    expect(text).toContain('- rail-review-state=independent correction review pending ⟨review:bench @09-01 21:19:40Z⟩');
     expect(text).toContain('[EXACT ACTIVE REQUEST · 48 chars · source=msg_active · source-time=2026-09-01T20:47:52.476Z · status=exact]');
     expect(text).toContain('[LAST MATERIAL ASSISTANT · 24 chars · source=msg_last · source-time=2026-09-01T20:48:13.307Z · status=exact]');
+
+    // Delivery keeps both endpoints and both source identities; only the
+    // five-clause provenance uniform collapses to one anchor. The bodies stay
+    // verbatim, and each still renders exactly once (#37479).
+    const delivered = renderRebirthPackageV6WithReport(withReviewDemand, DELIVERY).text;
+    expect(delivered).toContain('[EXACT ACTIVE REQUEST ⟨msg_active @09-01 20:47:52Z⟩]');
+    expect(delivered).toContain('[LAST MATERIAL ASSISTANT ⟨msg_last @09-01 20:48:13Z⟩]');
+    expect(delivered.match(/\[EXACT ACTIVE REQUEST /gu)).toHaveLength(1);
+    expect(delivered.match(/\[LAST MATERIAL ASSISTANT /gu)).toHaveLength(1);
+    // The review demand is execution state a successor must not lose.
+    expect(delivered).toContain('independent correction review pending');
   });
 
   it('renders honest not-requested recovery lanes with their reason (S4/S6 contract)', () => {
-    const { text } = renderRebirthPackageV6WithReport(benchmarkModel(), { packageBudget: 150_000 });
+    const { text } = renderRebirthPackageV6WithReport(benchmarkModel(), AUDIT);
     expect(text).toContain('status=not-requested');
     expect(text).toContain('reason=sidecar build path did not request an immutable Atlas edit capture');
     // Empty-handle not-requested lane renders recover=not-requested, never a
     // contradictory recover=unavailable fake handle.
-    expect(text).toContain('status=not-requested');
     expect(text).toContain('recover=not-requested');
     // A not-requested capture must not read as an attempted failure.
     expect(text).not.toContain('capture-degraded=active-edit-delta');
+
+    // Delivery drops the `status=` key, never the distinction it carries: a
+    // lane nobody asked for must still not read as a lane that failed.
+    const delivered = renderRebirthPackageV6WithReport(benchmarkModel(), DELIVERY).text;
+    expect(delivered).toContain('- atlas-edit-capture · not-requested · recover=not-requested · reason=sidecar build path did not request an immutable Atlas edit capture');
+    expect(delivered).not.toContain('capture-degraded=active-edit-delta');
+    // A lane nobody asked for must never advertise a fake handle.
+    expect(delivered).not.toContain('recover=unavailable');
   });
 
   it('renders the producer-fed lineage-chain and honest ops Now-card lines when supplied', () => {
@@ -329,15 +400,28 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
       episodeChapterIndex: base.episodeChapterIndex,
       lifeLedger: base.lifeLedger,
     });
-    const { text } = renderRebirthPackageV6WithReport(chained, { packageBudget: 150_000 });
+    const { text } = renderRebirthPackageV6WithReport(chained, AUDIT);
     expect(text).toContain('lineage-chain=root (inst-root) · 2026-08-24→2026-08-31 · archived');
     expect(text).toContain('worker-a (inst-a) · 2026-09-01→now · live-at-capture');
     expect(text).toContain('ops=git:unknown:worker-git-status-not-captured');
     expect(text).toContain('owned-live-children=continuity-scout(child-1)');
     expect(text).toContain('squad=squad-rebirth · rooms=rebirth-package-levelup');
+
+    // Delivery carries each of those facts in one prose line apiece. The
+    // 2026-09-09 cross-agent pollution was caught because the chain named who
+    // this instance descends from, so the chain is load-bearing, not decor.
+    const delivered = renderRebirthPackageV6WithReport(chained, DELIVERY).text;
+    expect(delivered).toContain('Lineage: root (inst-root) 2026-08-24→2026-08-31 archived → worker-a (inst-a) 2026-09-01→now live-at-capture');
+    // A failed repository probe still answers "what is the tree at?" — it must
+    // report unknown with its reason, never fall silent.
+    expect(delivered).toContain('Checkpoint: unknown · worker git status not captured');
+    // Principle 15: a live agent-created child is an inherited teardown debt.
+    expect(delivered).toContain('Owned children (teardown owed): continuity-scout(child-1)');
+    // Principle 14 scopes review eligibility to the executor's own squad.
+    expect(delivered).toContain('Squad: squad-rebirth');
   });
 
-  it('renders the legacy Runtime Model parity block when runtime-model context is supplied (integration gate)', () => {
+  it('renders the runtime-model transition in both modes, including unchanged (integration gate)', () => {
     const base = benchmarkModel();
     const withRuntime = buildRebirthPackageV6Model({
       boundaryAndActiveTask: {
@@ -358,12 +442,20 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
       episodeChapterIndex: base.episodeChapterIndex,
       lifeLedger: base.lifeLedger,
     });
-    const { text } = renderRebirthPackageV6WithReport(withRuntime, { packageBudget: 150_000 });
-    // Even an unchanged transition must render the block (parity with legacy).
-    expect(text).toContain('── Runtime Model ──');
-    expect(text).toContain('Predecessor: codex/gpt-5.5');
-    expect(text).toContain('Current/successor: codex/gpt-5.5');
-    expect(text).toContain('Changed: no');
+    const { text } = renderRebirthPackageV6WithReport(withRuntime, AUDIT);
+    // The four-line `── Runtime Model ──` block is retired; the transition it
+    // carried is not, and an UNCHANGED transition still has to render — a
+    // successor that cannot see it does not know whether the model reasoning
+    // now is the one that produced the work it inherited.
+    expect(text).not.toContain('── Runtime Model ──');
+    expect(text).toContain('runtime-model=codex/gpt-5.5 -> codex/gpt-5.5 · changed=no');
+
+    // Delivery states the same transition on one line, including the unchanged
+    // case: a successor that cannot see it would not know whether the model it
+    // is reasoning with is the one that produced the work it inherited.
+    const delivered = renderRebirthPackageV6WithReport(withRuntime, DELIVERY).text;
+    // Same vocabulary in both modes: one fact, one grammar.
+    expect(delivered).toContain('Runtime codex/gpt-5.5 → codex/gpt-5.5; changed=no');
   });
 
   it('renders a nonempty handle verbatim even on a not-requested lane (recover= contract)', () => {

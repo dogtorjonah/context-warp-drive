@@ -207,15 +207,21 @@ describe('FoldSession hard-epoch consume', () => {
     // The live question is carried only by the canonical exact-request block.
     // The provider merge must recognize it and avoid appending a second trailer.
     expect(content).toContain('LIVE CURRENT QUESTION');
-    expect(content.match(/\[EXACT ACTIVE REQUEST ·/gu)).toHaveLength(1);
+    // #37479 single-render invariant. Matched on the block opener alone so the
+    // count keeps holding across the long (`· N chars · source=…`) and compact
+    // (`⟨source @time⟩`) header grammars — what must never change is ONE.
+    expect(content.match(/\[EXACT ACTIVE REQUEST /gu)).toHaveLength(1);
     expect(content).not.toContain(HARD_EPOCH_LIVE_TURN_HEADER);
     // The v4 `captured=...·frontier=...` provenance line migrated to the v6
-    // Recovery Index's source/frontier semantics; assert that semantic actually
-    // rendered rather than omitting it. For this 5-message fixture the raw tail
-    // frontier is event#4 (each of the 5 folded rows is a canonical event and the
-    // live turn is the trailing event), with unavailable recoverability because
-    // the immutable capture/backing stores are absent here.
-    expect(content).toContain('frontier=event#4');
+    // boundary's capture anchor; assert that semantic actually rendered rather
+    // than omitting it. For this 5-message fixture the raw tail frontier is
+    // event#4 (each of the 5 folded rows is a canonical event and the live turn
+    // is the trailing event), with unavailable recoverability because the
+    // immutable capture/backing stores are absent here. D1 dropped the `key=`
+    // punctuation from the compact anchor, so the frontier is asserted on the
+    // capture line that carries it rather than as a bare `frontier=` token.
+    const captureAnchor = content.split('\n').find((l) => l.startsWith('Capture ')) ?? '';
+    expect(captureAnchor).toContain('frontier event#4');
     // The retired v4 `── Continuity Boundary (RECOVERY COORDINATES) ──` header is
     // gone; the v6 raw seed renders the live turn behind the (still-current)
     // HARD_EPOCH_LIVE_TURN_HEADER trailer, which is asserted above.
@@ -245,19 +251,18 @@ describe('FoldSession hard-epoch consume', () => {
     expect(out.stats.epochReason).toBe('hard-epoch');
     const content = out.messages[0].content as string;
     // v6 raw hard-epoch: the retired v4 `── Starred Moments ... ──` header is
-    // gone; the starred waypoint content now lives in the v6 Cognitive Artifacts
-    // frame. Assert the frame marker preserving the exact starred decision and
-    // source-time/source-id provenance (assertions below), and that the retired
-    // header is absent.
-    expect(content).toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5 dir=desc chars=');
-    // Structured trace cognition: the waypoint is a v6 row whose kind is its
-    // category, whose source is the exact tool-call id, and whose authority
-    // is pointer — never a re-rendered legacy ⭐ prose line.
+    // gone, and the separate Cognitive Artifacts frame is gone with it — a
+    // starred waypoint is something the agent DID, so it belongs in the one
+    // chronological Timeline beside the turns that produced it.
+    expect(content).toContain('[REBIRTH-V6-SECTION id=recentConversation order=6 dir=asc chars=');
+    // Structured trace cognition: the waypoint keeps its category as its kind,
+    // its authority, its exact tool-call id, and its source time — never a
+    // re-rendered legacy ⭐ prose line.
     expect(content).toMatch(
-      /· decision · Freeze intentional waypoints into raw hard epochs\. · source=call_hard_epoch_star · source-time=[^·]*20:29:00/u,
+      /decision \[pointer\]\nFreeze intentional waypoints into raw hard epochs\.\n⟨call_hard_epoch_star @[^⟩]*20:29:00Z⟩/u,
     );
-    expect(content).toContain('authority=pointer');
     expect(content).not.toContain('── Starred Moments (curated tap_star waypoints; separate from the thought trail) ──');
+    expect(content).not.toContain('── Cognitive Artifacts ──');
     expect(content).toContain('LIVE STARRED QUESTION');
   });
 

@@ -8,6 +8,14 @@
 
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import {
+  COMPACT_RECOVERY_PREAMBLE,
+  COMPACT_RECOVERY_SUPPRESSED_ROWS,
+  compactBoundary,
+  continuityAnchor,
+  currentTaskHazards,
+  historyCensus,
+} from './continuityPresentation.ts';
 
 import type {
   ContinuityHazardDescriptor,
@@ -250,11 +258,13 @@ export interface RebirthPackageV6RepositoryState {
 }
 
 /**
- * Optional runtime-model continuity carried into the v6 Boundary for legacy
- * Runtime Model parity (integration gate). The structured v6 renderer must
- * still surface the model transition (predecessor → successor, and whether it
- * changed) that the legacy render always emitted as `── Runtime Model ──`, so
- * the assembler supplies this context whenever the legacy package has it.
+ * Optional runtime-model continuity carried into the v6 Boundary. The legacy
+ * `── Runtime Model ──` heading block is retired — four framed lines for three
+ * tokens of information — but the fact it carried is not: the transition
+ * (predecessor → successor, and whether it changed) still renders in BOTH
+ * modes, as `runtime-model=… -> … · changed=no` in the diagnostic view and as
+ * `Runtime … → …; changed=no` in the delivered one. The assembler supplies
+ * this context whenever the legacy package has it.
  * Optional so retained v1 models (and existing constructors that predate this
  * field) remain valid; absent means no runtime-model context was provided.
  */
@@ -519,6 +529,8 @@ export interface RebirthPackageV6ActiveEditDelta {
 
 export interface RebirthPackageV6CognitiveArtifact {
   readonly provenanceId: string;
+  /** Author identity from the source record; missing on legacy rows means unknown. */
+  readonly sourceInstanceId?: string | null;
   readonly sourceAt: string | null;
   /** Registryglyph kind. `active_request` is S5 (audit-3 B7): a 🧭 continuity
    *  claim is an observation, never an instruction — so it is never painted as
@@ -783,6 +795,8 @@ export interface AdaptLegacyRebirthPackageV6Options {
 }
 
 export interface RenderRebirthPackageV6Options {
+  /** Explicit audit view; delivery defaults to compact agent presentation. */
+  readonly diagnostic?: boolean;
   /**
    * Soft total-package target (protected relay envelope included). When the
    * first render is larger, collapse-citizen sections are re-rendered at
@@ -833,6 +847,63 @@ export interface RenderedRebirthPackageV6Section {
   readonly collapse?: CollapseResult | null;
   /** Exact source-unit disposition for non-collapse omission citizens. */
   readonly unitPlacements?: readonly RebirthPackageV6UnitPlacement[];
+  /** Typed display rows; ledger ownership remains on the original section. */
+  readonly timelineRows?: readonly RebirthTimelineRow[];
+  readonly timelineSummary?: string;
+  /**
+   * Structured omission accounting for the unified timeline. The prose
+   * `timelineSummary` stays for diagnostic renders; the agent-facing package
+   * derives ONE census line from these numbers instead of re-parsing prose.
+   */
+  readonly timelineCensus?: RebirthTimelineCensus;
+}
+
+/**
+ * One ledger command for the whole capture instead of one per section. The
+ * section filter is the only difference between the per-section handles, so
+ * dropping it yields a command that addresses every omitted unit at once —
+ * the agent reads one route, not nine near-identical ones.
+ */
+function captureScopedLedgerCommand(handle: string | null): string | null {
+  if (!handle) return null;
+  const stripped = handle.replace(/\s*section_id="[^"]*"/u, '').replace(/\s{2,}/gu, ' ').trim();
+  return stripped.length > 0 ? stripped : null;
+}
+
+/**
+ * The timeline's one executable route back to what it did not render whole.
+ *
+ * God Rule 9: a census that declares omitted units without naming a recovery
+ * command is negative evidence dressed as accounting. The ledger addresses
+ * omitted rows by owner + capture id, so the command is derivable whenever
+ * those two identities are known — it does not additionally depend on the
+ * assembler having supplied a `continuity-ledger` directory row.
+ */
+function captureScopedOmissionCommand(model: RebirthPackageV6Model): string | null {
+  const owner = model.boundaryAndActiveTask.instanceId?.trim();
+  const captureId = model.boundaryAndActiveTask.captureId?.trim();
+  if (!owner || owner === 'unknown' || !captureId || captureId === 'unknown') return null;
+  return `continuity_ledger action="fetch" owner=${JSON.stringify(owner)}`
+    + ` capture_id=${JSON.stringify(captureId)}`
+    + ' omitted_only=true include_unknown_source_time=true limit=200';
+}
+
+/** Ledger-parity accounting for one timeline contributor section. */
+interface RebirthTimelineCensus {
+  readonly captured: number;
+  readonly rendered: number;
+  readonly matched: number | null;
+  /** suppressed-whole + rendered-truncated; equals the ledger's omitted rows. */
+  readonly incomplete: number;
+  /** Capture-scoped ledger command, section filter stripped. Null when nothing was omitted. */
+  readonly omissionCommand: string | null;
+}
+
+interface RebirthTimelineRow {
+  readonly id: string;
+  readonly sourceAt: string | null;
+  readonly text: string;
+  readonly compactText?: string;
 }
 
 export interface RebirthPackageV6UnitPlacement {
@@ -856,103 +927,39 @@ const SECTION_TITLES: Readonly<Record<RebirthPackageV6SectionId, string>> = Obje
 });
 
 /**
- * Generational floors (spec §4, dynamic fill 2026-08-26). These defaults are
- * scarcity weights and starting floors, never ceilings: Adaptive Backfill (§7)
- * offers unspent envelope room to EVERY admitted, non-explicit, incomplete
- * section, so no default below may truncate, omit, or evict content while the
- * 150k envelope has room. The ordinary profile is 145k content plus 5k framing.
- * Brain Merge adds a conditional protected cap and receives its own 300k
- * lifecycle envelope. Older lineage units collapse through the Continuity Ledger while
- * active-task, merge synthesis, and recovery sections remain must-push. Under
- * contention (demand > envelope) these values are the fairness partition and
- * the pre-dynamic scarcity behavior is preserved unchanged.
+ * Ordinary content: boundary 5k, timeline 105k, execution/edits 15k,
+ * recovery 10k, reserve 10k. Framing has a separate 5k allowance.
+ * The reserve belongs to dialogue unless merge synthesis is present.
+ * Conversation gets first admission; cognition may use only its remainder.
+ * These are phase ceilings, not scarcity weights that backfill can override.
  */
 export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
   Record<RebirthPackageV6SectionId, number>
 > = Object.freeze({
-  boundaryAndActiveTask: 15_000,
-  brainMergeSynthesis: 30_000,
-  executionState: 4_000,
-  // Edit evidence is the most re-derivable section in the package: every byte of
-  // it can be recovered from Atlas history, diffs, snapshots, and this section's
-  // own recovery handle. It held 60k — the entire 100k→150k increase — so diffs
-  // would stop clipping to a 10k summary. 30k still carries ordinary sessions at
-  // full fidelity and its unspent capacity keeps flowing to backfill, so the 30k
-  // it releases funds the one section that cannot be re-derived at all.
-  activeEditDelta: 24_000,
-  // An agent's own conclusions are the least recoverable continuity that exists.
-  // Source can be re-read and edits re-diffed, but a ruled-out hypothesis, a
-  // gotcha, or the reasoning behind a decision dies with the context that held
-  // it. At 6k this section shipped a token sample of a lifetime of cognition.
-  //
-  // A char cap alone cannot deliver this budget: the sidecar wire contract evicts
-  // the projection down to MAX_REBIRTH_COGNITIVE_PROJECTION_ROWS rows before this
-  // cap is ever consulted, so that row cap must stay high enough for the char
-  // budget to be the binding constraint rather than decoration.
-  cognitiveArtifacts: 50_000,
-  recentConversation: 12_000,
-  // The v7 lineage caps below are deliberately NOT the place to fund a larger
-  // section. Push-shrink degrades a body gracefully only while it stays above
-  // the collapse floor, so the lineage sections are also the package's shrinkable
-  // reserve against a protected, non-shrinkable relay envelope. Trimming them
-  // buys section budget by spending amputation headroom: a 24k oversubscription
-  // that used to shrink starts eliding whole sections instead.
-  operatorVault: 20_000,
-  // Episodes are the most re-derivable lineage section (the canonical
-  // transcript re-derives every band), so they fund the B7 life-ledger
-  // recency increase: episode 10k->5k pays for lifeLedger 5k->10k (operator
-  // default: 10k ledger cap,
-  // 5k spent from the lineage shrinkable reserve). The envelope total stays
-  // 150k under the fixed budget.
-  episodeChapterIndex: 5_000,
-  lifeLedger: 10_000,
-  recoveryIndex: 5_000,
+  boundaryAndActiveTask: 5_000,
+  brainMergeSynthesis: 10_000,
+  executionState: 3_000,
+  activeEditDelta: 12_000,
+  cognitiveArtifacts: 0,
+  recentConversation: 115_000,
+  operatorVault: 0,
+  episodeChapterIndex: 0,
+  lifeLedger: 0,
+  recoveryIndex: 10_000,
 });
 
 export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 150_000;
 
-/**
- * Audit-3 C1: phase-aware section budgets.
- *
- * The generic default partition (`DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS`
- * above) is phase-blind: it always gives 47%+ of the content budget to the
- * closed-wave chat/cognition chatter that dominates a rail-complete
- * continuation and under-prioritizes the pending/landed facts a successor in
- * that phase actually needs. The execution phase is DERIVED from facts already
- * on the model (never a new capture):
- *
- *   - rail-complete  → the current rail's state is 'complete' (or a terminal
- *                      review-close state). AED cuts to its summary floor (the
- *                      edits are landed; hunks are re-derivable from Atlas), a
- *                      modest cognition sees the already-preserved key rows,
- *                      and Recovery + Execution State get the room a handoff
- *                      needs.
- *   - rail-active    → the current rail is present and still open. The generic
- *                      defaults above already distribute for this case, so the
- *                      phase partition leaves them untouched (empty overrides
- *                      => is a no-op).
- *   - no-rail        → no current rail (idle/continuation without a rail). The
- *                      density of landed-vs-pending still favors recovery/
- *                      execution over live AED chatter, so it shares the
- *                      rail-complete partition (operator-aligned: "what is
- *                      pending, what landed, and the operator's last words —
- *                      almost nothing else").
- *
- * The phase table is push-down over the defaults inside the section-allocator
- * init, so an explicit caller-supplied `sectionMaxChars` override still wins
- * for the sections it names (the phase partition only fills unstated slots).
- */
+/** Phase ceilings derive from captured rail facts; unknown is not idle. */
 export type RebirthPackageExecutionPhase = 'rail-active' | 'rail-complete' | 'no-rail';
 
 /** W1-ratified rail-complete / no-rail partition (plan §3 Q4). */
 export const RAIL_COMPLETE_SECTION_OVERRIDES: Readonly<
   Partial<Record<RebirthPackageV6SectionId, number>>
 > = Object.freeze({
-  activeEditDelta: 8_000,
-  cognitiveArtifacts: 30_000,
-  recoveryIndex: 8_000,
-  operatorVault: 25_000,
-  episodeChapterIndex: 8_000,
+  executionState: 500,
+  activeEditDelta: 500,
+  recentConversation: 129_000,
 });
 
 /** W1-ratified rail-complete / no-rail backfill priority (recovery/execution first). */
@@ -2185,16 +2192,24 @@ export function adaptLegacyRebirthPackageToV6(
       ...receiptFactSource('review', reviewState, receipt?.liveState?.review.source),
     });
   }
-  for (const room of receipt?.liveState?.rooms.value ?? []) {
-    const text = `room=${room}`;
+  // D2(e): room and subscription membership is ONE observation taken at ONE
+  // capture instant, not N independently timed events. The audited specimen
+  // rendered fourteen coordination rows that all carried the same stamp, which
+  // reads as chronology and costs fourteen anchors for one fact. Collapse each
+  // list into a single counted fact; the members stay named, so nothing is lost
+  // but the repetition.
+  const rooms = receipt?.liveState?.rooms.value ?? [];
+  if (rooms.length > 0) {
+    const text = `rooms=${rooms.length}: ${rooms.join(', ')}`;
     executionFacts.push({
       kind: 'coordination',
       text,
       ...receiptFactSource('coordination', text, receipt?.liveState?.rooms.source),
     });
   }
-  for (const subscription of receipt?.liveState?.subscriptions.value ?? []) {
-    const text = `subscription=${subscription}`;
+  const subscriptions = receipt?.liveState?.subscriptions.value ?? [];
+  if (subscriptions.length > 0) {
+    const text = `subscriptions=${subscriptions.length}: ${subscriptions.join(', ')}`;
     executionFacts.push({
       kind: 'coordination',
       text,
@@ -2861,8 +2876,16 @@ function formatBuilderIdentityLine(builder: RebirthPackageV6BoundaryAndActiveTas
   const unaccountedMs = prepTotalMs !== null && totalWallMs !== null
     ? totalWallMs - prepTotalMs - (buildMsValue ?? 0)
     : null;
+  // S1: a residual reported as "cause unknown" tells an operator nothing it can
+  // act on. The span is bounded by construction — request→capture minus the
+  // instrumented prep stages minus package build — so name the UNINSTRUMENTED
+  // stages that can live inside it instead of leaving the reader to guess. This
+  // is a declaration of what is not yet measured, never an estimate: no share
+  // is attributed to any named stage without its own measurement (GOD RULE 7).
   const unaccountedText = unaccountedMs !== null
-    ? ` · unaccounted=${unaccountedMs}ms (cause unknown${unaccountedMs < 0 ? '; inconsistent measured spans' : ''}; capture only, not delivery/readiness)`
+    ? ` · unaccounted=${unaccountedMs}ms (${unaccountedMs < 0
+      ? 'inconsistent measured spans; '
+      : ''}uninstrumented: worker queue wait, request/response transport, capture persistence; capture only, not delivery/readiness)`
     : '';
   return `built-by=${path}${endpoint} · src=${treeSha} · files=${files}${packageBuildMs}${builtMs}${git}${sidecarBoot}${relayBoot}${prepText}${requestToCapture}${unaccountedText}`;
 }
@@ -3043,6 +3066,18 @@ export interface RebirthSectionCompletenessEntry {
   readonly reason: string | null;
   /** True when the body render lost content (incomplete/demoted/rolled-up). */
   readonly renderLoss: boolean;
+  /**
+   * True when the delivery deliberately does not render this section (limit 0)
+   * because D2 relocated its units to the continuity ledger.
+   *
+   * This is NOT a render loss, and calling it one is a lie with four mouths:
+   * the `capture-partial-lanes=` header, the Recovery Index `reason=`, the
+   * `RENDER-INCOMPLETE` trailer, and the section's own `partial=` surface all
+   * read this census. A successor told `operator-vault:cap` believes its vault
+   * was truncated under budget and goes looking for what it lost; the truth is
+   * that every unit is intact and addressed in the ledger.
+   */
+  readonly relocated: boolean;
 }
 
 export type RebirthSectionCompleteness = ReadonlyMap<
@@ -3078,6 +3113,7 @@ function hasCollapseLoss(body: RenderedV6SectionBody): boolean {
 export function computeSectionCompleteness(
   model: RebirthPackageV6Model,
   rendered: Readonly<Record<RebirthPackageV6SectionId, RenderedV6SectionBody>>,
+  limits?: Readonly<Record<RebirthPackageV6SectionId, number>>,
 ): RebirthSectionCompleteness {
   const census = new Map<RebirthPackageV6SectionId, RebirthSectionCompletenessEntry>();
   const sectionReason = (id: RebirthPackageV6SectionId): { reason: string | null; explained: boolean } => {
@@ -3108,7 +3144,8 @@ export function computeSectionCompleteness(
     if (!body) continue;
     const { reason, explained } = sectionReason(id);
     const loss = !body.complete || hasCollapseLoss(body);
-    if (!explained && !loss) continue;
+    const relocated = limits !== undefined && limits[id] <= 0;
+    if (!explained && !loss && !relocated) continue;
     const cls: RebirthPartialReasonClass | null = explained
       ? (id === 'cognitiveArtifacts' && classifyPartialReason(reason) === 'unknown'
         // Cognitive capture warnings are store-family even when their wording
@@ -3116,7 +3153,7 @@ export function computeSectionCompleteness(
         ? 'store'
         : classifyPartialReason(reason))
       : null;
-    census.set(id, { id, class: cls, reason, renderLoss: loss });
+    census.set(id, { id, class: cls, reason, renderLoss: loss, relocated });
   }
   return census;
 }
@@ -3124,8 +3161,15 @@ export function computeSectionCompleteness(
 /** Kebab lane label + optional multi-class (`merge+cap`) for header lines. */
 function censusLaneLabel(entry: RebirthSectionCompletenessEntry): string {
   const classes: string[] = [];
+  // Capture-side partiality survives relocation: units merged or horizon-cut
+  // BEFORE the render are still merged or horizon-cut in the ledger, so the
+  // capture class always leads.
   if (entry.class) classes.push(entry.class);
-  if (entry.renderLoss && entry.class !== 'cap') classes.push('cap');
+  // Relocation replaces only the render-loss component. A section the delivery
+  // deliberately does not render is complete, elsewhere — saying `cap` sends a
+  // successor hunting for bytes that were never lost.
+  if (entry.relocated) classes.push('relocated');
+  else if (entry.renderLoss && entry.class !== 'cap') classes.push('cap');
   return `${SECTION_LANE_IDS[entry.id]}:${classes.join('+') || 'cap'}`;
 }
 
@@ -3198,6 +3242,9 @@ function renderContinuationRecord(
   const referenceAt = boundary.capturedAt;
   const facts = model.executionState?.facts ?? [];
   const clip = (text: string, max = 160): string => {
+    if (boundary.activeRequest && text.trim() === boundary.activeRequest.text.trim()) {
+      return `[EXACT ACTIVE REQUEST · source=${boundary.activeRequest.source.provenanceId}]`;
+    }
     const flat = text.replace(/\s+/gu, ' ').trim();
     return flat.length <= max ? flat : `${cutAtWordBoundary(flat, max - 1)}…`;
   };
@@ -3242,7 +3289,9 @@ function renderContinuationRecord(
   lines.push(validation
     ? `latest-validation=${clip(validation.text)} · ${stamp(validation)}`
     : 'latest-validation=none-captured');
-  const decision = newest(model.cognitiveArtifacts.filter((row) => row.kind === 'decision'));
+  const decision = newest(model.cognitiveArtifacts.filter((row) => row.kind === 'decision'
+    && row.sourceInstanceId === boundary.instanceId && !row.supersededBy
+    && row.sourceAt && Number.isFinite(Date.parse(row.sourceAt))));
   lines.push(decision
     ? `latest-decision=${clip(decision.text)} · ${stamp(decision)}`
     : 'latest-decision=none-captured');
@@ -3322,13 +3371,48 @@ function boundaryHazardsLine(
     : `execution-blockers=${blockerFacts.length}`;
 }
 
+/**
+ * D1 density: the agent-facing Boundary.
+ *
+ * Same facts, same source ids and source times, one short anchor per row
+ * instead of five `key=value` clauses. The endpoint bodies (exact active
+ * request, last material assistant) stay verbatim and take the section's
+ * remaining budget; when the assistant body cannot fit whole it degrades
+ * through the ordinary bounded-projection path with its transcript handle, so
+ * a clipped answer is never presented as a complete one.
+ */
+function renderCompactBoundary(
+  model: RebirthPackageV6Model,
+  maxChars: number,
+  references: RebirthRecoveryReferenceCatalog,
+): { text: string; complete: boolean } {
+  const recovery = recoveryReference(
+    references,
+    model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
+  );
+  const assistantSource = model.boundaryAndActiveTask.lastMaterialAssistant;
+  const frameOnly = compactBoundary(model, '');
+  const assistantBudget = Math.max(512, maxChars - frameOnly.length - 64);
+  const assistant = assistantSource
+    ? boundedText(assistantSource.text, assistantBudget, recovery)
+    : null;
+  const bounded = boundedText(compactBoundary(model, assistant?.text ?? null), maxChars, recovery);
+  return { text: bounded.text, complete: bounded.complete && (assistant?.complete ?? true) };
+}
+
 function renderBoundary(
   model: RebirthPackageV6Model,
   maxChars: number,
   completeness?: RebirthSectionCompleteness,
   references: RebirthRecoveryReferenceCatalog = buildRecoveryReferenceCatalog(model),
+  compact = false,
 ): { text: string; complete: boolean } {
   const boundary = model.boundaryAndActiveTask;
+  // D1: the delivered boundary is prose the agent reads, but it is budgeted by
+  // the same allocator as every other section. Rendering it here — rather than
+  // substituting it after sections were sized — is what keeps the section cap
+  // binding instead of advisory.
+  if (compact) return renderCompactBoundary(model, maxChars, references);
   // Capture-degraded (store failures) is distinct from the completeness census
   // (audit-3 A8): both stay single-source, the header cannot drift from the
   // section bodies it describes.
@@ -3351,7 +3435,7 @@ function renderBoundary(
     // capture.
     `budget-phase=${deriveRebirthExecutionPhase(model)}`,
     ...(partialLanes.length > 0
-      ? [`capture-partial-lanes=${partialLanes.join(',')} · class-vocabulary=horizon|cap|store|merge|not-requested|unknown`]
+      ? [`capture-partial-lanes=${partialLanes.join(',')} · class-vocabulary=horizon|cap|store|merge|relocated|not-requested|unknown`]
       : []),
     ...(degradedLanes.length > 0
       ? [`capture-degraded=${degradedLanes.join(',')} · status=partial · per-lane recovery truth renders in each affected section`]
@@ -3365,20 +3449,19 @@ function renderBoundary(
   ];
   if (boundary.runtimeChange) lines.push(`runtime-change=${boundary.runtimeChange}`);
   if (boundary.runtimeModelContext) {
-    // Diagnostic Runtime Model parity: the structured v6 renderer must still
-    // surface the model transition (predecessor → successor, changed yes/no)
-    // that the legacy render always emitted as `── Runtime Model ──`. Rendering
-    // is keyed on supplied context (present whenever the assembler had a legacy
-    // runtime model), NOT on `changed===true`, so unchanged transitions still
-    // show `Changed: no` exactly like the legacy block.
+    // D2(g): the model transition is a Now-card fact, not its own block. Four
+    // lines and a rule carried three values; one line carries the same three
+    // and stops competing with the section headings an agent scans for.
+    // Rendering is keyed on supplied context (present whenever the assembler
+    // had a legacy runtime model), NOT on `changed===true`, so an unchanged
+    // transition still states `changed=no`.
     const snap = (s: RebirthPackageV6RuntimeModelSnapshot): string => (
       s.engine ? `${s.engine}/${s.model ?? 'unknown'}` : (s.model ?? 'unknown')
     );
     lines.push(
-      '── Runtime Model ──',
-      `  Predecessor: ${snap(boundary.runtimeModelContext.predecessor)}`,
-      `  Current/successor: ${snap(boundary.runtimeModelContext.successor)}`,
-      `  Changed: ${boundary.runtimeModelContext.changed ? 'yes' : 'no'}`,
+      `runtime-model=${snap(boundary.runtimeModelContext.predecessor)}`
+      + ` -> ${snap(boundary.runtimeModelContext.successor)}`
+      + ` · changed=${boundary.runtimeModelContext.changed ? 'yes' : 'no'}`,
     );
   }
   lines.push(formatBuilderIdentityLine(boundary.builder));
@@ -3656,6 +3739,43 @@ function renderBoundary(
   return { text: lines.join('\n'), complete: true };
 }
 
+/**
+ * D2(e): room-membership facts are stamped with the capture instant, not with
+ * when each room was actually joined. Rendered one-per-line they read as a
+ * burst of coordination that never happened, and they crowd out the execution
+ * facts that do carry real chronology. When a run of them shares one instant,
+ * they collapse to a single as-of census that names every room and claims no
+ * ordering. A coordination fact with its own distinct time is left alone.
+ */
+function renderExecutionKnownFacts(
+  known: readonly RebirthPackageV6ExecutionFact[],
+  renderFact: (fact: RebirthPackageV6ExecutionFact) => string,
+): string[] {
+  const coordination = known.filter((fact) => fact.kind === 'coordination');
+  const instant = coordination[0]?.sourceAt ?? null;
+  const collapsible = coordination.length >= 2
+    && instant !== null
+    && coordination.every((fact) => fact.sourceAt === instant);
+  if (!collapsible) return known.map(renderFact);
+  const rooms = coordination
+    .map((fact) => fact.text.replace(/^room=/u, '').trim())
+    .filter(Boolean);
+  const census = `- coordination · rooms=${rooms.length} as-of ${instant}`
+    + ` (capture instant, not join time): ${rooms.join(', ')}`;
+  const lines: string[] = [];
+  let censusEmitted = false;
+  for (const fact of known) {
+    if (fact.kind === 'coordination') {
+      // Hold the census at the first member's slot so the surrounding facts
+      // keep their real chronological neighbours.
+      if (!censusEmitted) { lines.push(census); censusEmitted = true; }
+      continue;
+    }
+    lines.push(renderFact(fact));
+  }
+  return lines;
+}
+
 function renderExecution(
   model: RebirthPackageV6Model,
   maxChars: number,
@@ -3666,16 +3786,26 @@ function renderExecution(
   // an explicit banner (mirroring renderCognition) where they make no recency claim.
   const known = model.executionState.facts.filter((fact) => fact.sourceAt);
   const unknown = model.executionState.facts.filter((fact) => !fact.sourceAt);
-  const factPrefix = (fact: RebirthPackageV6ExecutionFact): string => (
+  const factPrefix = (fact: RebirthPackageV6ExecutionFact): string => {
+    const request = model.boundaryAndActiveTask.activeRequest;
+    const text = request && fact.text.trim() === request.text.trim()
+      ? `[EXACT ACTIVE REQUEST · source=${request.source.provenanceId}]`
+      : fact.text;
     // Audit-2 A12: the label describes the fact's kind, not a demand claim.
-    fact.kind === 'review' ? `rail-review-state=${fact.text}` : `${fact.kind} · ${fact.text}`
+    return fact.kind === 'review' ? `rail-review-state=${text}` : `${fact.kind} · ${text}`;
+  };
+  // D1 density: source id and source time survive on every row, but as ONE
+  // trailing anchor instead of five `key=value` clauses. `[partial]` and
+  // `[predates-active-request]` are single tokens the package legend defines.
+  // Ingestion `observed-at` is processing time — telemetry, not chronology —
+  // and no longer competes with the fact itself for the reader's attention.
+  const factLabels = (fact: RebirthPackageV6ExecutionFact): string => (
+    `${fact.status === 'exact' ? '' : ` [${fact.status}]`}${fact.predatesActiveRequest ? ' [predates-active-request]' : ''}`
   );
-  const factSuffix = (fact: RebirthPackageV6ExecutionFact): string => (
-    `${fact.observedAt ? ` · observed-at=${fact.observedAt}` : ''}${fact.predatesActiveRequest ? ' · authority=predates-active-request' : ''}`
+  const renderFact = (fact: RebirthPackageV6ExecutionFact): string => (
+    `- ${factPrefix(fact)}${factLabels(fact)} ${continuityAnchor(fact.provenanceId, fact.sourceAt, model.boundaryAndActiveTask.capturedAt)}`
   );
-  const lines = known.map((fact) => (
-    `- ${factPrefix(fact)} · source=${fact.provenanceId} · source-time=${fact.sourceAt} · status=${fact.status}${factSuffix(fact)}`
-  ));
+  const lines = renderExecutionKnownFacts(known, renderFact);
   for (const reason of model.executionState.unknownReasons) {
     // Audit-2 A21: an unresolved disagreement between captured facts is a
     // conflict, not an unknown; a genuinely unknown reason keeps its label.
@@ -3683,9 +3813,7 @@ function renderExecution(
   }
   if (unknown.length > 0) {
     lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
-    for (const fact of unknown) {
-      lines.push(`- ${factPrefix(fact)} · source=${fact.provenanceId} · status=${fact.status}${factSuffix(fact)}`);
-    }
+    for (const fact of unknown) lines.push(renderFact(fact));
   }
   if (lines.length === 0) lines.push('- execution state captured as empty');
   return boundedText(
@@ -3834,10 +3962,15 @@ function renderActiveEdits(
   const lines = [
     `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · source-time=${delta.capturedSourceAt ?? 'unknown'} · observed-at=${delta.completedObservedAt ?? 'unknown'}${delta.atlasLandedCapture ? ` · atlas-landed-capture=${delta.atlasLandedCapture.status} rows=${delta.atlasLandedCapture.count} elapsed=${delta.atlasLandedCapture.elapsedMs}ms` : ''}`,
   ];
-  if (delta.state === 'none' && delta.files.length === 0) {
-    lines.push('Exact immutable capture proved zero open attributable diffs.');
-  } else if (delta.state === 'unknown' && delta.files.length === 0) {
-    lines.push('Active edit state is unknown; absence of evidence is not rendered as none.');
+  // E1 idle collapse: with no attributable file, the capture header and its
+  // one-sentence disposition are the same fact stated twice. Idle mode ships a
+  // single line carrying the state, the capture identity, and the honest
+  // disposition — `unknown` still never reads as `none`.
+  if (delta.files.length === 0 && (delta.state === 'none' || delta.state === 'unknown')) {
+    const disposition = delta.state === 'none'
+      ? 'Exact immutable capture proved zero open attributable diffs.'
+      : 'Active edit state is unknown; absence of evidence is not rendered as none.';
+    lines[0] = `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · ${disposition}`;
   }
   const trailer: string[] = [];
   if (delta.inheritedCaptureIds.length > 0) trailer.push(`inherited-captures=${delta.inheritedCaptureIds.join(',')}`);
@@ -3970,6 +4103,7 @@ function cognitionRowBody(
   referenceAt: string | null,
   sourceText?: string,
   recovery?: string | null,
+  compact = false,
 ): string {
   const declared = row.projection === 'truncated'
     ? ` · projection=truncated stored=${row.storedChars ?? row.text.length}/${row.sourceChars ?? 'unknown'} chars`
@@ -3991,6 +4125,17 @@ function cognitionRowBody(
       const hash = createHash('sha256').update(tail).digest('hex');
       excerpt = `\n[exact-source-excerpt/v1 · source=${row.provenanceId} · utf16-range=${start}..${sourceText.length} · sha256=${hash} · recover=${recovery ?? 'unavailable'}]\n${tail}\n[/exact-source-excerpt]`;
     }
+  }
+  // D1: the compact row keeps the body and every attestation that rides with
+  // it (including the exact-source excerpt of a late ruling) and moves the
+  // provenance to one trailing anchor. `retention` is selector diagnostics and
+  // does not survive; `projection=truncated` becomes the `[partial]` token the
+  // package legend defines.
+  if (compact) {
+    const labels = `${row.projection === 'truncated' ? ' [partial]' : ''}`
+      + `${row.supersededBy ? ` [EXPIRED → ${row.supersededBy}]` : ''}`
+      + ` [${row.authority}]`;
+    return `${row.kind}${labels}\n${row.text}${excerpt}\n${continuityAnchor(row.provenanceId, row.sourceAt, referenceAt)}`;
   }
   return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${retention}${declared}${excerpt}`;
 }
@@ -4154,6 +4299,8 @@ function renderCognition(
     const referenceAt = model.boundaryAndActiveTask.capturedAt;
     const rowBodies = new Map(rows.map((row) => [row.provenanceId,
       cognitionRowBody(row, referenceAt, fullTextById.get(row.provenanceId), recoveryHandle)]));
+    const compactRowBodies = new Map(rows.map((row) => [row.provenanceId,
+      cognitionRowBody(row, referenceAt, fullTextById.get(row.provenanceId), recoveryHandle, true)]));
     const assemble = (keep: readonly RebirthPackageV6CognitiveArtifact[]): string => {
       const kept = new Set(keep.map((row) => row.provenanceId));
       const suppressed = rows.filter((row) => !kept.has(row.provenanceId));
@@ -4232,6 +4379,35 @@ function renderCognition(
       complete: keep.length === rows.length
         && rows.every((row) => row.projection !== 'truncated'),
       unitPlacements,
+      timelineRows: keep.map((row) => ({
+        id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
+        sourceAt: row.sourceAt,
+        text: rowBodies.get(row.provenanceId)!,
+        compactText: compactRowBodies.get(row.provenanceId)!,
+      })),
+      timelineSummary: [
+        cognitionSuppressionHeader(
+          allSourceRows.length, keep.length,
+          rows.filter((row) => !keptIds.has(row.provenanceId)),
+          boundaryDedupedCount,
+          keep.filter((row) => row.projection === 'truncated').length,
+          rows.length - keep.length + keep.filter((row) => row.projection === 'truncated').length,
+          capture?.totalMatched ?? null,
+          keep.length < rows.length || keep.some((row) => row.projection === 'truncated') ? omissionHandle : null,
+          capture, recoveryHandle,
+        ),
+        ...tail,
+      ].join('\n'),
+      timelineCensus: {
+        captured: allSourceRows.length,
+        rendered: keep.length,
+        matched: capture?.totalMatched ?? null,
+        incomplete: rows.length - keep.length + keep.filter((row) => row.projection === 'truncated').length,
+        omissionCommand: keep.length < rows.length || keep.some((row) => row.projection === 'truncated')
+          ? captureScopedLedgerCommand(continuityLedgerOmissionHandle(model, 'cognitiveArtifacts'))
+            ?? captureScopedOmissionCommand(model)
+          : null,
+      },
     };
   };
 
@@ -4260,6 +4436,7 @@ function conversationRowText(
   row: RebirthPackageV6ConversationRow,
   referenceAt: string | null,
   recoveryHandle: string | null,
+  compactAnchor?: string,
 ): string {
   const baseProvenance = conversationRowBaseId(row.provenanceId);
   // Audit-2 A1: a coalesced message keeps one envelope on the base id and
@@ -4269,22 +4446,25 @@ function conversationRowText(
     ? renderConversationSeams(row.text, row.segmentOffsets)
     : null;
   const text = seamMarkers ?? row.text;
-  const replyLimit = 600;
+  const replyLimit = 1_500;
   const projectedReply = row.role === 'assistant' && text.length > replyLimit;
-  const renderedText = projectedReply ? text.slice(0, replyLimit) : text;
+  const renderedText = projectedReply
+    ? `${text.slice(0, 1_200)}\n[… middle omitted …]\n${text.slice(-300)}`
+    : text;
   const projection = projectedReply
     ? `\n[projection=truncated stored=${replyLimit}/${text.length} chars`
-      + `${recoveryHandle ? ` · recover=${recoveryHandle}` : ' · exact recovery unavailable'}]`
+      + ']'
     : '';
+  // Presentation changes the envelope, never the excerpt admitted by budget.
+  if (compactAnchor !== undefined) {
+    return `${row.role}${projectedReply ? ' [partial]' : ''}\n${renderedText}\n${compactAnchor}`;
+  }
   const segments = row.segmentOffsets?.length
     ? ` · segments=${row.segmentOffsets.length + 1}`
     : '';
   // Audit-3 C5: display stamp compaction; the store keeps exact ms.
   const stamp = row.sourceAt ? formatDisplayStamp(row.sourceAt, referenceAt) : 'unknown';
-  const exchangeGap = row.exchangeRecovery
-    ? `\n[exchange=partial: surrounding proposal/replies were not hydrated; recover=${row.exchangeRecovery}]`
-    : '';
-  return `[${row.role} · source=${baseProvenance}${segments} · source-time=${stamp}]\n${renderedText}${projection}${exchangeGap}`;
+  return `[${row.role} · source=${baseProvenance}${segments} · source-time=${stamp}]\n${renderedText}${projection}`;
 }
 
 /** Render-only seam markers for a coalesced segmented message (audit-2 A1). */
@@ -4448,10 +4628,30 @@ function renderConversation(
         id,
         placement: renderedIds.has(id) ? 'rendered' : 'elided',
         projected: projectedIds.has(id)
-          || (row.role === 'assistant' && (row.segmentOffsets?.length ? renderConversationSeams(row.text, row.segmentOffsets).length : row.text.length) > 600),
+          || (row.role === 'assistant' && (row.segmentOffsets?.length ? renderConversationSeams(row.text, row.segmentOffsets).length : row.text.length) > 1_500),
       };
     });
   };
+  const censusFor = (
+    placements: readonly RebirthPackageV6UnitPlacement[],
+  ): RebirthTimelineCensus => ({
+    captured: model.recentConversation.length,
+    rendered: placements.filter((placement) => placement.placement === 'rendered').length,
+    matched: null,
+    incomplete: placements.filter((placement) => placement.placement !== 'rendered' || placement.projected).length,
+    omissionCommand: placements.some((placement) => placement.placement !== 'rendered' || placement.projected)
+      ? captureScopedLedgerCommand(continuityLedgerOmissionHandle(model, 'recentConversation'))
+        ?? captureScopedOmissionCommand(model)
+        ?? model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle
+        ?? null
+      : null,
+  });
+  const timelineRowsFor = (rows: readonly RebirthPackageV6ConversationRow[]): RebirthTimelineRow[] => rows.map((row) => ({
+    id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
+    sourceAt: row.sourceAt,
+    text: renderRow(row),
+    compactText: conversationRowText(row, referenceAt, recoveryHandle, continuityAnchor(conversationRowBaseId(row.provenanceId), row.sourceAt, referenceAt)),
+  }));
   const lines = known.map(renderRow);
   if (unknown.length > 0) {
     lines.push(
@@ -4464,7 +4664,14 @@ function renderConversation(
   const dialogueText = lines.join('\n\n');
   const fullText = [fullEndpointReceipt, dialogueText].filter(Boolean).join('\n\n');
   if (fullText.length <= maxChars) {
-    return { text: fullText, complete: true, unitPlacements: placementsFor(model.recentConversation) };
+    const placements = placementsFor(model.recentConversation);
+    return {
+      text: fullText,
+      complete: true,
+      unitPlacements: placements,
+      timelineRows: timelineRowsFor(model.recentConversation),
+      timelineCensus: censusFor(placements),
+    };
   }
 
   // Conversation is a chronological section, so overflow must retain its tail:
@@ -4581,10 +4788,13 @@ function renderConversation(
     };
   }
 
+  const retainedPlacements = placementsFor([...retainedKnown, ...retainedUnknown]);
   return {
     text: withEndpointReceipt(compose(retainedKnown, retainedUnknown)),
     complete: false,
-    unitPlacements: placementsFor([...retainedKnown, ...retainedUnknown]),
+    unitPlacements: retainedPlacements,
+    timelineRows: timelineRowsFor([...retainedKnown, ...retainedUnknown]),
+    timelineCensus: censusFor(retainedPlacements),
   };
 }
 
@@ -4602,14 +4812,76 @@ function recoveryRowSectionId(rowId: string): RebirthPackageV6SectionId | null {
   return null;
 }
 
+/**
+ * Delivered-package declaration that a capture lane came back degraded.
+ *
+ * The `capture-degraded=` roll-up lives in the diagnostic header, and D2
+ * retired the hidden lineage sections' per-lane recovery rows. Together those
+ * two correct decisions left the DELIVERED package with no way to say that a
+ * lane was truncated — which is the 2026-08-28 outage exactly: eighteen hours
+ * of builds resolved zero lineage frontiers and every package still read
+ * clean. This line exists only when a lane is genuinely degraded, and it reads
+ * the same helper the diagnostic header reads so the two surfaces cannot drift.
+ */
+function compactDegradedCaptureLines(model: RebirthPackageV6Model): string[] {
+  const lanes = computeRebirthCaptureDegradedLanes(model);
+  if (lanes.length === 0) return [];
+  const reasonByLane: Readonly<Record<string, string | null | undefined>> = {
+    'operator-vault': model.operatorVault?.partialReason,
+    'episode-chapter-index': model.episodeChapterIndex?.partialReason,
+    'life-ledger': model.lifeLedger?.partialReason,
+    cognition: model.cognitiveArtifactCapture?.warnings.join(' ')
+      || model.cognitiveArtifactCapture?.missingFamilies.join(' '),
+    'active-edit-delta': model.activeEditDelta.reasons.join(' '),
+    'task-rail': model.boundaryAndActiveTask.nowCard?.currentRailAvailability?.reason,
+  };
+  return [`⚠ Degraded capture: ${lanes.map((lane) => {
+    const reason = reasonByLane[lane]?.trim();
+    return reason ? `${lane} (${oneLineClaim(reason, 160)})` : lane;
+  }).join(' · ')}`];
+}
+
 function renderRecovery(
   model: RebirthPackageV6Model,
   maxChars: number,
   completeness?: RebirthSectionCompleteness,
   references: RebirthRecoveryReferenceCatalog = buildRecoveryReferenceCatalog(model),
+  compact = false,
 ): { text: string; complete: boolean } {
-  const entries = model.recoveryIndex;
-  if (entries.length === 0) return { text: '- recovery index unavailable', complete: true };
+  // D2: the hidden lineage sections no longer render a body, so their
+  // per-section ledger routes would be four near-identical commands. The
+  // ledger index handle already addresses every one of their units, and the
+  // timeline census carries the capture-scoped fetch for what it omitted.
+  const entries = compact
+    ? model.recoveryIndex.filter((entry) => !COMPACT_RECOVERY_SUPPRESSED_ROWS.has(entry.id))
+    : model.recoveryIndex;
+  // Hazards, the degraded-capture declaration, and the lineage-history census
+  // are the things a successor acts on that no entry row carries. They are
+  // computed and reserved out of the cap BEFORE the entry loop so a long index
+  // cannot silently delete them — and before the empty-index early return, so
+  // an index that is absent (or contains only D2-suppressed lineage rows)
+  // cannot delete them either. That path is exactly how a truncated capture
+  // would go quiet again: no rows to carry a status, no roll-up header, and
+  // formerly no tail.
+  const tail = compact
+    ? [
+      ...currentTaskHazards(
+        model.recoveryIndex.find((entry) => entry.id === 'atlas-handoff-card')?.inlineEvidence ?? '',
+      ),
+      ...compactDegradedCaptureLines(model),
+      historyCensus(model),
+    ]
+    : [];
+  if (entries.length === 0) {
+    return {
+      text: ['- recovery index unavailable', ...tail].join('\n'),
+      complete: true,
+    };
+  }
+  const tailText = tail.length > 0 ? `\n${tail.join('\n')}` : '';
+  const entryBudget = tailText.length > 0 && tailText.length < maxChars
+    ? maxChars - tailText.length
+    : maxChars;
   // Recovery Index is a protected package section: its own renderer must never
   // slice it into "exact recovery unavailable" — that would delete the very
   // directory of recovery routes it exists to publish. Entry lines are
@@ -4633,13 +4905,14 @@ function renderRecovery(
   const usedEntries = references.entries.filter((entry) => (
     'usedHandles' in references && (references as MutableRecoveryReferenceCatalog).usedHandles.has(entry.handle)
   ));
-  const lines: string[] = usedEntries.length > 0
-    ? [
+  const lines: string[] = compact ? [COMPACT_RECOVERY_PREAMBLE] : [];
+  if (usedEntries.length > 0) {
+    lines.push(
       'Recovery handle legend (expand R<n> before execution):',
       ...usedEntries.map((entry) => `- ${entry.ref} = ${entry.handle}`),
       '',
-    ]
-    : [];
+    );
+  }
   let elided = false;
   let renderedEntries = 0;
   for (const entry of entries) {
@@ -4653,7 +4926,9 @@ function renderRecovery(
     const censusPartial = censusEntry !== undefined;
     const reasonSuffix = censusPartial
       ? ` · reason=${censusEntry?.reason?.trim()
-        || (censusEntry?.renderLoss ? 'render loss (demoted/rolled-up/truncated under budget)' : 'capture-side partiality; see section body')}`
+        || (censusEntry?.relocated
+          ? 'relocated to the continuity ledger; units intact and addressed there'
+          : censusEntry?.renderLoss ? 'render loss (demoted/rolled-up/truncated under budget)' : 'capture-side partiality; see section body')}`
       : entry.status !== 'available'
         ? ` · reason=${entry.reason?.trim() || 'unspecified'}`
         : '';
@@ -4675,7 +4950,17 @@ function renderRecovery(
           ? 'exact-full'
           : 'discovery'
     );
-    const line = `- ${entry.id} · ${entry.label} · status=${rowStatus} · ${countLabel}=${entry.count ?? 'unknown'}${frontier}${reasonSuffix} · scope=${recoveryScope} · recover=${recoverLabel}`;
+    // D1: the verbose row spends ~120 chars on six labelled clauses. The
+    // compact row keeps every decision-relevant fact — which route, whether it
+    // is available/partial and why, how much it addresses, whether it returns
+    // exact bytes or pointers, and the executable handle — and drops the
+    // restated human label and the ingestion-side frontier diagnostic.
+    const line = compact
+      ? `- ${entry.id} · ${rowStatus}`
+        + `${entry.count === null || entry.count === undefined ? '' : ` · ${countLabel}=${entry.count}`}`
+        + `${recoveryScope === 'discovery' ? '' : ` · ${recoveryScope}`}`
+        + ` · recover=${recoverLabel}${reasonSuffix}`
+      : `- ${entry.id} · ${entry.label} · status=${rowStatus} · ${countLabel}=${entry.count ?? 'unknown'}${frontier}${reasonSuffix} · scope=${recoveryScope} · recover=${recoverLabel}`;
     // Optional inline evidence (e.g. a captured Atlas handoff card body) rides
     // beneath its own handle line as a bounded indented snapshot. It never
     // overloads `label` (which stays a short title). If the evidence cannot fit
@@ -4687,7 +4972,7 @@ function renderRecovery(
     if (evidence) {
       const evidenceRecovery = recoveryReference(references, packageHandle || entry.handle);
       const evidenceHeader = `  ${entry.id}.inline-evidence: root recovery=${evidenceRecovery}`;
-      const budget = Math.max(0, maxChars - evidenceHeader.length - 60);
+      const budget = Math.max(0, entryBudget - evidenceHeader.length - 60);
       const ev = boundedText(
         evidence.split('\n').map((l) => `  ${l}`).join('\n'),
         budget,
@@ -4703,7 +4988,7 @@ function renderRecovery(
     // + evidence) can overflow, and on that path we keep the entry line and the
     // exact handle rather than dropping the whole route to an `unavailable`.
     const exactHandle = recoveryReference(references, packageHandle || entry.handle) || packageRef;
-    if (projected.length > maxChars) {
+    if (projected.length > entryBudget) {
       if (evidenceBlock) {
         lines.push(line);
         lines.push(
@@ -4726,6 +5011,7 @@ function renderRecovery(
     if (evidenceBlock) lines.push(evidenceBlock);
     renderedEntries += 1;
   }
+  lines.push(...tail);
   // A partial section must not look complete to manifests/consumers: report
   // complete=false whenever any recovery entry (or inline evidence) was
   // elided, even though every elision is explicit and the exact handle
@@ -4926,6 +5212,9 @@ interface RenderedV6SectionBody {
   readonly complete: boolean;
   readonly collapse?: CollapseResult | null;
   readonly unitPlacements?: readonly RebirthPackageV6UnitPlacement[];
+  readonly timelineRows?: readonly RebirthTimelineRow[];
+  readonly timelineSummary?: string;
+  readonly timelineCensus?: RebirthTimelineCensus;
 }
 
 /** Audit-3 B11: the newest K life rows stay verbatim through RLE. */
@@ -5126,6 +5415,7 @@ function renderSectionBodies(
   limits: Record<RebirthPackageV6SectionId, number>,
   timing?: RebirthPackageV6SectionTimingAccumulator,
   sharedReferences?: MutableRecoveryReferenceCatalog,
+  compact = false,
 ): Record<RebirthPackageV6SectionId, RenderedV6SectionBody> {
   // Audit-4 S7: ONE catalog per whole render pass — callers that re-render
   // sections (adaptive backfill, shrink probes) pass the same mutable catalog
@@ -5155,7 +5445,7 @@ function renderSectionBodies(
   );
   return {
     boundaryAndActiveTask: measureSectionRender(timing, 'boundaryAndActiveTask', () => (
-      renderBoundary(model, limits.boundaryAndActiveTask, undefined, references)
+      renderBoundary(model, limits.boundaryAndActiveTask, undefined, references, compact)
     )),
     brainMergeSynthesis: measureSectionRender(timing, 'brainMergeSynthesis', () => boundedText(
       model.brainMergeSynthesis ?? '',
@@ -5218,7 +5508,7 @@ function renderSectionBodies(
       return { ...led, text: applyLifeLedgerVerbatinRle(led.text) };
     }),
     recoveryIndex: measureSectionRender(timing, 'recoveryIndex', () => (
-      renderRecovery(model, limits.recoveryIndex, undefined, references)
+      renderRecovery(model, limits.recoveryIndex, undefined, references, compact)
     )),
   };
 }
@@ -5299,22 +5589,7 @@ function pushTargetChars(
   return Math.min(Math.floor(budget), Math.floor(configured));
 }
 
-/**
- * Adaptive Backfill (spec §7): after every section renders inside its floor,
- * the unspent global budget is handed out in priority order. Each grant raises
- * one section's cap by the entire remaining pool; the section takes only what
- * its next promotion needs, and the measured growth is what leaves the pool.
- * Because every admitted, non-explicit, incomplete section is eligible, the
- * loop converges to demand-first water-fill: while the envelope has room, no
- * default cap truncates anything — packages stop short of their lifecycle
- * envelope only when the available truth runs out (no padding). A bounded
- * fixed-point pass re-offers slack released when a later section's receipt or
- * row-boundary retention renders shorter than its provisional grant. Under
- * contention the defaults act as the fairness partition and behavior is
- * unchanged: a young lineage ships nearly all-verbatim and an old lineage
- * ships recent-verbatim plus a digest middle and an era/receipt deep past —
- * the O(log lifetime) curve emerging from one rule at every age.
- */
+/** Resolve bounded phase allocations, admitting whole dialogue exchanges first. */
 export function resolveAdaptiveSectionCaps(
   model: RebirthPackageV6Model,
   options: RenderRebirthPackageV6Options = {},
@@ -5339,57 +5614,44 @@ function resolveAdaptiveSectionCapsInternal(
     ...phaseOverrides,
     ...options.sectionMaxChars,
   };
-  const budget = pushTargetChars(model, options);
-  if (options.adaptiveBackfill === false || !Number.isFinite(budget) || budget <= 0) return limits;
-  const envelopeChars = Number.isFinite(options.envelopeChars)
-    ? Math.max(0, Math.floor(options.envelopeChars ?? 0))
-    : 0;
-
-  const admitted = admittedSectionIds(model);
-  let bodies = renderSectionBodies(model, limits, timing);
-  const framedLength = (): number => admitted
-    .map((id) => measureSectionRender(timing, id, () => frameSection(id, bodies[id].text).length))
-    .reduce((total, length, index) => total + length + (index > 0 ? 2 : 0), 0);
-
-  const availableSpare = (): number => budget
-    - envelopeChars
-    - REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS
-    - framedLength();
-  let spare = availableSpare();
-  if (spare <= 0) return limits;
-
-  // An explicitly supplied cap is a hard ceiling the caller asked for; backfill
-  // may only grow the defaults. Silently inflating a requested cap would make
-  // every caller-imposed bound advisory.
-  const explicitCaps = new Set<RebirthPackageV6SectionId>(
-    Object.keys(options.sectionMaxChars ?? {}) as RebirthPackageV6SectionId[],
-  );
-
-  const maxPasses = 4;
-  const fillPriority = backfillPriorityForPhase(phase);
-  for (let pass = 0; pass < maxPasses && spare >= 1; pass += 1) {
-    let passConsumedCapacity = false;
-    for (const id of fillPriority) {
-      if (spare < 1) break;
-      if (!admitted.includes(id)) continue;
-      if (explicitCaps.has(id)) continue;
-      if (bodies[id].complete) continue;
-      limits[id] += spare;
-      bodies = renderSectionBodies(model, limits, timing);
-      // Recompute from the whole rendered package, not just this section's
-      // growth. A later section can render a shorter receipt/row boundary and
-      // release capacity that the earlier priority citizens must see again.
-      const nextSpare = Math.max(0, availableSpare());
-      if (nextSpare < spare) passConsumedCapacity = true;
-      spare = nextSpare;
-    }
-    // A pass that consumed no capacity cannot make further progress. Track
-    // actual consumption rather than net spare: a later renderer may release
-    // more slack than an earlier citizen consumed, and that new room must be
-    // offered back to the priority head on the next pass. The hard bound still
-    // protects determinism if a future renderer oscillates.
-    if (!passConsumedCapacity) break;
+  const timelinePool = (phase === 'rail-active' ? 115_000 : 129_000)
+    - (model.brainMergeSynthesis?.trim() ? 10_000 : 0);
+  const explicitConversation = options.sectionMaxChars?.recentConversation;
+  limits.recentConversation = Math.min(limits.recentConversation, timelinePool);
+  const dialogue = renderConversation(model, limits.recentConversation, buildRecoveryReferenceCatalog(model));
+  const dialogueUsed = Math.min(limits.recentConversation, dialogue.text.length);
+  if (explicitConversation === undefined) limits.recentConversation = dialogueUsed;
+  if (options.sectionMaxChars?.cognitiveArtifacts === undefined) {
+    limits.cognitiveArtifacts = Math.max(0, timelinePool - dialogueUsed);
   }
+  // The conversation-first partition above reallocates WITHIN the ordinary
+  // 145k content envelope. A lifecycle that declares a LARGER envelope
+  // (brain_merge = 300k, or an explicit larger packageBudget) must not be
+  // silently shrunk to the ordinary partition: its surplus, plus whatever the
+  // timeline pool does not actually demand, funds the synthesis mandate the
+  // larger budget exists for. Ordinary rebirths have no surplus, so this is
+  // inert for them — including the extra demand probe, which only runs when
+  // surplus capacity actually exists. The surplus follows the CONTENT, not the
+  // envelope: with no donor synthesis to carry there is no mandate to fund, so
+  // a larger budget alone can never inflate a section that renders nothing.
+  const budget = packageBudgetChars(model, options);
+  const envelopeSurplus = Number.isFinite(budget)
+    ? Math.max(0, Math.floor(budget) - DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS)
+    : 0;
+  if (
+    envelopeSurplus > 0
+    && Boolean(model.brainMergeSynthesis?.trim())
+    && limits.brainMergeSynthesis > 0
+    && options.sectionMaxChars?.brainMergeSynthesis === undefined
+  ) {
+    const cognitionDemand = Math.min(
+      limits.cognitiveArtifacts,
+      renderCognition(model, limits.cognitiveArtifacts, buildRecoveryReferenceCatalog(model)).text.length,
+    );
+    const unusedTimelinePool = Math.max(0, limits.cognitiveArtifacts - cognitionDemand);
+    limits.brainMergeSynthesis += envelopeSurplus + unusedTimelinePool;
+  }
+
   return limits;
 }
 
@@ -5400,7 +5662,7 @@ export function renderRebirthPackageV6Sections(
   // Redaction lane: nothing republishes before it (pure, idempotent, cached).
   model = redactContinuityModel(model).model;
   const limits = resolveAdaptiveSectionCaps(model, options);
-  return renderSectionsWithLimits(model, limits);
+  return renderSectionsWithLimits(model, limits, undefined, undefined, !options.diagnostic);
 }
 
 function renderSectionsWithLimits(
@@ -5408,30 +5670,38 @@ function renderSectionsWithLimits(
   limits: Record<RebirthPackageV6SectionId, number>,
   timing?: RebirthPackageV6SectionTimingAccumulator,
   sharedReferences?: MutableRecoveryReferenceCatalog,
+  compact = false,
 ): readonly RenderedRebirthPackageV6Section[] {
   const references = sharedReferences ?? buildRecoveryReferenceCatalog(model);
-  const rendered = renderSectionBodies(model, limits, timing, references);
+  const rendered = renderSectionBodies(model, limits, timing, references, compact);
   // Audit-3 A8/S6: ONE completeness census derived from the actual rendered
   // bodies. The Boundary re-renders once WITH the census so its
   // capture-partial-lanes header, each section's partial= surface, the
   // RENDER-INCOMPLETE trailer, and the Recovery Index status= can never
   // disagree — one structure feeds all four.
-  const completeness = computeSectionCompleteness(model, rendered);
+  const completeness = computeSectionCompleteness(model, rendered, limits);
   rendered.boundaryAndActiveTask = measureSectionRender(timing, 'boundaryAndActiveTask', () => (
-    renderBoundary(model, limits.boundaryAndActiveTask, completeness, references)
+    renderBoundary(model, limits.boundaryAndActiveTask, completeness, references, compact)
   ));
   // Recovery section rows for rendered sections take the census status too
   // (fourth surface of the A8/S6 agreement), so it re-renders with the census.
   rendered.recoveryIndex = measureSectionRender(timing, 'recoveryIndex', () => (
-    renderRecovery(model, limits.recoveryIndex, completeness, references)
+    renderRecovery(model, limits.recoveryIndex, completeness, references, compact)
   ));
   const admitted = admittedSectionIds(model);
   // Render-loss sections in canonical order: the census's renderLoss flag is
   // the single basis for the trailer (was: admitted bodies with complete=false
   // — same outcome, now one structure with the header).
-  const incomplete = REBIRTH_PACKAGE_V6_SECTION_IDS.filter((id) => (
-    completeness.get(id)?.renderLoss === true
-  ));
+  // D2: a section the delivery deliberately does not render (limit 0 — life
+  // ledger, episode chapter index, operator vault) is NOT an incomplete render.
+  // Its units were relocated to the continuity ledger, and its own Recovery
+  // Index row carries that status. Listing it here would report a truthful
+  // relocation as a budget failure, and on a small package that false trailer
+  // outweighed the section body it was appended to.
+  const incomplete = REBIRTH_PACKAGE_V6_SECTION_IDS.filter((id) => {
+    const entry = completeness.get(id);
+    return entry?.renderLoss === true && entry.relocated === false;
+  });
   if (incomplete.length > 0 && admitted.includes('recoveryIndex')) {
     const trailer = `\n[RENDER-INCOMPLETE sections: ${incomplete.join(',')}]`;
     const recovery = rendered.recoveryIndex;
@@ -5442,10 +5712,13 @@ function renderSectionsWithLimits(
   return admitted.map((id) => ({
     id,
     title: SECTION_TITLES[id],
-    text: measureSectionRender(timing, id, () => frameSection(id, rendered[id].text)),
+    text: limits[id] <= 0 ? '' : measureSectionRender(timing, id, () => frameSection(id, rendered[id].text)),
     complete: rendered[id].complete,
     ...(rendered[id].collapse !== undefined ? { collapse: rendered[id].collapse } : {}),
     ...(rendered[id].unitPlacements !== undefined ? { unitPlacements: rendered[id].unitPlacements } : {}),
+    ...(rendered[id].timelineRows !== undefined ? { timelineRows: rendered[id].timelineRows } : {}),
+    ...(rendered[id].timelineSummary !== undefined ? { timelineSummary: rendered[id].timelineSummary } : {}),
+    ...(rendered[id].timelineCensus !== undefined ? { timelineCensus: rendered[id].timelineCensus } : {}),
   }));
 }
 
@@ -5630,11 +5903,83 @@ const REBIRTH_PACKAGE_V7_SHRINK_PRIORITY = [
   'activeEditDelta',
 ] as const satisfies readonly RebirthPackageV7CollapseSectionId[];
 
+/**
+ * ONE census line for the unified timeline.
+ *
+ * The diagnostic sub-counters the audited specimen shipped inline
+ * (`relay-drops{…}`, `upstream-rejects{…}`, `dedupe{…}`, per-section
+ * `recover=R<n>`) told the reader how the selector felt, not what it owed. What
+ * survives here is the parity fact a successor can act on: how many captured
+ * units did not render whole, and the single executable command that returns
+ * them. Per-section detail stays in `timelineSummary` for diagnostic renders
+ * and in the continuity ledger for exact recovery.
+ */
+function buildTimelineCensusLines(
+  sections: readonly RenderedRebirthPackageV6Section[],
+  dated: number,
+  quarantined: number,
+  partial: boolean,
+): string[] {
+  const censuses = sections
+    .map((section) => section.timelineCensus)
+    .filter((census): census is RebirthTimelineCensus => census !== undefined);
+  const captured = censuses.reduce((sum, census) => sum + census.captured, 0);
+  const incomplete = censuses.reduce((sum, census) => sum + census.incomplete, 0);
+  const matched = censuses.reduce<number | null>(
+    (sum, census) => (census.matched === null ? sum : (sum ?? 0) + census.matched),
+    null,
+  );
+  const commands = [...new Set(
+    censuses.map((census) => census.omissionCommand).filter((command): command is string => Boolean(command)),
+  )];
+  const accounting = censuses.length > 0
+    ? `; ${incomplete} of ${captured} captured units not fully rendered${matched === null ? '' : ` (${matched} matched upstream)`}`
+    : '';
+  const head = `Timeline census: ${dated} dated, ${quarantined} quarantined${accounting}; `
+    + `${partial ? 'partial' : 'captured rows complete'}.`;
+  return commands.length > 0 ? [head, `Omitted units: ${commands.join(' · ')}`] : [head];
+}
+
 function joinRenderedSections(
   sections: readonly RenderedRebirthPackageV6Section[],
   declaration: string | null,
+  model?: RebirthPackageV6Model,
 ): string {
-  const sectionsText = sections.map((section) => section.text).join('\n\n');
+  const timelineSections = sections.filter((section) => (
+    section.id === 'recentConversation' || section.id === 'cognitiveArtifacts'
+  ));
+  // Dialogue owns a duplicated message body. Identity aliases are exact
+  // message prefixes, never normalized prose or substring matches.
+  const rows = new Map<string, RebirthTimelineRow>();
+  for (const section of [...timelineSections].sort((a, b) => (
+    Number(a.id === 'recentConversation') - Number(b.id === 'recentConversation')
+  ))) {
+    for (const row of section.timelineRows ?? []) rows.set(row.id, row);
+  }
+  const known = [...rows.values()].filter((row) => row.sourceAt && Number.isFinite(Date.parse(row.sourceAt)))
+    .sort((a, b) => Date.parse(a.sourceAt!) - Date.parse(b.sourceAt!) || a.id.localeCompare(b.id));
+  const unknown = [...rows.values()].filter((row) => !row.sourceAt || !Number.isFinite(Date.parse(row.sourceAt)))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const partial = timelineSections.some((section) => !section.complete);
+  const body = [
+    ...(partial ? ['Timeline partial; omitted source units remain in the continuity ledger.'] : []),
+    ...(model
+      ? buildTimelineCensusLines(timelineSections, known.length, unknown.length, partial)
+      : timelineSections.flatMap((section) => section.timelineSummary ? [section.timelineSummary] : [])),
+    ...known.map((row) => model ? row.compactText ?? row.text : row.text),
+    ...(unknown.length > 0 ? ['Unknown source time (quarantined; not part of the chronology):', ...unknown.map((row) => model ? row.compactText ?? row.text : row.text)] : []),
+    // Extreme-cap fallbacks already attest exactly what was retained. Carry
+    // those bytes unchanged rather than reconstructing content from placements.
+    ...timelineSections.filter((section) => section.timelineRows === undefined).map((section) => section.text),
+  ].join('\n\n');
+  const timeline = `── Timeline ──\n[REBIRTH-V6-SECTION id=recentConversation order=6 dir=asc chars=${body.length}]\n${body}\n${V6_SECTION_CLOSE}`;
+  let emittedTimeline = false;
+  const sectionsText = sections.map((section) => {
+    if (section.id !== 'recentConversation' && section.id !== 'cognitiveArtifacts') return section.text;
+    if (emittedTimeline) return '';
+    emittedTimeline = true;
+    return timeline;
+  }).filter(Boolean).join('\n\n');
   return declaration ? `${declaration}\n\n${sectionsText}` : sectionsText;
 }
 
@@ -5663,6 +6008,7 @@ function shrinkCollapseSectionsToTarget(args: {
   initialText: string;
   targetChars: number;
   timing?: RebirthPackageV6SectionTimingAccumulator;
+  diagnostic?: boolean;
 }): RebirthPackageV7ShrinkOutcome {
   let limits = { ...args.initialLimits };
   let sections = args.initialSections;
@@ -5678,7 +6024,7 @@ function shrinkCollapseSectionsToTarget(args: {
     // Every probe gets a render-local recovery-reference ledger. A rejected
     // probe must not make later candidates pay for handles that will never
     // ship in their text.
-    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits, args.timing);
+    const candidateSections = renderSectionsWithLimits(args.model, candidateLimits, args.timing, undefined, !args.diagnostic);
     shrinkRenders += 1;
     return {
       limits: candidateLimits,
@@ -5686,7 +6032,7 @@ function shrinkCollapseSectionsToTarget(args: {
       // Admission is based on the exact bytes the final funnel can deliver.
       // Unreferenced legend rows are removed there, so retaining them for size
       // comparisons would over-shrink real continuity content.
-      text: pruneRecoveryLegendRows(joinRenderedSections(candidateSections, args.declaration)),
+      text: pruneRecoveryLegendRows(joinRenderedSections(candidateSections, args.declaration, args.diagnostic ? undefined : args.model)),
     };
   };
 
@@ -5789,10 +6135,10 @@ export function renderRebirthPackageV6WithReport(
     : 0;
   const sectionTiming = createSectionTimingAccumulator(options);
   const initialLimits = resolveAdaptiveSectionCapsInternal(model, options, sectionTiming);
-  const initialSections = renderSectionsWithLimits(model, initialLimits, sectionTiming, references);
+  const initialSections = renderSectionsWithLimits(model, initialLimits, sectionTiming, references, !options.diagnostic);
   // The final funnel always prunes unreferenced Recovery legend rows. Make
   // every earlier budget decision against that same deliverable byte shape.
-  const initialRendered = pruneRecoveryLegendRows(joinRenderedSections(initialSections, declaration));
+  const initialRendered = pruneRecoveryLegendRows(joinRenderedSections(initialSections, declaration, options.diagnostic ? undefined : model));
   const targetSectionChars = Number.isFinite(pushTarget) && pushTarget > 0
     ? Math.max(0, Math.floor(pushTarget) - envelopeChars)
     : Number.POSITIVE_INFINITY;
@@ -5805,6 +6151,7 @@ export function renderRebirthPackageV6WithReport(
       initialText: initialRendered,
       targetChars: targetSectionChars,
       timing: sectionTiming,
+      diagnostic: options.diagnostic,
     })
     : {
       sections: initialSections,
@@ -5987,30 +6334,30 @@ export function renderRebirthPackageV6WithReport(
     const bodyElided = optional
       .filter((section) => !includedOptional.has(section.id))
       .map((section) => section.id);
-    const blocks: string[] = declaration ? [declaration] : [];
+    const composedSections: RenderedRebirthPackageV6Section[] = [];
     for (const section of sectionsArg) {
       if (section.id === 'recoveryIndex' && (bodyElided.length > 0 || protectedOverrun)) {
-        blocks.push(
-          `[REBIRTH-V6-PACKAGE-ELISION original-chars=${initialRendered.length} budget=${budget}`
+        const notice = `[REBIRTH-V6-PACKAGE-ELISION original-chars=${initialRendered.length} budget=${budget}`
           + ` envelope-chars=${envelopeChars}`
           + ` elided-section-bodies=${bodyElided.join(',') || 'none'}`
           + ` protected-overrun=${protectedOverrun || envelopeOverrun}`
           + capNote
-          + ` recover=${recover}]`,
-        );
+          + ` recover=${recover}]`;
+        composedSections.push({ ...section, text: `${notice}\n${section.text}` });
+        continue;
       }
       if (protectedIds.has(section.id) || includedOptional.has(section.id)) {
-        blocks.push(section.text);
+        composedSections.push(section);
         continue;
       }
       // The normal body may yield, but the title/open/body/close frame is part
       // of the protected minimum package and can never disappear.
-      blocks.push(framedElisionSection(section, compactElisionReceipts || protectedOverrun));
+      composedSections.push({ ...section, text: framedElisionSection(section, compactElisionReceipts || protectedOverrun), timelineRows: undefined, timelineSummary: undefined });
     }
     // This is the exact pre-lint text finish() will deliver. Candidate
     // admission must not reject a section based on legend rows that the final
     // deterministic prune removes moments later.
-    return pruneRecoveryLegendRows(blocks.join('\n\n'));
+    return pruneRecoveryLegendRows(joinRenderedSections(composedSections, declaration, options.diagnostic ? undefined : model));
   };
 
   const included = new Set<RebirthPackageV6SectionId>();
@@ -6068,7 +6415,7 @@ export function renderRebirthPackageV6WithReport(
     let probeCap = Math.min(sectionLimits[section.id], remaining);
     for (let attempt = 0; attempt < 4 && probeCap >= 1; attempt += 1) {
       const candidateLimits = { ...sectionLimits, [section.id]: probeCap };
-      const candidateSections = renderSectionsWithLimits(model, candidateLimits, sectionTiming);
+      const candidateSections = renderSectionsWithLimits(model, candidateLimits, sectionTiming, undefined, !options.diagnostic);
       const candidateSection = candidateSections.find((probe) => probe.id === section.id);
       const fits = compose(candidateSections, candidate, compactElisionReceipts).length <= sectionBudget
         && reducedCapAdmitsContent(section.id, candidateSection);

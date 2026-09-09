@@ -87,7 +87,7 @@ describe('tail-epoch objective provenance', () => {
       'active-rail="rail-objective" active-step="verify-band" rail-objective="Ship the continuity repair"',
     );
     expect(rendered).toContain(
-      'source=thread-objective:tail-epoch#2:band#2:pre-fold:row#10..thread-objective:tail-epoch#2:band#2:pre-fold:row#19 n=10',
+      'source=thread-objective:tail-epoch#2:band#2:pre-fold:row#10..thread-objective:tail-epoch#2:band#2:pre-fold:row#19 (inclusive) n=10',
     );
     expect(rendered).toContain(
       'coordinate-frame=thread-objective:tail-epoch#2:band#2:pre-fold scope=pre-fold-snapshot comparable-within-frame-only',
@@ -112,7 +112,7 @@ describe('tail-epoch objective provenance', () => {
       ],
     });
     expect(rendered).toContain(
-      'source=thread-stack:event#12..thread-stack:event#18 n=7',
+      'source=thread-stack:event#12..thread-stack:event#18 (inclusive) n=7',
     );
     expect(rendered).toContain(
       'stack=frozen-prefix>tail-epoch#1[event:0..5)>tail-epoch#2[event:5..12)>tail-epoch#3[event:12..19)>seam@2026-07-16T01:30:00.000Z>raw-tail@event#19(+4)',

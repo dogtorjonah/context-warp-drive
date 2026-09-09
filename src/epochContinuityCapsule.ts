@@ -7,6 +7,11 @@ import type {
   LiveObjectiveProvenance,
   LiveObjectiveSource,
 } from './chronologicalProvenance.ts';
+// One legend, shared with the v6 rebirth package. A tail epoch and a rebirth
+// hand a successor the same anchor grammar (⟨source @time⟩), so the reader
+// learns it once instead of decoding a second dialect at the other boundary.
+// Type-only coupling to the package model keeps this import runtime-light.
+import { CONTINUITY_LEGEND } from './continuityPresentation.ts';
 import {
   isPendingAssistantContinuityState,
   PENDING_ASSISTANT_ACTION_CAPSULE_HEADER,
@@ -741,6 +746,7 @@ export function renderEpochContinuityCapsule(
     `${PENDING_ASSISTANT_ACTION_STATE_PREFIX}${stateJson}`,
     validation ? `validation: ${validation}` : '',
     liveState ? `live_state:\n${liveState}` : '',
+    CONTINUITY_LEGEND,
     renderEpochContinuityPointers(),
     `source: canonical ${input.source.unit}s ${sourceStart}..${sourceEndExclusive} (end-exclusive); raw resumes at ${input.source.unit} ${rawResumeIndex}; local pre-fold frame ${frameId} rows ${frameRowStart}..${frameRowEndInclusive}`,
   ].filter(Boolean).join('\n');

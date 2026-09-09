@@ -229,9 +229,20 @@ function model(
   });
 }
 
+/**
+ * The `capture-degraded=`/`built-by=` aggregate header lines belong to the
+ * explicit operator AUDIT view. The delivered package states each lane's
+ * degradation on that lane's own Recovery Index row instead of repeating a
+ * roll-up the agent cannot act on — so these header assertions render the
+ * diagnostic view deliberately, and a delivery-side test below pins that the
+ * per-lane truth an agent actually reads did not go quiet with the roll-up.
+ */
+const renderDiagnostic = (model: Parameters<typeof renderRebirthPackageV6>[0]): string =>
+  renderRebirthPackageV6(model, { diagnostic: true });
+
 describe('capture-degraded boundary header', () => {
   it('lists operator-vault when the lineage feed omitted unfrontiered ancestors', () => {
-    const rendered = renderRebirthPackageV6(model({
+    const rendered = renderDiagnostic(model({
       operatorVault: { units: [], rangeRecover: null, partialReason: OMISSION_REASON },
     }));
     const line = rendered.split('\n').find((row) => row.startsWith('capture-degraded='));
@@ -245,7 +256,7 @@ describe('capture-degraded boundary header', () => {
     // their own honest recovery/omission truth per-section (some are
     // ledger-addressable, others may be ledger-unreachable). The header
     // points to per-lane truth instead of overpromising uniform recoverability.
-    const rendered = renderRebirthPackageV6(model({
+    const rendered = renderDiagnostic(model({
       operatorVault: { units: [], rangeRecover: null, partialReason: OMISSION_REASON },
     }));
     const line = rendered.split('\n').find((row) => row.startsWith('capture-degraded='));
@@ -255,7 +266,7 @@ describe('capture-degraded boundary header', () => {
   });
 
   it('lists operator-vault when head-manifest frontier resolution failed', () => {
-    const rendered = renderRebirthPackageV6(model({
+    const rendered = renderDiagnostic(model({
       operatorVault: { units: [], rangeRecover: null, partialReason: RESOLUTION_FAILURE_REASON },
     }));
     const line = rendered.split('\n').find((row) => row.startsWith('capture-degraded='));
@@ -264,10 +275,35 @@ describe('capture-degraded boundary header', () => {
   });
 
   it('renders no capture-degraded line for a healthy frontier-bounded capture', () => {
-    const rendered = renderRebirthPackageV6(model({
+    const rendered = renderDiagnostic(model({
       operatorVault: { units: [], rangeRecover: null, partialReason: HEALTHY_FRONTIER_REASON },
     }));
     expect(rendered).not.toContain('capture-degraded=');
+  });
+
+  it('keeps the degradation visible per-lane in the DELIVERED package', () => {
+    // Retiring the roll-up header must not make a truncated capture read clean
+    // to the one reader who cannot ask for the audit view. D2 also retired the
+    // hidden lineage sections' own Recovery Index rows, so the surviving
+    // delivered surface is the compact degraded-capture line: it exists ONLY
+    // when a lane is genuinely degraded, it names the lane, and it carries the
+    // capture-side reason so a successor can tell a truncated vault from a
+    // bounded one.
+    const degraded = renderRebirthPackageV6(model({
+      operatorVault: { units: [], rangeRecover: null, partialReason: OMISSION_REASON },
+    }));
+    expect(degraded).not.toContain('capture-degraded=');
+    const laneRow = degraded.split('\n').find((row) => row.startsWith('⚠ Degraded capture:'));
+    expect(laneRow).toBeDefined();
+    expect(laneRow).toContain('operator-vault');
+    expect(laneRow).toContain('unfrontiered lineage id');
+
+    // A healthy frontier-bounded capture must not merely omit the phrase — it
+    // must publish no degradation claim at all.
+    const healthy = renderRebirthPackageV6(model({
+      operatorVault: { units: [], rangeRecover: null, partialReason: HEALTHY_FRONTIER_REASON },
+    }));
+    expect(healthy).not.toContain('⚠ Degraded capture:');
   });
 });
 
@@ -276,7 +312,7 @@ describe('capture-degraded boundary header', () => {
 // silence is never acceptable on the boundary header.
 describe('boundary builder-identity stamp', () => {
   it('renders a full built-by line when the builder identity is stamped', () => {
-    const rendered = renderRebirthPackageV6(model({}, {
+    const rendered = renderDiagnostic(model({}, {
       builder: {
         path: 'sidecar-worker-pool',
         endpoint: '127.0.0.1:3201',
@@ -293,7 +329,7 @@ describe('boundary builder-identity stamp', () => {
   });
 
   it('renders honest unknown when the identity is absent, and never throws on malformed stamps', () => {
-    const missing = renderRebirthPackageV6(model());
+    const missing = renderDiagnostic(model());
     expect(missing.split('\n').find((row) => row.startsWith('built-by=')))
       .toBe('built-by=unknown · builder identity was not stamped at capture');
 
@@ -303,7 +339,7 @@ describe('boundary builder-identity stamp', () => {
       'garbage',
       null,
     ]) {
-      const rendered = renderRebirthPackageV6(model({}, { builder: malformed }));
+      const rendered = renderDiagnostic(model({}, { builder: malformed }));
       const line = rendered.split('\n').find((row) => row.startsWith('built-by='));
       expect(line).toContain('built-by=');
       expect(line).not.toContain('undefined');
@@ -404,7 +440,7 @@ describe('boundary header and lane census can never drift', () => {
       const built = model(overrides);
       const helperLanes = computeRebirthCaptureDegradedLanes(built);
       expect(helperLanes).toEqual(expectedLanes);
-      const rendered = renderRebirthPackageV6(built);
+      const rendered = renderDiagnostic(built);
       const line = rendered.split('\n').find((row) => row.startsWith('capture-degraded='));
       if (helperLanes.length === 0) {
         expect(line).toBeUndefined();

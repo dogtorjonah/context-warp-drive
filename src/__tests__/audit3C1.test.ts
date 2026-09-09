@@ -99,10 +99,24 @@ function mergeModel(): RebirthPackageV6Model {
   });
 }
 
+/**
+ * S1 telemetry split: the builder/lane/version header lines are operator
+ * diagnostics, not agent-facing continuity, so the DELIVERED package no longer
+ * carries them. The four-surface agreement they pin is unchanged — it is now
+ * asserted on the surface that publishes it. Delivery-side truth for a degraded
+ * capture is pinned separately in rebirthCaptureDegradedLanes.test.ts.
+ */
+const renderAudit = (
+  model: RebirthPackageV6Model,
+  options: Record<string, unknown> = {},
+): ReturnType<typeof renderRebirthPackageV6WithReport> => (
+  renderRebirthPackageV6WithReport(model, { ...options, diagnostic: true })
+);
+
 describe('audit-3 C1: v2 partial-class (A8/S6) four-surface agreement', () => {
   it('classifies an explained duplicate-merge as `merge` across every completeness surface (never unknown)', () => {
     const model = mergeModel();
-    const { text } = renderRebirthPackageV6WithReport(model);
+    const { text } = renderAudit(model);
     // 1. Boundary header names the lane with class `merge`.
     expect(text).toContain('capture-partial-lanes=operator-vault:merge');
     expect(text).toContain('episode-chapter-index:merge');
@@ -131,14 +145,18 @@ describe('audit-3 C1: v2 partial-class (A8/S6) four-surface agreement', () => {
     const model = buildModel({
       episodeChapterIndex: { units, rangeRecover: null, partialReason: null },
     });
-    const { text } = renderRebirthPackageV6WithReport(model, {
+    const { text } = renderAudit(model, {
       packageBudget: 12000,
       sectionMaxChars: { episodeChapterIndex: 500 },
       adaptiveBackfill: false,
     });
     // Boundary header: the chapter lane carries the pressure class `cap`
-    // (kebab lane label from SECTION_LANE_IDS).
-    expect(text).toContain('capture-partial-lanes=episode-chapter-index:cap');
+    // (kebab lane label from SECTION_LANE_IDS). The lane is asserted WITHIN the
+    // census rather than as its prefix: D2's relocated lineage sections now
+    // also appear on this line, and pinning position would fail the moment an
+    // unrelated lane changes class.
+    const laneCensus = text.split('\n').find((l) => l.startsWith('capture-partial-lanes=')) ?? '';
+    expect(laneCensus).toContain('episode-chapter-index:cap');
     // Footer RENDER-INCOMPLETE names the capped section.
     expect(text).toContain('RENDER-INCOMPLETE sections: episodeChapterIndex');
     // No explained partiality silently labels the section content-complete.
@@ -180,16 +198,20 @@ describe('audit-3 C1: v2 partial-class (A8/S6) four-surface agreement', () => {
 
   it('renders the v2 class vocabulary including merge on the header line', () => {
     const model = mergeModel();
-    const { text } = renderRebirthPackageV6WithReport(model);
+    const { text } = renderAudit(model);
+    // `relocated` joined the vocabulary when D2 stopped rendering the hidden
+    // lineage sections: a section moved to the continuity ledger is a distinct
+    // class from one truncated under budget, and reporting the first as the
+    // second is the render-loss lie this vocabulary exists to prevent.
     expect(text).toContain(
-      'class-vocabulary=horizon|cap|store|merge|not-requested|unknown',
+      'class-vocabulary=horizon|cap|store|merge|relocated|not-requested|unknown',
     );
   });
 });
 
 describe('audit-3 C1: single versions= line (B8)', () => {
   it('replaces the old schema=/render= soup with one versions= line', () => {
-    const { text } = renderRebirthPackageV6WithReport(mergeModel());
+    const { text } = renderAudit(mergeModel());
     const lines = text.split('\n').filter((l) => l.startsWith('versions='));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(/^versions=model:.*render:v6-sections.*capture-id:naming-v2.*provenance:v1/u);
@@ -199,7 +221,11 @@ describe('audit-3 C1: single versions= line (B8)', () => {
 
 describe('audit-3 C1: life-ledger legend key parity (A4)', () => {
   it('legend names every row key the assembler emits (span/by/runtime/boundary/prior-status/package-chars/src)', () => {
-    const { text } = renderRebirthPackageV6WithReport(mergeModel());
+    // D2 relocated the Life Ledger body to the continuity ledger, so no
+    // default render carries its rows. The legend/row grammar still ships
+    // whenever a caller asks for the section explicitly (operator audit view),
+    // and that grammar is what this parity guard owns.
+    const { text } = renderAudit(mergeModel(), { sectionMaxChars: { lifeLedger: 4000 } });
     const legend = text.split('\n').find((l) => l.startsWith('legend: one line per life')) ?? '';
     // The life origin line renders the v3 grammar after a real life unit.
     for (const key of ['life ', 'span=', 'by=', 'runtime=', 'boundary=', 'prior-status=', 'package-chars=', 'src=']) {
@@ -211,7 +237,7 @@ describe('audit-3 C1: life-ledger legend key parity (A4)', () => {
 describe('audit-3 C1: hazards tri-state (C8)', () => {
   it('renders hazards=none/unknown/<n>/elided deterministically from execution blocker facts', () => {
     // No blocker facts: healthy empty receipt scan.
-    const empty = renderRebirthPackageV6WithReport({ ...mergeModel(), executionState: { facts: [], unknownReasons: [] } });
+    const empty = renderAudit({ ...mergeModel(), executionState: { facts: [], unknownReasons: [] } });
     expect(empty.text).toContain('execution-blockers=none');
     expect(empty.text).toContain('capture/index/render health reported separately');
   });
