@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto';
 import {
   buildRebirthPackageV6Model,
   lintPackageSelfChecks,
+  measureRebirthPackageMetadataDensity,
+  REBIRTH_PACKAGE_METADATA_RATIO_BARS,
+  REBIRTH_PACKAGE_PROSE_SECTION_IDS,
   renderRebirthPackageV6,
   renderRebirthPackageV6WithReport,
   sha256ContinuityLedgerVerbatim,
@@ -741,5 +744,63 @@ describe('rebirth package self-lint (S2)', () => {
       const matches = text.match(/self-check/g);
       if (matches) expect(text.length).toBeLessThanOrEqual(budget);
     }
+  });
+});
+
+describe('metadata density metric (rail-72adf723 S27)', () => {
+  it('separates decoration from a fact row\'s own content on a REAL render', () => {
+    // Measured against a real render of the benchmark model, never a synthetic
+    // string: the whole point of the metric is how the renderer's own grammar
+    // distributes decoration, which a hand-written fixture cannot exercise.
+    const rendered = renderRebirthPackageV6(benchmarkModel());
+    const density = measureRebirthPackageMetadataDensity(rendered);
+
+    expect(density.sections.length).toBeGreaterThan(0);
+    for (const section of density.sections) {
+      expect(section.ratio).toBeGreaterThanOrEqual(0);
+      expect(section.ratio).toBeLessThanOrEqual(1);
+      expect(section.decorationChars).toBeLessThanOrEqual(section.totalChars);
+      expect(section.sectionClass).toBe(
+        REBIRTH_PACKAGE_PROSE_SECTION_IDS.has(section.sectionId) ? 'prose' : 'structured',
+      );
+      expect(section.bar).toBe(REBIRTH_PACKAGE_METADATA_RATIO_BARS[section.sectionClass]);
+      expect(section.withinBar).toBe(section.ratio <= section.bar);
+    }
+
+    // Every prose-bearing section must clear the 0.30 bar the criterion was
+    // written for: prose diluted by decoration is the harm.
+    for (const section of density.sections.filter((entry) => entry.sectionClass === 'prose')) {
+      expect(section.withinBar).toBe(true);
+    }
+  });
+
+  it('counts an addressing anchor as decoration and a truth label as content', () => {
+    // The distinction the old keyed-line heuristic could not make. Both rows
+    // carry `key=value`; only one of them is telling you where to look.
+    const addressing = measureRebirthPackageMetadataDensity(
+      'shipped the allocator fix ⟨rail-72adf723:step-9 @09-09 07:05:32Z⟩',
+    ).overall;
+    const truthLabel = measureRebirthPackageMetadataDensity(
+      '- validation · scoped-vitest: call=completed · outcome=unknown · current-source=unverified',
+    ).overall;
+
+    expect(addressing.decorationChars).toBeGreaterThan(0);
+    expect(truthLabel.decorationChars).toBe(0);
+    expect(truthLabel.ratio).toBe(0);
+  });
+
+  it('never double-counts an addressing key that sits inside an anchor', () => {
+    const withKeyInsideAnchor = measureRebirthPackageMetadataDensity(
+      'row text ⟨source=abc @09-09 10:00:00Z⟩',
+    ).overall;
+    expect(withKeyInsideAnchor.decorationChars).toBe('⟨source=abc @09-09 10:00:00Z⟩'.length);
+  });
+
+  it('is total: an unframed string measures as one package span', () => {
+    const plain = measureRebirthPackageMetadataDensity('no section frames here');
+    expect(plain.sections).toHaveLength(0);
+    expect(plain.overall.sectionId).toBe('package');
+    expect(plain.overall.ratio).toBe(0);
+    expect(measureRebirthPackageMetadataDensity('').overall.ratio).toBe(0);
   });
 });

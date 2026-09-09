@@ -6161,6 +6161,124 @@ function pruneRecoveryLegendRows(text: string): string {
   return kept.join('\n');
 }
 
+/**
+ * ── Metadata density ────────────────────────────────────────────────────────
+ *
+ * WHY THIS EXISTS (rail-72adf723 S27). S19 asserted a "per-section metadata
+ * <= 0.30" bar with no metric behind it, so the measurement used an ad-hoc
+ * keyed-line heuristic that counted any `key=value` line as metadata. That
+ * heuristic scored executionState 0.973, recoveryIndex 0.450 and
+ * activeEditDelta 0.452 — not because those sections were diluted, but because
+ * they are FACT TABLES whose keyed lines are the content. A metric that
+ * penalises a fact table for being a fact table measures the wrong thing.
+ *
+ * THE DISTINCTION. The bar exists to stop provenance decoration from diluting
+ * the prose an agent actually reads. So:
+ *   - DECORATION is how to FIND or VERIFY a claim: the trailing `⟨source @time⟩`
+ *     anchor, and addressing keys whose values are opaque identifiers a reader
+ *     never interprets (call-id, result-source, sha256, capture-id, ...).
+ *   - CONTENT is what the row SAYS — including truth labels like
+ *     `outcome=unknown` or `current-source=unverified`, which change the
+ *     meaning of the claim and are exactly what a successor must read.
+ * A key is decoration because of what it addresses, not because it has an `=`.
+ */
+const REBIRTH_METADATA_ANCHOR_RE = /⟨[^⟩]*⟩/gu;
+
+/**
+ * Keys whose values are addressing/verification identifiers. Deliberately a
+ * closed list: a key earns membership by being something a reader USES TO LOOK
+ * SOMETHING UP rather than something they read. Truth/outcome labels are
+ * excluded on purpose.
+ */
+const REBIRTH_METADATA_ADDRESSING_KEYS: readonly string[] = Object.freeze([
+  'source', 'source-time', 'call-id', 'result-source', 'artifact-hashes',
+  'provenance', 'capture-id', 'exposure-id', 'recover', 'projection',
+  'authority', 'kept-by', 'frontier', 'sha256', 'atlas-file-row',
+  'evidence-ids', 'observed-at',
+]);
+
+const REBIRTH_METADATA_ADDRESSING_RE = new RegExp(
+  `(?<![A-Za-z0-9_-])(?:${REBIRTH_METADATA_ADDRESSING_KEYS.join('|')})=[^\\s·⟩]*`,
+  'gu',
+);
+
+/**
+ * Sections that carry prose a successor READS. The 0.30 bar is theirs: prose
+ * diluted by decoration is the harm the bar was written for.
+ */
+export const REBIRTH_PACKAGE_PROSE_SECTION_IDS: ReadonlySet<string> = new Set([
+  'boundaryAndActiveTask',
+  'recentConversation',
+]);
+
+/**
+ * Per-class bars. Structured sections get a higher bar because addressing is a
+ * legitimately larger share of a terse fact row — but not an unlimited one: a
+ * row that is more than half addressing is telling the agent where to look
+ * instead of what happened.
+ */
+export const REBIRTH_PACKAGE_METADATA_RATIO_BARS = Object.freeze({
+  prose: 0.30,
+  structured: 0.50,
+});
+
+export interface RebirthPackageMetadataDensity {
+  readonly sectionId: string;
+  readonly sectionClass: 'prose' | 'structured';
+  readonly totalChars: number;
+  readonly decorationChars: number;
+  /** decorationChars / totalChars; 0 for an empty section. */
+  readonly ratio: number;
+  readonly bar: number;
+  readonly withinBar: boolean;
+}
+
+function measureMetadataSpan(text: string): { totalChars: number; decorationChars: number } {
+  const totalChars = text.length;
+  let decorationChars = 0;
+  for (const match of text.matchAll(REBIRTH_METADATA_ANCHOR_RE)) decorationChars += match[0].length;
+  // Addressing keys are counted on the ANCHOR-STRIPPED text so a key inside an
+  // anchor is never double-counted.
+  const withoutAnchors = text.replace(REBIRTH_METADATA_ANCHOR_RE, '');
+  for (const match of withoutAnchors.matchAll(REBIRTH_METADATA_ADDRESSING_RE)) {
+    decorationChars += match[0].length;
+  }
+  return { totalChars, decorationChars };
+}
+
+/**
+ * Measure decoration density of a RENDERED package, overall and per section.
+ * Pure and total: any string yields a result. Section bodies are taken between
+ * a `[REBIRTH-V6-SECTION id=…]` header and its closing tag, so an unframed
+ * string measures as one `package` span rather than throwing.
+ */
+export function measureRebirthPackageMetadataDensity(rendered: string): {
+  readonly overall: RebirthPackageMetadataDensity;
+  readonly sections: readonly RebirthPackageMetadataDensity[];
+} {
+  const classify = (sectionId: string): 'prose' | 'structured' => (
+    REBIRTH_PACKAGE_PROSE_SECTION_IDS.has(sectionId) ? 'prose' : 'structured'
+  );
+  const describe = (sectionId: string, text: string): RebirthPackageMetadataDensity => {
+    const { totalChars, decorationChars } = measureMetadataSpan(text);
+    const sectionClass = classify(sectionId);
+    const bar = REBIRTH_PACKAGE_METADATA_RATIO_BARS[sectionClass];
+    const ratio = totalChars > 0 ? decorationChars / totalChars : 0;
+    return { sectionId, sectionClass, totalChars, decorationChars, ratio, bar, withinBar: ratio <= bar };
+  };
+
+  const sections: RebirthPackageMetadataDensity[] = [];
+  const headerRe = /\[REBIRTH-V6-SECTION id=([a-zA-Z0-9]+)[^\]]*\]/gu;
+  for (const match of rendered.matchAll(headerRe)) {
+    const sectionId = match[1];
+    const bodyStart = (match.index ?? 0) + match[0].length;
+    const closeAt = rendered.indexOf('[/REBIRTH-V6-SECTION]', bodyStart);
+    sections.push(describe(sectionId, rendered.slice(bodyStart, closeAt < 0 ? rendered.length : closeAt)));
+  }
+
+  return { overall: describe('package', rendered), sections };
+}
+
 export function renderRebirthPackageV6WithReport(
   model: RebirthPackageV6Model,
   options: RenderRebirthPackageV6Options = {},

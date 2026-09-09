@@ -1,11 +1,41 @@
 /**
- * Golden baseline test: freezes the EXACT renderCard output for known inputs
- * BEFORE the Fold Recall Unification carriers (pathEpisodes, pathAtlasMeta)
- * are added. After the carriers are implemented, step 11b re-runs this test
- * to prove empty new carriers = byte-identical output.
+ * Golden format gate for the rendered fold-recall card.
  *
- * This is the only honest way to prove byte-identical safety: compare the
- * changed code's output to a PRE-CHANGE frozen string, not to itself.
+ * ORIGINAL CHARTER (DISCHARGED): this file was created to freeze renderCard
+ * output BEFORE the Fold Recall Unification carriers (pathEpisodes,
+ * pathAtlasMeta) were added, so that "step 11b" could prove empty new carriers
+ * produced byte-identical output. That migration closed and the proof was
+ * delivered; the file no longer has a pre-change baseline to compare against,
+ * and it must not keep claiming that it does.
+ *
+ * CURRENT CHARTER: this is the only test that freezes the COMPLETE rendered
+ * card text end to end through the real compaction pipeline
+ * (intraTurnFold -> checkFoldTrigger -> foldContext -> buildFoldRecallContext).
+ * The card is a model-visible surface: agents read it at tool boundaries and
+ * downstream tooling parses its header and its Chronological Provenance line.
+ * The gate therefore guards against ACCIDENTAL format churn — a header token
+ * moving, a provenance clause silently changing shape, a marker disappearing.
+ * It is not a correctness proof of recall selection; the foldRecall behavioural
+ * suites own that.
+ *
+ * HOW TO CHANGE A SNAPSHOT HERE: a mismatch is a decision point, never a
+ * rubber stamp. Re-freeze only with the intended delta named in the commit
+ * record, the same shape S17's mistake registry uses. Silently accepting a diff
+ * turns this gate into a rubber stamp that reports "green" while the surface
+ * drifts.
+ *
+ * SNAPSHOTS RE-FROZEN 2026-09-09 (rail-72adf723 S22) for three intended
+ * renderer changes, all pre-existing and all deliberate:
+ *   1. Salient-turn omission marker: the header now reports partial inclusion
+ *      as "M of N chars folded · salient turn" instead of a bare "N chars
+ *      folded", so a card that carries only part of a turn says so.
+ *   2. Chronological Provenance range end + seam marker: the range now renders
+ *      "#0..#3 (inclusive)" where it previously rendered "#0..#4". The old text
+ *      was arithmetically ambiguous against its own n=4 (0..4 inclusive is five
+ *      messages, exclusive is four); the explicit inclusive seam resolves it.
+ *      This one is a CORRECTNESS repair, not cosmetics.
+ *   3. Raw-resume census: "raw-resumes=none" now carries its exact count as
+ *      "raw-resumes=none (0 exact)".
  */
 import { describe, expect, test } from 'vitest';
 
@@ -59,7 +89,7 @@ function indexFor(raw: FoldMessage[]) {
   return buildFoldIndex(raw, runPipeline(raw));
 }
 
-describe('foldRecall golden baseline (pre-unification)', () => {
+describe('foldRecall rendered-card format gate', () => {
   /**
    * CASE 1: A single path-touch trigger with one folded turn. No radar, no
    * deltas, no episodes — the simplest case. The full output text is frozen.
@@ -97,8 +127,8 @@ describe('foldRecall golden baseline (pre-unification)', () => {
       // Still snapshot the empty output so the baseline is captured.
     }
     expect(out.text).toMatchInlineSnapshot(`
-      "[Recalled from fold — research turn (relay/src/baseline-target.ts) | trigger: path-touch relay/src/baseline-target.ts | 3,260 chars folded]
-      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#4 n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known origin=derived topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none
+      "[Recalled from fold — research turn (relay/src/baseline-target.ts) | trigger: path-touch relay/src/baseline-target.ts | 3,100 of 3,260 chars folded · salient turn]
+      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#3 (inclusive) n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known origin=derived topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none (0 exact)
       ↞ source episode: Read · relay/src/baseline-target.ts
         ↳ Atlas drill-down unavailable
       User asked: Read baseline-target.ts
@@ -152,8 +182,8 @@ describe('foldRecall golden baseline (pre-unification)', () => {
     );
 
     expect(out.text).toMatchInlineSnapshot(`
-      "[Recalled from fold — research turn (relay/src/baseline-target.ts) | trigger: path-touch relay/src/baseline-target.ts | 3,296 chars folded]
-      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#4 n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known origin=derived topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none
+      "[Recalled from fold — research turn (relay/src/baseline-target.ts) | trigger: path-touch relay/src/baseline-target.ts | 3,134 of 3,296 chars folded · salient turn]
+      [Chronological Provenance v1] artifact=fold-recall#turn:0 class=retrieved-history source=?:message#0..?:message#3 (inclusive) n=4 @ time unknown..time unknown created=?:message#8 @ time unknown authority=historical-background supersession=none-known origin=derived topology=raw-history>artifact>none host=dedicated-synthetic-message representation=canonical raw-resumes=none (0 exact)
       ↞ source episode: Read · relay/src/baseline-target.ts
         ↳ Atlas drill-down unavailable
       Δ Source changed since fold — body below is the HISTORICAL folded copy; fresh-read before relying on it; what changed:
