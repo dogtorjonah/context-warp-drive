@@ -480,6 +480,30 @@ describe('timeline budgets', () => {
     expect(text.length).toBeLessThanOrEqual(150_000);
   });
 
+  it('protects 50k of distinct cognition while retaining the newest dialogue and all receipts', () => {
+    const model = buildRebirthPackageV6Model({
+      ...specimen(), recentConversation: pressureDialogue(),
+      cognitiveArtifacts: Array.from({ length: 400 }, (_, i) => ({
+        provenanceId: `chat:pressure-${i}`, sourceAt: new Date(Date.UTC(2026, 8, 8, 0, i)).toISOString(),
+        kind: 'decision' as const, authority: 'historical_observation' as const,
+        supersededBy: null, text: `DISTINCT FINDING ${i} ${'reason '.repeat(100)}`,
+      })),
+    });
+    const caps = resolveAdaptiveSectionCaps(model);
+    // Whole-unit packing can leave one row of slack, but not revert to 20k.
+    expect(caps.cognitiveArtifacts).toBeGreaterThan(49_000);
+    const rendered = renderRebirthPackageV6WithReport(model);
+    expect(rendered.text).toContain('OPERATOR REQUEST 79');
+    expect(rendered.text).toContain('ANSWER 79');
+    expect(rendered.text).toContain('DISTINCT FINDING 399');
+    const units = buildContinuityLedgerCaptureFromV6Render(model, rendered.collapse)!.units
+      .filter((unit) => unit.sectionId === 'cognitiveArtifacts');
+    expect(units).toHaveLength(400);
+    expect(units.some((unit) => unit.placement === 'elided')).toBe(true);
+    expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex
+      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(145_000);
+  });
+
   it('never reserves for cognition that has no distinct units', () => {
     const base = specimen();
     const dialogue = pressureDialogue();

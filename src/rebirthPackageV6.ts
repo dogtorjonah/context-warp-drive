@@ -958,12 +958,11 @@ export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 150_000;
 
 /**
  * The most the timeline pool reserves for distinct cognition ahead of dialogue.
- * Measured on this lineage's 2026-09-09 capture the units dialogue could not
- * own were 158 Atlas commit rows, 117 rail step ACKs, 31 chatroom posts and a
- * star; at compact-row size the newest day or two of those fit in 20k. The
- * reserve is demand-bound: cognition takes only what it fills, never padding.
+ * Protect 50k for distinct cognition alongside 65k for dialogue in the active
+ * 115k pool. Idle execution frees another 14k for dialogue. The reserve is
+ * demand-bound: cognition takes only what it fills, never padding.
  */
-export const COGNITIVE_TIMELINE_FLOOR_CHARS = 20_000;
+export const COGNITIVE_TIMELINE_FLOOR_CHARS = 50_000;
 
 /** Phase ceilings derive from captured rail facts; unknown is not idle. */
 export type RebirthPackageExecutionPhase = 'rail-active' | 'rail-complete' | 'no-rail';
