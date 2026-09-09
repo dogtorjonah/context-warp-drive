@@ -930,7 +930,13 @@ const SECTION_TITLES: Readonly<Record<RebirthPackageV6SectionId, string>> = Obje
  * Ordinary content: boundary 5k, timeline 105k, execution/edits 15k,
  * recovery 10k, reserve 10k. Framing has a separate 5k allowance.
  * The reserve belongs to dialogue unless merge synthesis is present.
- * Conversation gets first admission; cognition may use only its remainder.
+ * Every timeline citizen holds a budget (operator directive 2026-09-09):
+ * distinct cognition — units no dialogue row owns — reserves up to
+ * COGNITIVE_TIMELINE_FLOOR_CHARS, and only as much of it as it can actually
+ * fill; dialogue draws the rest of the pool first and inherits whatever
+ * cognition leaves. A cognitive artifact that IS a dialogue row (a register
+ * glyph harvested from a pane message) is dialogue-owned: it is never budgeted,
+ * rendered, or counted a second time (dialogueUnitKey).
  * These are phase ceilings, not scarcity weights that backfill can override.
  */
 export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
@@ -949,6 +955,15 @@ export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
 });
 
 export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 150_000;
+
+/**
+ * The most the timeline pool reserves for distinct cognition ahead of dialogue.
+ * Measured on this lineage's 2026-09-09 capture the units dialogue could not
+ * own were 158 Atlas commit rows, 117 rail step ACKs, 31 chatroom posts and a
+ * star; at compact-row size the newest day or two of those fit in 20k. The
+ * reserve is demand-bound: cognition takes only what it fills, never padding.
+ */
+export const COGNITIVE_TIMELINE_FLOOR_CHARS = 20_000;
 
 /** Phase ceilings derive from captured rail facts; unknown is not idle. */
 export type RebirthPackageExecutionPhase = 'rail-active' | 'rail-complete' | 'no-rail';
@@ -1351,6 +1366,17 @@ export const CONVERSATION_SEGMENT_SUFFIX = /:segment-\d+$/u;
 /** Stable message identity for a conversation row: the id minus any segment suffix. */
 export function conversationRowBaseId(provenanceId: string): string {
   return provenanceId.replace(CONVERSATION_SEGMENT_SUFFIX, '');
+}
+
+/**
+ * One unit, one owner. A register glyph harvested from a pane message and the
+ * dialogue row for that same message are the SAME unit: cognition stores it as
+ * `message:<id>`, dialogue as `<id>` (optionally `:segment-N`). This is the
+ * single identity both timeline citizens compare on, so the dialogue owns the
+ * unit and cognition never budgets, renders, or counts it a second time.
+ */
+export function dialogueUnitKey(id: string): string {
+  return conversationRowBaseId(id.replace(/^message:/u, ''));
 }
 
 /** Segment ordinal of a row: 0 = the base row, N for `:segment-N`. */
@@ -4308,11 +4334,24 @@ function cognitionSuppressionHeader(
  * deliberately (Atlas #40280); pressure therefore costs the oldest rows within
  * a priority band, which is the intended semantic.
  */
+/**
+ * Dialogue ownership handed to renderCognition. `candidates` are the dialogue
+ * identities the Timeline may render (dialogueCandidateKeys); `placements` are
+ * the conversation section's actual unit placements when that section has
+ * already rendered, so a dialogue-owned artifact can report where its one
+ * rendering went instead of claiming a second one.
+ */
+interface CognitionDialogueOwnership {
+  readonly candidates: ReadonlySet<string>;
+  readonly placements?: ReadonlyMap<string, RebirthPackageV6UnitPlacement>;
+}
+
 function renderCognition(
   model: RebirthPackageV6Model,
   maxChars: number,
   references: RebirthRecoveryReferenceCatalog,
   compact = false,
+  dialogue?: CognitionDialogueOwnership,
 ): RenderedV6SectionBody {
   const recoveryHandle = recoveryReference(
     references,
@@ -4333,7 +4372,23 @@ function renderCognition(
   addBoundaryBody(model.boundaryAndActiveTask.lastMaterialAssistant?.text);
   addBoundaryBody(model.boundaryAndActiveTask.activeRequestClaims?.latest.text);
   addBoundaryBody(model.boundaryAndActiveTask.activeRequestClaims?.previous?.text);
-  const allSourceRows = model.cognitiveArtifacts;
+  // One unit, one owner: an artifact whose identity is a dialogue candidate is
+  // the dialogue's unit. It leaves this section's budget, header counts and
+  // census entirely; its placement below mirrors the dialogue row's, so the
+  // ledger records the single rendering it actually received.
+  const dialogueOwnedRows = model.cognitiveArtifacts.filter((row) => (
+    dialogue?.candidates.has(dialogueUnitKey(row.provenanceId)) ?? false
+  ));
+  const dialogueOwnedIds = new Set(dialogueOwnedRows.map((row) => row.provenanceId));
+  const dialogueOwnedPlacements: RebirthPackageV6UnitPlacement[] = dialogueOwnedRows.map((row) => {
+    const mirrored = dialogue?.placements?.get(dialogueUnitKey(row.provenanceId));
+    return {
+      id: row.provenanceId,
+      placement: mirrored?.placement ?? 'elided',
+      projected: mirrored?.projected ?? false,
+    };
+  });
+  const allSourceRows = model.cognitiveArtifacts.filter((row) => !dialogueOwnedIds.has(row.provenanceId));
   const sourceRows = allSourceRows.filter((row) => !boundaryBodies.has(row.text.trim()));
   const fullTextById = new Map(sourceRows.filter((row) => row.projection !== 'truncated').map((row) => [row.provenanceId, row.text]));
   const boundaryDedupedCount = allSourceRows.length - sourceRows.length;
@@ -4474,15 +4529,20 @@ function renderCognition(
       }
     }
     const keptIds = new Set(keep.map((row) => row.provenanceId));
-    const unitPlacements: RebirthPackageV6UnitPlacement[] = rows.map((row) => ({
-      id: row.provenanceId,
-      placement: keptIds.has(row.provenanceId) ? 'rendered' : 'elided',
-      projected: row.projection === 'truncated' && !expandedIds.has(row.provenanceId),
-    }));
+    // Distinct units carry this section's own outcome; dialogue-owned units
+    // carry the mirrored dialogue outcome and stay out of every count below.
+    const unitPlacements: RebirthPackageV6UnitPlacement[] = [
+      ...rows.map((row) => ({
+        id: row.provenanceId,
+        placement: keptIds.has(row.provenanceId) ? 'rendered' as const : 'elided' as const,
+        projected: row.projection === 'truncated' && !expandedIds.has(row.provenanceId),
+      })),
+      ...dialogueOwnedPlacements,
+    ];
     const incomplete = rows.length - keep.length + keep.filter((row) => row.projection === 'truncated').length;
     const timeline = {
       timelineRows: keep.map((row) => ({
-        id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
+        id: dialogueUnitKey(row.provenanceId),
         sourceAt: row.sourceAt,
         text: rowBodies.get(row.provenanceId)!,
         compactText: compactRowBodies.get(row.provenanceId)!,
@@ -4746,7 +4806,7 @@ function conversationEndpointStubs(
     if (!message) return;
     const sourceAt = knownSourceTime(message.source.sourceAt);
     if (!sourceAt) return;
-    const id = conversationRowBaseId(message.source.provenanceId.replace(/^message:/u, ''));
+    const id = dialogueUnitKey(message.source.provenanceId);
     const body = `\u2192 ${note}; source ${message.chars} chars. See ${promotedAs} in Boundary (any truncation is declared there).`;
     stubs.push({
       id,
@@ -4795,9 +4855,20 @@ function mergeEndpointStubText(
   return out;
 }
 
+/**
+ * Identities of every dialogue candidate the Timeline may render — recent
+ * conversation rows plus (when the vault is folded into the chronology) the
+ * frontier-checked vault-only operator units. Cognition consults this set to
+ * decide which of its artifacts the dialogue already owns.
+ */
+function dialogueCandidateKeys(model: RebirthPackageV6Model, includeVault: boolean): ReadonlySet<string> {
+  const rows = includeVault ? conversationWithVault(model) : model.recentConversation;
+  return new Set(rows.map((row) => dialogueUnitKey(row.provenanceId)));
+}
+
 function conversationWithVault(model: RebirthPackageV6Model): readonly RebirthPackageV6ConversationRow[] {
   const rows = [...model.recentConversation];
-  const key = (id: string) => conversationRowBaseId(id.replace(/^message:/u, ''));
+  const key = dialogueUnitKey;
   const seen = new Set(rows.map((row) => key(row.provenanceId)));
   for (const endpoint of [model.boundaryAndActiveTask.activeRequest, model.boundaryAndActiveTask.lastMaterialAssistant]) {
     if (endpoint) seen.add(key(endpoint.source.provenanceId));
@@ -4882,7 +4953,7 @@ function renderConversation(
   const timelineRowsFor = (rows: readonly RebirthPackageV6ConversationRow[]): RebirthTimelineRow[] => [
     ...endpointStubs,
     ...rows.map((row) => ({
-      id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
+      id: dialogueUnitKey(row.provenanceId),
       sourceAt: row.sourceAt,
       text: renderRow(row),
       compactText: conversationRowText(row, referenceAt, recoveryHandle, continuityAnchor(conversationRowBaseId(row.provenanceId), row.sourceAt, referenceAt)),
@@ -5699,6 +5770,14 @@ function renderSectionBodies(
       .filter((placement) => placement.placement === 'rendered')
       .map((placement) => placement.id),
   );
+  // The dialogue has rendered: cognition learns which of its artifacts the
+  // dialogue owns (candidates) and what became of each (placements), so a
+  // register glyph is budgeted, rendered and counted exactly once — as dialogue.
+  const dialogueOwnership: CognitionDialogueOwnership = {
+    candidates: dialogueCandidateKeys(model, limits.operatorVault === 0),
+    placements: new Map((recentConversation.unitPlacements ?? [])
+      .map((placement) => [dialogueUnitKey(placement.id), placement] as const)),
+  };
   const renderedOperatorIds = new Set(
     model.recentConversation
       .filter((row) => row.role === 'user'
@@ -5725,7 +5804,7 @@ function renderSectionBodies(
       renderActiveEdits(model, limits.activeEditDelta, references)
     )),
     cognitiveArtifacts: measureSectionRender(timing, 'cognitiveArtifacts', () => (
-      renderCognition(model, limits.cognitiveArtifacts, references, compactTimeline)
+      renderCognition(model, limits.cognitiveArtifacts, references, compactTimeline, dialogueOwnership)
     )),
     recentConversation,
     operatorVault: measureSectionRender(timing, 'operatorVault', () => renderLineage(
@@ -5909,12 +5988,31 @@ function resolveAdaptiveSectionCapsInternal(
     - (model.brainMergeSynthesis?.trim() ? 10_000 : 0)
     - Math.max(0, limits.boundaryAndActiveTask - 5_000) + recoverySurplus + executionSurplus);
   const explicitConversation = options.sectionMaxChars?.recentConversation;
+  const explicitCognition = options.sectionMaxChars?.cognitiveArtifacts;
+  const includeVault = limits.operatorVault === 0;
+  // Every timeline citizen holds a budget. Distinct cognition — the units no
+  // dialogue row owns — reserves up to the floor, but only as much of it as it
+  // can actually fill at compact-row size: the reserve is measured demand, so
+  // an idle lineage with nothing distinct taxes dialogue by zero characters,
+  // and a busy one costs dialogue at most its oldest exchanges worth the floor.
+  let cognitionReserve = 0;
+  const owned = dialogueCandidateKeys(model, includeVault);
+  if (explicitConversation === undefined && explicitCognition === undefined) {
+    const hasDistinct = model.cognitiveArtifacts.some((row) => !owned.has(dialogueUnitKey(row.provenanceId)));
+    if (hasDistinct) {
+      const floor = Math.min(COGNITIVE_TIMELINE_FLOOR_CHARS, timelinePool);
+      const probe = renderCognition(model, floor, buildRecoveryReferenceCatalog(model), !options.diagnostic, { candidates: owned });
+      cognitionReserve = Math.min(floor, probe.text.length);
+    }
+  }
   limits.recentConversation = explicitConversation === undefined
-    ? timelinePool : Math.min(limits.recentConversation, timelinePool);
-  const dialogue = renderConversation(model, limits.recentConversation, buildRecoveryReferenceCatalog(model), !options.diagnostic, limits.operatorVault === 0);
+    ? Math.max(0, timelinePool - cognitionReserve) : Math.min(limits.recentConversation, timelinePool);
+  const dialogue = renderConversation(model, limits.recentConversation, buildRecoveryReferenceCatalog(model), !options.diagnostic, includeVault);
   const dialogueUsed = Math.min(limits.recentConversation, dialogue.text.length);
   if (explicitConversation === undefined) limits.recentConversation = dialogueUsed;
-  if (options.sectionMaxChars?.cognitiveArtifacts === undefined) {
+  if (explicitCognition === undefined) {
+    // Whatever dialogue leaves flows to cognition; the reserve is a floor, not
+    // a ceiling, and the two citizens always add up to the whole pool.
     limits.cognitiveArtifacts = Math.max(0, timelinePool - dialogueUsed);
   }
   // The conversation-first partition above reallocates WITHIN the ordinary
@@ -5939,7 +6037,7 @@ function resolveAdaptiveSectionCapsInternal(
   ) {
     const cognitionDemand = Math.min(
       limits.cognitiveArtifacts,
-      renderCognition(model, limits.cognitiveArtifacts, buildRecoveryReferenceCatalog(model)).text.length,
+      renderCognition(model, limits.cognitiveArtifacts, buildRecoveryReferenceCatalog(model), false, { candidates: owned }).text.length,
     );
     const unusedTimelinePool = Math.max(0, limits.cognitiveArtifacts - cognitionDemand);
     limits.brainMergeSynthesis += envelopeSurplus + unusedTimelinePool;

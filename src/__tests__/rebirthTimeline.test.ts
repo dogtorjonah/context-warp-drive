@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildRebirthPackageV6Model, buildContinuityLedgerCaptureFromV6Render, renderRebirthPackageV6WithReport, resolveAdaptiveSectionCaps, DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, RAIL_COMPLETE_SECTION_OVERRIDES } from '../rebirthPackageV6.ts';
+import { buildRebirthPackageV6Model, buildContinuityLedgerCaptureFromV6Render, renderRebirthPackageV6WithReport, resolveAdaptiveSectionCaps, COGNITIVE_TIMELINE_FLOOR_CHARS, DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, RAIL_COMPLETE_SECTION_OVERRIDES } from '../rebirthPackageV6.ts';
 
 const at = (minute: number) => `2026-09-09T04:${String(minute).padStart(2, '0')}:00.000Z`;
 
@@ -392,22 +392,116 @@ describe('complete working continuity', () => {
     expect(starved).not.toMatch(/\[cognition:[^\n]*\n\[… stored/u);
     expect(starved).not.toMatch(/^\[cognition:[^\]\n]*$/mu);
     expect(starved).not.toContain('DURABLE DECISION');
+    // `message:a1` is the dialogue's unit (see the ownership test below), so
+    // the census counts the three DISTINCT artifacts once each.
+    const distinct = base.cognitiveArtifacts.filter((row) => row.provenanceId !== 'message:a1').length;
+    expect(distinct).toBe(3);
     expect(censusOf(starved)).toEqual({
-      incomplete: base.cognitiveArtifacts.length,
-      captured: base.recentConversation.length + base.cognitiveArtifacts.length,
+      incomplete: distinct,
+      captured: base.recentConversation.length + distinct,
     });
     expect(starved).toContain('Omitted units:');
     // Natural pressure: dialogue demand alone exceeds the timeline pool.
-    const clock = (second: number) => `2026-09-09T03:${String(Math.floor(second / 60)).padStart(2, '0')}:${String(second % 60).padStart(2, '0')}.000Z`;
-    const recentConversation: Array<(typeof base.recentConversation)[number]> = [];
-    for (let i = 0; i < 80; i += 1) {
-      recentConversation.push({ provenanceId: `req-${i}`, sourceAt: clock(i * 10), role: 'user', text: `OPERATOR REQUEST ${i}`, exchangeId: `req-${i}` });
-      recentConversation.push({ provenanceId: `ans-${i}`, sourceAt: clock(i * 10 + 5), role: 'assistant', text: `ANSWER ${i} ` + 'reasoning '.repeat(200), exchangeId: `req-${i}` });
-    }
+    const recentConversation = pressureDialogue();
     const pressured = renderRebirthPackageV6WithReport(buildRebirthPackageV6Model({ ...base, recentConversation })).text;
     expect(pressured.length).toBeLessThanOrEqual(150_000);
     expect(pressured).not.toMatch(/^\[cognition:[^\]\n]*$/mu);
+    // With a1 gone from the dialogue, `message:a1` is distinct again: all four count.
     expect(censusOf(pressured).captured).toBe(recentConversation.length + base.cognitiveArtifacts.length);
     expect(pressured).toContain('Omitted units:');
+  });
+});
+
+/** 80 exchanges whose dialogue demand alone exceeds the timeline pool. */
+function pressureDialogue(): Array<ReturnType<typeof specimen>['recentConversation'][number]> {
+  const clock = (second: number) => `2026-09-09T03:${String(Math.floor(second / 60)).padStart(2, '0')}:${String(second % 60).padStart(2, '0')}.000Z`;
+  const rows: Array<ReturnType<typeof specimen>['recentConversation'][number]> = [];
+  for (let i = 0; i < 80; i += 1) {
+    rows.push({ provenanceId: `req-${i}`, sourceAt: clock(i * 10), role: 'user', text: `OPERATOR REQUEST ${i}`, exchangeId: `req-${i}` });
+    rows.push({ provenanceId: `ans-${i}`, sourceAt: clock(i * 10 + 5), role: 'assistant', text: `ANSWER ${i} ` + 'reasoning '.repeat(200), exchangeId: `req-${i}` });
+  }
+  return rows;
+}
+
+// Operator directive 2026-09-09: every timeline citizen holds a budget, and a
+// cognitive artifact that IS a dialogue row is dialogue. Distinct cognition
+// reserves a demand-bound floor ahead of dialogue; dialogue-owned artifacts are
+// budgeted, rendered and counted exactly once — as dialogue.
+describe('timeline budgets', () => {
+  const censusOf = (text: string) => {
+    const census = text.match(/Timeline census: \d+ dated, \d+ quarantined; (\d+) of (\d+) captured units not fully rendered/u);
+    return census ? { incomplete: Number(census[1]), captured: Number(census[2]) } : null;
+  };
+
+  it('a register glyph the dialogue owns is rendered once as dialogue and its ledger placement mirrors the dialogue row', () => {
+    const base = specimen();
+    const result = renderRebirthPackageV6WithReport(base);
+    // The body rendered is the dialogue's; the glyph copy never appears.
+    expect(result.text.match(/ANSWER START/gu)).toHaveLength(1);
+    expect(result.text).not.toContain('DUPLICATE GLYPH BODY');
+    // Distinct units render; the owned one is not in cognition's counts.
+    expect(result.text).toContain('DURABLE DECISION');
+    expect(result.text).toContain('COMMIT FINDING');
+    const census = censusOf(result.text);
+    if (census) expect(census.captured).toBe(base.recentConversation.length + 3);
+    // Ledger: the cognition unit reports the dialogue's outcome, not a second one.
+    const units = buildContinuityLedgerCaptureFromV6Render(base, result.collapse)!.units;
+    const owned = units.find((unit) => unit.unitId === 'message:a1');
+    expect(owned?.sectionId).toBe('cognitiveArtifacts');
+    expect(owned?.placement).toBe('rendered');
+    // Even with cognition starved to nothing, the owned unit stays rendered —
+    // its rendering was never cognition's to lose.
+    const starved = renderRebirthPackageV6WithReport(base, { sectionMaxChars: { cognitiveArtifacts: 82 } });
+    const starvedOwned = buildContinuityLedgerCaptureFromV6Render(base, starved.collapse)!.units
+      .find((unit) => unit.unitId === 'message:a1');
+    expect(starvedOwned?.placement).toBe('rendered');
+    expect(starved.text.match(/ANSWER START/gu)).toHaveLength(1);
+  });
+
+  it('reserves a demand-bound floor for distinct cognition under dialogue pressure', () => {
+    const base = specimen();
+    const model = buildRebirthPackageV6Model({ ...base, recentConversation: pressureDialogue() });
+    const caps = resolveAdaptiveSectionCaps(model);
+    const { text } = renderRebirthPackageV6WithReport(model);
+    // Dialogue alone would fill the pool; the distinct artifacts still render.
+    expect(text).toContain('DURABLE DECISION');
+    expect(text).toContain('COMMIT FINDING');
+    expect(text).toContain('DUPLICATE GLYPH BODY'); // a1 is not in this dialogue: distinct here
+    // The reserve is measured demand, never the whole floor for four short rows…
+    expect(caps.cognitiveArtifacts).toBeGreaterThan(0);
+    expect(caps.cognitiveArtifacts).toBeLessThan(COGNITIVE_TIMELINE_FLOOR_CHARS);
+    // …and the two citizens still add up to exactly the pool.
+    expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex
+      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(145_000);
+    // Dialogue paid with its OLDEST exchanges only; the newest are intact.
+    expect(text).toContain('OPERATOR REQUEST 79');
+    expect(text).toContain('ANSWER 79');
+    expect(text).not.toContain('OPERATOR REQUEST 0\n');
+    expect(text.length).toBeLessThanOrEqual(150_000);
+  });
+
+  it('never reserves for cognition that has no distinct units', () => {
+    const base = specimen();
+    const dialogue = pressureDialogue();
+    const ownedOnly = buildRebirthPackageV6Model({
+      ...base,
+      recentConversation: dialogue,
+      cognitiveArtifacts: [
+        { provenanceId: 'message:ans-79', sourceAt: dialogue.at(-1)!.sourceAt, kind: 'result', authority: 'historical_observation', supersededBy: null, text: 'GLYPH COPY OF ANSWER 79' },
+      ],
+    });
+    const none = buildRebirthPackageV6Model({ ...base, recentConversation: dialogue, cognitiveArtifacts: [] });
+    expect(resolveAdaptiveSectionCaps(ownedOnly).recentConversation).toBe(resolveAdaptiveSectionCaps(none).recentConversation);
+    const { text } = renderRebirthPackageV6WithReport(ownedOnly);
+    expect(text).not.toContain('GLYPH COPY OF ANSWER 79');
+    expect(text.match(/ANSWER 79 /gu)).toHaveLength(1);
+  });
+
+  it('explicit caller caps stay authoritative over the floor', () => {
+    const model = buildRebirthPackageV6Model({ ...specimen(), recentConversation: pressureDialogue() });
+    const caps = resolveAdaptiveSectionCaps(model, { sectionMaxChars: { cognitiveArtifacts: 5_000 } });
+    expect(caps.cognitiveArtifacts).toBe(5_000);
+    const capped = resolveAdaptiveSectionCaps(model, { sectionMaxChars: { recentConversation: 50_000 } });
+    expect(capped.recentConversation).toBe(50_000);
   });
 });
