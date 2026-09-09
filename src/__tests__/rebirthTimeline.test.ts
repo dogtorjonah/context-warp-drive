@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildRebirthPackageV6Model, buildContinuityLedgerCaptureFromV6Render, renderRebirthPackageV6WithReport, resolveAdaptiveSectionCaps, DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS } from '../rebirthPackageV6.ts';
+import { buildRebirthPackageV6Model, buildContinuityLedgerCaptureFromV6Render, renderRebirthPackageV6WithReport, resolveAdaptiveSectionCaps, DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, RAIL_COMPLETE_SECTION_OVERRIDES } from '../rebirthPackageV6.ts';
 
 const at = (minute: number) => `2026-09-09T04:${String(minute).padStart(2, '0')}:00.000Z`;
 
@@ -221,5 +221,89 @@ describe('D1 density', () => {
     const improved = Object.entries(compact)
       .filter(([id, ratio]) => verbose[id] !== undefined && ratio < verbose[id]!);
     expect(improved.length, label).toBeGreaterThan(0);
+  });
+  // S29: the single-render invariant (S8/T2) promotes the newest operator message
+  // out of the Timeline body. Dropping its ROW too made the chronology END at a
+  // SUPERSEDED message: a blinded probe lane reading the 2026-09-09T09:21Z package
+  // returned the operator's second-newest words as their latest instruction.
+  // Precedent #27966 fixed this class in the thinking trail with one-line pointer
+  // breadcrumbs; these assertions pin that behaviour for both promoted endpoints.
+  const promoted = () => buildRebirthPackageV6Model({
+    ...specimen(),
+    boundaryAndActiveTask: {
+      ...specimen().boundaryAndActiveTask,
+      activeRequest: { text: 'NEWEST OPERATOR WORDS', chars: 21, source: {
+        provenanceId: 'msg_newest_operator', sourceAt: at(9), status: 'exact', kind: 'message',
+      } },
+      lastMaterialAssistant: { text: 'NEWEST ASSISTANT WORDS', chars: 22, source: {
+        provenanceId: 'msg_newest_assistant', sourceAt: at(11), status: 'exact', kind: 'message',
+      } },
+    },
+  });
+
+  it('anchors promoted endpoints in the timeline so the chronology never ends on a superseded row', () => {
+    const text = renderRebirthPackageV6WithReport(promoted()).text;
+    const timeline = text.split('\u2500\u2500 Timeline \u2500\u2500')[1] ?? '';
+
+    // The promoted body still renders EXACTLY ONCE, in Boundary and Active Task.
+    expect(text.match(/NEWEST OPERATOR WORDS/gu)).toHaveLength(1);
+    expect(timeline).not.toContain('NEWEST OPERATOR WORDS');
+
+    // ...but the chronology now names it, with its own identity and source time.
+    expect(timeline).toContain('msg_newest_operator');
+    expect(timeline).toContain('msg_newest_assistant');
+
+    // The decisive assertion: a reader following the timeline tail cannot take the
+    // superseded operator row (OPERATOR FOLLOWUP) for the newest operator message.
+    expect(timeline.indexOf('msg_newest_operator'))
+      .toBeGreaterThan(timeline.indexOf('OPERATOR FOLLOWUP'));
+    expect(timeline.indexOf('msg_newest_assistant'))
+      .toBeGreaterThan(timeline.indexOf('msg_newest_operator'));
+  });
+
+  it('yields the endpoint stubs rather than evicting a real exchange under a tight cap', () => {
+    const model = promoted();
+    const roomy = renderRebirthPackageV6WithReport(model).text;
+    expect(roomy).toContain('msg_newest_operator');
+
+    // A cap tight enough that the ~200 stub chars would cost dialogue: conversation
+    // is the section the operator ranked highest, so the pointer is what gives way
+    // and the compact relocation receipt carries the declaration instead.
+    const tight = renderRebirthPackageV6WithReport(model, {
+      sectionMaxChars: { recentConversation: 260 },
+    }).text;
+    // Scope to the dialogue body: the Boundary section legitimately anchors the
+    // promoted endpoint by id, and that is the render this stub points at.
+    const dialogue = tight.split('\u2500\u2500 Recent Conversation \u2500\u2500')[1]
+      ?? tight.split('\u2500\u2500 Timeline \u2500\u2500')[1] ?? '';
+    expect(dialogue).toContain('OPERATOR FOLLOWUP');
+    expect(dialogue).not.toContain('msg_newest_operator');
+    expect(dialogue).toContain('endpoint rows: rendered in Boundary');
+  });
+  // S28: the step alleged that budget freed by the ledger-relocated sections
+  // evaporates instead of reaching the timeline. Measured against source that
+  // premise is FALSE - D2 + S9 already folded that share into the timeline pool,
+  // and the timeline's own leftovers already fund cognition. These assertions
+  // pin the conservation the step feared was broken, so a future edit that
+  // genuinely strands budget fails here instead of being rediscovered by audit.
+  it('conserves the 145k content envelope in both phases and never strands freed budget', () => {
+    const content = (table: Partial<Record<string, number>>) => Object.entries({
+      ...DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS, ...table,
+    }).filter(([id]) => id !== 'brainMergeSynthesis').reduce((sum, [, cap]) => sum + (cap ?? 0), 0);
+
+    expect(content({})).toBe(145_000);                              // rail-active
+    expect(content(RAIL_COMPLETE_SECTION_OVERRIDES)).toBe(145_000); // rail-complete / no-rail
+
+    // The ledger-relocated sections hold NO budget: their share is already part
+    // of the timeline pool, which is why relocating them cost the package nothing.
+    for (const id of ['operatorVault', 'episodeChapterIndex', 'lifeLedger'] as const) {
+      expect(DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS[id]).toBe(0);
+      expect(RAIL_COMPLETE_SECTION_OVERRIDES[id]).toBeUndefined();
+    }
+
+    // And whatever the dialogue does not spend funds cognition rather than
+    // evaporating: the two timeline citizens always add up to the whole pool.
+    const caps = resolveAdaptiveSectionCaps(specimen());
+    expect(caps.recentConversation + caps.cognitiveArtifacts).toBe(115_000);
   });
 });

@@ -243,8 +243,13 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     const sha = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
     // Frozen byte-exact hashes. Update deliberately only when the renderer's
     // formatting/honesty output intentionally changes.
-    expect(sha(first.text)).toBe('54b480cad522b19b2a74c0dbb96470ea53e5c0afc20524895b21de950a3b365a');
-    expect(sha(audit.text)).toBe('6b26bcca0d7b08ad26e11a5d4701e9041fc6a59dc21c4c1fb18ae761dcfdfd64');
+    // 2026-09-09 (S29): re-frozen for the promoted-endpoint pointer stubs. The
+    // verified delta in BOTH modes is exactly two one-line rows (msg_active,
+    // msg_last) at their true chronological positions plus the census moving
+    // 5 -> 7 dated; capture accounting (`0 of 5 captured units`) is unchanged and
+    // no message body is duplicated.
+    expect(sha(first.text)).toBe('cd3e75bd9fea14eca870cec6f5810564445e5ef6a5a3fadd508036546339eb35');
+    expect(sha(audit.text)).toBe('6b0905ea95bffb8cfc99d3a3fc4b4c3bae11c6f35de9f4defa0775319935563f');
   });
 
   const sectionIds = (text: string): string[] => [

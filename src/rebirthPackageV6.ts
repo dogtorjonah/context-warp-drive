@@ -4643,6 +4643,86 @@ function conversationEndpointReceipt(model: RebirthPackageV6Model): string {
   ].join('\n');
 }
 
+/**
+ * S29 — chronological pointer stubs for the promoted endpoint messages.
+ *
+ * `normalizeConversationRows` removes the active-request and last-material-assistant
+ * BODIES from this section so each renders exactly once (Boundary and Active Task).
+ * Dropping the ROW as well ends the delivered chronology at a SUPERSEDED message:
+ * on the 2026-09-09T09:21Z package a blinded probe lane read the operator's
+ * second-newest words back as their latest instruction. Precedent #27966 fixed this
+ * same class in the thinking trail by restoring skipped rows as one-line pointer
+ * breadcrumbs — chronological completeness without duplicating the body. These
+ * stubs are that breadcrumb, carrying the endpoint's own authoritative identity.
+ *
+ * God Rule 8: an endpoint whose source time is unknown makes no recency claim and
+ * is omitted here rather than guessed into the order; the endpoint relocation
+ * receipt still names it. Stub ids reuse the message's base id so the timeline's
+ * one-row-per-message dedupe can never place a stub beside its own body.
+ */
+function conversationEndpointStubs(
+  model: RebirthPackageV6Model,
+  referenceAt: string | null,
+): RebirthTimelineRow[] {
+  const stubs: RebirthTimelineRow[] = [];
+  const add = (
+    message: RebirthPackageV6ExactMessage | null,
+    role: 'user' | 'assistant',
+    promotedAs: string,
+    note: string,
+  ): void => {
+    if (!message) return;
+    const sourceAt = knownSourceTime(message.source.sourceAt);
+    if (!sourceAt) return;
+    const id = conversationRowBaseId(message.source.provenanceId.replace(/^message:/u, ''));
+    const body = `\u2192 ${note}; its ${message.chars} chars render verbatim once above as ${promotedAs}.`;
+    stubs.push({
+      id,
+      sourceAt,
+      text: `[${role} \u00b7 source=${id} \u00b7 source-time=${formatDisplayStamp(sourceAt, referenceAt)}`
+        + ` \u00b7 promoted=${promotedAs}]\n${body}`,
+      compactText: `${role}\n${body}\n${continuityAnchor(id, sourceAt, referenceAt)}`,
+    });
+  };
+  add(model.boundaryAndActiveTask.activeRequest, 'user', 'EXACT ACTIVE REQUEST', 'newest operator message');
+  add(
+    model.boundaryAndActiveTask.lastMaterialAssistant,
+    'assistant',
+    'LAST MATERIAL ASSISTANT',
+    'newest material assistant message',
+  );
+  return stubs;
+}
+
+/**
+ * Merge endpoint stubs into an ascending rendered-row list at their source-time
+ * position. Existing rows keep their order and bytes exactly; a stub only claims
+ * the first slot where a later-stamped row would follow it.
+ */
+function mergeEndpointStubText(
+  renderedRows: readonly string[],
+  rows: readonly RebirthPackageV6ConversationRow[],
+  stubs: readonly RebirthTimelineRow[],
+): string[] {
+  if (stubs.length === 0) return [...renderedRows];
+  const stubMs = (stub: RebirthTimelineRow): number => Date.parse(stub.sourceAt ?? '');
+  const ordered = [...stubs].sort((left, right) => stubMs(left) - stubMs(right));
+  const out: string[] = [];
+  let cursor = 0;
+  for (const stub of ordered) {
+    while (cursor < renderedRows.length) {
+      const rowAt = knownSourceTime(rows[cursor]?.sourceAt);
+      const rowMs = rowAt ? Date.parse(rowAt) : Number.NaN;
+      if (Number.isFinite(rowMs) && rowMs > stubMs(stub)) break;
+      out.push(renderedRows[cursor]!);
+      cursor += 1;
+    }
+    out.push(stub.text);
+  }
+  for (; cursor < renderedRows.length; cursor += 1) out.push(renderedRows[cursor]!);
+  return out;
+}
+
 function renderConversation(
   model: RebirthPackageV6Model,
   maxChars: number,
@@ -4664,6 +4744,11 @@ function renderConversation(
   const renderRow = (row: RebirthPackageV6ConversationRow): string => (
     conversationRowText(row, referenceAt, recoveryHandle)
   );
+  const endpointStubs = conversationEndpointStubs(model, referenceAt);
+  // Stubs are structural, but they are not free. Under extreme pressure the
+  // overflow path below drops them rather than let a two-line pointer evict a
+  // real exchange from the section the operator ranked highest.
+  let activeStubs: readonly RebirthTimelineRow[] = endpointStubs;
   const placementsFor = (
     renderedRows: readonly RebirthPackageV6ConversationRow[],
     projectedIds: ReadonlySet<string> = new Set(),
@@ -4693,13 +4778,16 @@ function renderConversation(
         ?? null
       : null,
   });
-  const timelineRowsFor = (rows: readonly RebirthPackageV6ConversationRow[]): RebirthTimelineRow[] => rows.map((row) => ({
-    id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
-    sourceAt: row.sourceAt,
-    text: renderRow(row),
-    compactText: conversationRowText(row, referenceAt, recoveryHandle, continuityAnchor(conversationRowBaseId(row.provenanceId), row.sourceAt, referenceAt)),
-  }));
-  const lines = known.map(renderRow);
+  const timelineRowsFor = (rows: readonly RebirthPackageV6ConversationRow[]): RebirthTimelineRow[] => [
+    ...endpointStubs,
+    ...rows.map((row) => ({
+      id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
+      sourceAt: row.sourceAt,
+      text: renderRow(row),
+      compactText: conversationRowText(row, referenceAt, recoveryHandle, continuityAnchor(conversationRowBaseId(row.provenanceId), row.sourceAt, referenceAt)),
+    })),
+  ];
+  const lines = mergeEndpointStubText(known.map(renderRow), known, activeStubs);
   if (unknown.length > 0) {
     lines.push(
       '',
@@ -4729,11 +4817,17 @@ function renderConversation(
   // Recent Conversation is admitted. Under pressure its full source-coordinate
   // detail yields to a compact pointer; the protected Boundary section carries
   // the exact endpoint identities, timestamps, and bytes.
-  const endpointReceipt = fullEndpointReceipt
+  // S29: when the chronological stubs render they ARE the relocation
+  // declaration — carrying exact identity, source time, and position — so the
+  // compact one-liner would only repeat them and is spent on dialogue instead.
+  const compactEndpointReceipt = fullEndpointReceipt
     ? 'endpoint rows: rendered in Boundary (active request + last assistant)'
     : '';
-  const endpointSeparatorChars = endpointReceipt && dialogueText ? 2 : 0;
-  const dialogueBudget = Math.max(0, maxChars - endpointReceipt.length - endpointSeparatorChars);
+  let endpointReceipt = activeStubs.length > 0 ? '' : compactEndpointReceipt;
+  const budgetFor = (receipt: string): number => (
+    Math.max(0, maxChars - receipt.length - (receipt && dialogueText ? 2 : 0))
+  );
+  let dialogueBudget = budgetFor(endpointReceipt);
   const withEndpointReceipt = (body: string): string => (
     [endpointReceipt, body].filter(Boolean).join('\n\n')
   );
@@ -4757,7 +4851,7 @@ function renderConversation(
       omittedUnknown,
       retainedKnown: selectedKnown,
       recoveryHandle,
-    }), ...selectedKnown.map(renderRow)];
+    }), ...mergeEndpointStubText(selectedKnown.map(renderRow), selectedKnown, activeStubs)];
     if (selectedUnknown.length > 0) {
       blocks.push(
         'Unknown source time (quarantined; not part of the chronology):',
@@ -4798,6 +4892,29 @@ function renderConversation(
     retainedKnown = selected;
   };
   applyBudget(exchangeGroups);
+  // A pointer must never cost a real exchange. Select once WITH the stubs and
+  // once without; the stubs are kept only when they evict no dialogue from the
+  // section the operator ranked highest. When they yield, the compact
+  // relocation receipt carries the declaration and the Boundary section still
+  // holds the exact endpoint identities, timestamps, and bytes.
+  if (activeStubs.length > 0) {
+    const stubbedRows = retainedKnown;
+    const stubbedReceipt = endpointReceipt;
+    const stubbedBudget = dialogueBudget;
+    activeStubs = [];
+    endpointReceipt = compactEndpointReceipt;
+    dialogueBudget = budgetFor(endpointReceipt);
+    applyBudget(exchangeGroups);
+    // stubbedRows empty means nothing fit beside the stubs at all: that render
+    // falls through to the truncated-latest-row receipt, which shows no stub,
+    // so the compact declaration must come back rather than vanish.
+    if (stubbedRows.length > 0 && retainedKnown.length <= stubbedRows.length) {
+      activeStubs = endpointStubs;
+      endpointReceipt = stubbedReceipt;
+      dialogueBudget = stubbedBudget;
+      retainedKnown = stubbedRows;
+    }
+  }
 
   for (const row of unknown) {
     const candidate = [...retainedUnknown, row];
