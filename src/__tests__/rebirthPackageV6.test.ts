@@ -1237,6 +1237,57 @@ describe('Rebirth Package v6', () => {
     expect(bannerTiny?.text).toContain(`${banner.slice(0, 7)}…\n[/REBIRTH-V6-SECTION]`);
   });
 
+  it('evicts lower-priority Atlas enrichment before a single edit row (S20 / Atlas #33488)', () => {
+    // Regression: the AED body arrives from the producer already composed as
+    // <edit trail> then '## Atlas Snapshot Source (salient files)' enrichment.
+    // The renderer re-trims that composed string against the v6 section cap;
+    // a plain newest-tail slice keeps the byte SUFFIX, which is the enrichment,
+    // so once the cap fell below the composed length EVERY edit row was evicted
+    // while the lower-priority snapshots survived -- and the omission marker
+    // still described that set as "newest". Measured on a same-input lab pair:
+    // old tree rendered 13 edit rows + 12 snapshot blocks, new tree rendered
+    // 0 edit rows and the same 12 snapshot blocks.
+    const editTrail = [
+      '[2026-08-27 08:00 PM UTC] Edit → relay/src/stale-edit.ts',
+      `OLD_EDIT_BODY ${'x'.repeat(300)}`,
+      '[2026-08-28 06:30 AM UTC] Edit → relay/src/newest-edit.ts',
+      'NEWEST_OPERATIONAL_EDIT',
+    ].join('\n');
+    const enrichment = [
+      '## Atlas Snapshot Source (salient files)',
+      '',
+      '[atlas_snapshot: relay/src/unrelated.ts @ changelog 111, 2026-08-01 00:00:00]',
+      `AMBIENT_SNAPSHOT_BODY ${'y'.repeat(900)}`,
+    ].join('\n');
+    const legacy = adaptLegacyRebirthPackageToV6({
+      predecessorName: 'legacy',
+      currentThread: '',
+      activeEditDelta: `${editTrail}\n\n${enrichment}`,
+    }, {
+      instanceId: 'instance-a',
+      workspace: 'voxxo-swarm',
+    });
+
+    // Cap that cannot hold trail + enrichment: the trail wins.
+    const squeezed = renderRebirthPackageV6Sections(legacy, {
+      sectionMaxChars: { activeEditDelta: 700 },
+    }).find((candidate) => candidate.id === 'activeEditDelta');
+    expect(squeezed?.text).toContain('NEWEST_OPERATIONAL_EDIT');
+    expect(squeezed?.text).not.toContain('AMBIENT_SNAPSHOT_BODY');
+    // The discard is named, not silent: absence must never read as "there was
+    // no enrichment".
+    expect(squeezed?.text).toMatch(/atlas snapshot enrichment omitted . \d+ chars/u);
+
+    // Cap that holds both: enrichment survives WITH its heading, so a reader can
+    // tell ambient snapshots apart from this agent's own edits.
+    const roomy = renderRebirthPackageV6Sections(legacy, {
+      sectionMaxChars: { activeEditDelta: 4_000 },
+    }).find((candidate) => candidate.id === 'activeEditDelta');
+    expect(roomy?.text).toContain('NEWEST_OPERATIONAL_EDIT');
+    expect(roomy?.text).toContain('## Atlas Snapshot Source (salient files)');
+    expect(roomy?.text).toContain('AMBIENT_SNAPSHOT_BODY');
+  });
+
   it('compacts provenance ids that embed the artifact note so each note renders once', () => {
     const note = 'Continuity Ledger locked: one store, two write sides, two read sides; never conclude absence without checking the ledger index first.';
     const value = model({

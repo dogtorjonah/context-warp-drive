@@ -2507,6 +2507,14 @@ function boundedText(
 }
 
 /**
+ * Heading the Active Edit Delta producer emits ahead of its lower-priority
+ * Atlas snapshot enrichment (rebirthPackageBuilder buildAtlasSnapshotSection).
+ * The renderer splits on it so a budget re-trim evicts enrichment before the
+ * authoritative edit trail.
+ */
+const ATLAS_SNAPSHOT_SUPPLEMENT_HEADING = '## Atlas Snapshot Source (salient files)';
+
+/**
  * Entry-aware newest retention (B5 / S11).
  *
  * A raw suffix slice of a timestamped edit log can land mid-line or mid-entry,
@@ -3956,8 +3964,47 @@ function renderActiveEdits(
     if (!editLog || maxChars <= banner.length + 1) {
       return boundedText(banner, maxChars, historyRecoveryHandle);
     }
-    const body = boundedNewestText(editLog, maxChars - banner.length - 1, historyRecoveryHandle);
-    return { text: `${banner}\n${body.text}`, complete: body.complete };
+    const bodyBudget = maxChars - banner.length - 1;
+    // Atlas #33488 invariant, re-asserted at the renderer. The timestamped edit
+    // trail is the authoritative handoff state; the trailing Atlas snapshot
+    // block is lower-priority enrichment. The producer already arbitrates that
+    // way, but this renderer re-trims the ALREADY-COMPOSED string against the
+    // v6 section cap, and a plain newest-tail slice keeps the byte SUFFIX --
+    // which is the enrichment. Once the cap fell below the composed length the
+    // suffix stopped reaching back past the enrichment heading, so every edit
+    // row was evicted while lower-priority snapshots survived and the omission
+    // marker still called them "newest". Split the two bodies and spend the
+    // budget on the trail first so both trims agree.
+    const supplementAt = editLog.indexOf(ATLAS_SNAPSHOT_SUPPLEMENT_HEADING);
+    const editTrail = (supplementAt >= 0 ? editLog.slice(0, supplementAt) : editLog).trimEnd();
+    const enrichment = supplementAt >= 0 ? editLog.slice(supplementAt).trimEnd() : '';
+    if (!enrichment || !editTrail) {
+      const body = boundedNewestText(editLog, bodyBudget, historyRecoveryHandle);
+      return { text: `${banner}\n${body.text}`, complete: body.complete };
+    }
+    if (editTrail.length + 1 < bodyBudget) {
+      // Trail fits whole: spend the remainder on enrichment from its START, so
+      // the reader keeps the enrichment heading and knows what those blocks are.
+      const supplement = boundedText(enrichment, bodyBudget - editTrail.length - 1, historyRecoveryHandle);
+      return {
+        text: `${banner}\n${editTrail}\n${supplement.text}`,
+        complete: supplement.complete,
+      };
+    }
+    // Trail alone is at or over budget: discard the lower-priority enrichment
+    // before losing a single edit row, and name the discard rather than letting
+    // it read as absence.
+    const discardNote = `\n[... atlas snapshot enrichment omitted . ${enrichment.length} chars . lower priority than the edit trail]`;
+    const noteFits = discardNote.length < bodyBudget;
+    const body = boundedNewestText(
+      editTrail,
+      noteFits ? bodyBudget - discardNote.length : bodyBudget,
+      historyRecoveryHandle,
+    );
+    return {
+      text: `${banner}\n${body.text}${noteFits ? discardNote : ''}`,
+      complete: false,
+    };
   }
   const lines = [
     `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · source-time=${delta.capturedSourceAt ?? 'unknown'} · observed-at=${delta.completedObservedAt ?? 'unknown'}${delta.atlasLandedCapture ? ` · atlas-landed-capture=${delta.atlasLandedCapture.status} rows=${delta.atlasLandedCapture.count} elapsed=${delta.atlasLandedCapture.elapsedMs}ms` : ''}`,
