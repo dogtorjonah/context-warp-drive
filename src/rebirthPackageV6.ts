@@ -6569,18 +6569,38 @@ export function lintPackageSelfChecks(model: RebirthPackageV6Model, renderedText
     }
   }
 
-  // Rule 5 — unknown-time rows presented as chronology. Any lineage/cognition
-  // unit with an unknown source time must render in the quarantine banner; if
-  // the model has unknown-time rows but the text shows no quarantine marker,
-  // they risk reading as chronological.
+  // Rule 5 — unknown-time rows presented as chronology. The risk this rule
+  // exists to catch is a row with no source time sitting inside a rendered
+  // chronological stream, where position alone implies an order the row cannot
+  // support (God Rule 8). The check therefore scopes to what the delivered text
+  // ACTUALLY renders as chronology, on both sides:
+  //
+  //  - The Timeline is the chronology now. Its conversation and cognition rows
+  //    were invisible to this rule before the section unification, so the one
+  //    section that can genuinely mis-order an undated row went unchecked.
+  //  - A lineage section only carries chronology risk when its body renders.
+  //    D2 relocates operatorVault/episodeChapterIndex/lifeLedger to the
+  //    continuity ledger, so their undated units are addressed, not ordered —
+  //    flagging them fired a permanent false positive on every package and
+  //    taught successors to read a real banner as noise.
+  const lineageSectionRendersBody = (id: RebirthPackageV6SectionId): boolean => (
+    renderedText.includes(`[REBIRTH-V6-SECTION id=${id}`)
+  );
   const unknownUnits = [
-    ...(model.operatorVault?.units ?? []),
-    ...(model.episodeChapterIndex?.units ?? []),
-    ...(model.lifeLedger?.units ?? []),
+    ...(lineageSectionRendersBody('operatorVault') ? model.operatorVault?.units ?? [] : []),
+    ...(lineageSectionRendersBody('episodeChapterIndex') ? model.episodeChapterIndex?.units ?? [] : []),
+    ...(lineageSectionRendersBody('lifeLedger') ? model.lifeLedger?.units ?? [] : []),
   ].filter((u) => (u.sourceAt ?? null) === null);
-  if (unknownUnits.length > 0 && !renderedText.includes('Unknown source time (quarantined')) {
+  const unknownTimelineRows = lineageSectionRendersBody('recentConversation')
+    ? [
+      ...(model.recentConversation ?? []).filter((row) => (row.sourceAt ?? null) === null),
+      ...(model.cognitiveArtifacts ?? []).filter((row) => (row.sourceAt ?? null) === null),
+    ].length
+    : 0;
+  const unknownRendered = unknownUnits.length + unknownTimelineRows;
+  if (unknownRendered > 0 && !renderedText.includes('Unknown source time (quarantined')) {
     checks.push(
-      `⚠ self-check: ${unknownUnits.length} unit(s) carry unknown source time but no quarantine banner rendered — unknown-time rows must not read as chronology.`,
+      `⚠ self-check: ${unknownRendered} rendered unit(s) carry unknown source time but no quarantine banner rendered — unknown-time rows must not read as chronology.`,
     );
   }
 

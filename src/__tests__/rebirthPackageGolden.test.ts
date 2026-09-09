@@ -615,12 +615,55 @@ describe('rebirth package self-lint (S2)', () => {
     expect(checks.some((c) => c.includes('derived row predates its source'))).toBe(true);
   });
 
-  it('flags unknown-time rows rendered without a quarantine banner (rule 5)', () => {
+  // Rule 5 scopes to what the delivered text actually renders as chronology.
+  // The risk is positional: an undated row inside a rendered stream implies an
+  // order it cannot support. A unit that is addressed but never ordered carries
+  // no such risk, so the rule must fire on the first and stay silent on the
+  // second — otherwise a permanent false positive teaches successors to read a
+  // real banner as noise.
+  const RULE_5 = (c: string): boolean => c.includes('unknown source time') && c.includes('no quarantine banner');
+  const SECTION = (id: string): string => `[REBIRTH-V6-SECTION id=${id} order=1 chars=10]`;
+
+  it('flags undated units inside a RENDERED lineage section with no quarantine banner (rule 5)', () => {
     const { model } = lintModel({
       operatorVault: lineage([unit({ id: 'op:unknown', sourceAt: null, kind: 'operator' })]),
     });
-    const checks = lintPackageSelfChecks(model, 'no quarantine banner in this text');
-    expect(checks.some((c) => c.includes('unknown source time') && c.includes('no quarantine banner'))).toBe(true);
+    expect(lintPackageSelfChecks(model, SECTION('operatorVault')).some(RULE_5)).toBe(true);
+  });
+
+  it('flags an undated TIMELINE row with no quarantine banner (rule 5)', () => {
+    // The section unification made the Timeline the chronology. Before it, this
+    // rule watched only the lineage sections, so the one section that can
+    // genuinely mis-order an undated row was the one it never looked at.
+    const { model } = lintModel({
+      recentConversation: [
+        {
+          provenanceId: 'raw-trace-conversation:undated',
+          sourceAt: null,
+          role: 'user' as const,
+          text: 'undated turn',
+        },
+      ],
+    });
+    expect(lintPackageSelfChecks(model, SECTION('recentConversation')).some(RULE_5)).toBe(true);
+  });
+
+  it('stays silent for undated units in a section relocated to the ledger (rule 5 negative)', () => {
+    // D2 relocates operatorVault/episodeChapterIndex/lifeLedger: their units are
+    // ledger-addressable, never rendered in order. No body, no chronology risk.
+    const { model } = lintModel({
+      operatorVault: lineage([unit({ id: 'op:unknown', sourceAt: null, kind: 'operator' })]),
+    });
+    const relocated = `${SECTION('boundaryAndActiveTask')}\n${SECTION('recoveryIndex')}`;
+    expect(lintPackageSelfChecks(model, relocated).some(RULE_5)).toBe(false);
+  });
+
+  it('stays silent when the quarantine banner is present (rule 5 negative)', () => {
+    const { model } = lintModel({
+      operatorVault: lineage([unit({ id: 'op:unknown', sourceAt: null, kind: 'operator' })]),
+    });
+    const banner = `${SECTION('operatorVault')}\nUnknown source time (quarantined; not part of the chronology):`;
+    expect(lintPackageSelfChecks(model, banner).some(RULE_5)).toBe(false);
   });
 
   it('never exceeds the hard cap when zero lint headroom is available (withSelfLint zero-boundary)', () => {
