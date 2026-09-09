@@ -2507,6 +2507,28 @@ function boundedText(
 }
 
 /**
+ * Bound a renderer-owned receipt to whole lines. Every line is one declared
+ * unit (a header, a census row, a capture warning), so a character slice would
+ * leave a torn header that reads as a complete fact (#41011). Leading lines are
+ * admitted while they and the omission marker fit; when not even the marker
+ * fits, the receipt yields entirely and the caller's census carries the truth.
+ */
+function boundedWholeLines(text: string, maxChars: number, recoveryHandle: string | null): string {
+  if (text.length <= maxChars) return text;
+  const lines = text.split('\n');
+  const marker = (omitted: number): string => (
+    `[… ${omitted} receipt lines omitted${recoveryHandle ? ` · recover: ${recoveryHandle}` : ''} …]`
+  );
+  const kept: string[] = [];
+  for (const line of lines) {
+    if ([...kept, line, marker(lines.length)].join('\n').length > maxChars) break;
+    kept.push(line);
+  }
+  const bounded = [...kept, marker(lines.length - kept.length)].join('\n');
+  return bounded.length <= maxChars ? bounded : '';
+}
+
+/**
  * Heading the Active Edit Delta producer emits ahead of its lower-priority
  * Atlas snapshot enrichment (rebirthPackageBuilder buildAtlasSnapshotSection).
  * The renderer splits on it so a budget re-trim evicts enrichment before the
@@ -4451,24 +4473,14 @@ function renderCognition(
         compactRowBodies.set(row.provenanceId, cognitionRowBody(original, referenceAt, undefined, recoveryHandle, true));
       }
     }
-    // Even the protected tail can exceed a pathologically small caller cap; the
-    // character-bounded fallback keeps the section's contract (never exceed
-    // maxChars) with the exact recovery handle attached.
     const keptIds = new Set(keep.map((row) => row.provenanceId));
     const unitPlacements: RebirthPackageV6UnitPlacement[] = rows.map((row) => ({
       id: row.provenanceId,
       placement: keptIds.has(row.provenanceId) ? 'rendered' : 'elided',
       projected: row.projection === 'truncated' && !expandedIds.has(row.provenanceId),
     }));
-    if (text.length > maxChars) {
-      const bounded = boundedText(text, maxChars, recoveryHandle);
-      return { ...bounded, unitPlacements };
-    }
-    return {
-      text,
-      complete: keep.length === rows.length
-        && keep.every((row) => row.projection !== 'truncated'),
-      unitPlacements,
+    const incomplete = rows.length - keep.length + keep.filter((row) => row.projection === 'truncated').length;
+    const timeline = {
       timelineRows: keep.map((row) => ({
         id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
         sourceAt: row.sourceAt,
@@ -4481,9 +4493,9 @@ function renderCognition(
           rows.filter((row) => !keptIds.has(row.provenanceId)),
           boundaryDedupedCount,
           keep.filter((row) => row.projection === 'truncated').length,
-          rows.length - keep.length + keep.filter((row) => row.projection === 'truncated').length,
+          incomplete,
           capture?.totalMatched ?? null,
-          keep.length < rows.length || keep.some((row) => row.projection === 'truncated') ? omissionHandle : null,
+          incomplete > 0 ? omissionHandle : null,
           capture, recoveryHandle,
         ),
         ...tail,
@@ -4492,12 +4504,33 @@ function renderCognition(
         captured: allSourceRows.length,
         rendered: keep.length,
         matched: capture?.totalMatched ?? null,
-        incomplete: rows.length - keep.length + keep.filter((row) => row.projection === 'truncated').length,
-        omissionCommand: keep.length < rows.length || keep.some((row) => row.projection === 'truncated')
+        incomplete,
+        omissionCommand: incomplete > 0
           ? captureScopedLedgerCommand(continuityLedgerOmissionHandle(model, 'cognitiveArtifacts'))
             ?? captureScopedOmissionCommand(model)
           : null,
       },
+    };
+    // Even the protected tail can exceed a pathologically small cap (or the
+    // whole-exchange slack the conversation-first allocator leaves behind).
+    // The section contract (never exceed maxChars) is kept with whole receipt
+    // lines, never a character slice, and the timeline census still counts
+    // every evicted unit with its ledger route — an empty body is declared
+    // eviction, not silent absence.
+    if (text.length > maxChars) {
+      return {
+        text: boundedWholeLines(text, maxChars, recoveryHandle),
+        complete: false,
+        unitPlacements,
+        ...timeline,
+      };
+    }
+    return {
+      text,
+      complete: keep.length === rows.length
+        && keep.every((row) => row.projection !== 'truncated'),
+      unitPlacements,
+      ...timeline,
     };
   };
 

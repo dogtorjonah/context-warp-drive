@@ -375,4 +375,39 @@ describe('complete working continuity', () => {
     expect(section).toContain('execution entries omitted');
     expect(section).not.toContain('old-room');
   });
+
+  it('declares evicted cognition in the timeline census instead of slicing its header', () => {
+    const base = specimen();
+    const censusOf = (text: string) => {
+      const census = text.match(/Timeline census: \d+ dated, \d+ quarantined; (\d+) of (\d+) captured units not fully rendered/u);
+      expect(census).not.toBeNull();
+      return { incomplete: Number(census![1]), captured: Number(census![2]) };
+    };
+    // The conversation-first allocator can leave cognition only the
+    // whole-exchange slack — in the audited 2026-09-09 package, 82 chars: less
+    // than the section's own header. That cap once produced a torn
+    // `[cognition: rendered=0 captured=171 m` line and dropped every cognition
+    // unit from the census.
+    const starved = renderRebirthPackageV6WithReport(base, { sectionMaxChars: { cognitiveArtifacts: 82 } }).text;
+    expect(starved).not.toMatch(/\[cognition:[^\n]*\n\[… stored/u);
+    expect(starved).not.toMatch(/^\[cognition:[^\]\n]*$/mu);
+    expect(starved).not.toContain('DURABLE DECISION');
+    expect(censusOf(starved)).toEqual({
+      incomplete: base.cognitiveArtifacts.length,
+      captured: base.recentConversation.length + base.cognitiveArtifacts.length,
+    });
+    expect(starved).toContain('Omitted units:');
+    // Natural pressure: dialogue demand alone exceeds the timeline pool.
+    const clock = (second: number) => `2026-09-09T03:${String(Math.floor(second / 60)).padStart(2, '0')}:${String(second % 60).padStart(2, '0')}.000Z`;
+    const recentConversation: Array<(typeof base.recentConversation)[number]> = [];
+    for (let i = 0; i < 80; i += 1) {
+      recentConversation.push({ provenanceId: `req-${i}`, sourceAt: clock(i * 10), role: 'user', text: `OPERATOR REQUEST ${i}`, exchangeId: `req-${i}` });
+      recentConversation.push({ provenanceId: `ans-${i}`, sourceAt: clock(i * 10 + 5), role: 'assistant', text: `ANSWER ${i} ` + 'reasoning '.repeat(200), exchangeId: `req-${i}` });
+    }
+    const pressured = renderRebirthPackageV6WithReport(buildRebirthPackageV6Model({ ...base, recentConversation })).text;
+    expect(pressured.length).toBeLessThanOrEqual(150_000);
+    expect(pressured).not.toMatch(/^\[cognition:[^\]\n]*$/mu);
+    expect(censusOf(pressured).captured).toBe(recentConversation.length + base.cognitiveArtifacts.length);
+    expect(pressured).toContain('Omitted units:');
+  });
 });

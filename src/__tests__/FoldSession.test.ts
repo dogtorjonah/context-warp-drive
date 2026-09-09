@@ -347,17 +347,19 @@ describe('FoldSession marathon pressure folding', () => {
     expect(preparedText).toContain('Continuity refresh: a same-instance hard epoch (context reset) just completed.');
     expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     // Canonical v6 hard-epoch semantic (retired the v4 flat Raw Trace Coordinate
-    // Closet forensic section): the hard-epoch package renders the fixed six-frame
-    // model in canonical order — boundary/task, execution, active edits, cognition,
-    // conditional conversation, recovery. Assert each frame opens with its
-    // `[REBIRTH-V6-SECTION id=<id> order=<n> [dir=<direction>] chars=` marker and that the frames appear in
-    // canonical order (boundary before recovery), while the old v4 Closet header
-    // is gone from the rendered package.
+    // Closet forensic section): the hard-epoch package renders the fixed frame
+    // model in canonical order — boundary/task, execution, active edits, one
+    // chronological Timeline, recovery. Conversation and cognition are ONE
+    // interleaved chronology: joinRenderedSections merges the cognitiveArtifacts
+    // rows into the `── Timeline ──` frame that keeps the recentConversation
+    // identity, so a standalone cognition frame must never render. Assert each
+    // frame opens with its `[REBIRTH-V6-SECTION id=<id> order=<n> [dir=<direction>] chars=`
+    // marker and that the frames appear in canonical order (boundary before
+    // recovery), while the old v4 Closet header is gone from the rendered package.
     const v6Frames = [
       ['boundaryAndActiveTask', 1, null],
       ['executionState', 3, 'asc'],
       ['activeEditDelta', 4, 'asc'],
-      ['cognitiveArtifacts', 5, 'desc'],
       ['recentConversation', 6, 'asc'],
       ['recoveryIndex', 10, 'asc'],
     ] as const;
@@ -366,12 +368,25 @@ describe('FoldSession marathon pressure folding', () => {
         `[REBIRTH-V6-SECTION id=${frameId} order=${order}${direction ? ` dir=${direction}` : ''} chars=`,
       );
     }
+    expect(preparedText).toContain('── Timeline ──\n[REBIRTH-V6-SECTION id=recentConversation order=6 dir=asc chars=');
+    expect(preparedText).not.toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
     expect(preparedText.indexOf('[REBIRTH-V6-SECTION id=boundaryAndActiveTask'))
       .toBeLessThan(preparedText.indexOf('[REBIRTH-V6-SECTION id=recoveryIndex'));
     expect(preparedText).not.toContain('── Raw Trace Coordinate Closet (ids/paths/values preserved from full trace) ──');
-    // The planted full literal survives into the v6 conversation/cognition output.
+    // The planted path coordinate survives into the v6 Timeline output.
     expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_27.ts');
-    expect(preparedText).not.toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
+    // The oversized active tool result never survives whole. Its only quotation
+    // is the bounded pending-operation receipt in Execution State (the last
+    // message was that tool result), which keeps the head literal and elides
+    // the 5,000-char body behind an explicit omission marker.
+    expect(preparedText).not.toMatch(/X{1000}/u);
+    expect(preparedText.split('ACTIVE_STEP_27_FULL_PAYLOAD').length - 1).toBeLessThanOrEqual(1);
+    const payloadAt = preparedText.indexOf('ACTIVE_STEP_27_FULL_PAYLOAD');
+    if (payloadAt >= 0) {
+      const owningFrame = preparedText.slice(0, payloadAt).lastIndexOf('[REBIRTH-V6-SECTION id=');
+      expect(preparedText.slice(owningFrame, owningFrame + 60)).toContain('id=executionState');
+      expect(preparedText.slice(payloadAt, payloadAt + 6_000)).toContain('chars omitted');
+    }
   });
 
   it('full-recomputes repeated over-ceiling calls instead of suppressing pressure epochs', () => {
