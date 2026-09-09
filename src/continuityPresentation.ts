@@ -49,6 +49,10 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
     `Capture ${b.captureId} @${b.capturedAt ?? 'unknown'} · frontier ${b.sourceFrontier ?? 'unknown'}`,
     CONTINUITY_LEGEND,
   ];
+  // The live exchange precedes expendable context. A bounded section must
+  // never retain a superseded interpretation while losing the request itself.
+  if (b.activeRequest) lines.push('', `[EXACT ACTIVE REQUEST ${source(b.activeRequest.source)}]`, b.activeRequest.text, '[/EXACT ACTIVE REQUEST]');
+  if (b.lastMaterialAssistant) lines.push('', `[LAST MATERIAL ASSISTANT ${source(b.lastMaterialAssistant.source)}]`, retainedAssistant ?? '[partial: source text omitted]', '[/LAST MATERIAL ASSISTANT]');
   // Identity provenance stays visible: the 09-09 pollution incident was found
   // because the chain named who this instance actually descends from. One line,
   // one hop per arrow, born-as only when a rename would otherwise read as a
@@ -131,11 +135,11 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
     .at(-1);
   const latest = (kind: string) => newest(facts.filter(f => f.kind === kind));
   // #37479 single-render invariant: a derived row whose body IS the active
-  // request points at the verbatim copy below instead of reprinting it, so
+  // request points at the named verbatim block instead of reprinting it, so
   // promoting a fact into the boundary can never double-charge the request.
   const clip = (text: string, max = 160): string => {
     if (b.activeRequest && text.trim() === b.activeRequest.text.trim()) {
-      return `[EXACT ACTIVE REQUEST below]`;
+      return `[see EXACT ACTIVE REQUEST]`;
     }
     const flat = text.replace(/\s+/gu, ' ').trim();
     return flat.length <= max ? flat : `${flat.slice(0, max - 1).replace(/\s+\S*$/u, '')}\u2026`;
@@ -164,6 +168,8 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
   const decision = newest(model.cognitiveArtifacts
     .filter((row) => row.kind === 'decision' && row.sourceAt
       && row.sourceInstanceId === b.instanceId
+      && !railQuiet
+      && (!b.activeRequest?.source.sourceAt || Date.parse(row.sourceAt) >= Date.parse(b.activeRequest.source.sourceAt))
       && !row.supersededBy));
   if (decision) lines.push(`Latest decision: ${clip(decision.text)} ${continuityAnchor(decision.provenanceId, decision.sourceAt, b.capturedAt)}`);
   const blockers = facts.filter((f) => f.kind === 'blocker');
@@ -198,7 +204,7 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
   // Pending-assistant facts already passed the shared settlement reducer. A
   // completed rail never resurrects a settled assistant promise as next work.
   const next = latest('next_action');
-  if (next && !terminal) lines.push(`Next: ${b.activeRequest?.text.trim() === next.text.trim() ? '[EXACT ACTIVE REQUEST below]' : next.text}${next.predatesActiveRequest ? ' [predates-active-request]' : ''} ${continuityAnchor(next.provenanceId, next.sourceAt, b.capturedAt)}`);
+  if (next && !terminal) lines.push(`Next: ${b.activeRequest?.text.trim() === next.text.trim() ? '[see EXACT ACTIVE REQUEST]' : next.text}${next.predatesActiveRequest ? ' [predates-active-request]' : ''} ${continuityAnchor(next.provenanceId, next.sourceAt, b.capturedAt)}`);
   const claims = b.activeRequestClaims;
   if (claims) {
     // God Rule 11: an expired claim must name what expired it. The expiring
@@ -212,11 +218,9 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
       : claims.latestStatus === 'expired_by_newer_operator'
         ? `EXPIRED${expirer} — do not execute`
         : 'FALLBACK ONLY — operator frontier unknown; not an instruction';
-    lines.push(`${label}: ${claims.latest.text.split('\n')[0]} ${source(claims.latest.source)}`);
-    if (claims.previous && claims.latestStatus === 'current') lines.push(`EXPIRED/FALLBACK: ${claims.previous.text.split('\n')[0]} ${source(claims.previous.source)}`);
+    lines.push(`${label}: ${clip(claims.latest.text.split('\n')[0], 300)} ${source(claims.latest.source)}`);
+    if (claims.previous && claims.latestStatus === 'current') lines.push(`EXPIRED/FALLBACK: ${clip(claims.previous.text.split('\n')[0], 300)} ${source(claims.previous.source)}`);
   }
-  if (b.activeRequest) lines.push('', `[EXACT ACTIVE REQUEST ${source(b.activeRequest.source)}]`, b.activeRequest.text, '[/EXACT ACTIVE REQUEST]');
-  if (b.lastMaterialAssistant) lines.push('', `[LAST MATERIAL ASSISTANT ${source(b.lastMaterialAssistant.source)}]`, retainedAssistant ?? '[partial: source text omitted]', '[/LAST MATERIAL ASSISTANT]');
   return lines.join('\n');
 }
 

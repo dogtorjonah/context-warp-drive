@@ -2160,9 +2160,13 @@ describe('Rebirth Package v6', () => {
       adaptiveBackfill: false, sectionMaxChars: { cognitiveArtifacts: 2500 },
     });
     expect(rendered).toContain(ruling);
-    expect(rendered).toContain('exact-source-excerpt/v1');
-    expect(rendered).toContain(`utf16-range=${source.indexOf(ruling)}..${source.length}`);
-    expect(rendered).toContain(`sha256=${sha256ContinuityLedgerVerbatim(ruling)}`);
+    expect(rendered).toContain('exact closing excerpt');
+    expect(rendered).toContain(`characters ${source.indexOf(ruling)}..${source.length}`);
+    expect(rendered).not.toContain('sha256=');
+    const diagnostic = renderRebirthPackageV6(value, {
+      diagnostic: true, adaptiveBackfill: false, sectionMaxChars: { cognitiveArtifacts: 2500 },
+    });
+    expect(diagnostic).toContain(`sha256=${sha256ContinuityLedgerVerbatim(ruling)}`);
   });
 
   it('labels the cadence population and excludes future and reversed spans', () => {

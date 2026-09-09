@@ -19,6 +19,7 @@ import {
   type RebirthPackageV6Model,
   type RebirthPackageV7LineageSection,
   type RebirthPackageV7LineageUnit,
+  type RenderRebirthPackageV6Options,
 } from '../rebirthPackageV6.ts';
 import { renderRawRebirthSeed, renderRawRebirthSeedWithReport } from '../rawRebirthSeed.ts';
 
@@ -118,7 +119,7 @@ const LINEAGE_SECTION_CAPS = {
   lifeLedger: 20_000,
 } as const;
 
-function fundLineage<T extends { sectionMaxChars?: Record<string, number> }>(options: T): T {
+function fundLineage(options: RenderRebirthPackageV6Options): RenderRebirthPackageV6Options {
   return {
     ...options,
     sectionMaxChars: { ...LINEAGE_SECTION_CAPS, ...(options.sectionMaxChars ?? {}) },
@@ -128,7 +129,7 @@ function fundLineage<T extends { sectionMaxChars?: Record<string, number> }>(opt
 function sectionText(
   value: RebirthPackageV6Model,
   id: string,
-  options: { sectionMaxChars?: Record<string, number> } = {},
+  options: RenderRebirthPackageV6Options = {},
 ): string | null {
   const found = renderRebirthPackageV6Sections(value, fundLineage(options)).find((s) => s.id === id);
   return found ? found.text : null;
@@ -262,12 +263,15 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(text).toContain('protected-overrun=false');
     expect(text).not.toContain('omitted-sections=');
     for (const id of REBIRTH_PACKAGE_V6_SECTION_IDS) {
+      // Vault-only operator rows now join dialogue. Cognition shares that
+      // chronology's frame rather than publishing a second section.
+      if (id === 'cognitiveArtifacts' && text.includes('── Timeline ──')) continue;
       const order = REBIRTH_PACKAGE_V6_SECTION_IDS.indexOf(id) + 1;
       const frames = text.match(new RegExp(`\\[REBIRTH-V6-SECTION id=${id} order=${order}(?: dir=\\w+)? chars=`, 'gu')) ?? [];
       expect(frames, `${id} must retain exactly one protected frame`).toHaveLength(1);
     }
     for (const id of collapse.omittedSectionIds) {
-      expect(text).toContain(`[REBIRTH-V6-SECTION id=${id}`);
+      if (id !== 'cognitiveArtifacts') expect(text).toContain(`[REBIRTH-V6-SECTION id=${id}`);
       expect(text).toContain(`[EVICTED section=${id}`);
     }
   });
@@ -548,19 +552,17 @@ describe('Rebirth Package v7 — lineage sections', () => {
     ]);
   });
 
-  it('funds the vault beyond its declared cap only when backfill is enabled', () => {
+  it('honors explicit vault caps independently of the legacy backfill flag', () => {
     const value = model({ operatorVault: lineage(600) });
-    // D2 zeroed the delivery default for this section, so the declared cap
-    // under test is the one the caller supplies; backfill must still be able
-    // to fund the section BEYOND it when residual envelope capacity exists.
-    // An explicit caller cap stays authoritative for the section it names, so
-    // backfill is observable against the DECLARED DEFAULT partition: with
-    // backfill enabled the funded render consumes residual envelope capacity
-    // that the fixed-cap render leaves unspent.
     const withBackfill = renderRebirthPackageV6(value, fundLineage({ adaptiveBackfill: true }));
-    const withoutBackfill = renderRebirthPackageV6(value, { adaptiveBackfill: false });
+    const withoutBackfill = renderRebirthPackageV6(value, fundLineage({ adaptiveBackfill: false }));
     expect(withoutBackfill.length).toBeLessThanOrEqual(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
-    expect(withBackfill.length).toBeGreaterThan(withoutBackfill.length);
+    expect(withBackfill).toBe(withoutBackfill);
+    const vault = renderRebirthPackageV6Sections(value, fundLineage({})).find((section) => section.id === 'operatorVault')!;
+    const bodyChars = Number(vault.text.match(/ chars=(\d+)\]/u)?.[1]);
+    expect(bodyChars).toBeGreaterThan(0);
+    expect(bodyChars).toBeLessThanOrEqual(LINEAGE_SECTION_CAPS.operatorVault);
+    expect(vault.complete).toBe(false);
   });
 });
 

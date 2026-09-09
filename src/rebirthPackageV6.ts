@@ -3299,6 +3299,9 @@ function renderContinuationRecord(
     : 'latest-validation=none-captured');
   const decision = newest(model.cognitiveArtifacts.filter((row) => row.kind === 'decision'
     && row.sourceInstanceId === boundary.instanceId && !row.supersededBy
+    && boundary.nowCard?.currentRailAvailability?.status !== 'none'
+    && !['complete', 'review-closed', 'all-resolved', 'none'].includes(boundary.nowCard?.currentRail?.state ?? '')
+    && (!boundary.activeRequest?.source.sourceAt || (row.sourceAt && Date.parse(row.sourceAt) >= Date.parse(boundary.activeRequest.source.sourceAt)))
     && row.sourceAt && Number.isFinite(Date.parse(row.sourceAt))));
   lines.push(decision
     ? `latest-decision=${clip(decision.text)} · ${stamp(decision)}`
@@ -3824,11 +3827,18 @@ function renderExecution(
     for (const fact of unknown) lines.push(renderFact(fact));
   }
   if (lines.length === 0) lines.push('- execution state captured as empty');
-  return boundedText(
-    lines.join('\n'),
-    maxChars,
-    recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle),
-  );
+  const full = lines.join('\n');
+  if (full.length <= maxChars) return { text: full, complete: true };
+  const recovery = recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle);
+  const omitted = (count: number) => `[… ${count} execution entries omitted${recovery ? ` · recover: ${recovery}` : ''} …]`;
+  const kept: string[] = [];
+  // Admit complete rows. An oversized room roster must not consume the cap
+  // before a short unresolved operation or validation can be shown.
+  for (const line of lines) {
+    if ([...kept, line, omitted(lines.length)].join('\n').length <= maxChars) kept.push(line);
+  }
+  const text = [...kept, omitted(lines.length - kept.length)].join('\n');
+  return { text: text.length <= maxChars ? text : '', complete: false };
 }
 
 function contributorSummary(contributors: readonly RebirthPackageV6EditContributor[]): string {
@@ -4170,7 +4180,9 @@ function cognitionRowBody(
     if (start > row.text.length && start < sourceText.length) {
       const tail = sourceText.slice(start);
       const hash = createHash('sha256').update(tail).digest('hex');
-      excerpt = `\n[exact-source-excerpt/v1 · source=${row.provenanceId} · utf16-range=${start}..${sourceText.length} · sha256=${hash} · recover=${recovery ?? 'unavailable'}]\n${tail}\n[/exact-source-excerpt]`;
+      excerpt = compact
+        ? `\n[exact closing excerpt · characters ${start}..${sourceText.length}]\n${tail}\n[/exact closing excerpt]`
+        : `\n[exact-source-excerpt/v1 · source=${row.provenanceId} · utf16-range=${start}..${sourceText.length} · sha256=${hash} · recover=${recovery ?? 'unavailable'}]\n${tail}\n[/exact-source-excerpt]`;
     }
   }
   // D1: the compact row keeps the body and every attestation that rides with
@@ -4181,7 +4193,7 @@ function cognitionRowBody(
   if (compact) {
     const labels = `${row.projection === 'truncated' ? ' [partial]' : ''}`
       + `${row.supersededBy ? ` [EXPIRED → ${row.supersededBy}]` : ''}`
-      + ` [${row.authority}]`;
+      + (row.authority === 'historical_observation' ? '' : ` [${row.authority}]`);
     return `${row.kind}${labels}\n${row.text}${excerpt}\n${continuityAnchor(row.provenanceId, row.sourceAt, referenceAt)}`;
   }
   return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${retention}${declared}${excerpt}`;
@@ -4278,6 +4290,7 @@ function renderCognition(
   model: RebirthPackageV6Model,
   maxChars: number,
   references: RebirthRecoveryReferenceCatalog,
+  compact = false,
 ): RenderedV6SectionBody {
   const recoveryHandle = recoveryReference(
     references,
@@ -4375,10 +4388,11 @@ function renderCognition(
           || right.provenanceId.localeCompare(left.provenanceId));
       const unknown = keep.filter((row) => !row.sourceAt);
       const referenceAt = model.boundaryAndActiveTask.capturedAt;
-      for (const row of known) lines.push(`${formatDisplayStamp(row.sourceAt, referenceAt)} · ${rowBodies.get(row.provenanceId)}`);
+      for (const row of known) lines.push(compact ? compactRowBodies.get(row.provenanceId)!
+        : `${formatDisplayStamp(row.sourceAt, referenceAt)} · ${rowBodies.get(row.provenanceId)}`);
       if (unknown.length > 0) {
         lines.push('', 'Unknown source time (quarantined; not part of the chronology):');
-        for (const row of unknown) lines.push(`- ${rowBodies.get(row.provenanceId)}`);
+        for (const row of unknown) lines.push(compact ? compactRowBodies.get(row.provenanceId)! : `- ${rowBodies.get(row.provenanceId)}`);
       }
       if (keep.length === 0) {
         if (!capture) {
@@ -4408,6 +4422,35 @@ function renderCognition(
       keep = keep.slice(0, -1);
       text = assemble(keep);
     }
+    // Scarcity projections are a starting point, not a permanent ceiling.
+    // Restore newest retained source bodies while space remains, without
+    // evicting another admitted artifact to pay for an expansion.
+    const expandedIds = new Set<string>();
+    if (!demandProbe) {
+      const newest = [...keep].sort((a, b) => (b.sourceAt ?? '').localeCompare(a.sourceAt ?? '')
+        || a.provenanceId.localeCompare(b.provenanceId));
+      for (const row of newest) {
+        if (row.projection !== 'truncated') continue;
+        const original = sourceRows.find((candidate) => candidate.provenanceId === row.provenanceId && candidate.projection !== 'truncated');
+        if (!original) continue;
+        const bodies = compact ? compactRowBodies : rowBodies;
+        const previousBody = bodies.get(row.provenanceId)!;
+        const restoredBody = cognitionRowBody(original, referenceAt, undefined, recoveryHandle, compact);
+        if (text.length + restoredBody.length - previousBody.length > maxChars) continue;
+        bodies.set(row.provenanceId, restoredBody);
+        const candidate = keep.map((entry) => entry.provenanceId === row.provenanceId ? original : entry);
+        const restored = assemble(candidate);
+        if (restored.length > maxChars) {
+          bodies.set(row.provenanceId, previousBody);
+          continue;
+        }
+        keep = candidate;
+        text = restored;
+        expandedIds.add(row.provenanceId);
+        rowBodies.set(row.provenanceId, cognitionRowBody(original, referenceAt, undefined, recoveryHandle));
+        compactRowBodies.set(row.provenanceId, cognitionRowBody(original, referenceAt, undefined, recoveryHandle, true));
+      }
+    }
     // Even the protected tail can exceed a pathologically small caller cap; the
     // character-bounded fallback keeps the section's contract (never exceed
     // maxChars) with the exact recovery handle attached.
@@ -4415,7 +4458,7 @@ function renderCognition(
     const unitPlacements: RebirthPackageV6UnitPlacement[] = rows.map((row) => ({
       id: row.provenanceId,
       placement: keptIds.has(row.provenanceId) ? 'rendered' : 'elided',
-      projected: row.projection === 'truncated',
+      projected: row.projection === 'truncated' && !expandedIds.has(row.provenanceId),
     }));
     if (text.length > maxChars) {
       const bounded = boundedText(text, maxChars, recoveryHandle);
@@ -4424,7 +4467,7 @@ function renderCognition(
     return {
       text,
       complete: keep.length === rows.length
-        && rows.every((row) => row.projection !== 'truncated'),
+        && keep.every((row) => row.projection !== 'truncated'),
       unitPlacements,
       timelineRows: keep.map((row) => ({
         id: conversationRowBaseId(row.provenanceId.replace(/^message:/u, '')),
@@ -4493,15 +4536,11 @@ function conversationRowText(
     ? renderConversationSeams(row.text, row.segmentOffsets)
     : null;
   const text = seamMarkers ?? row.text;
-  const replyLimit = 1_500;
-  const projectedReply = row.role === 'assistant' && text.length > replyLimit;
-  const renderedText = projectedReply
-    ? `${text.slice(0, 1_200)}\n[… middle omitted …]\n${text.slice(-300)}`
-    : text;
-  const projection = projectedReply
-    ? `\n[projection=truncated stored=${replyLimit}/${text.length} chars`
-      + ']'
-    : '';
+  // Measure real demand. Only the exchange allocator may omit source text;
+  // a fixed row cap must not discard reasoning while capacity sits unused.
+  const renderedText = text;
+  const projectedReply = false;
+  const projection = '';
   // Presentation changes the envelope, never the excerpt admitted by budget.
   if (compactAnchor !== undefined) {
     return `${row.role}${projectedReply ? ' [partial]' : ''}\n${renderedText}\n${compactAnchor}`;
@@ -4675,7 +4714,7 @@ function conversationEndpointStubs(
     const sourceAt = knownSourceTime(message.source.sourceAt);
     if (!sourceAt) return;
     const id = conversationRowBaseId(message.source.provenanceId.replace(/^message:/u, ''));
-    const body = `\u2192 ${note}; its ${message.chars} chars render verbatim once above as ${promotedAs}.`;
+    const body = `\u2192 ${note}; source ${message.chars} chars. See ${promotedAs} in Boundary (any truncation is declared there).`;
     stubs.push({
       id,
       sourceAt,
@@ -4723,17 +4762,46 @@ function mergeEndpointStubText(
   return out;
 }
 
+function conversationWithVault(model: RebirthPackageV6Model): readonly RebirthPackageV6ConversationRow[] {
+  const rows = [...model.recentConversation];
+  const key = (id: string) => conversationRowBaseId(id.replace(/^message:/u, ''));
+  const seen = new Set(rows.map((row) => key(row.provenanceId)));
+  for (const endpoint of [model.boundaryAndActiveTask.activeRequest, model.boundaryAndActiveTask.lastMaterialAssistant]) {
+    if (endpoint) seen.add(key(endpoint.source.provenanceId));
+  }
+  // These units have already passed capture's lineage/frontier gate. Never
+  // query additional owners or expand ancestry while preparing a render.
+  for (const unit of model.operatorVault?.units ?? []) {
+    if (unit.kind !== 'operator' || seen.has(key(unit.id))) continue;
+    const text = unit.verbatim.replace(/^\[operator · source=[^\n]+\]\n/u, '');
+    if (!text.trim()) continue;
+    seen.add(key(unit.id));
+    rows.push({ provenanceId: unit.id, sourceAt: knownSourceTime(unit.sourceAt), role: 'user',
+      text: unit.projection ? `${text}\n[partial historical operator source]` : text,
+      exchangeId: unit.id });
+  }
+  return rows.sort((a, b) => {
+    const left = knownSourceTime(a.sourceAt);
+    const right = knownSourceTime(b.sourceAt);
+    return left && right ? Date.parse(left) - Date.parse(right) || a.provenanceId.localeCompare(b.provenanceId)
+      : left ? -1 : right ? 1 : a.provenanceId.localeCompare(b.provenanceId);
+  });
+}
+
 function renderConversation(
   model: RebirthPackageV6Model,
   maxChars: number,
   references: RebirthRecoveryReferenceCatalog,
+  compact = false,
+  includeVault = true,
 ): RenderedV6SectionBody {
   // God Rule 8: unknown source time never participates in the chronology. Known-time
   // rows stream chronologically; unknown-time rows are quarantined under an explicit
   // banner (mirroring renderCognition and renderExecution) where they make no recency
   // claim and can never be mistaken for a continuous dialogue sequence.
-  const known = model.recentConversation.filter((row) => row.sourceAt);
-  const unknown = model.recentConversation.filter((row) => !row.sourceAt);
+  const conversation = includeVault ? conversationWithVault(model) : model.recentConversation;
+  const known = conversation.filter((row) => row.sourceAt);
+  const unknown = conversation.filter((row) => !row.sourceAt);
   // Audit-3 C5: display stamps trim ms (and year when it matches capture); the
   // reference instant is the model's own capturedAt for determinism.
   const referenceAt = model.boundaryAndActiveTask.capturedAt;
@@ -4742,7 +4810,8 @@ function renderConversation(
     model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
   );
   const renderRow = (row: RebirthPackageV6ConversationRow): string => (
-    conversationRowText(row, referenceAt, recoveryHandle)
+    conversationRowText(row, referenceAt, recoveryHandle, compact
+      ? continuityAnchor(conversationRowBaseId(row.provenanceId), row.sourceAt, referenceAt) : undefined)
   );
   const endpointStubs = conversationEndpointStubs(model, referenceAt);
   // Stubs are structural, but they are not free. Under extreme pressure the
@@ -4754,20 +4823,19 @@ function renderConversation(
     projectedIds: ReadonlySet<string> = new Set(),
   ): RebirthPackageV6UnitPlacement[] => {
     const renderedIds = new Set(renderedRows.map((row) => conversationRowBaseId(row.provenanceId)));
-    return model.recentConversation.map((row) => {
+    return conversation.map((row) => {
       const id = conversationRowBaseId(row.provenanceId);
       return {
         id,
         placement: renderedIds.has(id) ? 'rendered' : 'elided',
-        projected: projectedIds.has(id)
-          || (row.role === 'assistant' && (row.segmentOffsets?.length ? renderConversationSeams(row.text, row.segmentOffsets).length : row.text.length) > 1_500),
+        projected: projectedIds.has(id) || Boolean(model.operatorVault?.units.find((unit) => unit.id === id)?.projection),
       };
     });
   };
   const censusFor = (
     placements: readonly RebirthPackageV6UnitPlacement[],
   ): RebirthTimelineCensus => ({
-    captured: model.recentConversation.length,
+    captured: conversation.length,
     rendered: placements.filter((placement) => placement.placement === 'rendered').length,
     matched: null,
     incomplete: placements.filter((placement) => placement.placement !== 'rendered' || placement.projected).length,
@@ -4799,12 +4867,12 @@ function renderConversation(
   const dialogueText = lines.join('\n\n');
   const fullText = [fullEndpointReceipt, dialogueText].filter(Boolean).join('\n\n');
   if (fullText.length <= maxChars) {
-    const placements = placementsFor(model.recentConversation);
+    const placements = placementsFor(conversation);
     return {
       text: fullText,
       complete: true,
       unitPlacements: placements,
-      timelineRows: timelineRowsFor(model.recentConversation),
+      timelineRows: timelineRowsFor(conversation),
       timelineCensus: censusFor(placements),
     };
   }
@@ -5580,6 +5648,7 @@ function renderSectionBodies(
   timing?: RebirthPackageV6SectionTimingAccumulator,
   sharedReferences?: MutableRecoveryReferenceCatalog,
   compact = false,
+  compactTimeline = compact,
 ): Record<RebirthPackageV6SectionId, RenderedV6SectionBody> {
   // Audit-4 S7: ONE catalog per whole render pass — callers that re-render
   // sections (adaptive backfill, shrink probes) pass the same mutable catalog
@@ -5590,7 +5659,7 @@ function renderSectionBodies(
     model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
   );
   const recentConversation = measureSectionRender(timing, 'recentConversation', () => (
-    renderConversation(model, limits.recentConversation, references)
+    renderConversation(model, limits.recentConversation, references, compactTimeline, limits.operatorVault === 0)
   ));
   const renderedConversationIds = new Set(
     (recentConversation.unitPlacements ?? [])
@@ -5623,7 +5692,7 @@ function renderSectionBodies(
       renderActiveEdits(model, limits.activeEditDelta, references)
     )),
     cognitiveArtifacts: measureSectionRender(timing, 'cognitiveArtifacts', () => (
-      renderCognition(model, limits.cognitiveArtifacts, references)
+      renderCognition(model, limits.cognitiveArtifacts, references, compactTimeline)
     )),
     recentConversation,
     operatorVault: measureSectionRender(timing, 'operatorVault', () => renderLineage(
@@ -5717,7 +5786,7 @@ function admittedSectionIds(model: RebirthPackageV6Model): readonly RebirthPacka
   return REBIRTH_PACKAGE_V6_SECTION_IDS.filter((id) => {
     if (id === 'brainMergeSynthesis') return Boolean(model.brainMergeSynthesis?.trim());
     if (id === 'recentConversation') {
-      return model.recentConversation.length > 0 || conversationEndpointReceipt(model).length > 0;
+      return conversationWithVault(model).length > 0 || conversationEndpointReceipt(model).length > 0;
     }
     if ((REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(id)) {
       const section = lineageSection(model, id as RebirthPackageV7LineageSectionId);
@@ -5778,11 +5847,38 @@ function resolveAdaptiveSectionCapsInternal(
     ...phaseOverrides,
     ...options.sectionMaxChars,
   };
-  const timelinePool = (phase === 'rail-active' ? 115_000 : 129_000)
-    - (model.brainMergeSynthesis?.trim() ? 10_000 : 0);
+  // The newest exact exchange may grow beyond the old fixed boundary cap.
+  // Fund it from the same envelope, before historical dialogue and cognition.
+  if (options.sectionMaxChars?.boundaryAndActiveTask === undefined) {
+    limits.boundaryAndActiveTask = Math.min(145_000, Math.max(limits.boundaryAndActiveTask,
+      compactBoundary(model, model.boundaryAndActiveTask.lastMaterialAssistant?.text ?? null).length + 64));
+  }
+  // Reserve recovery's measured demand plus room for the final completeness
+  // census. Unused directory space belongs to conversation, not blank padding.
+  const recoveryReserve = options.sectionMaxChars?.recoveryIndex === undefined
+    ? Math.min(limits.recoveryIndex, renderRecovery(model, limits.recoveryIndex).text.length + 1_024)
+    : limits.recoveryIndex;
+  const recoverySurplus = limits.recoveryIndex - recoveryReserve;
+  limits.recoveryIndex = recoveryReserve;
+  const references = buildRecoveryReferenceCatalog(model);
+  let executionSurplus = 0;
+  for (const id of ['executionState', 'activeEditDelta'] as const) {
+    if (options.sectionMaxChars?.[id] !== undefined) continue;
+    const body = id === 'executionState'
+      ? renderExecution(model, limits[id], references)
+      : renderActiveEdits(model, limits[id], references);
+    // Retain room for final capture labels, then give unused capacity to prose.
+    const reserved = Math.min(limits[id], Math.max(500, body.text.length + 256));
+    executionSurplus += limits[id] - reserved;
+    limits[id] = reserved;
+  }
+  const timelinePool = Math.max(0, (phase === 'rail-active' ? 115_000 : 129_000)
+    - (model.brainMergeSynthesis?.trim() ? 10_000 : 0)
+    - Math.max(0, limits.boundaryAndActiveTask - 5_000) + recoverySurplus + executionSurplus);
   const explicitConversation = options.sectionMaxChars?.recentConversation;
-  limits.recentConversation = Math.min(limits.recentConversation, timelinePool);
-  const dialogue = renderConversation(model, limits.recentConversation, buildRecoveryReferenceCatalog(model));
+  limits.recentConversation = explicitConversation === undefined
+    ? timelinePool : Math.min(limits.recentConversation, timelinePool);
+  const dialogue = renderConversation(model, limits.recentConversation, buildRecoveryReferenceCatalog(model), !options.diagnostic, limits.operatorVault === 0);
   const dialogueUsed = Math.min(limits.recentConversation, dialogue.text.length);
   if (explicitConversation === undefined) limits.recentConversation = dialogueUsed;
   if (options.sectionMaxChars?.cognitiveArtifacts === undefined) {
@@ -5825,8 +5921,10 @@ export function renderRebirthPackageV6Sections(
 ): readonly RenderedRebirthPackageV6Section[] {
   // Redaction lane: nothing republishes before it (pure, idempotent, cached).
   model = redactContinuityModel(model).model;
-  const limits = resolveAdaptiveSectionCaps(model, options);
-  return renderSectionsWithLimits(model, limits, undefined, undefined, !options.diagnostic);
+  const limits = resolveAdaptiveSectionCaps(model, { ...options, diagnostic: true });
+  // Standalone section readers retain their self-describing source envelopes;
+  // the joined agent Timeline uses compact rows with its shared legend.
+  return renderSectionsWithLimits(model, limits, undefined, undefined, !options.diagnostic, false);
 }
 
 function renderSectionsWithLimits(
@@ -5835,9 +5933,10 @@ function renderSectionsWithLimits(
   timing?: RebirthPackageV6SectionTimingAccumulator,
   sharedReferences?: MutableRecoveryReferenceCatalog,
   compact = false,
+  compactTimeline = compact,
 ): readonly RenderedRebirthPackageV6Section[] {
   const references = sharedReferences ?? buildRecoveryReferenceCatalog(model);
-  const rendered = renderSectionBodies(model, limits, timing, references, compact);
+  const rendered = renderSectionBodies(model, limits, timing, references, compact, compactTimeline);
   // Audit-3 A8/S6: ONE completeness census derived from the actual rendered
   // bodies. The Boundary re-renders once WITH the census so its
   // capture-partial-lanes header, each section's partial= surface, the
@@ -5961,6 +6060,10 @@ function buildCollapseReport(
   telemetry: RebirthPackageV7EvictionTelemetry,
 ): RebirthPackageV7CollapseReport {
   const omitted = new Set<RebirthPackageV6SectionId>(omittedSectionIds);
+  const dialogue = sections.find((section) => section.id === 'recentConversation');
+  const deliveredDialogue = new Set(!omitted.has('recentConversation')
+    ? (dialogue?.unitPlacements ?? []).filter((row) => row.placement === 'rendered' && !row.projected).map((row) => row.id)
+    : []);
   const citizens = sections.filter((section): section is RenderedRebirthPackageV6Section & { collapse: CollapseResult } => (
     section.collapse != null
     && ((REBIRTH_PACKAGE_V7_LINEAGE_SECTION_IDS as readonly string[]).includes(section.id)
@@ -5969,10 +6072,13 @@ function buildCollapseReport(
   return {
     sections: citizens.map((section) => ({
       sectionId: section.id as RebirthPackageV7CollapseSectionId,
-      placements: section.collapse.placements,
+      placements: section.collapse.placements.map((placement) => section.id === 'operatorVault'
+        && deliveredDialogue.has(conversationRowBaseId(placement.id))
+        ? { ...placement, tier: 't0' as const } : placement),
       demotions: section.collapse.demotions,
       droppedToFloorRollup: section.collapse.droppedToFloorRollup,
-      sectionElided: omitted.has(section.id),
+      sectionElided: omitted.has(section.id) && !(section.id === 'operatorVault'
+        && section.collapse.placements.some((placement) => deliveredDialogue.has(conversationRowBaseId(placement.id)))),
     })),
     omissionSections: sections
       .filter((section): section is RenderedRebirthPackageV6Section & {
@@ -6132,9 +6238,14 @@ function joinRenderedSections(
       : timelineSections.flatMap((section) => section.timelineSummary ? [section.timelineSummary] : [])),
     ...known.map((row) => model ? row.compactText ?? row.text : row.text),
     ...(unknown.length > 0 ? ['Unknown source time (quarantined; not part of the chronology):', ...unknown.map((row) => model ? row.compactText ?? row.text : row.text)] : []),
-    // Extreme-cap fallbacks already attest exactly what was retained. Carry
-    // those bytes unchanged rather than reconstructing content from placements.
-    ...timelineSections.filter((section) => section.timelineRows === undefined).map((section) => section.text),
+    // Preserve fallback receipt bodies inside the shared frame. These strings
+    // are renderer-owned section frames; source content inside stays intact.
+    ...timelineSections.filter((section) => section.timelineRows === undefined).map((section) => (
+      section.text.startsWith(`── ${SECTION_TITLES[section.id]} ──\n${V6_SECTION_OPEN_PREFIX} id=${section.id} `)
+        && section.text.endsWith(`\n${V6_SECTION_CLOSE}`)
+        ? section.text.split('\n').slice(2, -1).join('\n')
+        : section.text
+    )),
   ].join('\n\n');
   const timeline = `── Timeline ──\n[REBIRTH-V6-SECTION id=recentConversation order=6 dir=asc chars=${body.length}]\n${body}\n${V6_SECTION_CLOSE}`;
   let emittedTimeline = false;
@@ -6585,14 +6696,14 @@ export function renderRebirthPackageV6WithReport(
         + `${omissionHandle ? ` recover=${omissionHandle}` : ''}]`
         + (omissionHandle ? '' : '\nCognitive artifacts evicted; ledger unreachable');
     } else if (section.id === 'recentConversation'
-      && (model.recentConversation.length > 0 || conversationEndpointReceipt(model).length > 0)) {
+      && (conversationWithVault(model).length > 0 || conversationEndpointReceipt(model).length > 0)) {
       const transcriptHandle = recoveryReference(
         references,
         model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
       );
       const endpointBodies = Number(Boolean(model.boundaryAndActiveTask.activeRequest))
         + Number(Boolean(model.boundaryAndActiveTask.lastMaterialAssistant));
-      body = `[EVICTED section=recentConversation rows=${model.recentConversation.length}`
+      body = `[EVICTED section=recentConversation rows=${conversationWithVault(model).length}`
         + ` endpoint-bodies-relocated=${endpointBodies}`
         + `${transcriptHandle ? ` recover=${transcriptHandle}` : ''}]`
         + (transcriptHandle ? '' : '\nRecent conversation evicted; exact recovery unavailable');

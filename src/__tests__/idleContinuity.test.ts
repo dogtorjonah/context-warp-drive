@@ -120,7 +120,9 @@ describe('E1 idle continuity', () => {
       ],
     });
     const head = boundaryOf(renderRebirthPackageV6WithReport(value).text);
-    expect(head).toContain('Latest decision: SELF RULING');
+    // Ownership alone does not make a closed task's decision current.
+    expect(head).not.toContain('Latest decision:');
+    expect(renderRebirthPackageV6WithReport(value).text).toContain('SELF RULING');
     expect(head).not.toContain('Latest decision: ANCESTOR RULING');
   });
 

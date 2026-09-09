@@ -27,15 +27,29 @@ function specimen() {
 }
 
 describe('unified rebirth timeline', () => {
+  it('admits operator history when the vault is the only conversation source', () => {
+    const value = buildRebirthPackageV6Model({ ...specimen(),
+      recentConversation: [], cognitiveArtifacts: [],
+      operatorVault: { rangeRecover: null, units: [{
+        id: 'vault-only', kind: 'operator', sourceAt: at(1), sourceEndAt: at(1),
+        verbatim: '[operator · source=vault-only]\nVAULT ONLY OPERATOR WORDS',
+        digest: 'vault-only', claim: 'vault-only', eraKey: '2026-09-09', recover: 'source-reader',
+      }] },
+    });
+    const result = renderRebirthPackageV6WithReport(value);
+    expect(result.text).toContain('VAULT ONLY OPERATOR WORDS');
+    expect(result.text).toContain('vault-only');
+    expect(result.text.match(/VAULT ONLY OPERATOR WORDS/gu)).toHaveLength(1);
+  });
   it('retains every hidden lineage source and hash across display budgets', () => {
     const unit = (id: string, kind: 'life' | 'operator' | 'episode') => ({
       id, kind, sourceAt: at(1), sourceEndAt: at(2), verbatim: `Exact source ${id}`,
       digest: id, claim: id, eraKey: '2026-09-09', recover: 'source-reader',
     });
     const value = buildRebirthPackageV6Model({ ...specimen(),
-      lifeLedger: { units: [unit('life-one', 'life')] },
-      operatorVault: { units: [unit('vault-one', 'operator')] },
-      episodeChapterIndex: { units: [unit('episode-one', 'episode')] },
+      lifeLedger: { rangeRecover: null, units: [unit('life-one', 'life')] },
+      operatorVault: { rangeRecover: null, units: [unit('vault-one', 'operator')] },
+      episodeChapterIndex: { rangeRecover: null, units: [unit('episode-one', 'episode')] },
     });
     const hidden = renderRebirthPackageV6WithReport(value);
     const visible = renderRebirthPackageV6WithReport(value, { sectionMaxChars: {
@@ -48,7 +62,7 @@ describe('unified rebirth timeline', () => {
     expect(proofs(hidden)).toEqual(proofs(visible));
     expect(hidden.text).not.toContain('Exact source life-one');
     expect(hidden.text).not.toContain('Exact source episode-one');
-    expect(hidden.text).not.toContain('Exact source vault-one');
+    expect(hidden.text).toContain('Exact source vault-one');
   });
   it('reserves 145k content and gives idle execution surplus to the timeline', () => {
     const defaults = DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS;
@@ -64,10 +78,12 @@ describe('unified rebirth timeline', () => {
     });
     const caps = resolveAdaptiveSectionCaps(idle);
     expect(caps.executionState + caps.activeEditDelta).toBe(1_000);
-    expect(caps.recentConversation + caps.cognitiveArtifacts).toBe(129_000);
-    expect(caps.cognitiveArtifacts - active.cognitiveArtifacts).toBe(14_000);
+    expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex).toBe(139_000);
+    expect(active.executionState + active.activeEditDelta).toBeLessThan(15_000);
+    expect(active.recentConversation + active.cognitiveArtifacts + active.recoveryIndex
+      + active.executionState + active.activeEditDelta + active.boundaryAndActiveTask).toBe(145_000);
     expect(caps.boundaryAndActiveTask).toBe(5_000);
-    expect(caps.recoveryIndex).toBe(10_000);
+    expect(caps.recoveryIndex).toBeLessThanOrEqual(10_000);
     expect(renderRebirthPackageV6WithReport(idle).text.length).toBeLessThanOrEqual(150_000);
     const complete = buildRebirthPackageV6Model({
       ...idle,
@@ -117,7 +133,7 @@ describe('unified rebirth timeline', () => {
     // the timeline states its omission accounting once and names the one
     // executable route back to the units it did not render whole.
     expect(result.text).toMatch(/Timeline census: \d+ dated, \d+ quarantined; \d+ of \d+ captured units not fully rendered/u);
-    expect(result.text).toMatch(/Omitted units: continuity_ledger action="fetch"/u);
+    expect(result.text).not.toContain('[… middle omitted …]');
     expect(result.text).not.toContain('section_id=');
   });
 });
@@ -177,9 +193,9 @@ describe('D1 density', () => {
     });
     return buildRebirthPackageV6Model({
       ...specimen(),
-      lifeLedger: { units: [unit('life-one', 'life')] },
-      operatorVault: { units: [unit('vault-one', 'operator')] },
-      episodeChapterIndex: { units: [unit('episode-one', 'episode')] },
+      lifeLedger: { rangeRecover: null, units: [unit('life-one', 'life')] },
+      operatorVault: { rangeRecover: null, units: [unit('vault-one', 'operator')] },
+      episodeChapterIndex: { rangeRecover: null, units: [unit('episode-one', 'episode')] },
       executionState: {
         facts: [
           { provenanceId: 'rail:one', sourceAt: at(6), status: 'exact', kind: 'rail', text: 'rail-72adf723 · active · step D1' },
@@ -233,10 +249,10 @@ describe('D1 density', () => {
     boundaryAndActiveTask: {
       ...specimen().boundaryAndActiveTask,
       activeRequest: { text: 'NEWEST OPERATOR WORDS', chars: 21, source: {
-        provenanceId: 'msg_newest_operator', sourceAt: at(9), status: 'exact', kind: 'message',
+        provenanceId: 'msg_newest_operator', sourceAt: at(9), status: 'exact',
       } },
       lastMaterialAssistant: { text: 'NEWEST ASSISTANT WORDS', chars: 22, source: {
-        provenanceId: 'msg_newest_assistant', sourceAt: at(11), status: 'exact', kind: 'message',
+        provenanceId: 'msg_newest_assistant', sourceAt: at(11), status: 'exact',
       } },
     },
   });
@@ -304,6 +320,59 @@ describe('D1 density', () => {
     // And whatever the dialogue does not spend funds cognition rather than
     // evaporating: the two timeline citizens always add up to the whole pool.
     const caps = resolveAdaptiveSectionCaps(specimen());
-    expect(caps.recentConversation + caps.cognitiveArtifacts).toBe(115_000);
+    expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex
+      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(145_000);
+  });
+});
+
+describe('complete working continuity', () => {
+  it('protects the exact newest exchange from a flattened expired claim', () => {
+    const base = specimen();
+    const request = 'Cross reference the unused envelope and vault coverage.';
+    const answer = 'Previous assessment ' + 'reasoning '.repeat(900) + ' FINAL CONCLUSION';
+    const source = (id: string, minute: number) => ({ provenanceId: id, sourceAt: at(minute), status: 'exact' as const });
+    const model = buildRebirthPackageV6Model({ ...base, boundaryAndActiveTask: {
+      ...base.boundaryAndActiveTask,
+      activeRequest: { text: request, chars: request.length, source: source('current-request', 29) },
+      lastMaterialAssistant: { text: answer, chars: answer.length, source: source('last-answer', 28) },
+      activeRequestClaims: { latest: { text: 'Expired interpretation '.repeat(600), chars: 13800, source: source('old-claim', 27) }, latestStatus: 'expired_by_newer_operator', previous: null },
+    } });
+    const { text } = renderRebirthPackageV6WithReport(model);
+    expect(text.split(request)).toHaveLength(2);
+    expect(text).toContain(answer);
+    expect(text.indexOf(request)).toBeLessThan(text.indexOf('EXPIRED (superseded'));
+    expect(text).toContain('superseded by');
+    expect(text.length).toBeLessThanOrEqual(150_000);
+  });
+
+  it('retains full long reasoning when capacity is available', () => {
+    const model = specimen();
+    const { text } = renderRebirthPackageV6WithReport(model);
+    expect(text).toContain(model.recentConversation.find(row => row.role === 'assistant')!.text);
+    expect(text).not.toContain('[… middle omitted …]');
+  });
+
+  it('interleaves vault-only operator evidence once and preserves immutable proof bytes', () => {
+    const base = specimen();
+    const unit = (id: string, minute: number, text: string) => ({ id, kind: 'operator' as const, sourceAt: at(minute), verbatim: `[operator · source=${id} · source-time=${at(minute)}]\n${text}`, digest: text, claim: id, recover: 'source-reader', eraKey: '2026-09-09' });
+    const model = buildRebirthPackageV6Model({ ...base, operatorVault: { rangeRecover: null, units: [unit('u1', 1, 'OPERATOR START'), unit('vault-only', 4, 'HISTORICAL VAULT DECISION')] } });
+    const { text } = renderRebirthPackageV6WithReport(model);
+    expect(text.split('OPERATOR START')).toHaveLength(2);
+    expect(text.split('HISTORICAL VAULT DECISION')).toHaveLength(2);
+    expect(text.indexOf('HISTORICAL VAULT DECISION')).toBeLessThan(text.indexOf('OPERATOR FOLLOWUP'));
+    expect(model.operatorVault!.units[1].verbatim).toContain('[operator · source=vault-only');
+  });
+
+  it('keeps execution facts whole when a roster is too large', () => {
+    const base = specimen();
+    const model = buildRebirthPackageV6Model({ ...base, executionState: { facts: [
+      { kind: 'coordination', provenanceId: 'rooms', sourceAt: at(3), status: 'exact', text: 'rooms: ' + 'old-room '.repeat(500) },
+      { kind: 'blocker', provenanceId: 'blocking-fact', sourceAt: at(4), status: 'exact', text: 'Review has not finished' },
+    ], unknownReasons: [] } });
+    const { text } = renderRebirthPackageV6WithReport(model, { sectionMaxChars: { executionState: 500 } });
+    const section = text.match(/id=executionState[^\]]*\]\n([\s\S]*?)\n\[\/REBIRTH-V6-SECTION\]/)![1];
+    expect(section).toContain('Review has not finished');
+    expect(section).toContain('execution entries omitted');
+    expect(section).not.toContain('old-room');
   });
 });
