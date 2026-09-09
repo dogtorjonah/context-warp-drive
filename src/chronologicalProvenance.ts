@@ -797,6 +797,8 @@ export interface ContinuityPackageProvenanceInput {
   readonly rawTailCount: number;
   /** Authoritative source time of the first exact raw row after the package. */
   readonly rawResumeTimestamp?: string;
+  /** Exact first delivered row, preferred over a derived positional frontier. */
+  readonly rawResumeSourceId?: string;
 }
 
 export interface EmbeddedContinuityArtifactProvenanceInput {
@@ -886,7 +888,7 @@ export function renderContinuityPackageProvenance(
   const rawResumesAt: ChronologicalPoint = {
     traceId: input.traceId,
     unit: 'event',
-    ...(sourceEventCount !== undefined
+    ...(input.rawResumeSourceId ? { id: input.rawResumeSourceId } : sourceEventCount !== undefined
       ? { index: sourceEventCount }
       : { id: 'raw-tail-start' }),
     timestamp: knownTimestamp(input.rawResumeTimestamp),

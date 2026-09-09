@@ -321,7 +321,7 @@ describe('raw rebirth seed renderer', () => {
   });
 
   test('exports the relay raw package defaults', () => {
-    expect(DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS).toBe(100_000);
+    expect(DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS).toBe(200_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.lastUserAiMessages).toBe(50_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.currentThread).toBe(50_000);
     expect(DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS.rawTraceCoordinateCloset).toBe(8_000);
@@ -1638,7 +1638,7 @@ describe('structured v6 rows from the raw hard-epoch trace', () => {
   test('promotes the newest assistant PROSE row as LAST MATERIAL ASSISTANT, never a compact tool trace', () => {
     const rendered = buildRawRebirthSeedFromMessages(trace, v6Options);
     expect(rendered).toContain(
-      `[LAST MATERIAL ASSISTANT · ${prose.length} chars · source=message:assistant-2 · source-time=2026-09-06T17:58:00.000Z · status=exact]\n${prose}\n[/LAST MATERIAL ASSISTANT]`,
+      `[LAST MATERIAL ASSISTANT ⟨message:assistant-2 @09-06 17:58:00Z⟩]\n${prose}\n[/LAST MATERIAL ASSISTANT]`,
     );
     expect(rendered).not.toMatch(/\[LAST MATERIAL ASSISTANT[^\n]*\]\n⟨tool/u);
   });
@@ -1646,7 +1646,7 @@ describe('structured v6 rows from the raw hard-epoch trace', () => {
   test('surfaces the trailing tool call as a pending_operation fact with exact source instead of as speech', () => {
     const rendered = buildRawRebirthSeedFromMessages(trace, v6Options);
     expect(section(rendered, 'Execution State')).toContain(
-      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight · source=message:tool-2 · source-time=2026-09-06T17:58:10.000Z · status=exact',
+      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=in-flight',
     );
     expect(rendered).not.toContain('source=message:tool-1');
   });
@@ -1657,26 +1657,28 @@ describe('structured v6 rows from the raw hard-epoch trace', () => {
       { role: 'assistant', content: '⟨tool result Bash: 12 passed⟩', sourceIdentity: 'message:tool-result-2', tsMs: at('2026-09-06T17:58:20.000Z') },
     ], v6Options);
     expect(section(rendered, 'Execution State')).toContain(
-      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=result-received · source=message:tool-2 ·',
+      '- pending_operation · ⟨tool Bash {"command":"npm test"}⟩ · operation=result-received',
     );
   });
 
   test('renders Recent Conversation rows with exact source identity and time instead of legacy-conversation/unknown', () => {
-    const conversation = section(buildRawRebirthSeedFromMessages(trace, v6Options), 'Recent Conversation');
-    expect(conversation).toContain('[user · source=message:user-1 · source-time=');
-    expect(conversation).toContain('[assistant · source=message:assistant-1 · source-time=');
-    expect(conversation).toContain('Checking the migration order first.');
+    const rendered = buildRawRebirthSeedFromMessages(trace, v6Options);
+    const conversation = section(rendered, 'Timeline');
+    expect(conversation).toContain('⟨message:user-1 @09-06 17:57:00Z⟩');
+    expect(conversation).toContain('⟨message:assistant-1 @09-06 17:57:30Z⟩');
+    expect(section(rendered, 'Raw hot tail')).toContain('Checking the migration order first.');
     expect(conversation).not.toContain('legacy-conversation');
     expect(conversation).not.toContain('source-time=unknown');
     expect(conversation).not.toContain('⟨tool');
   });
 
   test('derives Cognitive Artifacts from register glyph rows and tap_star waypoints with source provenance', () => {
-    const cognition = section(buildRawRebirthSeedFromMessages(trace, v6Options), 'Cognitive Artifacts');
-    expect(cognition).toContain('· result · The migration order is already additive; no rewrite needed. · source=message:assistant-2 · source-time=');
-    expect(cognition).toContain('· decision · Keep the migration additive; no rewrite. · source=message:star-1 · source-time=');
-    expect(cognition).toContain('authority=pointer');
-    expect(cognition).toContain('derived from the retained provider trace only');
+    const rendered = buildRawRebirthSeedFromMessages(trace, v6Options);
+    const cognition = section(rendered, 'Timeline');
+    expect(cognition).toContain('⟨assistant-2 @09-06 17:58:00Z⟩');
+    expect(cognition).toContain('⟨message:star-1 @09-06 17:57:50Z⟩');
+    expect(cognition).toContain('Exact source appears in Raw hot tail');
+    expect(section(rendered, 'Raw hot tail')).toContain('Keep the migration additive; no rewrite.');
     expect(cognition).not.toContain('⟨tool');
   });
 

@@ -206,7 +206,6 @@ describe('FoldSession E10 sawtooth eviction', () => {
       ['boundaryAndActiveTask', 1, null],
       ['executionState', 3, 'asc'],
       ['activeEditDelta', 4, 'asc'],
-      ['cognitiveArtifacts', 5, 'desc'],
       ['recentConversation', 6, 'asc'],
       ['recoveryIndex', 10, 'asc'],
     ] as const;
@@ -221,7 +220,7 @@ describe('FoldSession E10 sawtooth eviction', () => {
     // The newest planted path survives inline, while the bulky provider result
     // is intentionally represented by the compact conversation frame.
     expect(preparedText).toContain('/home/jonah/context-warp-drive/src/file_27.ts');
-    expect(preparedText).not.toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
+    expect(preparedText).toContain('ACTIVE_STEP_27_FULL_PAYLOAD');
   });
 
   test('eviction:false preserves the pre-E10 monotonic fold block behavior', () => {
@@ -520,7 +519,7 @@ describe('FoldSession tail-epoch runway gate', () => {
     expect(body.split(HARD_EPOCH_CONTINUITY_DIRECTIVE)).toHaveLength(2);
     expect(body).toContain('RAW_PRIOR_TRACE_MARKER');
     expect(body).toContain('[REBIRTH-V6-SECTION id=boundaryAndActiveTask order=1 chars=');
-    expect(body).not.toContain('TOOL_RESULT_MARKER non-string trailing user payload');
+    expect(body.match(/TOOL_RESULT_MARKER non-string trailing user payload/g)).toHaveLength(1);
     expect(body.match(/LIVE_TRIGGER_MARKER/g)).toHaveLength(1);
   });
 

@@ -78,10 +78,10 @@ describe('unified rebirth timeline', () => {
     });
     const caps = resolveAdaptiveSectionCaps(idle);
     expect(caps.executionState + caps.activeEditDelta).toBe(1_000);
-    expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex).toBe(139_000);
+    expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex).toBe(189_000);
     expect(active.executionState + active.activeEditDelta).toBeLessThan(15_000);
     expect(active.recentConversation + active.cognitiveArtifacts + active.recoveryIndex
-      + active.executionState + active.activeEditDelta + active.boundaryAndActiveTask).toBe(145_000);
+      + active.executionState + active.activeEditDelta + active.boundaryAndActiveTask).toBe(195_000);
     expect(caps.boundaryAndActiveTask).toBe(5_000);
     expect(caps.recoveryIndex).toBeLessThanOrEqual(10_000);
     expect(renderRebirthPackageV6WithReport(idle).text.length).toBeLessThanOrEqual(150_000);
@@ -321,7 +321,7 @@ describe('D1 density', () => {
     // evaporating: the two timeline citizens always add up to the whole pool.
     const caps = resolveAdaptiveSectionCaps(specimen());
     expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex
-      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(145_000);
+      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(195_000);
   });
 });
 
@@ -402,9 +402,9 @@ describe('complete working continuity', () => {
     });
     expect(starved).toContain('Omitted units:');
     // Natural pressure: dialogue demand alone exceeds the timeline pool.
-    const recentConversation = pressureDialogue();
+    const recentConversation = pressureDialogue(120);
     const pressured = renderRebirthPackageV6WithReport(buildRebirthPackageV6Model({ ...base, recentConversation })).text;
-    expect(pressured.length).toBeLessThanOrEqual(150_000);
+    expect(pressured.length).toBeLessThanOrEqual(200_000);
     expect(pressured).not.toMatch(/^\[cognition:[^\]\n]*$/mu);
     // With a1 gone from the dialogue, `message:a1` is distinct again: all four count.
     expect(censusOf(pressured).captured).toBe(recentConversation.length + base.cognitiveArtifacts.length);
@@ -412,13 +412,13 @@ describe('complete working continuity', () => {
   });
 });
 
-/** 80 exchanges whose dialogue demand alone exceeds the timeline pool. */
-function pressureDialogue(): Array<ReturnType<typeof specimen>['recentConversation'][number]> {
+/** Use 120 exchanges when dialogue alone must exceed the 200k envelope. */
+function pressureDialogue(count = 80): Array<ReturnType<typeof specimen>['recentConversation'][number]> {
   const clock = (second: number) => `2026-09-09T03:${String(Math.floor(second / 60)).padStart(2, '0')}:${String(second % 60).padStart(2, '0')}.000Z`;
   const rows: Array<ReturnType<typeof specimen>['recentConversation'][number]> = [];
-  for (let i = 0; i < 80; i += 1) {
+  for (let i = 0; i < count; i += 1) {
     rows.push({ provenanceId: `req-${i}`, sourceAt: clock(i * 10), role: 'user', text: `OPERATOR REQUEST ${i}`, exchangeId: `req-${i}` });
-    rows.push({ provenanceId: `ans-${i}`, sourceAt: clock(i * 10 + 5), role: 'assistant', text: `ANSWER ${i} ` + 'reasoning '.repeat(200), exchangeId: `req-${i}` });
+    rows.push({ provenanceId: `ans-${i}`, sourceAt: clock(i * 10 + 5), role: 'assistant', text: `ANSWER ${i} ` + 'reasoning '.repeat(300), exchangeId: `req-${i}` });
   }
   return rows;
 }
@@ -460,7 +460,7 @@ describe('timeline budgets', () => {
 
   it('reserves a demand-bound floor for distinct cognition under dialogue pressure', () => {
     const base = specimen();
-    const model = buildRebirthPackageV6Model({ ...base, recentConversation: pressureDialogue() });
+    const model = buildRebirthPackageV6Model({ ...base, recentConversation: pressureDialogue(120) });
     const caps = resolveAdaptiveSectionCaps(model);
     const { text } = renderRebirthPackageV6WithReport(model);
     // Dialogue alone would fill the pool; the distinct artifacts still render.
@@ -472,12 +472,12 @@ describe('timeline budgets', () => {
     expect(caps.cognitiveArtifacts).toBeLessThan(COGNITIVE_TIMELINE_FLOOR_CHARS);
     // …and the two citizens still add up to exactly the pool.
     expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex
-      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(145_000);
+      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(195_000);
     // Dialogue paid with its OLDEST exchanges only; the newest are intact.
-    expect(text).toContain('OPERATOR REQUEST 79');
-    expect(text).toContain('ANSWER 79');
+    expect(text).toContain('OPERATOR REQUEST 119');
+    expect(text).toContain('ANSWER 119');
     expect(text).not.toContain('OPERATOR REQUEST 0\n');
-    expect(text.length).toBeLessThanOrEqual(150_000);
+    expect(text.length).toBeLessThanOrEqual(200_000);
   });
 
   it('protects 50k of distinct cognition while retaining the newest dialogue and all receipts', () => {
@@ -501,7 +501,7 @@ describe('timeline budgets', () => {
     expect(units).toHaveLength(400);
     expect(units.some((unit) => unit.placement === 'elided')).toBe(true);
     expect(caps.recentConversation + caps.cognitiveArtifacts + caps.recoveryIndex
-      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(145_000);
+      + caps.executionState + caps.activeEditDelta + caps.boundaryAndActiveTask).toBe(195_000);
   });
 
   it('never reserves for cognition that has no distinct units', () => {

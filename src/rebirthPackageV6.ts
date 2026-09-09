@@ -33,6 +33,7 @@ import {
   type CollapseUnitPlacement,
 } from './generationalCollapse.ts';
 import { redactContinuityModel } from './redactionLane.ts';
+import { hotTailIdentity, selectRebirthHotTail, type RebirthHotTailRow } from './rebirthHotTail.ts';
 
 export const REBIRTH_PACKAGE_V6_VERSION = 'rebirth-package-v6/v1' as const;
 /**
@@ -676,6 +677,7 @@ export const EMPTY_REBIRTH_PACKAGE_V7_LINEAGE_SECTION: RebirthPackageV7LineageSe
   Object.freeze({ units: [], rangeRecover: null, partialReason: null });
 
 export interface RebirthPackageV6Model {
+  readonly rawHotTail?: readonly RebirthHotTailRow[];
   readonly version: RebirthPackageVersion;
   readonly boundaryAndActiveTask: RebirthPackageV6BoundaryAndActiveTask;
   /**
@@ -704,6 +706,7 @@ export interface RebirthPackageV6Model {
 }
 
 export interface BuildRebirthPackageV6ModelInput {
+  readonly rawHotTail?: readonly RebirthHotTailRow[];
   readonly boundaryAndActiveTask: RebirthPackageV6BoundaryAndActiveTask;
   readonly brainMergeSynthesis?: string;
   readonly executionState?: RebirthPackageV6ExecutionState;
@@ -954,7 +957,7 @@ export const DEFAULT_REBIRTH_PACKAGE_V6_SECTION_MAX_CHARS: Readonly<
   recoveryIndex: 10_000,
 });
 
-export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 150_000;
+export const DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS = 200_000;
 
 /**
  * The most the timeline pool reserves for distinct cognition ahead of dialogue.
@@ -1546,6 +1549,7 @@ export function buildRebirthPackageV6Model(
   const activeRequest = nonEmpty(input.boundaryAndActiveTask.activeRequest?.text);
   const lastAssistant = nonEmpty(input.boundaryAndActiveTask.lastMaterialAssistant?.text);
   const model: RebirthPackageV6Model = {
+    ...(input.rawHotTail ? { rawHotTail: input.rawHotTail.map((row) => ({ ...row })) } : {}),
     version: REBIRTH_PACKAGE_V7_VERSION,
     boundaryAndActiveTask: input.boundaryAndActiveTask,
     ...(nonEmpty(input.brainMergeSynthesis)
@@ -4388,7 +4392,10 @@ function renderCognition(
     };
   });
   const allSourceRows = model.cognitiveArtifacts.filter((row) => !dialogueOwnedIds.has(row.provenanceId));
-  const sourceRows = allSourceRows.filter((row) => !boundaryBodies.has(row.text.trim()));
+  const rawIds = new Set(selectRebirthHotTail(model.rawHotTail ?? []).rows.map((row) => hotTailIdentity(row.id)));
+  const sourceRows = allSourceRows.filter((row) => !boundaryBodies.has(row.text.trim()))
+    .map((row) => rawIds.has(hotTailIdentity(row.provenanceId))
+      ? { ...row, text: '→ Exact source appears in Raw hot tail.', projection: undefined } : row);
   const fullTextById = new Map(sourceRows.filter((row) => row.projection !== 'truncated').map((row) => [row.provenanceId, row.text]));
   const boundaryDedupedCount = allSourceRows.length - sourceRows.length;
 
@@ -4902,7 +4909,10 @@ function renderConversation(
   // rows stream chronologically; unknown-time rows are quarantined under an explicit
   // banner (mirroring renderCognition and renderExecution) where they make no recency
   // claim and can never be mistaken for a continuous dialogue sequence.
-  const conversation = includeVault ? conversationWithVault(model) : model.recentConversation;
+  const rawIds = new Set(selectRebirthHotTail(model.rawHotTail ?? []).rows.map((row) => hotTailIdentity(row.id)));
+  const conversation = (includeVault ? conversationWithVault(model) : model.recentConversation)
+    .map((row) => rawIds.has(hotTailIdentity(row.provenanceId))
+      ? { ...row, text: '→ Exact source appears in Raw hot tail.' } : row);
   const known = conversation.filter((row) => row.sourceAt);
   const unknown = conversation.filter((row) => !row.sourceAt);
   // Audit-3 C5: display stamps trim ms (and year when it matches capture); the
@@ -5984,6 +5994,7 @@ function resolveAdaptiveSectionCapsInternal(
     limits[id] = reserved;
   }
   const timelinePool = Math.max(0, (phase === 'rail-active' ? 115_000 : 129_000)
+    + Math.max(0, Math.min(200_000, packageBudgetChars(model, options)) - 150_000)
     - (model.brainMergeSynthesis?.trim() ? 10_000 : 0)
     - Math.max(0, limits.boundaryAndActiveTask - 5_000) + recoverySurplus + executionSurplus);
   const explicitConversation = options.sectionMaxChars?.recentConversation;
@@ -6051,6 +6062,9 @@ export function renderRebirthPackageV6Sections(
 ): readonly RenderedRebirthPackageV6Section[] {
   // Redaction lane: nothing republishes before it (pure, idempotent, cached).
   model = redactContinuityModel(model).model;
+  // A section-only read does not deliver the raw appendix, so its rows must
+  // remain self-contained instead of referring to an absent tail.
+  if (model.rawHotTail) model = { ...model, rawHotTail: undefined };
   const limits = resolveAdaptiveSectionCaps(model, { ...options, diagnostic: true });
   // Standalone section readers retain their self-describing source envelopes;
   // the joined agent Timeline uses compact rows with its shared legend.
@@ -6135,6 +6149,7 @@ export interface RebirthPackageV7SectionCollapseReport {
 }
 
 export interface RebirthPackageV7CollapseReport {
+  readonly rawHotTailIds?: readonly string[];
   readonly sections: readonly RebirthPackageV7SectionCollapseReport[];
   /** Non-collapse sections whose exact source-unit omissions are ledgered. */
   readonly omissionSections: readonly RebirthPackageV6OmissionSectionReport[];
@@ -6641,6 +6656,39 @@ export function renderRebirthPackageV6WithReport(
   model: RebirthPackageV6Model,
   options: RenderRebirthPackageV6Options = {},
 ): RenderedRebirthPackageV6WithReport {
+  const redacted = redactContinuityModel(model);
+  model = redacted.model;
+  if (!model.rawHotTail?.length) return renderRebirthPackagePastWithReport(model, options);
+  const budget = packageBudgetChars(model, options);
+  // Appended rows share the effective delivery limit with the past and its
+  // outer envelope. Reserve the past's existing allowance before selecting
+  // whole rows, otherwise a small push target can be exceeded by the tail alone.
+  const envelopeChars = Number.isFinite(options.envelopeChars)
+    ? Math.max(0, Math.floor(options.envelopeChars ?? 0)) : 0;
+  const tailLimit = Math.max(0, pushTargetChars(model, options) - envelopeChars - 10_000 - 2);
+  const tail = selectRebirthHotTail(model.rawHotTail, Math.min(50_000, tailLimit));
+  const tailChars = tail.text ? tail.text.length + 2 : 0;
+  const past = renderRebirthPackagePastWithReport({ ...model, rawHotTail: tail.rows }, {
+    ...options,
+    packageBudget: Math.max(1, budget - tailChars),
+    ...(options.pushTargetChars !== undefined
+      ? { pushTargetChars: Math.max(1, options.pushTargetChars - tailChars) } : {}),
+  }, redacted.declaration);
+  return { ...past,
+    text: tail.text ? `${past.text}\n\n${tail.text}` : past.text,
+    collapse: { ...past.collapse, rawHotTailIds: tail.rows.map((row) => row.id), telemetry: { ...past.collapse.telemetry,
+      budgetChars: budget,
+      finalTotalChars: past.collapse.telemetry.finalTotalChars + tailChars,
+      initialTotalChars: past.collapse.telemetry.initialTotalChars + tailChars,
+    } },
+  };
+}
+
+function renderRebirthPackagePastWithReport(
+  model: RebirthPackageV6Model,
+  options: RenderRebirthPackageV6Options,
+  inheritedRedactionDeclaration?: string | null,
+): RenderedRebirthPackageV6WithReport {
   // Redaction lane first: sections, eviction envelopes, and ledger capture
   // must all derive from the same redacted model, and the aggregate
   // declaration must ride INSIDE the budget math, never appended beyond it.
@@ -6650,7 +6698,9 @@ export function renderRebirthPackageV6WithReport(
   // the accepted composition only; speculative shrink probes build their own
   // usage ledgers so rejected candidates cannot contaminate later sizing.
   const references = buildRecoveryReferenceCatalog(model);
-  const declaration = lane.declaration;
+  // A tail-selection clone contains already-redacted bytes but has no cached
+  // redaction receipt. Preserve the original declaration through that clone.
+  const declaration = inheritedRedactionDeclaration ?? lane.declaration;
   const budget = packageBudgetChars(model, options);
   const pushTarget = pushTargetChars(model, options);
   const envelopeChars = Number.isFinite(options.envelopeChars)
@@ -7206,6 +7256,7 @@ export type ContinuityLedgerLifecycle = 'rebirth' | 'tail-epoch' | 'hard-epoch';
 export type ContinuityLedgerPlacement = 'rendered' | 'folded' | 'elided';
 export type ContinuityLedgerCaptureSectionId =
   | RebirthPackageV7CollapseSectionId
+  | 'rawHotTail'
   | 'cognitiveArtifacts'
   | 'tailEpoch'
   | 'hardEpoch';
@@ -7356,6 +7407,19 @@ export function buildContinuityLedgerCaptureFromV6Render(
     : null;
 
   const units: ContinuityLedgerCaptureUnit[] = [];
+  const rawIds = new Set(report.rawHotTailIds ?? []);
+  for (const row of model.rawHotTail ?? []) {
+    const rendered = rawIds.has(row.id);
+    units.push({
+      unitId: `raw-tail:${row.id}`, kind: `message:${row.kind}`, sectionId: 'rawHotTail',
+      sourceProvenanceId: row.id, sourceIdentityAuthority: 'exact', sourceIndex: null,
+      sourceInstanceId: row.sourceInstanceId, sourceTime: row.sourceAt, sourceEndTime: row.sourceAt,
+      eraKey: row.sourceAt.slice(0, 10), tier: rendered ? 't0' : 't4',
+      tierBasis: rendered ? 'rendered' : 'cap-overflow', placement: rendered ? 'rendered' : 'elided',
+      claim: `${row.kind} source ${row.id}`, verbatim: row.text,
+      sha256: sha256ContinuityLedgerVerbatim(row.text), origin: 'declared', recover: row.recover, workspace,
+    });
+  }
   for (const sectionReport of report.sections) {
     const sectionUnits = sectionReport.sectionId === 'activeEditDelta'
       ? buildActiveEditCollapseUnits(model)

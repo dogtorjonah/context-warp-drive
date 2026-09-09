@@ -54,6 +54,7 @@ import {
   isPortableGenuineOperatorMessage,
   selectRoleAwareRebirthDialogueWindow,
 } from './rebirthDialogue.ts';
+import { selectRebirthHotTail, type RebirthHotTailRow } from './rebirthHotTail.ts';
 import {
   adaptLegacyRebirthPackageToV6,
   buildContinuityLedgerCaptureFromV6Render,
@@ -504,7 +505,7 @@ interface VisibleTraceMessage {
   readonly sourceTimestamp?: string;
 }
 
-export const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 100_000;
+export const DEFAULT_RAW_REBIRTH_SEED_PACKAGE_BUDGET_CHARS = 200_000;
 
 export const DEFAULT_RAW_REBIRTH_SEED_SECTION_MAX_CHARS: Record<RawRebirthSeedSectionId, number> = {
   lastUserAiMessages: 50_000,
@@ -1612,9 +1613,8 @@ function renderRawRebirthSeedV6WithReport(input: RawRebirthSeedInput): RenderedR
       ? input.continuityReceipt
       : undefined;
     const receiptFrontier = receipt?.liveState?.rawTailFrontier.value;
-    const rawTailCount = receiptFrontier?.exactCount
-      ?? (input.userMessageTriggered === true && Boolean(input.triggeringUserMessage?.trim()) ? 1 : 0);
-    const chronology = renderContinuityPackageProvenance({
+    let hotRows = model.rawHotTail ? selectRebirthHotTail(model.rawHotTail).rows : undefined;
+    const renderChronology = () => renderContinuityPackageProvenance({
       artifact: input.headerOverride?.trim()
         ? 'continuity-package#custom'
         : `rebirth-package#${lifecycleBoundary}`,
@@ -1625,19 +1625,29 @@ function renderRawRebirthSeedV6WithReport(input: RawRebirthSeedInput): RenderedR
       sourceLastTimestamp: receipt?.canonicalRange?.lastEventTimestamp
         ?? input.sourceLastTimestamp,
       createdTimestamp: receipt?.capturedAt ?? input.createdTimestamp,
-      rawTailCount,
-      rawResumeTimestamp: receiptFrontier?.sourceTimestamp ?? input.rawResumeTimestamp,
+      rawTailCount: hotRows?.length ?? receiptFrontier?.exactCount
+        ?? (input.userMessageTriggered === true && Boolean(input.triggeringUserMessage?.trim()) ? 1 : 0),
+      rawResumeTimestamp: hotRows?.[0]?.sourceAt ?? receiptFrontier?.sourceTimestamp ?? input.rawResumeTimestamp,
+      ...(hotRows?.[0] ? { rawResumeSourceId: hotRows[0].id } : {}),
     }) ?? '';
+    const chronology = renderChronology();
     const envelopeText = chronology ? `${defaultHeader}\n${chronology}` : defaultHeader;
     const rendered = renderRebirthPackageV6WithReport(model, {
       packageBudget: input.packageBudget,
       // Account for the envelope→sections `\n\n` separator in the allocator's
       // prefix-overhead reservation so the produced total stays in budget.
-      envelopeChars: envelopeText.length + 2,
+      envelopeChars: envelopeText.length + 2 + (model.rawHotTail?.length
+        ? 256 + Math.max(...model.rawHotTail.map((row) => row.id.length)) : 0),
     });
+    if (rendered.collapse.rawHotTailIds) {
+      const ids = new Set(rendered.collapse.rawHotTailIds);
+      hotRows = model.rawHotTail?.filter((row) => ids.has(row.id));
+    }
+    const finalChronology = renderChronology();
+    const finalEnvelope = finalChronology ? `${defaultHeader}\n${finalChronology}` : defaultHeader;
     const continuityLedger = buildContinuityLedgerCaptureFromV6Render(model, rendered.collapse);
     return {
-      text: `${envelopeText}\n\n${rendered.text}`,
+      text: `${finalEnvelope}\n\n${rendered.text}`,
       collapse: rendered.collapse,
       ...(continuityLedger ? { continuityLedger } : {}),
     };
@@ -3460,7 +3470,7 @@ export function buildRawRebirthSeedFromMessages(
     const ledger = buildOpenLoopLedgerSection({ operatorTexts, blockedTrailText: openQuestions });
     if (ledger) openQuestions = openQuestions.trim() ? `${openQuestions.trim()}\n\n${ledger}` : ledger;
   }
-  let thinkingTrail = buildActivityLogFromMessages(
+  let thinkingTrail = options.canonicalV6Fallback ? '' : buildActivityLogFromMessages(
     visibleMessages,
     traceEnd,
     Math.max(200, Math.floor(options.activityMessageChars ?? 1_000)),
@@ -3759,7 +3769,24 @@ export function buildRawRebirthSeedFromMessages(
         }
       : {}),
   });
-  return renderRawRebirthSeed({ ...rawInput, rebirthV6 });
+  const rawHotTail: RebirthHotTailRow[] = [];
+  for (let index = Math.max(0, traceEnd - 500); index < traceEnd; index += 1) {
+    if (excluded.has(index)) continue;
+    const message = visibleMessages[index];
+    if (!message) continue;
+    const id = exactFoldMessageSourceIdentity(message);
+    const sourceAt = foldMessageSourceTimestamp(message);
+    if (!id || !sourceAt) continue;
+    const text = typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
+    if (!text) continue;
+    rawHotTail.push({ id, sourceAt, sourceInstanceId: options.instanceId ?? 'unknown',
+      kind: message.role === 'user' ? 'user' : 'assistant', text,
+      recover: options.instanceId
+        ? `tap_instance_messages action="recent" target_instance_id="${options.instanceId}" message_id="${id}"`
+        : 'unavailable (source owner unknown)',
+    });
+  }
+  return renderRawRebirthSeed({ ...rawInput, rebirthV6: { ...rebirthV6, rawHotTail } });
 }
 
 // ══════════════════════════════════════════════════════════════════════════

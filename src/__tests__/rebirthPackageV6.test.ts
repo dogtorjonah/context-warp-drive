@@ -1338,7 +1338,7 @@ describe('Rebirth Package v6', () => {
   });
 
   it('renders timestamped cognition newest-first and backfills toward the global package cap', () => {
-    const cognitiveArtifacts = Array.from({ length: 240 }, (_, index) => ({
+    const cognitiveArtifacts = Array.from({ length: 400 }, (_, index) => ({
       provenanceId: `cognition:${index}`,
       sourceAt: new Date(Date.UTC(2026, 7, 1, 0, index)).toISOString(),
       kind: 'result' as const,
@@ -1352,7 +1352,7 @@ describe('Rebirth Package v6', () => {
     const rendered = renderRebirthPackageV6(value);
 
     expect(section).toBeTruthy();
-    expect(section!.text).toContain('artifact-239');
+    expect(section!.text).toContain('artifact-399');
     expect(section!.text).not.toContain('artifact-0 ');
     expect(section!.text.length).toBeGreaterThan(60_000);
     expect(rendered.length).toBeGreaterThan(90_000);

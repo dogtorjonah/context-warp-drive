@@ -22,6 +22,8 @@
 // ── Types ──
 
 export interface BirthFoldSeedMessage {
+  /** Hydrate durable vault state only when the package already carries history. */
+  vaultOnly?: boolean;
   role: 'user' | 'assistant';
   content: string;
   /**
