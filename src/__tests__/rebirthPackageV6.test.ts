@@ -3689,6 +3689,8 @@ describe('continuation record (boundary)', () => {
     expect(rendered).toContain('dirty=62 staged=1');
     expect(rendered).toContain('changed-paths=relay/src/file-0.ts relay/src/file-1.ts');
     expect(rendered).toContain('(+46 more)');
+    const delivered = renderRebirthPackageV6(dirty);
+    expect(delivered).toContain(`Changed paths voxxo-swarm: ${sample.join(' ')} (+46 more)`);
     // A root without a sample renders byte-identically to the pre-sample line:
     // no empty `changed-paths=` appears for a clean or unread capture.
     const clean = model({
@@ -3711,6 +3713,7 @@ describe('continuation record (boundary)', () => {
       },
     });
     expect(renderRebirthPackageV6(clean, { diagnostic: true })).not.toContain('changed-paths=');
+    expect(renderRebirthPackageV6(clean)).not.toContain('Changed paths');
   });
 
   it('harvests declared open items from the delivered pool, newest-first and source-linked', () => {

@@ -188,6 +188,10 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
       continue;
     }
     lines.push(`Checkpoint ${repo.name}: ${repo.branch ?? '?'}@${repo.sha7 ?? '?'} · dirty=${repo.dirtyCount ?? '?'} · staged=${repo.stagedCount ?? '?'} ${now?.ops ? source(now.ops.source) : ''}`);
+    if (repo.dirtyPaths?.length) {
+      const remainder = Math.max(0, (repo.dirtyPathsTotal ?? repo.dirtyPaths.length) - repo.dirtyPaths.length);
+      lines.push(`Changed paths ${repo.name}: ${repo.dirtyPaths.join(' ')}${remainder ? ` (+${remainder} more)` : ''}`);
+    }
   }
   for (const [error, names] of repoErrors) {
     lines.push(`Checkpoint ${names.length === 1 ? names[0]! : `${names.length} roots (${names.join(', ')})`}: ${error} ${now?.ops ? source(now.ops.source) : ''}`);
