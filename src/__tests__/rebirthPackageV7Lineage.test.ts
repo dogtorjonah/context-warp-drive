@@ -16,6 +16,7 @@ import {
   renderRebirthPackageV6,
   renderRebirthPackageV6Sections,
   renderRebirthPackageV6WithReport,
+  resolveAdaptiveSectionCaps,
   type RebirthPackageV6Model,
   type RebirthPackageV7LineageSection,
   type RebirthPackageV7LineageUnit,
@@ -178,8 +179,34 @@ describe('Rebirth Package v7 — lineage sections', () => {
       .filter(([id]) => id !== 'brainMergeSynthesis')
       .map(([, cap]) => cap)
       .reduce((total, cap) => total + cap, 0);
-    expect(ordinaryCapSum + REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS)
-      .toBe(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS);
+    // Split envelope (2026-09-09): the static ordinary caps + framing reserve
+    // partition the 150k package BODY. The declared 200k total adds up to 50k
+    // of dynamic headroom that resolveAdaptiveSectionCapsInternal routes to the
+    // timeline pool — the one cap that scales with packageBudget above 150k
+    // (`Math.min(200_000, packageBudgetChars) - 150_000` in the pool formula).
+    const packageBodyEnvelopeChars = 150_000;
+    expect(ordinaryCapSum + REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS).toBe(packageBodyEnvelopeChars);
+    expect(DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS - packageBodyEnvelopeChars).toBe(50_000);
+    // The headroom is demand-bound (a section cap collapses to the bytes the
+    // section can actually fill), so observe it with a conversation that
+    // out-demands both pools: the 200k budget's extra 50k must reach the
+    // timeline pool, less at most one whole exchange of admission slack.
+    const bigDialogue: ReadonlyArray<{
+      provenanceId: string;
+      sourceAt: string;
+      role: 'user' | 'assistant';
+      text: string;
+    }> = Array.from({ length: 300 }, (_, index) => ({
+      provenanceId: `message:big-${index}`,
+      sourceAt: new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      text: 'x'.repeat(1_200),
+    }));
+    const capsAt200k = resolveAdaptiveSectionCaps(model({ recentConversation: bigDialogue }), { packageBudget: 200_000 });
+    const capsAt150k = resolveAdaptiveSectionCaps(model({ recentConversation: bigDialogue }), { packageBudget: 150_000 });
+    const headroomChars = capsAt200k.recentConversation - capsAt150k.recentConversation;
+    expect(headroomChars).toBeGreaterThanOrEqual(45_000);
+    expect(headroomChars).toBeLessThanOrEqual(50_000);
     // S9 conversation-first partition: the synthesis base cap is the exact
     // amount the timeline pool yields when a synthesis is present, so an
     // ORDINARY rebirth carrying donor synthesis cannot raid the timeline. The
@@ -381,8 +408,13 @@ describe('Rebirth Package v7 — lineage sections', () => {
     // floor regardless of that label. Tolerate one such drop; a genuinely thin
     // render lands thousands of chars short, not ~150.
     const oneMarginalWholeUnitDrop = 200;
+    // Split envelope: this fixture saturates the lineage (body) sections only,
+    // so the fill floor is the 150k package BODY minus the framing reserve —
+    // not the 200k total, whose extra headroom feeds the timeline pool and
+    // stays available to the raw hot tail at assembly time.
+    const packageBodyEnvelopeChars = 150_000;
     expect(rendered.length).toBeGreaterThan(
-      DEFAULT_REBIRTH_PACKAGE_V6_BUDGET_CHARS
+      packageBodyEnvelopeChars
         - REBIRTH_PACKAGE_V7_FRAMING_RESERVE_CHARS
         - oneMarginalWholeUnitDrop,
     );
@@ -446,7 +478,7 @@ describe('Rebirth Package v7 — lineage sections', () => {
     }
   });
 
-  it('accepts a lower push target while retaining the 200k hard ceiling', () => {
+  it('treats a lower push target as a soft target while the 200k budget stays the hard ceiling', () => {
     const value = model({
       operatorVault: lineage(600),
       episodeChapterIndex: lineage(300),
@@ -458,7 +490,13 @@ describe('Rebirth Package v7 — lineage sections', () => {
     });
     expect(collapse.telemetry.budgetChars).toBe(200_000);
     expect(collapse.telemetry.pushTargetChars).toBe(150_000);
-    expect(collapse.telemetry.finalTotalChars).toBeLessThanOrEqual(150_000);
+    // Split envelope: the push target is a soft delivery target — it bounds the
+    // appended raw-tail allowance and is reported through targetMissChars —
+    // while the declared budget is the hard ceiling a saturated render must
+    // stay inside. (Pre-split this asserted the total <= pushTarget, which held
+    // only while the whole envelope was the push target.)
+    expect(collapse.telemetry.finalTotalChars).toBeLessThanOrEqual(200_000);
+    expect(collapse.telemetry.targetMissChars).toBeGreaterThan(0);
     expect(collapse.telemetry.hardOverrunChars).toBe(0);
     expect(collapse.omittedSectionIds).toEqual([]);
   });

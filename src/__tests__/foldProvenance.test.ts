@@ -170,15 +170,14 @@ describe('verifyPrepareReceipt', () => {
     const history = sampleHistory();
     const receipt = buildPrepareReceipt(history, freshSession().prepare(history));
 
-    // A different config produces a different fold of the same history.
-    const divergent = new FoldSession({
-      foldConfig: {
-        ...TEST_FOLD_CONFIG,
-        assistantTextBudget: { fullRetentionChars: 5_000, essenceRetentionChars: 0 },
-      },
-      freeze: { enabled: true, ttlMs: 60_000, maxTailChars: 150_000 },
-      now: () => 1_000,
-    }).prepare(history);
+    // The probe carries a prepared view that no longer matches the receipt's
+    // frozen view (a turn appended after the receipt was issued). The
+    // raw-history probe is deliberately not supplied, so the only dimension
+    // under test is the view digest.
+    const divergent = freshSession().prepare([
+      ...history,
+      { role: 'user', content: 'an extra question that arrives after the receipt' },
+    ]);
 
     const result = verifyPrepareReceipt(receipt, { outcome: divergent });
     expect(result.verdict).toBe('stale');
