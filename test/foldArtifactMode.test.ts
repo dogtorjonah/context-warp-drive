@@ -329,8 +329,8 @@ describe('FoldSession env integration', () => {
   it('flag off: session fold renders skeleton block (byte-identical to pre-feature)', () => {
     vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
     const session = new FoldSession({ foldConfig: TEST_FOLD_CONFIG, freeze: false });
-    const outcome = session.prepare(fixtureHistory());
-    const block = outcome.result?.messages.find(m =>
+    const outcome = session.fold(fixtureHistory(), 2);
+    const block = outcome.messages.find(m =>
       typeof m.content === 'string' && m.content.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE));
     expect(block).toBeDefined();
     expect(block!.content as string).not.toContain('[Fold receipts');
@@ -340,8 +340,8 @@ describe('FoldSession env integration', () => {
   it('flag on: session fold renders artifact block, and flipping the flag back re-renders skeletons without restart', () => {
     vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '1');
     const session = new FoldSession({ foldConfig: TEST_FOLD_CONFIG, freeze: false });
-    const artifactOutcome = session.prepare(fixtureHistory());
-    const artifactBlock = artifactOutcome.result?.messages.find(m =>
+    const artifactOutcome = session.fold(fixtureHistory(), 2);
+    const artifactBlock = artifactOutcome.messages.find(m =>
       typeof m.content === 'string' && m.content.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE));
     expect(artifactBlock).toBeDefined();
     const artifactText = artifactBlock!.content as string;
@@ -352,13 +352,22 @@ describe('FoldSession env integration', () => {
     // Same session, env flipped off: next fold render is byte-identical to the
     // never-enabled skeleton render — the restart-free toggle contract.
     vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', '0');
-    const skeletonOutcome = session.prepare(fixtureHistory());
-    const skeletonBlock = skeletonOutcome.result?.messages.find(m =>
+    const skeletonOutcome = session.fold(fixtureHistory(), 2);
+    const skeletonBlock = skeletonOutcome.messages.find(m =>
       typeof m.content === 'string' && m.content.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE));
     const pristine = new FoldSession({ foldConfig: TEST_FOLD_CONFIG, freeze: false });
-    const pristineOutcome = pristine.prepare(fixtureHistory());
-    const pristineBlock = pristineOutcome.result?.messages.find(m =>
+    const pristineOutcome = pristine.fold(fixtureHistory(), 2);
+    const pristineBlock = pristineOutcome.messages.find(m =>
       typeof m.content === 'string' && m.content.includes(FOLD_BLOCK_PREAMBLE_SIGNATURE));
     expect(skeletonBlock!.content).toBe(pristineBlock!.content);
+  });
+
+  it.each(['0', '1'])('keeps automatic preparation raw without measured pressure (flag %s)', (flag) => {
+    vi.stubEnv('VOXXO_FOLD_ARTIFACT_ONLY', flag);
+    const session = new FoldSession({ foldConfig: TEST_FOLD_CONFIG, freeze: false });
+    const history = fixtureHistory();
+    const outcome = session.prepare(history);
+    expect(outcome.messages).toEqual(history);
+    expect(outcome.stats.turnsFolded).toBe(0);
   });
 });

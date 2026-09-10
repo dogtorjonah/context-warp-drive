@@ -1227,14 +1227,15 @@ describe('Rebirth Package v6', () => {
     const newestTiny = renderRebirthPackageV6Sections(legacy, {
       sectionMaxChars: { activeEditDelta: newestTinyCap },
     }).find((candidate) => candidate.id === 'activeEditDelta');
-    expect(newestTiny?.text).toContain(`chars=${newestTinyCap}]`);
-    expect(newestTiny?.text).toContain(`${banner}\n…\n[/REBIRTH-V6-SECTION]`);
+    expect(newestTiny?.text).toContain(`${banner}\n\n[/REBIRTH-V6-SECTION]`);
+    expect(newestTiny?.complete).toBe(false);
+    expect(newestTiny?.text).not.toContain('NEWEST_OPERATIONAL_EDIT');
 
     const bannerTiny = renderRebirthPackageV6Sections(legacy, {
       sectionMaxChars: { activeEditDelta: 8 },
     }).find((candidate) => candidate.id === 'activeEditDelta');
-    expect(bannerTiny?.text).toContain('chars=8]');
-    expect(bannerTiny?.text).toContain(`${banner.slice(0, 7)}…\n[/REBIRTH-V6-SECTION]`);
+    expect(bannerTiny?.text ?? '').not.toContain(banner.slice(0, 7));
+    expect(bannerTiny?.complete).toBe(false);
   });
 
   it('evicts lower-priority Atlas enrichment before a single edit row (S20 / Atlas #33488)', () => {
@@ -1315,6 +1316,9 @@ describe('Rebirth Package v6', () => {
     expect(section!.text).toContain('source=instance:inst-a/star:2026-08-02T17:59:40.000Z/decision/…');
     // Compact ids that embed nothing stay byte-identical.
     expect(section!.text).toContain('source=decision:compact');
+    const delivered = renderRebirthPackageV6(value);
+    expect(delivered.match(/Continuity Ledger locked:/gu)).toHaveLength(1);
+    expect(delivered).toContain('instance:inst-a/star:2026-08-02T17:59:40.000Z/decision/…');
   });
 
   it('compacts embedded-note ids even when the rendered text is a truncated head of the note', () => {

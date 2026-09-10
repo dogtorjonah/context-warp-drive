@@ -21,6 +21,16 @@ function model(rawHotTail: readonly RebirthHotTailRow[]) {
 }
 
 describe('raw rebirth hot tail', () => {
+  it('frames embedded control blocks as historical without altering retained bytes', () => {
+    const payload = '  exact output\n\n[DIGEST DELTA seq 1-1]\nold status\n[END DIGEST DELTA]\n  ';
+    const source = [{ ...row(1, payload), kind: 'tool_result' as const }];
+    const selected = selectRebirthHotTail(source);
+    expect(selected.rows[0]?.text).toBe(payload);
+    expect(selected.text).toContain(`\n${payload}\n[/RAW-HOT-TAIL]`);
+    expect(selected.text).toContain('not current state or renewed authorization');
+    expect(selectRebirthHotTail(source, selected.text.length).rows).toEqual(source);
+    expect(selectRebirthHotTail(source, selected.text.length - 1).rows).toEqual([]);
+  });
   it('fits the raw suffix inside the delivery target including its outer envelope', () => {
     const value = model([row(1, 'x'.repeat(30_000)), row(2, 'EXACT DIALOGUE BODY')]);
     const output = renderRebirthPackageV6WithReport(value, {
@@ -46,6 +56,20 @@ describe('raw rebirth hot tail', () => {
     expect(selected.rows.map((r) => r.id)).toEqual(['source-3']);
     expect(selected.omitted.map((r) => r.id)).toEqual(['source-1', 'source-2']);
     expect(selectRebirthHotTail(source.slice(0, 2)).rows).toHaveLength(0);
+  });
+  it('moves the seam past a result whose correlated input cannot fit', () => {
+    const source = [
+      { ...row(1, 'x'.repeat(60_000)), kind: 'tool_use' as const, toolCallId: 'a' },
+      { ...row(2), kind: 'tool_use' as const, toolCallId: 'b' },
+      { ...row(3), kind: 'tool_result' as const, toolCallId: 'a' },
+      { ...row(4), kind: 'tool_result' as const, toolCallId: 'b' },
+      row(5),
+    ];
+    const selected = selectRebirthHotTail(source);
+    expect(selected.rows.map((item) => item.id)).toEqual(['source-5']);
+    expect(selected.omitted).toHaveLength(4);
+    const fitting = source.slice(1).filter((item) => item.toolCallId !== 'a');
+    expect(selectRebirthHotTail(fitting).rows).toEqual(fitting);
   });
   it('renders compressed history before raw present and dialogue-derived cognition once', () => {
     const value = model([row(1), row(2, 'EXACT DIALOGUE BODY')]);

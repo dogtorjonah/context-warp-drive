@@ -2575,8 +2575,8 @@ const ATLAS_SNAPSHOT_SUPPLEMENT_HEADING = '## Atlas Snapshot Source (salient fil
  * start) within the budget-fitted newest window, so the retained tail begins at
  * a clean entry boundary and is never longer than `maxChars`. The marker names
  * the omitted chars AND the number of whole entries dropped by the boundary
- * alignment. Content without '[' entry headers (no entry structure to align to)
- * retains the plain budget-fitted newest window unchanged.
+ * alignment. If no complete entry fits, omit the body rather than retaining
+ * an unlabelled suffix of a record.
  */
 function boundedNewestText(
   text: string,
@@ -2634,7 +2634,7 @@ function boundedNewestText(
     let start = Math.max(0, Math.min(text.length, text.length - Math.max(0, want)));
     if (start > 0) {
       const firstHeader = text.indexOf('\n[', start);
-      if (firstHeader >= 0) start = firstHeader + 1;
+      start = firstHeader >= 0 ? firstHeader + 1 : text.length;
     } else if (!text.startsWith('[')) {
       // advancing into a body that begins without a header — keep from the top
       const firstHeader = text.indexOf('\n[');
@@ -2663,7 +2663,7 @@ function boundedNewestText(
   // Final admission check — never ship over cap.
   const finalMarker = buildMarker(chosen);
   if (finalMarker.length + (text.length - chosen) > maxChars) {
-    return { text: boundedProjectionFallback(text, maxChars, true), complete: false };
+    return { text: boundedWholeLines(finalMarker.trimEnd(), maxChars, authoritativeHistoryHandle), complete: false };
   }
   return { text: `${finalMarker}${text.slice(chosen)}`, complete: false };
 }
@@ -3458,8 +3458,8 @@ function renderCompactBoundary(
   const assistant = assistantSource
     ? boundedText(assistantSource.text, assistantBudget, recovery)
     : null;
-  const bounded = boundedText(compactBoundary(model, assistant?.text ?? null), maxChars, recovery);
-  return { text: bounded.text, complete: bounded.complete && (assistant?.complete ?? true) };
+  const text = compactBoundary(model, assistant?.text ?? null);
+  return { text: boundedWholeLines(text, maxChars, recovery), complete: text.length <= maxChars && (assistant?.complete ?? true) };
 }
 
 function renderBoundary(
@@ -4023,7 +4023,7 @@ function renderActiveEdits(
     if (/^Provenance:\s+⌖c[0-9]+/u.test(lastLogLine)) linesOfLog.pop();
     const editLog = linesOfLog.join('\n').trimEnd();
     if (!editLog || maxChars <= banner.length + 1) {
-      return boundedText(banner, maxChars, historyRecoveryHandle);
+      return { text: boundedWholeLines(banner, maxChars, historyRecoveryHandle), complete: banner.length <= maxChars };
     }
     const bodyBudget = maxChars - banner.length - 1;
     // Atlas #33488 invariant, re-asserted at the renderer. The timestamped edit
@@ -4046,7 +4046,11 @@ function renderActiveEdits(
     if (editTrail.length + 1 < bodyBudget) {
       // Trail fits whole: spend the remainder on enrichment from its START, so
       // the reader keeps the enrichment heading and knows what those blocks are.
-      const supplement = boundedText(enrichment, bodyBudget - editTrail.length - 1, historyRecoveryHandle);
+      const supplementBudget = bodyBudget - editTrail.length - 1;
+      const supplement = {
+        text: boundedWholeLines(enrichment, supplementBudget, historyRecoveryHandle),
+        complete: enrichment.length <= supplementBudget,
+      };
       return {
         text: `${banner}\n${editTrail}\n${supplement.text}`,
         complete: supplement.complete,
@@ -4088,7 +4092,8 @@ function renderActiveEdits(
   for (const reason of delta.reasons) trailer.push(`reason=${reason}`);
   const units = buildActiveEditCollapseUnits(model);
   if (units.length === 0) {
-    return boundedText([...lines, ...trailer].join('\n'), maxChars, recoveryHandle);
+    const text = [...lines, ...trailer].join('\n');
+    return { text: boundedWholeLines(text, maxChars, recoveryHandle), complete: text.length <= maxChars };
   }
   // Collapse citizenship: the state header and capture-honesty trailer stay
   // verbatim-protected; per-file blocks demote through the generational engine
@@ -4245,7 +4250,7 @@ function cognitionRowBody(
     const labels = `${row.projection === 'truncated' ? ' [partial]' : ''}`
       + `${row.supersededBy ? ` [EXPIRED → ${row.supersededBy}]` : ''}`
       + (row.authority === 'historical_observation' ? '' : ` [${row.authority}]`);
-    return `${row.kind}${labels}\n${row.text}${excerpt}\n${continuityAnchor(row.provenanceId, row.sourceAt, referenceAt)}`;
+    return `${row.kind}${labels}\n${row.text}${excerpt}\n${continuityAnchor(compactCognitionSource(row.provenanceId, sourceText ?? row.text), row.sourceAt, referenceAt)}`;
   }
   return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${retention}${declared}${excerpt}`;
 }
@@ -5013,10 +5018,10 @@ function renderConversation(
     [endpointReceipt, body].filter(Boolean).join('\n\n')
   );
   if (known.length === 0 && unknown.length === 0) {
-    return { ...boundedText(fullEndpointReceipt, maxChars, recoveryHandle), unitPlacements: [] };
+    return { text: boundedWholeLines(fullEndpointReceipt, maxChars, recoveryHandle), complete: fullEndpointReceipt.length <= maxChars, unitPlacements: [] };
   }
   if (dialogueBudget === 0) {
-    return { text: boundedText(endpointReceipt, maxChars, recoveryHandle).text, complete: false, unitPlacements: placementsFor([]) };
+    return { text: boundedWholeLines(endpointReceipt, maxChars, recoveryHandle), complete: false, unitPlacements: placementsFor([]) };
   }
   let retainedKnown: RebirthPackageV6ConversationRow[] = [];
   let retainedUnknown: RebirthPackageV6ConversationRow[] = [];
@@ -6110,7 +6115,8 @@ function renderSectionsWithLimits(
     return entry?.renderLoss === true && entry.relocated === false;
   });
   if (incomplete.length > 0 && admitted.includes('recoveryIndex')) {
-    const trailer = `\n[RENDER-INCOMPLETE sections: ${incomplete.join(',')}]`;
+    const visibleSections = [...new Set(incomplete.map((id) => id === 'cognitiveArtifacts' ? 'recentConversation' : id))];
+    const trailer = `\n[RENDER-INCOMPLETE sections: ${visibleSections.join(',')}]`;
     const recovery = rendered.recoveryIndex;
     if (recovery.text.length + trailer.length <= limits.recoveryIndex) {
       rendered.recoveryIndex = { ...recovery, text: `${recovery.text}${trailer}` };
