@@ -152,6 +152,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'glm-4.6v-flash': 128_000,
 
   // ── DeepSeek models ──
+  'deepseek-flash': 1_000_000,
   'deepseek-v4-pro': 1_000_000,
   'deepseek-v4-flash': 1_000_000,
 
