@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { RebirthPackageV6Model, RebirthPackageV6SourceRef } from './rebirthPackageV6.ts';
+import type { RebirthPackageV6ConversationRow, RebirthPackageV6Model, RebirthPackageV6SourceRef } from './rebirthPackageV6.ts';
 
 /**
  * Stable push key for a source unit.
@@ -37,6 +37,96 @@ export function continuityStamp(at: string | null, referenceAt?: string | null):
 
 export function continuityAnchor(id: string, at: string | null, referenceAt?: string | null): string {
   return `⟨${id} @${continuityStamp(at, referenceAt)}⟩`;
+}
+
+/** Declared-open-item markers: line-leading labels this fleet's agents use. */
+const OPEN_ITEM_MARKERS = [
+  'signpost:',
+  'still open:',
+  'remaining:',
+  'open items:',
+  'outstanding:',
+] as const;
+/** Bounded declared-open-items record: max items, per-item chars, total chars. */
+export const OPEN_ITEMS_MAX_ITEMS = 6;
+export const OPEN_ITEMS_MAX_ITEM_CHARS = 180;
+export const OPEN_ITEMS_MAX_CHARS = 720;
+
+export interface RebirthPackageV6OpenItem {
+  readonly text: string;
+  readonly provenanceId: string;
+  readonly sourceAt: string | null;
+}
+
+/** Word-boundary clip for one declared item (truncation is always marked). */
+function clipOpenItem(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars - 1).replace(/\s+\S*$/u, '')}\u2026`;
+}
+
+/** Normalize a candidate label line: strip list bullets and emphasis pairs. */
+function openItemLabelLine(raw: string): string {
+  const trimmed = raw.trim().replace(/^[-•]\s+/u, '');
+  const debold = trimmed.replace(/^\*{1,2}(.+?)\*{1,2}\s*/u, '$1 ');
+  return debold.replace(/^[>\s]+/u, '').trim();
+}
+
+/** Last declared open item inside one assistant row, clipped to the item cap. */
+function declaredOpenItemText(text: string): string | null {
+  const lines = text.split('\n');
+  let found: string | null = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const label = openItemLabelLine(lines[index]!);
+    const lower = label.toLowerCase();
+    const marker = OPEN_ITEM_MARKERS.find((candidate) => lower.startsWith(candidate));
+    if (!marker) continue;
+    let remainder = label.slice(marker.length).trim();
+    if (!remainder) {
+      // A bare label takes the next non-empty line as its body.
+      for (let next = index + 1; next < lines.length; next += 1) {
+        const candidate = openItemLabelLine(lines[next]!);
+        if (candidate) { remainder = candidate; break; }
+      }
+    }
+    if (remainder) found = remainder.replace(/\s+/gu, ' ').trim() || null;
+  }
+  if (!found) return null;
+  return clipOpenItem(found, OPEN_ITEMS_MAX_ITEM_CHARS);
+}
+
+/**
+ * Harvest the assistant's DECLARED open items from the delivered conversation
+ * pool: the tail-line `Signpost:`/`Still open:`/`Remaining:`/`Open items:`/
+ * `Outstanding:` labels this fleet's agents use to hand off unfinished work.
+ * A declaration trace only — it never infers completion or resolution, and it
+ * reads exactly the delivered rows, so it cannot cite an item the successor
+ * cannot also read. Newest-first; duplicate texts collapse to the newest row;
+ * bounded by OPEN_ITEMS_MAX_* with no unstated truncation (an over-budget
+ * candidate is skipped whole, never silently re-said).
+ */
+export function extractDeclaredOpenItems(
+  rows: readonly Pick<RebirthPackageV6ConversationRow, 'role' | 'text' | 'provenanceId' | 'sourceAt'>[],
+): RebirthPackageV6OpenItem[] {
+  const items: RebirthPackageV6OpenItem[] = [];
+  const seen = new Set<string>();
+  let budget = OPEN_ITEMS_MAX_CHARS;
+  // Undated rows remain in conversation quarantine, never in a recency ranking.
+  const dated = rows.filter((row) => row.sourceAt && Number.isFinite(Date.parse(row.sourceAt)))
+    .sort((a, b) => Date.parse(b.sourceAt!) - Date.parse(a.sourceAt!)
+      || a.provenanceId.localeCompare(b.provenanceId));
+  for (const row of dated) {
+    if (items.length >= OPEN_ITEMS_MAX_ITEMS) break;
+    if (row.role !== 'assistant' || !row.text) continue;
+    const declared = declaredOpenItemText(row.text);
+    if (!declared) continue;
+    const normalized = declared.toLowerCase().replace(/\s+/gu, ' ');
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    if (declared.length + 24 > budget) continue;
+    budget -= declared.length + 24;
+    items.push({ text: declared, provenanceId: row.provenanceId, sourceAt: row.sourceAt });
+  }
+  return items;
 }
 
 export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant: string | null): string {
@@ -179,6 +269,19 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
   lines.push(newestBlocker
     ? `Unresolved blockers: ${blockers.length} \u00b7 newest ${clip(newestBlocker.text)} ${continuityAnchor(newestBlocker.provenanceId, newestBlocker.sourceAt, b.capturedAt)}`
     : 'Unresolved blockers: none captured.');
+  // S6 declared open items (delivered form): the newest signpost/checklist
+  // declarations the assistant left in the delivered pool — a declaration
+  // trace, never a resolution claim. Bounded to the newest three with an
+  // exact remainder; source-linked like every other continuation fact.
+  const openItems = extractDeclaredOpenItems(model.recentConversation ?? []);
+  if (openItems.length > 0) {
+    const shownOpenItems = openItems.slice(0, 3);
+    lines.push(`Open items: ${openItems.length} declared \u00b7 ${shownOpenItems.map((item) => (
+      `${clip(item.text, 140)} ${continuityAnchor(item.provenanceId, item.sourceAt, b.capturedAt)}`
+    )).join(' \u00b7 ')}${openItems.length > shownOpenItems.length ? ` (+${openItems.length - shownOpenItems.length} more)` : ''}`);
+  } else {
+    lines.push('Open items: none declared.');
+  }
   const owned: string[] = [];
   for (const file of model.activeEditDelta.files) {
     const label = `${file.filePath} (${file.closureState})`;

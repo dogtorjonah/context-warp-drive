@@ -246,9 +246,12 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     // The newest exchange now precedes historical context; endpoint pointers
     // declare source length without falsely promising an untruncated body.
     // Vault-only operator rows join the timeline, with source identity dedupe.
+    // Declared open items render in the delivered boundary and the diagnostic
+    // record (declaration trace, newest-first, dated rows only — undated
+    // declarations stay quarantined per God Rule 8).
     // The semantic cases below and rebirthTimeline cover these intended deltas.
-    expect(sha(first.text)).toBe('9f57ea6140626a46bb8096278db60982cf1874dbfe487d11bd409db98ad1537d');
-    expect(sha(audit.text)).toBe('6e6b6c78d8fa40d5bc2a0554b9a4df1c04ad22421b2676ae6d4c1ca77c7262db');
+    expect(sha(first.text)).toBe('1759a31c8e070c6fb69985c0873f1d608119d03948c84d4c63d08cd941758d5d');
+    expect(sha(audit.text)).toBe('52a0a40e6956fcc4ba020204ba03822610c16d81747da4acda95dabafaa579c6');
   });
 
   const sectionIds = (text: string): string[] => [

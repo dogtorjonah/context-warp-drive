@@ -720,8 +720,8 @@ describe('Rebirth Package v6', () => {
         packageBudget: budget,
         sectionMaxChars: { cognitiveArtifacts: explicitCap },
       };
-      const { text } = renderRebirthPackageV6WithReport(value, options, { diagnostic: true });
-      const cognitiveSection = renderRebirthPackageV6Sections(value, options, { diagnostic: true })
+      const { text } = renderRebirthPackageV6WithReport(value, options);
+      const cognitiveSection = renderRebirthPackageV6Sections(value, options)
         .find((section) => section.id === 'cognitiveArtifacts')!;
       // `dir=` (audit-2 A27) may or may not follow `order=N` on the frame.
       const sectionMatch = cognitiveSection.text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5[^\]]*chars=(\d+)\]/);
@@ -3661,6 +3661,94 @@ describe('continuation record (boundary)', () => {
     const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
     expect(text).toContain('checkpoint=voxxo-swarm:main@22a4cf5 dirty=19 staged=1 · source=test:ops · source-time=');
     expect(text).not.toContain('context-warp-drive');
+  });
+
+  it('renders a bounded changed-paths sample with the exact remainder in the ops roll-up', () => {
+    const base = model();
+    const sample = Array.from({ length: 16 }, (_, index) => `relay/src/file-${index}.ts`);
+    const dirty = model({
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          ...(base.boundaryAndActiveTask.nowCard ?? {} as never),
+          ops: {
+            repositoryState: 'dirty',
+            repositoryReason: null,
+            repositories: [
+              { name: 'voxxo-swarm', branch: 'main', sha7: '22a4cf5', dirtyCount: 62, stagedCount: 1, dirtyPaths: sample, dirtyPathsTotal: 62, capturedAt: '2026-08-02T17:59:59.000Z', error: null },
+            ],
+            ownedLiveChildren: [],
+            squad: null,
+            rooms: [],
+            source: { provenanceId: 'test:ops', sourceAt: '2026-08-02T17:59:59.000Z', status: 'exact' },
+          },
+        },
+      },
+    });
+    const rendered = renderRebirthPackageV6(dirty, { diagnostic: true });
+    expect(rendered).toContain('dirty=62 staged=1');
+    expect(rendered).toContain('changed-paths=relay/src/file-0.ts relay/src/file-1.ts');
+    expect(rendered).toContain('(+46 more)');
+    // A root without a sample renders byte-identically to the pre-sample line:
+    // no empty `changed-paths=` appears for a clean or unread capture.
+    const clean = model({
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          ...(base.boundaryAndActiveTask.nowCard ?? {} as never),
+          ops: {
+            repositoryState: 'clean',
+            repositoryReason: null,
+            repositories: [
+              { name: 'voxxo-swarm', branch: 'main', sha7: '22a4cf5', dirtyCount: 0, stagedCount: 0, capturedAt: '2026-08-02T17:59:59.000Z', error: null },
+            ],
+            ownedLiveChildren: [],
+            squad: null,
+            rooms: [],
+            source: { provenanceId: 'test:ops', sourceAt: '2026-08-02T17:59:59.000Z', status: 'exact' },
+          },
+        },
+      },
+    });
+    expect(renderRebirthPackageV6(clean, { diagnostic: true })).not.toContain('changed-paths=');
+  });
+
+  it('harvests declared open items from the delivered pool, newest-first and source-linked', () => {
+    const value = model({
+      recentConversation: [
+        { provenanceId: 'message:old', sourceAt: '2026-08-02T10:00:00.000Z', role: 'assistant', text: '🏁 Old work.\n\nSignpost: stale item from yesterday.' },
+        { provenanceId: 'message:new', sourceAt: '2026-08-02T11:00:00.000Z', role: 'assistant', text: '🏁 New work.\n\n**Signpost:** keyword-only ledger discovery remains open.' },
+        { provenanceId: 'message:dup', sourceAt: '2026-08-02T12:00:00.000Z', role: 'assistant', text: 'Signpost: keyword-only ledger discovery remains open.' },
+        { provenanceId: 'message:undated', sourceAt: null, role: 'assistant', text: 'Signpost: keyword-only ledger discovery remains open.' },
+        { provenanceId: 'message:user', sourceAt: '2026-08-02T12:30:00.000Z', role: 'user', text: 'Signpost: operator text never counts.' },
+      ],
+    });
+    const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
+    expect(text).toContain('open-items=2 declared');
+    expect(text).toContain('[1] keyword-only ledger discovery remains open.');
+    expect(text).toContain('⟨message:dup @');
+    expect(text).not.toContain('message:undated');
+    // Duplicate declarations collapse to the newest row; the older copy's text
+    // does not re-enter the record.
+    expect(text.match(/keyword-only ledger discovery remains open/gu)).toHaveLength(1);
+    expect(text).toContain('[2] stale item from yesterday.');
+    expect(text).not.toContain('operator text never counts');
+    // S6: the DELIVERED boundary carries the same declaration trace in compact
+    // prose form; the diagnostic record above is the full key=value view.
+    const delivered = renderRebirthPackageV6(value);
+    expect(delivered).toContain('Open items: 2 declared');
+    expect(delivered).toContain('⟨message:dup @');
+  });
+
+  it('states none-declared when the delivered pool declares no open items', () => {
+    const value = model({
+      recentConversation: [
+        { provenanceId: 'message:a', sourceAt: '2026-08-02T10:00:00.000Z', role: 'assistant', text: '🏁 All done; shipped.' },
+        { provenanceId: 'message:b', sourceAt: '2026-08-02T10:30:00.000Z', role: 'user', text: 'Still open: operator text never counts.' },
+      ],
+    });
+    expect(record(renderRebirthPackageV6(value, { diagnostic: true }))).toContain('open-items=none-declared');
+    expect(renderRebirthPackageV6(value)).toContain('Open items: none declared.');
   });
 
   it('never stamps a receipt that could not name the request row as an exact source', () => {

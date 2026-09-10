@@ -14,7 +14,9 @@ import {
   compactBoundary,
   continuityAnchor,
   currentTaskHazards,
+  extractDeclaredOpenItems,
   historyCensus,
+  OPEN_ITEMS_MAX_ITEM_CHARS,
 } from './continuityPresentation.ts';
 
 import type {
@@ -253,6 +255,10 @@ export interface RebirthPackageV6RepositoryState {
   readonly sha7: string | null;
   readonly dirtyCount: number | null;
   readonly stagedCount: number | null;
+  /** Bounded changed-path sample the counts were derived from; absent when clean or unread. */
+  readonly dirtyPaths?: readonly string[] | null;
+  /** Exact changed-path row count the sample was drawn from (the sample may be shorter). */
+  readonly dirtyPathsTotal?: number | null;
   readonly capturedAt: string | null;
   /** Set when the probe failed; branch/sha/counts stay null. */
   readonly error: string | null;
@@ -3362,6 +3368,17 @@ function renderContinuationRecord(
   lines.push(newestBlocker
     ? `unresolved-blockers=${blockers.length} · newest: ${clip(newestBlocker.text)} · ${stamp(newestBlocker)}`
     : 'unresolved-blockers=none-captured');
+  // S6: declared open items — the signpost/checklist labels the assistant left
+  // in the delivered pool, newest-first and source-linked. A declaration
+  // trace, never a resolution claim; none-declared states the check ran.
+  const openItems = extractDeclaredOpenItems(model.recentConversation ?? []);
+  if (openItems.length > 0) {
+    lines.push(`open-items=${openItems.length} declared · ${openItems.map((item, index) => (
+      `[${index + 1}] ${clip(item.text, OPEN_ITEMS_MAX_ITEM_CHARS)} ⟨${item.provenanceId} @${formatDisplayStamp(item.sourceAt, referenceAt)}⟩`
+    )).join(' · ')}`);
+  } else {
+    lines.push('open-items=none-declared');
+  }
   const ownedPaths: string[] = [];
   const seenPaths = new Set<string>();
   const addPath = (label: string): void => {
@@ -3656,9 +3673,18 @@ function renderBoundary(
         // roots)`, healthy rows stay per-root.
         const labelFor = (repo: typeof repos[number]): string => {
           const head = readOptionalRepoString(repo, 'headCommittedAt');
-          return repo.error
-            ? `${repo.name}:error:${boundedRailAvailabilityReason(repo.error)} as-of=${repo.capturedAt ?? 'unknown'}`
-            : `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7 ?? '…'} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'}${head ? ` head-committed=${head}` : ''} as-of=${repo.capturedAt ?? 'unknown'}`;
+          if (repo.error) {
+            return `${repo.name}:error:${boundedRailAvailabilityReason(repo.error)} as-of=${repo.capturedAt ?? 'unknown'}`;
+          }
+          // Bounded changed-path sample from the same probe as the counts;
+          // `(+N more)` is the exact remainder, so a truncated sample is never
+          // read as the whole set. A root without a sample renders
+          // byte-identically to the pre-sample checkpoint line.
+          const sample = repo.dirtyPaths && repo.dirtyPaths.length > 0 ? repo.dirtyPaths : null;
+          const remainder = sample && repo.dirtyPathsTotal != null && repo.dirtyPathsTotal > sample.length
+            ? ` (+${repo.dirtyPathsTotal - sample.length} more)`
+            : '';
+          return `${repos.length > 1 ? `${repo.name}:` : ''}${repo.branch ?? 'unknown'}@${repo.sha7 ?? '…'} dirty=${repo.dirtyCount ?? '?'} staged=${repo.stagedCount ?? '?'}${head ? ` head-committed=${head}` : ''} as-of=${repo.capturedAt ?? 'unknown'}${sample ? ` changed-paths=${sample.join(' ')}${remainder}` : ''}`;
         };
         const errorSignature = (repo: typeof repos[number]): string | null => (
           repo.error
