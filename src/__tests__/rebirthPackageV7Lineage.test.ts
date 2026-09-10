@@ -170,8 +170,14 @@ describe('Rebirth Package v7 — lineage sections', () => {
     expect(order.indexOf('operatorVault')).toBeGreaterThan(order.indexOf('recentConversation'));
     expect(order.indexOf('episodeChapterIndex')).toBe(order.indexOf('operatorVault') + 1);
     expect(order.indexOf('lifeLedger')).toBe(order.indexOf('episodeChapterIndex') + 1);
-    // recoveryIndex stays last so recovery handles are never displaced by lineage.
-    expect(order[order.length - 1]).toBe('recoveryIndex');
+    // The lineage trio closes the registry; the Recovery Index precedes the
+    // Timeline (2026-09-10) so the seam stubs run straight into the raw tail.
+    // Recovery handles are protected against displacement by budget order, not
+    // registry position: last to yield in REBIRTH_PACKAGE_V7_BACKFILL_PRIORITY
+    // and first to refill in RAIL_COMPLETE_BACKFILL_PRIORITY.
+    expect(order.slice(-3)).toEqual(['operatorVault', 'episodeChapterIndex', 'lifeLedger']);
+    expect(order.indexOf('recoveryIndex')).toBe(order.indexOf('activeEditDelta') + 1);
+    expect(order.indexOf('recoveryIndex')).toBeLessThan(order.indexOf('cognitiveArtifacts'));
   });
 
   it('keeps the ordinary profile at budget and treats Brain Merge as a conditional protected cap', () => {

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { selectRebirthHotTail, type RebirthHotTailRow } from '../rebirthHotTail.ts';
-import { buildRebirthPackageV6Model, renderRebirthPackageV6WithReport, buildContinuityLedgerCaptureFromV6Render } from '../rebirthPackageV6.ts';
+import {
+  buildRebirthPackageV6Model, renderRebirthPackageV6WithReport, buildContinuityLedgerCaptureFromV6Render,
+  resolveAdaptiveSectionCaps, type RebirthPackageV6CognitiveArtifact,
+} from '../rebirthPackageV6.ts';
 
 const at = (n: number) => new Date(Date.UTC(2026, 8, 9, 12, n)).toISOString();
 const row = (n: number, text = `payload ${n}`): RebirthHotTailRow => ({
@@ -99,5 +102,102 @@ describe('raw rebirth hot tail', () => {
     expect(output.text).toContain('[REDACTION-LANE spans=1 kinds=sk-token×1]');
     const receipt = buildContinuityLedgerCaptureFromV6Render(value, output.collapse)!;
     expect(receipt.units.find((u) => u.sectionId === 'rawHotTail')?.verbatim).toBe('[REDACTED:sk-token]');
+  });
+});
+
+describe('seam rule for distinct cognition', () => {
+  const owner = {
+    lifecycle: 'continuation', lifecycleMeaning: 'same identity', captureId: 'seam-fixture',
+    capturedAt: at(59), sourceFrontier: 'source-59', instanceId: 'self', instanceName: 'self',
+    predecessorInstanceId: null, predecessorName: null, workspace: 'test', cwd: '/test',
+    runtimeChange: null, activeRequest: null, lastMaterialAssistant: null,
+  } as const;
+  // A retained atlas_commit_batch result exactly as the tail carries it: the
+  // inner JSON is string-escaped inside the tool_result block.
+  const atlasResult = (n: number, id: number, body = '') => ({
+    ...row(n, `[{"type":"text","text":"atlas_commit_batch: 1/1 processed\\n{\\"items\\":[{\\"changelog_id\\":${id},\\"summary\\":\\"✅ #${id} src/x.ts ${body}\\"}]}"}]`),
+    kind: 'tool_result' as const,
+  });
+  const artifact = (over: Partial<RebirthPackageV6CognitiveArtifact> = {}): RebirthPackageV6CognitiveArtifact => ({
+    provenanceId: 'workspace:test/changelog:4242', sourceAt: at(51), sourceInstanceId: 'self', kind: 'discovery',
+    authority: 'authoritative_source', supersededBy: null, text: 'EXACT ATLAS BODY', ...over,
+  });
+  const dialogue = (count: number, size: number) => Array.from({ length: count }, (_, n) => ({
+    provenanceId: `dialogue-${n}`, sourceAt: at(n), role: 'assistant' as const,
+    text: `DIALOGUE ROW ${n} ${'d'.repeat(size)}`,
+  }));
+  function seamModel(
+    rawHotTail: readonly RebirthHotTailRow[],
+    rows: readonly RebirthPackageV6CognitiveArtifact[],
+    conversation = dialogue(1, 20),
+  ) {
+    return buildRebirthPackageV6Model({
+      rawHotTail, boundaryAndActiveTask: owner, recentConversation: conversation, cognitiveArtifacts: rows,
+    });
+  }
+  const timelineOf = (text: string) => text.slice(0, text.indexOf('[RAW-HOT-TAIL]'));
+
+  it('stubs a post-seam unit of this instance whose identity is observed in the retained tail', () => {
+    const value = seamModel([row(50), atlasResult(51, 4242, 'EXACT ATLAS BODY')], [artifact()]);
+    const output = renderRebirthPackageV6WithReport(value);
+    expect(timelineOf(output.text)).toContain('Source identity appears in Raw hot tail (post-seam unit of this instance)');
+    expect(timelineOf(output.text)).not.toContain('EXACT ATLAS BODY');
+    expect(output.text.match(/EXACT ATLAS BODY/g)).toHaveLength(1);
+  });
+  it('keeps the body of a pre-seam unit even when a retained row quotes its identity', () => {
+    const value = seamModel([row(50), atlasResult(51, 4242)], [artifact({ sourceAt: at(3) })]);
+    const text = timelineOf(renderRebirthPackageV6WithReport(value).text);
+    expect(text).toContain('EXACT ATLAS BODY');
+    expect(text).not.toContain('Source identity appears in Raw hot tail');
+  });
+  it.each([['peer', 'peer'], ['unknown', undefined]])('keeps the body of a post-seam unit with %s authorship', (_label, sourceInstanceId) => {
+    const value = seamModel([row(50), atlasResult(51, 4242)], [artifact({ sourceInstanceId })]);
+    const text = timelineOf(renderRebirthPackageV6WithReport(value).text);
+    expect(text).toContain('EXACT ATLAS BODY');
+    expect(text).not.toContain('Source identity appears in Raw hot tail');
+  });
+  it('keeps the body when the retained tail never names the unit', () => {
+    const value = seamModel([row(50), atlasResult(51, 9999)], [artifact()]);
+    const text = timelineOf(renderRebirthPackageV6WithReport(value).text);
+    expect(text).toContain('EXACT ATLAS BODY');
+    expect(text).not.toContain('Source identity appears in Raw hot tail');
+  });
+  it('recognizes rail-step and chat-message identities in the retained payloads', () => {
+    const tail = [
+      { ...row(50, 'mcp__voxxo-core__task_rail\n{"mode":"shoot","ack_step_id":"l3-seam-cognition","ack_status":"done"}'), kind: 'tool_use' as const, toolCallId: 'r' },
+      { ...row(51, '[{"type":"text","text":"[chatroom-auto-commit] {\\"draftId\\":\\"d1\\",\\"messageId\\":\\"zLBDTlG_QPkT\\"}"}]'), kind: 'tool_result' as const, toolCallId: 'r' },
+    ];
+    const value = seamModel(tail, [
+      artifact({ provenanceId: 'rail:rail-9d1692e3/step:l3-seam-cognition', text: 'EXACT RAIL NOTE', kind: 'result' }),
+      artifact({ provenanceId: 'room:H_z4wwPxDBqN/message:zLBDTlG_QPkT', text: 'EXACT CHAT BODY', kind: 'decision' }),
+      artifact({ provenanceId: 'room:H_z4wwPxDBqN/message:zLBDTlG_QPkX', text: 'EXACT OTHER CHAT BODY', kind: 'decision' }),
+    ]);
+    const text = timelineOf(renderRebirthPackageV6WithReport(value).text);
+    expect(text).not.toContain('EXACT RAIL NOTE');
+    expect(text).not.toContain('EXACT CHAT BODY');
+    expect(text).toContain('EXACT OTHER CHAT BODY');
+    expect(text.match(/Source identity appears in Raw hot tail/g)).toHaveLength(2);
+  });
+  it("returns the stubbed unit's budget to the dialogue pool", () => {
+    // Dialogue demand saturates the timeline pool in BOTH variants, so the
+    // dialogue cap difference is exactly the body the stub no longer reserves,
+    // whatever the pool's absolute size; the two citizens still sum to one pool.
+    const conversation = dialogue(66, 3_000);
+    const body = `ATLAS-BODY-MARKER ${'a'.repeat(40_000)}`;
+    const tail = [row(50), atlasResult(51, 4242)];
+    const stubbed = seamModel(tail, [artifact({ text: body })], conversation);
+    const embodied = seamModel(tail, [artifact({ text: body, sourceInstanceId: 'peer' })], conversation);
+    const stubbedCaps = resolveAdaptiveSectionCaps(stubbed);
+    const embodiedCaps = resolveAdaptiveSectionCaps(embodied);
+    expect(stubbedCaps.recentConversation - embodiedCaps.recentConversation).toBeGreaterThanOrEqual(35_000);
+    expect(stubbedCaps.recentConversation + stubbedCaps.cognitiveArtifacts)
+      .toBe(embodiedCaps.recentConversation + embodiedCaps.cognitiveArtifacts);
+    const stubbedText = renderRebirthPackageV6WithReport(stubbed).text;
+    const embodiedText = renderRebirthPackageV6WithReport(embodied).text;
+    // Oldest-first eviction: the freed budget keeps an exchange the body evicts.
+    expect(stubbedText).toContain('DIALOGUE ROW 12 ');
+    expect(stubbedText).not.toContain('ATLAS-BODY-MARKER');
+    expect(embodiedText).not.toContain('DIALOGUE ROW 12 ');
+    expect(embodiedText).toContain('ATLAS-BODY-MARKER');
   });
 });

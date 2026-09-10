@@ -254,7 +254,7 @@ describe('FoldSession hard-epoch consume', () => {
     // gone, and the separate Cognitive Artifacts frame is gone with it — a
     // starred waypoint is something the agent DID, so it belongs in the one
     // chronological Timeline beside the turns that produced it.
-    expect(content).toContain('[REBIRTH-V6-SECTION id=recentConversation order=6 dir=asc chars=');
+    expect(content).toContain('[REBIRTH-V6-SECTION id=recentConversation order=7 dir=asc chars=');
     // Structured trace cognition: the waypoint keeps its category as its kind,
     // its authority, its exact tool-call id, and its source time — never a
     // re-rendered legacy ⭐ prose line.

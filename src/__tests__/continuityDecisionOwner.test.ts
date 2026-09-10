@@ -17,9 +17,9 @@ it('uses source authorship instead of admission priority or latest lineage life'
       { provenanceId: 'foreign-row', sourceInstanceId: 'ancestor', sourceAt: at, kind: 'decision', authority: 'evidence', supersededBy: null, text: 'FOREIGN DECISION' },
       { provenanceId: 'unknown-row', sourceAt: at, kind: 'decision', authority: 'evidence', supersededBy: null, text: 'UNKNOWN AUTHOR' },
     ],
-    lifeLedger: { units: [{ id: 'later-life', sourceAt: at, sourceEndAt: at, kind: 'life', verbatim: 'life', digest: 'life', claim: 'life', eraKey: '2026-09-09', recover: 'source' }] },
+    lifeLedger: { units: [{ id: 'later-life', sourceAt: at, sourceEndAt: at, kind: 'life', verbatim: 'life', digest: 'life', claim: 'life', eraKey: '2026-09-09', recover: 'source' }], rangeRecover: 'source' },
   });
-  const head = compactBoundary(model, null);
+  const head = compactBoundary(model, null, []);
   expect(head).toContain('Latest decision: OWNER DECISION');
   expect(head).not.toContain('FOREIGN DECISION');
   expect(head).not.toContain('UNKNOWN AUTHOR');

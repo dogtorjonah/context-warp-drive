@@ -56,6 +56,37 @@ export interface RebirthPackageV6OpenItem {
   readonly text: string;
   readonly provenanceId: string;
   readonly sourceAt: string | null;
+  /** `declared` = an assistant signpost; `capture` = the package's own degraded-capture declaration. */
+  readonly kind: 'declared' | 'capture';
+  /** The declaration predates the newest genuine operator message (both times known). */
+  readonly predatesActiveRequest: boolean;
+}
+
+/**
+ * Supersession inputs for the open-items record. Every field is optional and
+ * fails closed: with nothing supplied, nothing is retired and nothing is added.
+ */
+export interface OpenItemsSupersession {
+  /** Newest genuine operator message time; older declarations are labeled, never retired. */
+  readonly activeRequestAt?: string | null;
+  /** Source times of self-authored ship-class rail ACKs; declarations older than the newest one are retired. */
+  readonly shipAcksAt?: readonly (string | null | undefined)[];
+  /** The package's own degraded-capture declarations, admitted as open items at capture time. */
+  readonly degradedCapture?: readonly { readonly lane: string; readonly reason: string | null }[];
+  readonly capturedAt?: string | null;
+}
+
+/**
+ * Rail steps whose done-ACK closes the work a signpost belonged to. Matched on
+ * the step id of `rail:<rail>/step:<step>` provenance — structure, not prose:
+ * `ship`, `l2-validate-ship`, `close`, `closeout`, `complete`, `validate`, `final`.
+ */
+export const OPEN_ITEM_SHIP_STEP_RE =
+  /(?:^|[^a-z])(?:ship|shipped|close|closeout|complete|completed|validate|validated|final|finalize)(?:[^a-z]|$)/iu;
+
+export function shipClassRailStep(provenanceId: string): boolean {
+  const step = /^rail:[^/]+\/step:(.+)$/u.exec(provenanceId)?.[1];
+  return step !== undefined && OPEN_ITEM_SHIP_STEP_RE.test(step);
 }
 
 /** Word-boundary clip for one declared item (truncation is always marked). */
@@ -71,8 +102,8 @@ function openItemLabelLine(raw: string): string {
   return debold.replace(/^[>\s]+/u, '').trim();
 }
 
-/** Last declared open item inside one assistant row, clipped to the item cap. */
-function declaredOpenItemText(text: string): string | null {
+/** Last declared open item inside one assistant row, clipped to `maxChars`. */
+function declaredOpenItemText(text: string, maxChars = OPEN_ITEMS_MAX_ITEM_CHARS): string | null {
   const lines = text.split('\n');
   let found: string | null = null;
   for (let index = 0; index < lines.length; index += 1) {
@@ -91,45 +122,128 @@ function declaredOpenItemText(text: string): string | null {
     if (remainder) found = remainder.replace(/\s+/gu, ' ').trim() || null;
   }
   if (!found) return null;
-  return clipOpenItem(found, OPEN_ITEMS_MAX_ITEM_CHARS);
+  return clipOpenItem(found, maxChars);
 }
 
 /**
- * Harvest the assistant's DECLARED open items from the delivered conversation
- * pool: the tail-line `Signpost:`/`Still open:`/`Remaining:`/`Open items:`/
- * `Outstanding:` labels this fleet's agents use to hand off unfinished work.
- * A declaration trace only — it never infers completion or resolution, and it
- * reads exactly the delivered rows, so it cannot cite an item the successor
- * cannot also read. Newest-first; duplicate texts collapse to the newest row;
- * bounded by OPEN_ITEMS_MAX_* with no unstated truncation (an over-budget
- * candidate is skipped whole, never silently re-said).
+ * The open-items record: the package's own degraded-capture declarations plus
+ * the assistant's DECLARED open items (`Signpost:`/`Still open:`/`Remaining:`/
+ * `Open items:`/`Outstanding:`) from the delivered conversation pool.
+ *
+ * Supersession is structural, never prose inference:
+ *  - a declaration older than the newest self-authored ship-class rail ACK is
+ *    retired — shipped work restates its open set in the ship message;
+ *  - a newer declaration replaces older ones — a signpost is the agent's
+ *    current open set at that moment, not an accumulating ledger;
+ *  - a surviving declaration older than the newest genuine operator message is
+ *    labeled `predatesActiveRequest`, never silently trusted and never dropped.
+ * Degraded-capture lanes render first: they are the newest facts (capture
+ * time) and the biggest live gaps, so they can never be absent while an older
+ * signpost is present. Undated rows stay quarantined. Bounded by
+ * OPEN_ITEMS_MAX_* with no unstated truncation (an over-budget candidate is
+ * skipped whole, never silently re-said); the surviving declaration may use
+ * the budget the retired ones no longer consume.
  */
 export function extractDeclaredOpenItems(
   rows: readonly Pick<RebirthPackageV6ConversationRow, 'role' | 'text' | 'provenanceId' | 'sourceAt'>[],
+  supersession: OpenItemsSupersession = {},
 ): RebirthPackageV6OpenItem[] {
   const items: RebirthPackageV6OpenItem[] = [];
-  const seen = new Set<string>();
   let budget = OPEN_ITEMS_MAX_CHARS;
+  const known = (value: string | null | undefined): number | null => {
+    const parsed = value ? Date.parse(value) : Number.NaN;
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const capturedAt = known(supersession.capturedAt) !== null ? supersession.capturedAt! : null;
+  for (const gap of supersession.degradedCapture ?? []) {
+    if (items.length >= OPEN_ITEMS_MAX_ITEMS) break;
+    const reason = gap.reason?.replace(/\s+/gu, ' ').trim();
+    const text = clipOpenItem(`capture degraded: ${gap.lane}${reason ? ` \u2014 ${reason}` : ''}`, OPEN_ITEMS_MAX_ITEM_CHARS);
+    if (text.length + 24 > budget) continue;
+    budget -= text.length + 24;
+    items.push({ text, provenanceId: `capture:${gap.lane}`, sourceAt: capturedAt, kind: 'capture', predatesActiveRequest: false });
+  }
+  const newestShipAt = (supersession.shipAcksAt ?? [])
+    .map(known)
+    .reduce<number | null>((max, at) => (at !== null && (max === null || at > max) ? at : max), null);
+  const activeRequestAt = known(supersession.activeRequestAt);
   // Undated rows remain in conversation quarantine, never in a recency ranking.
-  const dated = rows.filter((row) => row.sourceAt && Number.isFinite(Date.parse(row.sourceAt)))
+  const dated = rows.filter((row) => known(row.sourceAt) !== null)
     .sort((a, b) => Date.parse(b.sourceAt!) - Date.parse(a.sourceAt!)
       || a.provenanceId.localeCompare(b.provenanceId));
+  const seen = new Set<string>();
+  let newestDeclarationAt: number | null = null;
   for (const row of dated) {
     if (items.length >= OPEN_ITEMS_MAX_ITEMS) break;
     if (row.role !== 'assistant' || !row.text) continue;
-    const declared = declaredOpenItemText(row.text);
+    const at = Date.parse(row.sourceAt!);
+    // Rows are newest-first, so the first retirement boundary crossed ends the scan.
+    if (newestShipAt !== null && at < newestShipAt) break;
+    if (newestDeclarationAt !== null && at < newestDeclarationAt) break;
+    const declared = declaredOpenItemText(row.text, Math.max(OPEN_ITEMS_MAX_ITEM_CHARS, budget - 24));
     if (!declared) continue;
+    newestDeclarationAt ??= at;
     const normalized = declared.toLowerCase().replace(/\s+/gu, ' ');
     if (seen.has(normalized)) continue;
     seen.add(normalized);
     if (declared.length + 24 > budget) continue;
     budget -= declared.length + 24;
-    items.push({ text: declared, provenanceId: row.provenanceId, sourceAt: row.sourceAt });
+    items.push({
+      text: declared,
+      provenanceId: row.provenanceId,
+      sourceAt: row.sourceAt,
+      kind: 'declared',
+      predatesActiveRequest: activeRequestAt !== null && at < activeRequestAt,
+    });
   }
   return items;
 }
 
-export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant: string | null): string {
+/** Count label shared by the delivered and diagnostic open-items lines. */
+export function openItemsCountLabel(items: readonly RebirthPackageV6OpenItem[]): string {
+  const declared = items.filter((item) => item.kind === 'declared').length;
+  const capture = items.length - declared;
+  if (capture === 0) return `${items.length} declared`;
+  if (declared === 0) return `${items.length} capture-degraded`;
+  return `${items.length} (${declared} declared, ${capture} capture-degraded)`;
+}
+
+/** Item text as both views render it: the label carries the supersession state. */
+export function openItemText(item: RebirthPackageV6OpenItem): string {
+  return item.predatesActiveRequest ? `${item.text} (predates the active request)` : item.text;
+}
+
+function openItemsLine(items: readonly RebirthPackageV6OpenItem[], referenceAt: string | null): string {
+  if (items.length === 0) return 'Open items: none declared.';
+  return `Open items: ${openItemsCountLabel(items)} \u00b7 ${items.map((item) => (
+    `${openItemText(item)} ${continuityAnchor(item.provenanceId, item.sourceAt, referenceAt)}`
+  )).join(' \u00b7 ')}`;
+}
+
+/**
+ * Absorbed (brain-merged) donor identities as one label, or null when the
+ * model carries none. Shared by the delivered Boundary and the diagnostic
+ * record so both list the same donors, apart from fork ancestors.
+ */
+export function absorbedLineageLabel(
+  now: RebirthPackageV6Model['boundaryAndActiveTask']['nowCard'] | null | undefined,
+): string | null {
+  const donors = (now?.absorbedLineage ?? []).filter((donor) => donor.instanceId?.trim());
+  if (donors.length === 0) return null;
+  return donors.map((donor) => {
+    const id = donor.instanceId.trim();
+    const label = donor.instanceName?.trim() ? `${donor.instanceName.trim()} (${id})` : id;
+    const source = donor.source ? ` ${donor.source}` : '';
+    const mergedAt = donor.mergedAt ? ` merged=${donor.mergedAt.slice(0, 16)}Z` : '';
+    return `${label}${source}${mergedAt}`;
+  }).join(', ');
+}
+
+export function compactBoundary(
+  model: RebirthPackageV6Model,
+  retainedAssistant: string | null,
+  openItems: readonly RebirthPackageV6OpenItem[],
+): string {
   const b = model.boundaryAndActiveTask;
   const now = b.nowCard;
   const source = (s: RebirthPackageV6SourceRef) => continuityAnchor(s.provenanceId, s.sourceAt, b.capturedAt);
@@ -156,6 +270,10 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
       return `${label}${bornAs}${span}${state}`;
     }).join(' → ')}`);
   }
+  // Donors are not ancestors: a merged mind's identity is listed on its own
+  // line so its Timeline rows (tagged [absorbed:<id>]) resolve to a name.
+  const absorbed = absorbedLineageLabel(now);
+  if (absorbed) lines.push(`Absorbed lineage (brain-merged, not fork ancestors): ${absorbed}`);
   if (now?.parentIdentity) lines.push(`Inherited from ${now.parentIdentity.instanceName ?? now.parentIdentity.instanceId}; fork point ${now.parentIdentity.checkpointMessageId ?? 'unknown'} ${source(now.parentIdentity.source)}`);
   const runtime = b.runtimeModelContext;
   // Same vocabulary as the diagnostic `runtime-model=` row: one fact must not
@@ -273,19 +391,12 @@ export function compactBoundary(model: RebirthPackageV6Model, retainedAssistant:
   lines.push(newestBlocker
     ? `Unresolved blockers: ${blockers.length} \u00b7 newest ${clip(newestBlocker.text)} ${continuityAnchor(newestBlocker.provenanceId, newestBlocker.sourceAt, b.capturedAt)}`
     : 'Unresolved blockers: none captured.');
-  // S6 declared open items (delivered form): the newest signpost/checklist
-  // declarations the assistant left in the delivered pool — a declaration
-  // trace, never a resolution claim. Bounded to the newest three with an
-  // exact remainder; source-linked like every other continuation fact.
-  const openItems = extractDeclaredOpenItems(model.recentConversation ?? []);
-  if (openItems.length > 0) {
-    const shownOpenItems = openItems.slice(0, 3);
-    lines.push(`Open items: ${openItems.length} declared \u00b7 ${shownOpenItems.map((item) => (
-      `${clip(item.text, 140)} ${continuityAnchor(item.provenanceId, item.sourceAt, b.capturedAt)}`
-    )).join(' \u00b7 ')}${openItems.length > shownOpenItems.length ? ` (+${openItems.length - shownOpenItems.length} more)` : ''}`);
-  } else {
-    lines.push('Open items: none declared.');
-  }
+  // Open items (delivered form): the caller supplies the record from the one
+  // model-level extractor (openItemsForModel) so the delivered and diagnostic
+  // views cannot drift — the package's degraded-capture declarations first,
+  // then the newest surviving signpost. Bounded by the extractor and
+  // source-linked like every other continuation fact.
+  lines.push(openItemsLine(openItems, b.capturedAt));
   const owned: string[] = [];
   for (const file of model.activeEditDelta.files) {
     const label = `${file.filePath} (${file.closureState})`;

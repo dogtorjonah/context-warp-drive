@@ -724,7 +724,7 @@ describe('Rebirth Package v6', () => {
       const cognitiveSection = renderRebirthPackageV6Sections(value, options)
         .find((section) => section.id === 'cognitiveArtifacts')!;
       // `dir=` (audit-2 A27) may or may not follow `order=N` on the frame.
-      const sectionMatch = cognitiveSection.text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=5[^\]]*chars=(\d+)\]/);
+      const sectionMatch = cognitiveSection.text.match(/\[REBIRTH-V6-SECTION id=cognitiveArtifacts order=6[^\]]*chars=(\d+)\]/);
       expect(sectionMatch).not.toBeNull();
       expect(Number(sectionMatch![1])).toBeLessThanOrEqual(explicitCap);
       expect(text.length).toBeLessThanOrEqual(budget);
@@ -2378,8 +2378,8 @@ describe('Rebirth Package v6', () => {
       'Boundary and Active Task',
       'Execution State',
       'Active Edit Delta',
-      'Timeline',
       'Recovery Index',
+      'Timeline',
     ];
     for (let index = 1; index < titles.length; index += 1) {
       expect(rendered.indexOf(`── ${titles[index - 1]} ──`))
@@ -2447,9 +2447,9 @@ describe('audit-2 Lane A render regressions', () => {
       cognitiveArtifacts: [{ provenanceId: 'c:1', sourceAt: '2026-08-02T17:00:00.000Z', kind: 'result', text: 'r', authority: 'a', supersededBy: null }],
     });
     const text = renderRebirthPackageV6(value);
-    expect(text).toMatch(/id=recentConversation order=6 dir=asc chars=/u); // interleaved source chronology
+    expect(text).toMatch(/id=recentConversation order=7 dir=asc chars=/u); // interleaved source chronology
     expect(text).toMatch(/id=activeEditDelta order=4 dir=asc chars=/u);     // oldest-first
-    expect(text).toMatch(/id=recoveryIndex order=10 dir=asc chars=/u);      // directory order
+    expect(text).toMatch(/id=recoveryIndex order=5 dir=asc chars=/u);       // directory order, ahead of the timeline
     expect(text).toMatch(/id=boundaryAndActiveTask order=1(?! dir=) chars=/u); // no dir (head content)
   });
 
@@ -3727,20 +3727,93 @@ describe('continuation record (boundary)', () => {
       ],
     });
     const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
-    expect(text).toContain('open-items=2 declared');
-    expect(text).toContain('[1] keyword-only ledger discovery remains open.');
+    // S7: a signpost is the agent's current open set, so the newest declaring
+    // row governs and older declarations are superseded — the 10:00 item no
+    // longer re-enters the record. Every surviving declaration here predates
+    // the 17:58 active request, so it carries the label rather than reading as
+    // current.
+    expect(text).toContain('open-items=1 declared');
+    expect(text).toContain('[1] keyword-only ledger discovery remains open. (predates the active request)');
     expect(text).toContain('⟨message:dup @');
     expect(text).not.toContain('message:undated');
-    // Duplicate declarations collapse to the newest row; the older copy's text
-    // does not re-enter the record.
     expect(text.match(/keyword-only ledger discovery remains open/gu)).toHaveLength(1);
-    expect(text).toContain('[2] stale item from yesterday.');
+    expect(text).not.toContain('stale item from yesterday');
     expect(text).not.toContain('operator text never counts');
-    // S6: the DELIVERED boundary carries the same declaration trace in compact
-    // prose form; the diagnostic record above is the full key=value view.
+    // The DELIVERED boundary carries the same record in compact prose form; the
+    // diagnostic record above is the full key=value view.
     const delivered = renderRebirthPackageV6(value);
-    expect(delivered).toContain('Open items: 2 declared');
+    expect(delivered).toContain('Open items: 1 declared');
+    expect(delivered).toContain('keyword-only ledger discovery remains open. (predates the active request)');
     expect(delivered).toContain('⟨message:dup @');
+  });
+
+  it('retires declarations older than a self-authored ship-class rail ACK, never a peer\'s', () => {
+    const declared = { provenanceId: 'message:signpost', sourceAt: '2026-08-02T10:00:00.000Z', role: 'assistant' as const, text: '🏁 Committed.\n\nSignpost: restart preflight still pending.' };
+    const shipAck = (sourceInstanceId: string) => ({
+      provenanceId: 'rail:rail-x/step:l2-validate-ship', sourceInstanceId, sourceAt: '2026-08-02T10:30:00.000Z',
+      kind: 'result' as const, authority: 'evidence', supersededBy: null, text: 'Committed 12850b96; preflight PASS.',
+    });
+    const shipped = model({ recentConversation: [declared], cognitiveArtifacts: [shipAck('instance-a')] });
+    expect(record(renderRebirthPackageV6(shipped, { diagnostic: true }))).toContain('open-items=none-declared');
+    expect(renderRebirthPackageV6(shipped)).toContain('Open items: none declared.');
+    // A peer's ship closes nothing of ours; an unknown author closes nothing either.
+    for (const ack of [shipAck('peer'), { ...shipAck('instance-a'), sourceInstanceId: undefined }]) {
+      const kept = model({ recentConversation: [declared], cognitiveArtifacts: [ack] });
+      expect(record(renderRebirthPackageV6(kept, { diagnostic: true }))).toContain('[1] restart preflight still pending.');
+      expect(renderRebirthPackageV6(kept)).toContain('Open items: 1 declared');
+    }
+    // A non-ship step never retires: the work is still in flight.
+    const midflight = model({ recentConversation: [declared], cognitiveArtifacts: [{ ...shipAck('instance-a'), provenanceId: 'rail:rail-x/step:l2-archaeology' }] });
+    expect(record(renderRebirthPackageV6(midflight, { diagnostic: true }))).toContain('[1] restart preflight still pending.');
+  });
+
+  it('labels a surviving declaration that predates the active request and drops none that follow it', () => {
+    const older = { provenanceId: 'message:older', sourceAt: '2026-08-02T17:00:00.000Z', role: 'assistant' as const, text: 'Signpost: seam rule still open.' };
+    const before = model({ recentConversation: [older, { provenanceId: 'message:mid', sourceAt: '2026-08-02T17:30:00.000Z', role: 'assistant' as const, text: 'Signpost: recovery index order still open.' }] });
+    const beforeText = record(renderRebirthPackageV6(before, { diagnostic: true }));
+    expect(beforeText).toContain('open-items=1 declared');
+    expect(beforeText).toContain('[1] recovery index order still open. (predates the active request)');
+    expect(beforeText).not.toContain('seam rule still open');
+    const after = model({ recentConversation: [older, { provenanceId: 'message:after', sourceAt: '2026-08-02T17:59:00.000Z', role: 'assistant' as const, text: 'Signpost: absorbed-lineage attribution still open.' }] });
+    const afterText = record(renderRebirthPackageV6(after, { diagnostic: true }));
+    expect(afterText).toContain('[1] absorbed-lineage attribution still open. ⟨message:after @');
+    expect(afterText).not.toContain('predates the active request');
+    expect(renderRebirthPackageV6(after)).toContain('absorbed-lineage attribution still open. ⟨message:after @');
+  });
+
+  it('admits the package\'s degraded-capture lanes as open items in both views, ahead of declarations', () => {
+    const reason = 'immutable Atlas edit capture attempted but failed (unavailable): Atlas Edit Sessions worker queue-timeout after 5069ms on the storage lane (task never started)';
+    const value = model({
+      activeEditDelta: exactDelta({ state: 'unknown', files: [], reasons: [reason] }),
+      recentConversation: [{ provenanceId: 'message:sign', sourceAt: '2026-08-02T17:59:00.000Z', role: 'assistant' as const, text: 'Signpost: seam rule for cognition rows.' }],
+    });
+    const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
+    expect(text).toContain('open-items=2 (1 declared, 1 capture-degraded)');
+    expect(text).toContain('[1] capture degraded: active-edit-delta — immutable Atlas edit capture attempted but failed (unavailable)');
+    expect(text).toContain('⟨capture:active-edit-delta @');
+    expect(text).toContain('[2] seam rule for cognition rows. ⟨message:sign @');
+    const delivered = renderRebirthPackageV6(value);
+    expect(delivered).toContain('Open items: 2 (1 declared, 1 capture-degraded)');
+    expect(delivered).toContain('capture degraded: active-edit-delta — immutable Atlas edit capture attempted but failed (unavailable)');
+    // The existing degraded-capture line stays, sourced from the same census.
+    expect(delivered).toContain('⚠ Degraded capture: active-edit-delta (');
+    // Capture-only: no declaration at all still surfaces the gap.
+    const captureOnly = model({ activeEditDelta: exactDelta({ state: 'unknown', files: [], reasons: [reason] }) });
+    expect(record(renderRebirthPackageV6(captureOnly, { diagnostic: true }))).toContain('open-items=1 capture-degraded');
+    expect(renderRebirthPackageV6(captureOnly)).toContain('Open items: 1 capture-degraded');
+  });
+
+  it('lets the surviving declaration use the budget retired ones no longer consume', () => {
+    const long = `Signpost: ${'(1) storage-lane backlog; '.repeat(16).trim()}`;
+    const value = model({ recentConversation: [{ provenanceId: 'message:long', sourceAt: '2026-08-02T17:59:00.000Z', role: 'assistant' as const, text: long }] });
+    const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
+    // 16 × 26 chars ≈ 415: well past the old 180-char item clip, whole here.
+    expect(text).toContain(`[1] ${long.slice('Signpost: '.length)} ⟨message:long @`);
+    const oversized = model({ recentConversation: [{ provenanceId: 'message:huge', sourceAt: '2026-08-02T17:59:00.000Z', role: 'assistant' as const, text: `Signpost: ${'word '.repeat(300)}` }] });
+    const clipped = record(renderRebirthPackageV6(oversized, { diagnostic: true }));
+    const item = /\[1\] ([^⟨]+)⟨message:huge @/u.exec(clipped)?.[1]?.trim() ?? '';
+    expect(item.endsWith('…')).toBe(true);
+    expect(item.length).toBeLessThanOrEqual(720 - 24);
   });
 
   it('states none-declared when the delivered pool declares no open items', () => {
@@ -3752,6 +3825,38 @@ describe('continuation record (boundary)', () => {
     });
     expect(record(renderRebirthPackageV6(value, { diagnostic: true }))).toContain('open-items=none-declared');
     expect(renderRebirthPackageV6(value)).toContain('Open items: none declared.');
+  });
+
+  it('attributes absorbed-lineage rows and lists donors apart from fork ancestors, byte-identical without a merge', () => {
+    const base = model();
+    const rows = [
+      { provenanceId: 'message:donor-question', sourceInstanceId: 'okx5rX6S', sourceAt: '2026-08-02T17:59:50.000Z', kind: 'question' as const, authority: 'historical_observation', supersededBy: null, text: 'DONOR QUESTION about fixer scope.' },
+      { provenanceId: 'decision:self', sourceInstanceId: 'instance-a', sourceAt: '2026-08-02T17:59:45.000Z', kind: 'decision' as const, authority: 'historical_observation', supersededBy: null, text: 'OWN DECISION to keep the invariant.' },
+    ];
+    const merged = model({
+      boundaryAndActiveTask: {
+        ...base.boundaryAndActiveTask,
+        nowCard: {
+          ...(base.boundaryAndActiveTask.nowCard ?? {} as never),
+          absorbedLineage: [{ instanceId: 'okx5rX6S', instanceName: 'rebirth-await-auditor-fixer', source: 'archived', mergedAt: '2026-08-02T17:59:00.000Z' }],
+        },
+      },
+      cognitiveArtifacts: rows,
+    });
+    const delivered = renderRebirthPackageV6(merged);
+    expect(delivered).toContain('Absorbed lineage (brain-merged, not fork ancestors): rebirth-await-auditor-fixer (okx5rX6S) archived merged=2026-08-02T17:59Z');
+    expect(delivered).toMatch(/question \[absorbed:okx5rX6S\]\nDONOR QUESTION about fixer scope\./u);
+    expect(delivered).not.toMatch(/decision[^\n]*\[absorbed/u);
+    const diagnostic = renderRebirthPackageV6(merged, { diagnostic: true });
+    // The diagnostic Now card lists donors beside lineage-chain=, outside the
+    // continuation record.
+    expect(diagnostic).toContain('absorbed-lineage=rebirth-await-auditor-fixer (okx5rX6S) archived merged=2026-08-02T17:59Z');
+    expect(diagnostic).toMatch(/DONOR QUESTION about fixer scope\.[^\n]*· author=absorbed:okx5rX6S/u);
+    expect(diagnostic).not.toMatch(/OWN DECISION[^\n]*author=absorbed/u);
+    // Without a merge nothing changes: no donor line, no tag.
+    const plain = renderRebirthPackageV6(model({ cognitiveArtifacts: rows }));
+    expect(plain).not.toContain('Absorbed lineage');
+    expect(plain).not.toContain('[absorbed:');
   });
 
   it('never stamps a receipt that could not name the request row as an exact source', () => {

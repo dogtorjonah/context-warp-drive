@@ -250,8 +250,15 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     // record (declaration trace, newest-first, dated rows only — undated
     // declarations stay quarantined per God Rule 8).
     // The semantic cases below and rebirthTimeline cover these intended deltas.
-    expect(sha(first.text)).toBe('1759a31c8e070c6fb69985c0873f1d608119d03948c84d4c63d08cd941758d5d');
-    expect(sha(audit.text)).toBe('52a0a40e6956fcc4ba020204ba03822610c16d81747da4acda95dabafaa579c6');
+    // 2026-09-10 (L3 S6): the Recovery Index now precedes the Timeline. The only
+    // deltas are section order and `order=` frame numbers (recoveryIndex 10→5;
+    // the merged Timeline frame 6→7, now registry-derived instead of a literal);
+    // every section body is byte-identical, pinned by the section-order case
+    // below. One assertion so a deliberate re-freeze reads both digests at once.
+    expect({ delivery: sha(first.text), audit: sha(audit.text) }).toEqual({
+      delivery: 'a9f766238fb072ae97d6bfa4dc8b03be307f5294f295f4641808e34105ee0336',
+      audit: '9b49383ecea5826e495ac9dcc8f8c1090927f8282d77ff33fb582b4662f0b73a',
+    });
   });
 
   const sectionIds = (text: string): string[] => [
@@ -289,8 +296,8 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
         'boundaryAndActiveTask:1',
         'executionState:3',
         'activeEditDelta:4',
-        'recentConversation:6',
-        'recoveryIndex:10',
+        'recoveryIndex:5',
+        'recentConversation:7',
       ]);
     },
   );

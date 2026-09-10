@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import {
+  absorbedLineageLabel,
   COMPACT_RECOVERY_PREAMBLE,
   COMPACT_RECOVERY_SUPPRESSED_ROWS,
   compactBoundary,
@@ -16,7 +17,10 @@ import {
   currentTaskHazards,
   extractDeclaredOpenItems,
   historyCensus,
-  OPEN_ITEMS_MAX_ITEM_CHARS,
+  openItemsCountLabel,
+  openItemText,
+  shipClassRailStep,
+  type RebirthPackageV6OpenItem,
 } from './continuityPresentation.ts';
 
 import type {
@@ -55,12 +59,19 @@ export const REBIRTH_PACKAGE_V6_SECTION_IDS = [
   'brainMergeSynthesis',
   'executionState',
   'activeEditDelta',
+  // The Recovery Index precedes the timeline (operator direction 2026-09-10):
+  // the reader's frame — identity, degraded lanes, recovery routes — sits above
+  // the compressed past, and the timeline's newest rows (the seam stubs) run
+  // straight into the raw hot tail with no legend between them. Composition,
+  // the `order=` frame numbers and the RENDER-INCOMPLETE trailer all derive
+  // from this list; the trailer still rides the Recovery Index body, whose
+  // rows are census-derived and therefore independent of render position.
+  'recoveryIndex',
   'cognitiveArtifacts',
   'recentConversation',
   'operatorVault',
   'episodeChapterIndex',
   'lifeLedger',
-  'recoveryIndex',
 ] as const;
 
 /** Lineage sections introduced by the generational contract. */
@@ -180,6 +191,21 @@ export interface RebirthPackageV6NowCard {
     readonly sourceEndAt?: string | null;
     /** Null means the captured inputs did not carry an authoritative runtime state. */
     readonly archived: boolean | null;
+  }[];
+  /**
+   * Brain-merged (absorbed) donor identities: instances whose cognition this
+   * receiver inherited at a merge moment. They are NOT fork ancestors — the
+   * lineage chain above never lists them — and their Timeline rows are
+   * attributed so a donor's question or verdict is never read as the
+   * receiver's own. Additive and optional: a model without a merge renders
+   * byte-identically. `mergedAt` bounds the donor's own memory (rows after
+   * absorption are the receiver's); absent = unknown.
+   */
+  readonly absorbedLineage?: readonly {
+    readonly instanceId: string;
+    readonly instanceName: string | null;
+    readonly source?: 'live' | 'archived' | null;
+    readonly mergedAt?: string | null;
   }[];
   /**
    * Captured operator-facing process facts. Repository cleanliness remains
@@ -3368,13 +3394,15 @@ function renderContinuationRecord(
   lines.push(newestBlocker
     ? `unresolved-blockers=${blockers.length} · newest: ${clip(newestBlocker.text)} · ${stamp(newestBlocker)}`
     : 'unresolved-blockers=none-captured');
-  // S6: declared open items — the signpost/checklist labels the assistant left
-  // in the delivered pool, newest-first and source-linked. A declaration
-  // trace, never a resolution claim; none-declared states the check ran.
-  const openItems = extractDeclaredOpenItems(model.recentConversation ?? []);
+  // Open items — one model-level record (openItemsForModel) shared with the
+  // delivered boundary: degraded-capture declarations first, then the newest
+  // surviving signpost, with structural supersession (self-authored ship-class
+  // rail ACKs, newer declarations) and a predates-active-request label.
+  // none-declared states the check ran.
+  const openItems = openItemsForModel(model);
   if (openItems.length > 0) {
-    lines.push(`open-items=${openItems.length} declared · ${openItems.map((item, index) => (
-      `[${index + 1}] ${clip(item.text, OPEN_ITEMS_MAX_ITEM_CHARS)} ⟨${item.provenanceId} @${formatDisplayStamp(item.sourceAt, referenceAt)}⟩`
+    lines.push(`open-items=${openItemsCountLabel(openItems)} · ${openItems.map((item, index) => (
+      `[${index + 1}] ${openItemText(item)} ⟨${item.provenanceId} @${formatDisplayStamp(item.sourceAt, referenceAt)}⟩`
     )).join(' · ')}`);
   } else {
     lines.push('open-items=none-declared');
@@ -3470,12 +3498,13 @@ function renderCompactBoundary(
     model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
   );
   const assistantSource = model.boundaryAndActiveTask.lastMaterialAssistant;
-  const frameOnly = compactBoundary(model, '');
+  const openItems = openItemsForModel(model);
+  const frameOnly = compactBoundary(model, '', openItems);
   const assistantBudget = Math.max(512, maxChars - frameOnly.length - 64);
   const assistant = assistantSource
     ? boundedText(assistantSource.text, assistantBudget, recovery)
     : null;
-  const text = compactBoundary(model, assistant?.text ?? null);
+  const text = compactBoundary(model, assistant?.text ?? null, openItems);
   return { text: boundedWholeLines(text, maxChars, recovery), complete: text.length <= maxChars && (assistant?.complete ?? true) };
 }
 
@@ -3628,6 +3657,10 @@ function renderBoundary(
       .join(' → ');
     lines.push(`lineage-chain=${chain}`);
   }
+  // Absorbed (brain-merged) donors are listed apart from fork ancestors; the
+  // delivered Boundary prints the same label through the same helper.
+  const absorbedLineage = absorbedLineageLabel(now);
+  if (absorbedLineage) lines.push(`absorbed-lineage=${absorbedLineage}`);
   if (now?.ops) {
     // Audit-3 A2/owned-children/v1: flat legacy `{id,name}` rows render the
     // joined `name(id)` list only; when the capture supplies richer per-child
@@ -4243,6 +4276,7 @@ function cognitionRowBody(
   sourceText?: string,
   recovery?: string | null,
   compact = false,
+  absorbed?: ReadonlySet<string>,
 ): string {
   const declared = row.projection === 'truncated'
     ? ` · projection=truncated stored=${row.storedChars ?? row.text.length}/${row.sourceChars ?? 'unknown'} chars`
@@ -4272,13 +4306,20 @@ function cognitionRowBody(
   // provenance to one trailing anchor. `retention` is selector diagnostics and
   // does not survive; `projection=truncated` becomes the `[partial]` token the
   // package legend defines.
+  // A row authored by an absorbed (brain-merged) donor is the donor's voice,
+  // not the receiver's; the tag rides the row so a donor's question or verdict
+  // can never be read as this instance's own. Absent donors = no tag, so a
+  // package without a merge renders byte-identically.
+  const donor = row.sourceInstanceId?.trim();
+  const absorbedTag = donor && absorbed?.has(donor) ? donor : null;
   if (compact) {
     const labels = `${row.projection === 'truncated' ? ' [partial]' : ''}`
       + `${row.supersededBy ? ` [EXPIRED → ${row.supersededBy}]` : ''}`
-      + (row.authority === 'historical_observation' ? '' : ` [${row.authority}]`);
+      + (row.authority === 'historical_observation' ? '' : ` [${row.authority}]`)
+      + (absorbedTag ? ` [absorbed:${absorbedTag}]` : '');
     return `${row.kind}${labels}\n${row.text}${excerpt}\n${continuityAnchor(compactCognitionSource(row.provenanceId, sourceText ?? row.text), row.sourceAt, referenceAt)}`;
   }
-  return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${retention}${declared}${excerpt}`;
+  return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${absorbedTag ? ` · author=absorbed:${absorbedTag}` : ''}${retention}${declared}${excerpt}`;
 }
 
 function cognitionSuppressionHeader(
@@ -4375,6 +4416,59 @@ function cognitionSuppressionHeader(
  * already rendered, so a dialogue-owned artifact can report where its one
  * rendering went instead of claiming a second one.
  */
+/**
+ * Exact identity token a distinct cognition unit leaves in the raw tool payload
+ * that produced it, or null when its family leaves none (stars, legacy rows).
+ * Atlas: `atlas_commit(_batch)` results carry `"changelog_id":<id>` (JSON,
+ * string-escaped inside a tool_result block) and the `#<id>` summary line.
+ * Rail: the `task_rail` input names the ACKed step id. Chat: the publish
+ * receipt names the `messageId`. Tokens match whole, never as prose.
+ */
+function cognitionIdentityPattern(provenanceId: string): RegExp | null {
+  const changelog = /(?:^|[/:])(?:atlas-)?changelog:(\d+)$/u.exec(provenanceId);
+  if (changelog) return new RegExp(`(?:changelog_id\\\\?"\\s*:\\s*|#)${changelog[1]}(?!\\d)`, 'u');
+  const step = /^rail:[^/]+\/step:([\w.-]+)$/u.exec(provenanceId);
+  if (step) return new RegExp(`(?<![\\w.-])${escapeIdentityToken(step[1]!)}(?![\\w.-])`, 'u');
+  const message = /^room:[^/]+\/message:([\w-]+)$/u.exec(provenanceId);
+  if (message) return new RegExp(`(?<![\\w-])${escapeIdentityToken(message[1]!)}(?![\\w-])`, 'u');
+  return null;
+}
+
+function escapeIdentityToken(token: string): string {
+  return token.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+/**
+ * Seam rule for distinct cognition. A dialogue row IS a raw row, so exact
+ * identity decides its stub. An Atlas/rail/chat unit is derived from a raw
+ * tool call whose id it never shares; identity alone can never stub it, so the
+ * same unit rendered twice — a body here and its producing payload verbatim in
+ * the tail. This predicate stubs such a unit only when every gate holds: it was
+ * authored by the package owner (unknown author fails closed), its source time
+ * lies inside the retained window, and its identity token is observed in the
+ * retained bytes. Time is a bound, never the evidence (rebirthHotTail.ts: never
+ * infer ownership by time); an unknown-time unit never participates.
+ */
+function rawTailIdentityObserver(
+  rows: readonly RebirthHotTailRow[],
+  ownerInstanceId: string | null | undefined,
+): (row: RebirthPackageV6CognitiveArtifact) => boolean {
+  const owner = ownerInstanceId?.trim();
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  if (!owner || !first || !last) return () => false;
+  const windowStart = Date.parse(first.sourceAt);
+  const windowEnd = Date.parse(last.sourceAt);
+  if (!Number.isFinite(windowStart) || !Number.isFinite(windowEnd)) return () => false;
+  const retained = rows.map((row) => row.text).join('\n');
+  return (row) => {
+    if (row.sourceInstanceId?.trim() !== owner) return false;
+    const at = row.sourceAt ? Date.parse(row.sourceAt) : Number.NaN;
+    if (!Number.isFinite(at) || at < windowStart || at > windowEnd) return false;
+    return cognitionIdentityPattern(row.provenanceId)?.test(retained) ?? false;
+  };
+}
+
 interface CognitionDialogueOwnership {
   readonly candidates: ReadonlySet<string>;
   readonly placements?: ReadonlyMap<string, RebirthPackageV6UnitPlacement>;
@@ -4423,10 +4517,15 @@ function renderCognition(
     };
   });
   const allSourceRows = model.cognitiveArtifacts.filter((row) => !dialogueOwnedIds.has(row.provenanceId));
-  const rawIds = new Set(selectRebirthHotTail(model.rawHotTail ?? []).rows.map((row) => hotTailIdentity(row.id)));
+  const rawTail = selectRebirthHotTail(model.rawHotTail ?? []);
+  const rawIds = new Set(rawTail.rows.map((row) => hotTailIdentity(row.id)));
+  const observedInRawTail = rawTailIdentityObserver(rawTail.rows, model.boundaryAndActiveTask.instanceId);
   const sourceRows = allSourceRows.filter((row) => !boundaryBodies.has(row.text.trim()))
     .map((row) => rawIds.has(hotTailIdentity(row.provenanceId))
-      ? { ...row, text: '→ Exact source appears in Raw hot tail.', projection: undefined } : row);
+      ? { ...row, text: '→ Exact source appears in Raw hot tail.', projection: undefined }
+      : observedInRawTail(row)
+        ? { ...row, text: '→ Source identity appears in Raw hot tail (post-seam unit of this instance).', projection: undefined }
+        : row);
   const fullTextById = new Map(sourceRows.filter((row) => row.projection !== 'truncated').map((row) => [row.provenanceId, row.text]));
   const boundaryDedupedCount = allSourceRows.length - sourceRows.length;
 
@@ -4471,10 +4570,13 @@ function renderCognition(
     demandProbe: boolean,
   ): RenderedV6SectionBody | null => {
     const referenceAt = model.boundaryAndActiveTask.capturedAt;
+    const absorbedIds = new Set(
+      (model.boundaryAndActiveTask.nowCard?.absorbedLineage ?? []).map((entry) => entry.instanceId.trim()).filter(Boolean),
+    );
     const rowBodies = new Map(rows.map((row) => [row.provenanceId,
-      cognitionRowBody(row, referenceAt, fullTextById.get(row.provenanceId), recoveryHandle)]));
+      cognitionRowBody(row, referenceAt, fullTextById.get(row.provenanceId), recoveryHandle, false, absorbedIds)]));
     const compactRowBodies = new Map(rows.map((row) => [row.provenanceId,
-      cognitionRowBody(row, referenceAt, fullTextById.get(row.provenanceId), recoveryHandle, true)]));
+      cognitionRowBody(row, referenceAt, fullTextById.get(row.provenanceId), recoveryHandle, true, absorbedIds)]));
     const assemble = (keep: readonly RebirthPackageV6CognitiveArtifact[]): string => {
       const kept = new Set(keep.map((row) => row.provenanceId));
       const suppressed = rows.filter((row) => !kept.has(row.provenanceId));
@@ -4549,7 +4651,7 @@ function renderCognition(
         if (!original) continue;
         const bodies = compact ? compactRowBodies : rowBodies;
         const previousBody = bodies.get(row.provenanceId)!;
-        const restoredBody = cognitionRowBody(original, referenceAt, undefined, recoveryHandle, compact);
+        const restoredBody = cognitionRowBody(original, referenceAt, undefined, recoveryHandle, compact, absorbedIds);
         if (text.length + restoredBody.length - previousBody.length > maxChars) continue;
         bodies.set(row.provenanceId, restoredBody);
         const candidate = keep.map((entry) => entry.provenanceId === row.provenanceId ? original : entry);
@@ -4561,8 +4663,8 @@ function renderCognition(
         keep = candidate;
         text = restored;
         expandedIds.add(row.provenanceId);
-        rowBodies.set(row.provenanceId, cognitionRowBody(original, referenceAt, undefined, recoveryHandle));
-        compactRowBodies.set(row.provenanceId, cognitionRowBody(original, referenceAt, undefined, recoveryHandle, true));
+        rowBodies.set(row.provenanceId, cognitionRowBody(original, referenceAt, undefined, recoveryHandle, false, absorbedIds));
+        compactRowBodies.set(row.provenanceId, cognitionRowBody(original, referenceAt, undefined, recoveryHandle, true, absorbedIds));
       }
     }
     const keptIds = new Set(keep.map((row) => row.provenanceId));
@@ -5199,9 +5301,13 @@ function recoveryRowSectionId(rowId: string): RebirthPackageV6SectionId | null {
  * clean. This line exists only when a lane is genuinely degraded, and it reads
  * the same helper the diagnostic header reads so the two surfaces cannot drift.
  */
-function compactDegradedCaptureLines(model: RebirthPackageV6Model): string[] {
-  const lanes = computeRebirthCaptureDegradedLanes(model);
-  if (lanes.length === 0) return [];
+/**
+ * The package's own degraded-capture declarations: one per lane the canonical
+ * census flags, with that lane's capture-side reason. Consumed by the delivered
+ * `⚠ Degraded capture:` line and by the open-items record, so the two surfaces
+ * name the same lanes with the same reasons.
+ */
+export function degradedCaptureDeclarations(model: RebirthPackageV6Model): Array<{ lane: string; reason: string | null }> {
   const reasonByLane: Readonly<Record<string, string | null | undefined>> = {
     'operator-vault': model.operatorVault?.partialReason,
     'episode-chapter-index': model.episodeChapterIndex?.partialReason,
@@ -5211,10 +5317,36 @@ function compactDegradedCaptureLines(model: RebirthPackageV6Model): string[] {
     'active-edit-delta': model.activeEditDelta.reasons.join(' '),
     'task-rail': model.boundaryAndActiveTask.nowCard?.currentRailAvailability?.reason,
   };
-  return [`⚠ Degraded capture: ${lanes.map((lane) => {
-    const reason = reasonByLane[lane]?.trim();
-    return reason ? `${lane} (${oneLineClaim(reason, 160)})` : lane;
-  }).join(' · ')}`];
+  return computeRebirthCaptureDegradedLanes(model).map((lane) => ({ lane, reason: reasonByLane[lane]?.trim() || null }));
+}
+
+/**
+ * The one open-items record both boundary views render (L3 S7). Supersession
+ * inputs come from the model itself: the newest genuine operator message, the
+ * owner's ship-class rail ACKs among the cognitive artifacts (author-gated — a
+ * peer's ship closes nothing here), and the canonical degraded-capture census.
+ */
+export function openItemsForModel(model: RebirthPackageV6Model): RebirthPackageV6OpenItem[] {
+  const owner = model.boundaryAndActiveTask.instanceId?.trim();
+  const shipAcksAt = owner
+    ? model.cognitiveArtifacts
+      .filter((row) => row.sourceInstanceId?.trim() === owner && shipClassRailStep(row.provenanceId))
+      .map((row) => row.sourceAt)
+    : [];
+  return extractDeclaredOpenItems(model.recentConversation ?? [], {
+    activeRequestAt: model.boundaryAndActiveTask.activeRequest?.source.sourceAt ?? null,
+    shipAcksAt,
+    degradedCapture: degradedCaptureDeclarations(model),
+    capturedAt: model.boundaryAndActiveTask.capturedAt,
+  });
+}
+
+function compactDegradedCaptureLines(model: RebirthPackageV6Model): string[] {
+  const lanes = degradedCaptureDeclarations(model);
+  if (lanes.length === 0) return [];
+  return [`⚠ Degraded capture: ${lanes.map(({ lane, reason }) => (
+    reason ? `${lane} (${oneLineClaim(reason, 160)})` : lane
+  )).join(' · ')}`];
 }
 
 function renderRecovery(
@@ -6003,7 +6135,7 @@ function resolveAdaptiveSectionCapsInternal(
   // Fund it from the same envelope, before historical dialogue and cognition.
   if (options.sectionMaxChars?.boundaryAndActiveTask === undefined) {
     limits.boundaryAndActiveTask = Math.min(145_000, Math.max(limits.boundaryAndActiveTask,
-      compactBoundary(model, model.boundaryAndActiveTask.lastMaterialAssistant?.text ?? null).length + 64));
+      compactBoundary(model, model.boundaryAndActiveTask.lastMaterialAssistant?.text ?? null, openItemsForModel(model)).length + 64));
   }
   // Reserve recovery's measured demand plus room for the final completeness
   // census. Unused directory space belongs to conversation, not blank padding.
@@ -6424,7 +6556,12 @@ function joinRenderedSections(
         : section.text
     )),
   ].join('\n\n');
-  const timeline = `── Timeline ──\n[REBIRTH-V6-SECTION id=recentConversation order=6 dir=asc chars=${body.length}]\n${body}\n${V6_SECTION_CLOSE}`;
+  // The merged frame carries recentConversation's canonical order from the
+  // registry — never a literal — so a present Timeline and an absent
+  // `recentConversation(order=N,…)` census entry name the same N, and moving a
+  // section in REBIRTH_PACKAGE_V6_SECTION_IDS cannot desynchronize the two.
+  const timelineOrder = REBIRTH_PACKAGE_V6_SECTION_IDS.indexOf('recentConversation') + 1;
+  const timeline = `── Timeline ──\n[REBIRTH-V6-SECTION id=recentConversation order=${timelineOrder} dir=asc chars=${body.length}]\n${body}\n${V6_SECTION_CLOSE}`;
   let emittedTimeline = false;
   const sectionsText = sections.map((section) => {
     if (section.id !== 'recentConversation' && section.id !== 'cognitiveArtifacts') return section.text;

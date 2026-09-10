@@ -348,8 +348,8 @@ describe('FoldSession marathon pressure folding', () => {
     expect(preparedText).toContain('[CONTEXT REBIRTH] Lifecycle boundary: same_instance_hard_epoch for "predecessor".');
     // Canonical v6 hard-epoch semantic (retired the v4 flat Raw Trace Coordinate
     // Closet forensic section): the hard-epoch package renders the fixed frame
-    // model in canonical order — boundary/task, execution, active edits, one
-    // chronological Timeline, recovery. Conversation and cognition are ONE
+    // model in canonical order — boundary/task, execution, active edits,
+    // recovery, one chronological Timeline. Conversation and cognition are ONE
     // interleaved chronology: joinRenderedSections merges the cognitiveArtifacts
     // rows into the `── Timeline ──` frame that keeps the recentConversation
     // identity, so a standalone cognition frame must never render. Assert each
@@ -360,15 +360,15 @@ describe('FoldSession marathon pressure folding', () => {
       ['boundaryAndActiveTask', 1, null],
       ['executionState', 3, 'asc'],
       ['activeEditDelta', 4, 'asc'],
-      ['recentConversation', 6, 'asc'],
-      ['recoveryIndex', 10, 'asc'],
+      ['recoveryIndex', 5, 'asc'],
+      ['recentConversation', 7, 'asc'],
     ] as const;
     for (const [frameId, order, direction] of v6Frames) {
       expect(preparedText).toContain(
         `[REBIRTH-V6-SECTION id=${frameId} order=${order}${direction ? ` dir=${direction}` : ''} chars=`,
       );
     }
-    expect(preparedText).toContain('── Timeline ──\n[REBIRTH-V6-SECTION id=recentConversation order=6 dir=asc chars=');
+    expect(preparedText).toContain('── Timeline ──\n[REBIRTH-V6-SECTION id=recentConversation order=7 dir=asc chars=');
     expect(preparedText).not.toContain('[REBIRTH-V6-SECTION id=cognitiveArtifacts');
     expect(preparedText.indexOf('[REBIRTH-V6-SECTION id=boundaryAndActiveTask'))
       .toBeLessThan(preparedText.indexOf('[REBIRTH-V6-SECTION id=recoveryIndex'));
