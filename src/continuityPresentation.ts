@@ -24,14 +24,36 @@ export const CONTINUITY_LEGEND = 'Continuity: ⟨source @time⟩ identifies sour
  * can never imply a different year than the source carries, and an unparseable
  * stamp renders verbatim rather than being reformatted into a guess.
  */
+const normalizedTimestampCache = new Map<string, string | null>();
+const MAX_NORMALIZED_TIMESTAMPS = 8192;
+const ZONED_TIMESTAMP = /^(?:\d{4}|[+-]\d{6})-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:?\d{2})$/i;
+
+/**
+ * The renderer revisits the same source instants across exact budget passes.
+ * Cache only bounded, explicitly zoned inputs: local-time parsing must still
+ * observe the host timezone, and mutable source models are never cached.
+ */
+export function normalizeContinuityTimestamp(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const cached = normalizedTimestampCache.get(value);
+  if (cached !== undefined) return cached;
+  const parsed = Date.parse(value);
+  const result = Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+  if (value.length <= 64 && ZONED_TIMESTAMP.test(value)) {
+    if (normalizedTimestampCache.size >= MAX_NORMALIZED_TIMESTAMPS) {
+      normalizedTimestampCache.clear();
+    }
+    normalizedTimestampCache.set(value, result);
+  }
+  return result;
+}
+
 export function continuityStamp(at: string | null, referenceAt?: string | null): string {
   if (!at) return 'unknown';
-  const ms = Date.parse(at);
-  if (!Number.isFinite(ms)) return at;
-  const iso = new Date(ms).toISOString();
-  const refMs = referenceAt ? Date.parse(referenceAt) : Number.NaN;
-  const sameYear = Number.isFinite(refMs)
-    && new Date(refMs).toISOString().slice(0, 4) === iso.slice(0, 4);
+  const iso = normalizeContinuityTimestamp(at);
+  if (!iso) return at;
+  const referenceIso = normalizeContinuityTimestamp(referenceAt);
+  const sameYear = referenceIso !== null && referenceIso.slice(0, 4) === iso.slice(0, 4);
   return `${sameYear ? iso.slice(5, 10) : iso.slice(0, 10)} ${iso.slice(11, 19)}Z`;
 }
 

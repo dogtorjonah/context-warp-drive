@@ -33,6 +33,23 @@ function lineage(count: number): CollapseUnit[] {
 }
 
 describe('generational collapse', () => {
+  it('fully accounts for zero-budget relocation across starting tiers and receipt eligibility', () => {
+    const units = [
+      unit({ id: 'a', kind: 'episode', startTier: 't0' }),
+      unit({ id: 'b', kind: 'episode', startTier: 't1', verified: false }),
+      unit({ id: 'c', sourceAt: null, startTier: 't2' }),
+      unit({ id: 'd', startTier: 't3' }),
+      unit({ id: 'e', startTier: 't4' }),
+    ];
+    const result = collapseUnits({ units, maxChars: 0, recencyFloorK: 2, recencyFloorKind: 'episode', floorRecover: 'exact-range' });
+    expect(result.text).toBe(formatCollapseRollup(units, 'exact-range'));
+    expect(result.demotions).toBe(9);
+    expect(result.droppedToFloorRollup).toBe(5);
+    expect(result.complete).toBe(false);
+    expect(result.placements.every((placement) => placement.tier === 't4')).toBe(true);
+    expect(result.tierCounts).toEqual({ t0: 0, t1: 0, t2: 0, t3: 0, t4: 5 });
+  });
+
   it('keeps every unit verbatim when the budget allows', () => {
     const units = lineage(5);
     const result = collapseUnits({ units, maxChars: 100_000 });

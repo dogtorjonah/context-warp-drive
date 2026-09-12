@@ -330,6 +330,8 @@ interface RenderState {
   readonly demotionKnown: readonly CollapseUnit[];
   readonly unknown: readonly CollapseUnit[];
   readonly tiers: Map<string, CollapseTier>;
+  /** Per-pool/tier scan positions; reset when recency protection changes. */
+  readonly demotionCursors: Map<string, number>;
   /**
    * Unit ids protected by the B7 recency floor (never demote below t1). Mutable:
    * the audit-2 A14 floor-overflow path clears it when the section cannot fit
@@ -449,7 +451,13 @@ function effectiveFloor(unit: CollapseUnit, state: RenderState): CollapseTier {
  * before known-time units (they claim no recency); oldest-first within a tier.
  */
 function firstDemotableAt(pool: readonly CollapseUnit[], tier: CollapseTier, state: RenderState, excludeProtected: boolean): CollapseUnit | null {
-  for (const unit of pool) {
+  // Breadth-first selection exhausts lower tiers before visiting this tier.
+  // Demotion only moves forward, so previously skipped positions cannot become
+  // candidates in this pass. Protected and unprotected passes stay separate.
+  const key = `${pool === state.unknown ? 'unknown' : 'known'}:${tier}:${excludeProtected}`;
+  for (let index = state.demotionCursors.get(key) ?? 0; index < pool.length; index += 1) {
+    const unit = pool[index]!;
+    state.demotionCursors.set(key, index + 1);
     const current = state.tiers.get(unit.id) ?? 't0';
     if (current !== tier) continue;
     if (current === effectiveFloor(unit, state)) continue;
@@ -512,6 +520,7 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
     demotionKnown,
     unknown,
     tiers,
+    demotionCursors: new Map(),
     recencyProtectedIds,
   };
 
@@ -529,6 +538,25 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
 
   let text = renderState(state, options.rangeRecover);
   let demotions = 0;
+  // With no allowance and nonempty per-unit bodies, no intermediate tier can
+  // fit. Walk the same tier edges without repeatedly rendering those states.
+  // Empty bodies and duplicate identities retain the general algorithm.
+  if (maxChars === 0 && tiers.size === sorted.length
+    && sorted.every((unit) => unit.verbatim.length > 0 && unit.digest.length > 0)) {
+    for (const unit of sorted) {
+      let tier = tiers.get(unit.id)!;
+      let next = nextTier(tier, unit.verified !== true);
+      while (next) {
+        tier = next;
+        demotions += 1;
+        next = nextTier(tier, unit.verified !== true);
+      }
+      tiers.set(unit.id, tier);
+    }
+    state.recencyProtectedIds.clear();
+    state.demotionCursors.clear();
+    text = renderState(state, options.rangeRecover);
+  }
   // Each unit can be demoted at most COLLAPSE_TIERS.length - 1 times, so this
   // loop is bounded by construction and always terminates.
   const demotionCeiling = sorted.length * (COLLAPSE_TIERS.length - 1);
@@ -577,6 +605,7 @@ export function collapseUnits(options: CollapseOptions): CollapseResult {
   if (text.length > maxChars && state.recencyProtectedIds.size > 0) {
     const protectedUnits = sorted.filter((unit) => state.recencyProtectedIds.has(unit.id));
     state.recencyProtectedIds = new Set();
+    state.demotionCursors.clear();
     for (const unit of protectedUnits) {
       const current = tiers.get(unit.id) ?? 't0';
       const demoted = nextTier(current, unit.verified !== true);

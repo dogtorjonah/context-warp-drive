@@ -14,6 +14,7 @@ import {
   COMPACT_RECOVERY_SUPPRESSED_ROWS,
   compactBoundary,
   continuityAnchor,
+  normalizeContinuityTimestamp,
   currentTaskHazards,
   extractDeclaredOpenItems,
   historyCensus,
@@ -1139,9 +1140,7 @@ function nonEmpty(value: string | null | undefined): string | null {
 }
 
 function knownSourceTime(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+  return normalizeContinuityTimestamp(value);
 }
 
 /**
@@ -4805,6 +4804,7 @@ function conversationOmissionMarker(args: {
   retainedKnown: readonly RebirthPackageV6ConversationRow[];
   recoveryHandle: string | null;
   latestKnownTailOmitted?: boolean;
+  census?: { omittedExchanges: number; retainedExchanges: number; omittedChars: number };
 }): string {
   const parts: string[] = [];
   if (args.omittedKnown.length > 0) {
@@ -4816,12 +4816,12 @@ function conversationOmissionMarker(args: {
     const countExchanges = (rows: readonly RebirthPackageV6ConversationRow[]): number => (
       new Set(rows.map(exchangeKey)).size
     );
-    const retainedKeys = new Set(args.retainedKnown.map(exchangeKey));
-    const omittedExchanges = new Set(
-      args.omittedKnown.map(exchangeKey).filter((key) => !retainedKeys.has(key)),
+    const retainedKeys = args.census ? null : new Set(args.retainedKnown.map(exchangeKey));
+    const omittedExchanges = args.census?.omittedExchanges ?? new Set(
+      args.omittedKnown.map(exchangeKey).filter((key) => !retainedKeys!.has(key)),
     ).size;
-    const retainedExchanges = countExchanges(args.retainedKnown);
-    const omittedChars = args.omittedKnown.reduce((total, row) => total + row.text.length, 0);
+    const retainedExchanges = args.census?.retainedExchanges ?? countExchanges(args.retainedKnown);
+    const omittedChars = args.census?.omittedChars ?? args.omittedKnown.reduce((total, row) => total + row.text.length, 0);
     const retainedFrom = args.retainedKnown[0]?.sourceAt ?? null;
     const recover = args.recoveryHandle
       ? `${args.recoveryHandle} after=${last}`
@@ -5055,10 +5055,17 @@ function renderConversation(
     references,
     model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle,
   );
-  const renderRow = (row: RebirthPackageV6ConversationRow): string => (
-    conversationRowText(row, referenceAt, recoveryHandle, compact
-      ? continuityAnchor(conversationRowBaseId(row.provenanceId), row.sourceAt, referenceAt) : undefined)
-  );
+  // Budget probes revisit the same rows. This synchronous render owns its
+  // cache: model edits, recovery catalogs and later renders cannot reuse it.
+  const rowText = new Map<RebirthPackageV6ConversationRow, string>();
+  const renderRow = (row: RebirthPackageV6ConversationRow): string => {
+    const cached = rowText.get(row);
+    if (cached !== undefined) return cached;
+    const text = conversationRowText(row, referenceAt, recoveryHandle, compact
+      ? continuityAnchor(conversationRowBaseId(row.provenanceId), row.sourceAt, referenceAt) : undefined);
+    rowText.set(row, text);
+    return text;
+  };
   const endpointStubs = conversationEndpointStubs(model, referenceAt);
   // Stubs are structural, but they are not free. Under extreme pressure the
   // overflow path below drops them rather than let a two-line pointer evict a
@@ -5154,18 +5161,47 @@ function renderConversation(
   let retainedKnown: RebirthPackageV6ConversationRow[] = [];
   let retainedUnknown: RebirthPackageV6ConversationRow[] = [];
 
+  // Every probe selects a suffix of known rows and a prefix of quarantine.
+  // Count exchanges by their LAST occurrence: a repeated exchange key belongs
+  // to the retained side until its final row is omitted, even if noncontiguous.
+  const lastExchangeIndex = new Map<string, number>();
+  const sourceCharPrefix = [0];
+  const knownTextPrefix = [0];
+  const unknownTextPrefix = [0];
+  known.forEach((row, index) => {
+    lastExchangeIndex.set(row.exchangeId ?? `${row.role}:${conversationRowBaseId(row.provenanceId)}`, index);
+    sourceCharPrefix.push(sourceCharPrefix[index]! + row.text.length);
+    knownTextPrefix.push(knownTextPrefix[index]! + renderRow(row).length);
+  });
+  unknown.forEach((row, index) => unknownTextPrefix.push(unknownTextPrefix[index]! + renderRow(row).length));
+  const exchangeEnds = new Set(lastExchangeIndex.values());
+  const omittedExchangePrefix = [0];
+  for (let index = 0; index < known.length; index += 1) {
+    omittedExchangePrefix.push(omittedExchangePrefix[index]! + (exchangeEnds.has(index) ? 1 : 0));
+  }
+  const omissionMarker = (selectedKnown: readonly RebirthPackageV6ConversationRow[], selectedUnknown: readonly RebirthPackageV6ConversationRow[]): string => {
+    const omitted = known.length - selectedKnown.length;
+    const omittedExchanges = omittedExchangePrefix[omitted]!;
+    return conversationOmissionMarker({
+      omittedKnown: known.slice(0, omitted), omittedUnknown: unknown.slice(selectedUnknown.length),
+      retainedKnown: selectedKnown, recoveryHandle,
+      census: { omittedExchanges, retainedExchanges: lastExchangeIndex.size - omittedExchanges, omittedChars: sourceCharPrefix[omitted]! },
+    });
+  };
+  const composeLength = (selectedKnown: readonly RebirthPackageV6ConversationRow[], selectedUnknown: readonly RebirthPackageV6ConversationRow[]): number => {
+    const knownChars = knownTextPrefix[known.length]! - knownTextPrefix[known.length - selectedKnown.length]!;
+    const quarantineChars = selectedUnknown.length > 0
+      ? 'Unknown source time (quarantined; not part of the chronology):'.length + unknownTextPrefix[selectedUnknown.length]! : 0;
+    const followingBlocks = selectedKnown.length + activeStubs.length + selectedUnknown.length + (selectedUnknown.length > 0 ? 1 : 0);
+    return omissionMarker(selectedKnown, selectedUnknown).length + knownChars + quarantineChars
+      + activeStubs.reduce((total, stub) => total + stub.text.length, 0) + 2 * followingBlocks;
+  };
+
   const compose = (
     selectedKnown: readonly RebirthPackageV6ConversationRow[],
     selectedUnknown: readonly RebirthPackageV6ConversationRow[],
   ): string => {
-    const omittedKnown = known.slice(0, known.length - selectedKnown.length);
-    const omittedUnknown = unknown.slice(selectedUnknown.length);
-    const blocks = [conversationOmissionMarker({
-      omittedKnown,
-      omittedUnknown,
-      retainedKnown: selectedKnown,
-      recoveryHandle,
-    }), ...mergeEndpointStubText(selectedKnown.map(renderRow), selectedKnown, activeStubs)];
+    const blocks = [omissionMarker(selectedKnown, selectedUnknown), ...mergeEndpointStubText(selectedKnown.map(renderRow), selectedKnown, activeStubs)];
     if (selectedUnknown.length > 0) {
       blocks.push(
         'Unknown source time (quarantined; not part of the chronology):',
@@ -5200,7 +5236,7 @@ function renderConversation(
     let selected: RebirthPackageV6ConversationRow[] = [];
     for (let i = groups.length - 1; i >= 0; i -= 1) {
       const candidate = [...groups[i]!, ...selected];
-      if (compose(candidate, retainedUnknown).length > dialogueBudget) break;
+      if (composeLength(candidate, retainedUnknown) > dialogueBudget) break;
       selected = candidate;
     }
     retainedKnown = selected;
@@ -5232,7 +5268,7 @@ function renderConversation(
 
   for (const row of unknown) {
     const candidate = [...retainedUnknown, row];
-    if (compose(retainedKnown, candidate).length > dialogueBudget) break;
+    if (composeLength(retainedKnown, candidate) > dialogueBudget) break;
     retainedUnknown = candidate;
   }
 

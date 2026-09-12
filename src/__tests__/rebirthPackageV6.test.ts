@@ -3321,6 +3321,26 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
     expect(text).toContain('recover: R1 after=2026-09-02T08:01:00.000Z');
   });
 
+  it('does not count a partially retained noncontiguous exchange as omitted', () => {
+    const rows: RebirthPackageV6ConversationRow[] = Array.from({ length: 6 }, (_, index) => ({
+      provenanceId: `repeat-${index}`, role: index % 2 === 0 ? 'user' : 'assistant',
+      sourceAt: new Date(Date.UTC(2026, 8, 2, 8 + Math.floor(index / 2), index % 2)).toISOString(),
+      exchangeId: index < 2 || index >= 4 ? 'shared' : 'middle',
+      text: `repeat-${index}:${'x'.repeat(180)}`,
+    }));
+    const value = model({ recentConversation: rows });
+    const options = { sectionMaxChars: { recentConversation: 1_400 } };
+    const section = renderRebirthPackageV6Sections(value, options).find((entry) => entry.id === 'recentConversation')!;
+    expect(section.text).toContain('omitted 0 exchanges');
+    expect(section.text).toContain('omitted-rows=2');
+    expect(section.text).toContain('retained-from=2026-09-02T09:00:00.000Z');
+    expect(section.unitPlacements?.filter((entry) => entry.placement === 'rendered')).toHaveLength(4);
+    // A later render must observe changed source text rather than an old row cache.
+    rows[5] = { ...rows[5]!, text: 'changed-source-content' };
+    const changed = model({ recentConversation: rows });
+    expect(renderRebirthPackageV6Sections(changed, options).find((entry) => entry.id === 'recentConversation')!.text).toContain('changed-source-content');
+  });
+
   it('preserves assistant replies shorter than the 1,500-character display cap', () => {
     const value = model({
       recentConversation: [{
