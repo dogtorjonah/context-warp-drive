@@ -3467,7 +3467,7 @@ describe('structured last assistant and pending operation (raw hard-epoch path)'
     });
     const rendered = renderRebirthPackageV6(value, { diagnostic: true });
     expect(rendered).toContain(
-      `[LAST MATERIAL ASSISTANT · ${structured.text.length} chars · source=message:assistant-8 · source-time=2026-09-06T17:58:00.000Z · status=exact]\n${structured.text}`,
+      `[LAST MATERIAL ASSISTANT · ${structured.text.length} chars · source=message:assistant-8 · source-time=2026-09-06T17:58:00.000Z · status=exact]\nHistorical assistant report; not independently verified. Completion and evidence claims describe that source time.\n${structured.text}`,
     );
     expect(rendered).toMatch(
       /- pending_operation · ⟨tool Bash \{"command":"npm test"\}⟩ · operation=in-flight ⟨message:tool-9 @[^⟩]*17:58:10Z⟩/u,
@@ -3650,7 +3650,7 @@ describe('continuation record (boundary)', () => {
     // the request's source (never the literal `unknown`), the request body is
     // rendered exactly once, and the trailing operation keeps its own source.
     expect(rendered).not.toContain('[CONTINUATION RECORD');
-    expect(rendered).toMatch(/\[EXACT ACTIVE REQUEST ⟨message:user-2 @[^⟩]*18:00:00Z⟩\]/u);
+    expect(rendered).toMatch(/\[EXACT ACTIVE REQUEST ⟨message:user-2 @[^⟩]*18:00:00Z⟩ · chars=\d+\]/u);
     expect(rendered).not.toMatch(/\[EXACT ACTIVE REQUEST ⟨unknown /u);
     expect(rendered.match(/Also mirror it\./gu)).toHaveLength(1);
     expect(rendered).toMatch(/Pending operation: ⟨tool Bash \{"command":"npm test"\}⟩ · operation=in-flight ⟨message:tool-1 @[^⟩]*17:58:10Z⟩/u);
@@ -3813,14 +3813,16 @@ describe('continuation record (boundary)', () => {
     expect(text).toContain('⟨capture:active-edit-delta @');
     expect(text).toContain('[2] seam rule for cognition rows. ⟨message:sign @');
     const delivered = renderRebirthPackageV6(value);
-    expect(delivered).toContain('Open items: 2 (1 declared, 1 capture-degraded)');
+    expect(delivered).toContain('Open items: 1 declared (assistant report; not verified)');
+    expect(delivered).toContain('Capture uncertainty: 1');
     expect(delivered).toContain('capture degraded: active-edit-delta — immutable Atlas edit capture attempted but failed (unavailable)');
     // The existing degraded-capture line stays, sourced from the same census.
     expect(delivered).toContain('⚠ Degraded capture: active-edit-delta (');
     // Capture-only: no declaration at all still surfaces the gap.
     const captureOnly = model({ activeEditDelta: exactDelta({ state: 'unknown', files: [], reasons: [reason] }) });
     expect(record(renderRebirthPackageV6(captureOnly, { diagnostic: true }))).toContain('open-items=1 capture-degraded');
-    expect(renderRebirthPackageV6(captureOnly)).toContain('Open items: 1 capture-degraded');
+    expect(renderRebirthPackageV6(captureOnly)).toContain('Open items: none declared.');
+    expect(renderRebirthPackageV6(captureOnly)).toContain('Capture uncertainty: 1');
   });
 
   it('lets the surviving declaration use the budget retired ones no longer consume', () => {
@@ -3834,6 +3836,36 @@ describe('continuation record (boundary)', () => {
     const item = /\[1\] ([^⟨]+)⟨message:huge @/u.exec(clipped)?.[1]?.trim() ?? '';
     expect(item.endsWith('…')).toBe(true);
     expect(item.length).toBeLessThanOrEqual(720 - 24);
+  });
+
+  it('harvests an endpoint-only explicit residual before its closing signpost', () => {
+    const text = 'Open items:\n- restart remains pending.\n- verify live behavior.\n\nSignpost: inspect the package.';
+    const value = model({ boundaryAndActiveTask: {
+      ...model().boundaryAndActiveTask,
+      lastMaterialAssistant: {
+        text, chars: text.length,
+        source: { provenanceId: 'message:endpoint', sourceAt: '2026-08-02T17:59:59.000Z', status: 'exact' },
+      },
+    } });
+    const diagnostic = record(renderRebirthPackageV6(value, { diagnostic: true }));
+    expect(diagnostic).toContain('restart remains pending.');
+    expect(diagnostic).toContain('verify live behavior.');
+    expect(diagnostic).toContain('message:endpoint');
+    expect(diagnostic).not.toContain('inspect the package.');
+    const boundary = renderRebirthPackageV6Sections(value).find(section => section.id === 'boundaryAndActiveTask')!.text;
+    expect(boundary).toContain('Open items: 1 declared (assistant report; not verified) · restart remains pending.');
+  });
+
+  it('reconciles a later observed relay boot without certifying the loaded code', () => {
+    const runtime = (boot: string) => model({ executionState: {
+      facts: [{ kind: 'runtime', provenanceId: 'runtime:boot', sourceAt: '2026-08-02T18:00:00.000Z',
+        status: 'exact', text: `relay boot=${boot} · activation=unknown` }], unknownReasons: [],
+    } });
+    const later = renderRebirthPackageV6(runtime('2026-08-02T17:59:00.000Z'));
+    expect(later).toContain('Later relay boot recorded @2026-08-02T17:59:00.000Z');
+    expect(later).toContain('Loaded-code identity and live behavior remain unverified.');
+    expect(renderRebirthPackageV6(runtime('2026-08-02T17:00:00.000Z'))).not.toContain('Later relay boot recorded');
+    expect(renderRebirthPackageV6(runtime('unknown'))).not.toContain('Later relay boot recorded');
   });
 
   it('states none-declared when the delivered pool declares no open items', () => {

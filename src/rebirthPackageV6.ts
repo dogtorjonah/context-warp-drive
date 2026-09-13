@@ -208,6 +208,8 @@ export interface RebirthPackageV6NowCard {
     readonly source?: 'live' | 'archived' | null;
     readonly mergedAt?: string | null;
   }[];
+  /** Captured identity gaps; never infer a donor ID or dialogue author. */
+  readonly attributionUncertainty?: string;
   /**
    * Captured operator-facing process facts. Repository cleanliness remains
    * explicitly unknown until a worker probe supplies it; registry-derived
@@ -3660,6 +3662,7 @@ function renderBoundary(
   // delivered Boundary prints the same label through the same helper.
   const absorbedLineage = absorbedLineageLabel(now);
   if (absorbedLineage) lines.push(`absorbed-lineage=${absorbedLineage}`);
+  if (now?.attributionUncertainty) lines.push(`Attribution uncertainty: ${now.attributionUncertainty}`);
   if (now?.ops) {
     // Audit-3 A2/owned-children/v1: flat legacy `{id,name}` rows render the
     // joined `name(id)` list only; when the capture supplies richer per-child
@@ -3850,6 +3853,7 @@ function renderBoundary(
     lines.push(
       '',
       `[LAST MATERIAL ASSISTANT · ${boundary.lastMaterialAssistant.chars} chars · ${formatSource(boundary.lastMaterialAssistant.source)}]`,
+      'Historical assistant report; not independently verified. Completion and evidence claims describe that source time.',
       assistant.text,
       '[/LAST MATERIAL ASSISTANT]',
     );
@@ -4142,12 +4146,22 @@ function renderActiveEdits(
       : 'Active edit state is unknown; absence of evidence is not rendered as none.';
     lines[0] = `state=${delta.state} · capture=${delta.captureId ?? 'unknown'} · ${disposition}`;
   }
+  if (delta.files.some((file) => file.baselineQuality === 'baseline_unknown' || file.state === 'unknown')) {
+    lines.push('Attribution uncertainty: these records do not establish current unfinished work; closure and operation liveness remain unverified.');
+  }
   const trailer: string[] = [];
   if (delta.inheritedCaptureIds.length > 0) trailer.push(`inherited-captures=${delta.inheritedCaptureIds.join(',')}`);
   if (delta.truncated || delta.omittedFiles > 0) {
     trailer.push(`capture partial: omitted-files=${delta.omittedFiles} recover=${recoveryHandle || 'unavailable'}`);
   }
-  for (const reason of delta.reasons) trailer.push(`reason=${reason}`);
+  for (const reason of delta.reasons) {
+    // Old immutable captures retain their source wording; clarify only this
+    // exact legacy census at presentation, without rewriting stored evidence.
+    const legacyPending = /^(\d+) mutation\(s\) in flight$/u.exec(reason);
+    trailer.push(`reason=${legacyPending
+      ? `${reason} [unresolved prepared receipts; current liveness unknown]`
+      : reason}`);
+  }
   const units = buildActiveEditCollapseUnits(model);
   if (units.length === 0) {
     const text = [...lines, ...trailer].join('\n');
@@ -5369,7 +5383,15 @@ export function openItemsForModel(model: RebirthPackageV6Model): RebirthPackageV
       .filter((row) => row.sourceInstanceId?.trim() === owner && shipClassRailStep(row.provenanceId))
       .map((row) => row.sourceAt)
     : [];
-  return extractDeclaredOpenItems(model.recentConversation ?? [], {
+  const lastAssistant = model.boundaryAndActiveTask.lastMaterialAssistant;
+  const rows = [...(model.recentConversation ?? [])];
+  // Endpoint bodies may be owned by the boundary/raw tail rather than the
+  // conversation pool. Their declarations still belong to the same source.
+  if (lastAssistant && !rows.some(row => row.provenanceId === lastAssistant.source.provenanceId)) {
+    rows.push({ role: 'assistant', text: lastAssistant.text,
+      provenanceId: lastAssistant.source.provenanceId, sourceAt: lastAssistant.source.sourceAt });
+  }
+  return extractDeclaredOpenItems(rows, {
     activeRequestAt: model.boundaryAndActiveTask.activeRequest?.source.sourceAt ?? null,
     shipAcksAt,
     degradedCapture: degradedCaptureDeclarations(model),
@@ -6552,7 +6574,8 @@ function buildTimelineCensusLines(
     : '';
   const head = `Timeline census: ${dated} dated, ${quarantined} quarantined${accounting}; `
     + `${partial ? 'partial' : 'captured rows complete'}.`;
-  return commands.length > 0 ? [head, `Omitted units: ${commands.join(' · ')}`] : [head];
+  const populations = 'Populations: dated/quarantined = rendered Timeline rows; captured/not fully rendered = dialogue + cognition; matched upstream = cognition candidates; ledger = all captured unit families.';
+  return commands.length > 0 ? [head, populations, `Omitted units: ${commands.join(' · ')}`] : [head, populations];
 }
 
 function joinRenderedSections(

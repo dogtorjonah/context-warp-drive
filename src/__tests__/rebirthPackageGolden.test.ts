@@ -256,8 +256,10 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     // every section body is byte-identical, pinned by the section-order case
     // below. One assertion so a deliberate re-freeze reads both digests at once.
     expect({ delivery: sha(first.text), audit: sha(audit.text) }).toEqual({
-      delivery: 'a9f766238fb072ae97d6bfa4dc8b03be307f5294f295f4641808e34105ee0336',
-      audit: '9b49383ecea5826e495ac9dcc8f8c1090927f8282d77ff33fb582b4662f0b73a',
+      // Length-framed compact request, historical-report qualification, and
+      // explicit recovery/population semantics intentionally change both views.
+      delivery: 'da32996f49fcdc807fb60055cc24a0794eda103a03a8f01999adbc4ec2c90774',
+      audit: 'f8572bc58d4bb84f2c0244c5b0c39acb0c63cb506b24de465cc5c24987cacb73',
     });
   });
 
@@ -357,7 +359,7 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     // five-clause provenance uniform collapses to one anchor. The bodies stay
     // verbatim, and each still renders exactly once (#37479).
     const delivered = renderRebirthPackageV6WithReport(withReviewDemand, DELIVERY).text;
-    expect(delivered).toContain('[EXACT ACTIVE REQUEST ⟨msg_active @09-01 20:47:52Z⟩]');
+    expect(delivered).toContain('[EXACT ACTIVE REQUEST ⟨msg_active @09-01 20:47:52Z⟩ · chars=50]');
     expect(delivered).toContain('[LAST MATERIAL ASSISTANT ⟨msg_last @09-01 20:48:13Z⟩]');
     expect(delivered.match(/\[EXACT ACTIVE REQUEST /gu)).toHaveLength(1);
     expect(delivered.match(/\[LAST MATERIAL ASSISTANT /gu)).toHaveLength(1);

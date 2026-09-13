@@ -128,20 +128,37 @@ function openItemLabelLine(raw: string): string {
 function declaredOpenItemText(text: string, maxChars = OPEN_ITEMS_MAX_ITEM_CHARS): string | null {
   const lines = text.split('\n');
   let found: string | null = null;
+  let explicit = false;
   for (let index = 0; index < lines.length; index += 1) {
     const label = openItemLabelLine(lines[index]!);
     const lower = label.toLowerCase();
     const marker = OPEN_ITEM_MARKERS.find((candidate) => lower.startsWith(candidate));
     if (!marker) continue;
+    // An explicit residual list wins over a closing navigation signpost.
+    if (marker === 'signpost:' && explicit) continue;
     let remainder = label.slice(marker.length).trim();
     if (!remainder) {
-      // A bare label takes the next non-empty line as its body.
+      // Preserve a contiguous declared list, not merely its first bullet.
+      const parts: string[] = [];
       for (let next = index + 1; next < lines.length; next += 1) {
-        const candidate = openItemLabelLine(lines[next]!);
-        if (candidate) { remainder = candidate; break; }
+        const raw = lines[next]!;
+        if (!raw.trim()) {
+          if (parts.length > 0) break;
+          continue;
+        }
+        const candidate = openItemLabelLine(raw);
+        if (OPEN_ITEM_MARKERS.some(item => candidate.toLowerCase().startsWith(item))) break;
+        const bullet = /^\s*(?:[-*•]|\d+[.)])\s+/u.test(raw);
+        if (parts.length > 0 && !bullet) break;
+        parts.push(candidate);
+        if (!bullet) break;
       }
+      remainder = parts.join('; ');
     }
-    if (remainder) found = remainder.replace(/\s+/gu, ' ').trim() || null;
+    if (remainder) {
+      found = remainder.replace(/\s+/gu, ' ').trim() || null;
+      explicit = marker !== 'signpost:';
+    }
   }
   if (!found) return null;
   return clipOpenItem(found, maxChars);
@@ -236,10 +253,15 @@ export function openItemText(item: RebirthPackageV6OpenItem): string {
 }
 
 function openItemsLine(items: readonly RebirthPackageV6OpenItem[], referenceAt: string | null): string {
-  if (items.length === 0) return 'Open items: none declared.';
-  return `Open items: ${openItemsCountLabel(items)} \u00b7 ${items.map((item) => (
+  const declared = items.filter((item) => item.kind === 'declared');
+  const capture = items.filter((item) => item.kind === 'capture');
+  const render = (group: readonly RebirthPackageV6OpenItem[]) => group.map((item) => (
     `${openItemText(item)} ${continuityAnchor(item.provenanceId, item.sourceAt, referenceAt)}`
-  )).join(' \u00b7 ')}`;
+  )).join(' \u00b7 ');
+  return [
+    declared.length ? `Open items: ${declared.length} declared (assistant report; not verified) · ${render(declared)}` : 'Open items: none declared.',
+    ...(capture.length ? [`Capture uncertainty: ${capture.length} · ${render(capture)}`] : []),
+  ].join('\n');
 }
 
 /**
@@ -277,8 +299,8 @@ export function compactBoundary(
   ];
   // The live exchange precedes expendable context. A bounded section must
   // never retain a superseded interpretation while losing the request itself.
-  if (b.activeRequest) lines.push('', `[EXACT ACTIVE REQUEST ${source(b.activeRequest.source)}]`, b.activeRequest.text, '[/EXACT ACTIVE REQUEST]');
-  if (b.lastMaterialAssistant) lines.push('', `[LAST MATERIAL ASSISTANT ${source(b.lastMaterialAssistant.source)}]`, retainedAssistant ?? '[partial: source text omitted]', '[/LAST MATERIAL ASSISTANT]');
+  if (b.activeRequest) lines.push('', `[EXACT ACTIVE REQUEST ${source(b.activeRequest.source)} · chars=${b.activeRequest.text.length}]`, b.activeRequest.text, '[/EXACT ACTIVE REQUEST]');
+  if (b.lastMaterialAssistant) lines.push('', `[LAST MATERIAL ASSISTANT ${source(b.lastMaterialAssistant.source)}]`, 'Historical assistant report; not independently verified. Completion and evidence claims describe that source time.', retainedAssistant ?? '[partial: source text omitted]', '[/LAST MATERIAL ASSISTANT]');
   // Identity provenance stays visible: the 09-09 pollution incident was found
   // because the chain named who this instance actually descends from. One line,
   // one hop per arrow, born-as only when a rename would otherwise read as a
@@ -296,6 +318,7 @@ export function compactBoundary(
   // line so its Timeline rows (tagged [absorbed:<id>]) resolve to a name.
   const absorbed = absorbedLineageLabel(now);
   if (absorbed) lines.push(`Absorbed lineage (brain-merged, not fork ancestors): ${absorbed}`);
+  if (now?.attributionUncertainty) lines.push(`Attribution uncertainty: ${clipOpenItem(now.attributionUncertainty, 400)}`);
   if (now?.parentIdentity) lines.push(`Inherited from ${now.parentIdentity.instanceName ?? now.parentIdentity.instanceId}; fork point ${now.parentIdentity.checkpointMessageId ?? 'unknown'} ${source(now.parentIdentity.source)}`);
   const runtime = b.runtimeModelContext;
   // Same vocabulary as the diagnostic `runtime-model=` row: one fact must not
@@ -435,9 +458,15 @@ export function compactBoundary(
   // actually has is whether the code it just landed is running. The runtime
   // fact already derives that from relay boot vs newest commit; idle is where
   // it earns a line instead of competing with execution state.
-  const activation = railQuiet ? latest('runtime') : undefined;
+  const activation = newest(facts.filter(f => f.kind === 'runtime' && /\bactivation=|\brelay boot=/u.test(f.text)));
   if (activation) {
     lines.push(`Activation: ${clip(activation.text, 240)} ${continuityAnchor(activation.provenanceId, activation.sourceAt, b.capturedAt)}`);
+    const boot = /\bboot=([^\s·]+)/u.exec(activation.text)?.[1];
+    const bootAt = normalizeContinuityTimestamp(boot);
+    const handoffAt = normalizeContinuityTimestamp(b.lastMaterialAssistant?.source.sourceAt);
+    if (bootAt && handoffAt && Date.parse(bootAt) > Date.parse(handoffAt)) {
+      lines.push(`Later relay boot recorded @${bootAt}; prior handoff activation claims are historical. Loaded-code identity and live behavior remain unverified.`);
+    }
   }
   const pending = latest('pending_operation') ?? latest('pending_assistant_action');
   lines.push(pending ? `Pending operation: ${clip(pending.text, 300)} ${continuityAnchor(pending.provenanceId, pending.sourceAt, b.capturedAt)}` : 'Pending operation: none captured.');
