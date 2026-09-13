@@ -454,10 +454,10 @@ export function compactBoundary(
   if (owned.length > 0) {
     lines.push(`Owned paths: ${owned.slice(0, 6).join(' \u00b7 ')}${owned.length > 6 ? ` (+${owned.length - 6} more)` : ''}`);
   }
-  // Idle mode's other half: with no task in flight, the question a successor
-  // actually has is whether the code it just landed is running. The runtime
-  // fact already derives that from relay boot vs newest commit; idle is where
-  // it earns a line instead of competing with execution state.
+  // Whether the code a successor just landed is running is answered by the
+  // runtime facts: activation/relay-boot evidence earns a line whenever it
+  // exists, and a boot newer than the last handoff marks that handoff's
+  // activation claims historical without asserting what actually loaded.
   const activation = newest(facts.filter(f => f.kind === 'runtime' && /\bactivation=|\brelay boot=/u.test(f.text)));
   if (activation) {
     lines.push(`Activation: ${clip(activation.text, 240)} ${continuityAnchor(activation.provenanceId, activation.sourceAt, b.capturedAt)}`);
