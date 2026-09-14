@@ -68,6 +68,8 @@ const OPEN_ITEM_MARKERS = [
   'remaining:',
   'open items:',
   'outstanding:',
+  'residuals:',
+  'follow-ups:',
 ] as const;
 /** Bounded declared-open-items record: max items, per-item chars, total chars. */
 export const OPEN_ITEMS_MAX_ITEMS = 6;
@@ -119,7 +121,7 @@ function clipOpenItem(text: string, maxChars: number): string {
 
 /** Normalize a candidate label line: strip list bullets and emphasis pairs. */
 function openItemLabelLine(raw: string): string {
-  const trimmed = raw.trim().replace(/^[-•]\s+/u, '');
+  const trimmed = raw.trim().replace(/^#{1,6}\s+/u, '').replace(/^(?:[-*•]|\d+[.)])\s+/u, '');
   const debold = trimmed.replace(/^\*{1,2}(.+?)\*{1,2}\s*/u, '$1 ');
   return debold.replace(/^[>\s]+/u, '').trim();
 }
@@ -131,23 +133,24 @@ function declaredOpenItemText(text: string, maxChars = OPEN_ITEMS_MAX_ITEM_CHARS
   let explicit = false;
   for (let index = 0; index < lines.length; index += 1) {
     const label = openItemLabelLine(lines[index]!);
-    const lower = label.toLowerCase();
+    const heading = /^(open items|residuals|follow-ups)(?:\s*\([^\n]*\))?\s*:?\s*$/iu.exec(label);
+    const normalizedLabel = heading ? `${heading[1]}:` : label;
+    const lower = normalizedLabel.toLowerCase();
     const marker = OPEN_ITEM_MARKERS.find((candidate) => lower.startsWith(candidate));
     if (!marker) continue;
     // An explicit residual list wins over a closing navigation signpost.
     if (marker === 'signpost:' && explicit) continue;
-    let remainder = label.slice(marker.length).trim();
+    let remainder = normalizedLabel.slice(marker.length).trim();
     if (!remainder) {
       // Preserve a contiguous declared list, not merely its first bullet.
       const parts: string[] = [];
       for (let next = index + 1; next < lines.length; next += 1) {
         const raw = lines[next]!;
         if (!raw.trim()) {
-          if (parts.length > 0) break;
           continue;
         }
         const candidate = openItemLabelLine(raw);
-        if (OPEN_ITEM_MARKERS.some(item => candidate.toLowerCase().startsWith(item))) break;
+        if (/^\s*#{1,6}\s/u.test(raw) || OPEN_ITEM_MARKERS.some(item => candidate.toLowerCase().startsWith(item))) break;
         const bullet = /^\s*(?:[-*•]|\d+[.)])\s+/u.test(raw);
         if (parts.length > 0 && !bullet) break;
         parts.push(candidate);
@@ -276,10 +279,12 @@ export function absorbedLineageLabel(
   if (donors.length === 0) return null;
   return donors.map((donor) => {
     const id = donor.instanceId.trim();
-    const label = donor.instanceName?.trim() ? `${donor.instanceName.trim()} (${id})` : id;
+    const ancestor = now?.lineageChain?.find(hop => hop.instanceId === id);
+    const name = ancestor?.instanceName?.trim() || donor.instanceName?.trim();
+    const label = name ? `${name} (${id})` : id;
     const source = donor.source ? ` ${donor.source}` : '';
     const mergedAt = donor.mergedAt ? ` merged=${donor.mergedAt.slice(0, 16)}Z` : '';
-    return `${label}${source}${mergedAt}`;
+    return `${label}${ancestor ? ' [also fork ancestor]' : ''}${source}${mergedAt}`;
   }).join(', ');
 }
 
@@ -314,10 +319,10 @@ export function compactBoundary(
       return `${label}${bornAs}${span}${state}`;
     }).join(' → ')}`);
   }
-  // Donors are not ancestors: a merged mind's identity is listed on its own
+  // Merge participation can overlap fork ancestry; list it on its own
   // line so its Timeline rows (tagged [absorbed:<id>]) resolve to a name.
   const absorbed = absorbedLineageLabel(now);
-  if (absorbed) lines.push(`Absorbed lineage (brain-merged, not fork ancestors): ${absorbed}`);
+  if (absorbed) lines.push(`Absorbed lineage (brain-merged; ancestry overlaps labeled): ${absorbed}`);
   if (now?.attributionUncertainty) lines.push(`Attribution uncertainty: ${clipOpenItem(now.attributionUncertainty, 400)}`);
   if (now?.parentIdentity) lines.push(`Inherited from ${now.parentIdentity.instanceName ?? now.parentIdentity.instanceId}; fork point ${now.parentIdentity.checkpointMessageId ?? 'unknown'} ${source(now.parentIdentity.source)}`);
   const runtime = b.runtimeModelContext;
@@ -544,7 +549,7 @@ export const COMPACT_RECOVERY_SUPPRESSED_ROWS: ReadonlySet<string> = new Set([
   'atlas-handoff-card',
 ]);
 
-export const COMPACT_RECOVERY_PREAMBLE = 'Recovery routes are executable as written. Automatic recall is push: touching a path delivers its context; nothing here needs to be asked for.';
+export const COMPACT_RECOVERY_PREAMBLE = 'Recovery routes are executable as written. Automatic recall is push: touching a path delivers its context; nothing here needs to be asked for. Section order is registry order: unused sections have no body, cognition joins Timeline, and lineage stores are addressed below. Unreferenced R numbers are pruned; gaps are intentional.';
 
 /**
  * One line for the whole lineage-history estate.

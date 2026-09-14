@@ -2852,6 +2852,23 @@ describe('audit-3 A: S5 cognitive-kind model (A model seam)', () => {
 });
 
 describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
+  it('keeps daily witnesses under pressure and restores full source bodies with room', () => {
+    const rows = Array.from({ length: 8 }, (_, index) => ({
+      provenanceId: `daily:${index}`, sourceAt: `2026-07-${String(index + 20).padStart(2, '0')}T00:00:00Z`,
+      kind: 'result' as const, authority: 'evidence' as const, supersededBy: null,
+      retention: 'daily-floor' as const, text: `DAY-${index} ${'exact source details '.repeat(100)} END-${index}`,
+    }));
+    const value = model({ cognitiveArtifacts: rows });
+    const scarce = renderRebirthPackageV6Sections(value, { adaptiveBackfill: false,
+      sectionMaxChars: { cognitiveArtifacts: 5000 } }).find(s => s.id === 'cognitiveArtifacts')!.text;
+    for (let index = 0; index < 8; index++) expect(scarce).toContain(`DAY-${index}`);
+    expect(scarce).toContain('kept-by=daily-floor');
+    expect(scarce).toContain('projection=truncated');
+    const full = renderRebirthPackageV6Sections(value, { adaptiveBackfill: false,
+      sectionMaxChars: { cognitiveArtifacts: 30000 } }).find(s => s.id === 'cognitiveArtifacts')!.text;
+    for (const row of rows) expect(full).toContain(row.text);
+  });
+
   it('admits a retention=lineage-floor flow row ahead of higher-priority unprotected kinds under budget pressure', () => {
     // The audited specimen rendered ZERO kept-by rows: the floor was honored
     // at selection then dropped whole by the render-stage budget pass. The
@@ -3680,7 +3697,8 @@ describe('continuation record (boundary)', () => {
     });
     const text = record(renderRebirthPackageV6(value, { diagnostic: true }));
     expect(text).toContain('checkpoint=voxxo-swarm:main@22a4cf5 dirty=19 staged=1 · source=test:ops · source-time=');
-    expect(text).not.toContain('context-warp-drive');
+    expect(text).not.toContain('checkpoint=context-warp-drive');
+    expect(text).toContain('capture degraded: repository-checkpoint — context-warp-drive: probe timed out');
   });
 
   it('renders a bounded changed-paths sample with the exact remainder in the ops roll-up', () => {
@@ -3839,7 +3857,7 @@ describe('continuation record (boundary)', () => {
   });
 
   it('harvests an endpoint-only explicit residual before its closing signpost', () => {
-    const text = 'Open items:\n- restart remains pending.\n- verify live behavior.\n\nSignpost: inspect the package.';
+    const text = '## Residuals (owned, not claimed resolved)\n\n1. restart remains pending.\n\n2. verify live behavior.\n\nSignpost: inspect the package.';
     const value = model({ boundaryAndActiveTask: {
       ...model().boundaryAndActiveTask,
       lastMaterialAssistant: {
@@ -3896,7 +3914,7 @@ describe('continuation record (boundary)', () => {
       cognitiveArtifacts: rows,
     });
     const delivered = renderRebirthPackageV6(merged);
-    expect(delivered).toContain('Absorbed lineage (brain-merged, not fork ancestors): rebirth-await-auditor-fixer (okx5rX6S) archived merged=2026-08-02T17:59Z');
+    expect(delivered).toContain('Absorbed lineage (brain-merged; ancestry overlaps labeled): rebirth-await-auditor-fixer (okx5rX6S) archived merged=2026-08-02T17:59Z');
     expect(delivered).toMatch(/question \[absorbed:okx5rX6S\]\nDONOR QUESTION about fixer scope\./u);
     expect(delivered).not.toMatch(/decision[^\n]*\[absorbed/u);
     const diagnostic = renderRebirthPackageV6(merged, { diagnostic: true });

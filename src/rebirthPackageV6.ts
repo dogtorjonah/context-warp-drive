@@ -578,7 +578,7 @@ export interface RebirthPackageV6CognitiveArtifact {
    *  renderer may label it kept-by=lineage-floor. `required-overlay` = a
    *  deliberately overlaid requirement. Absent = intrinsically current,
    *  ordinary admission. Additive; persisted rows stay valid. */
-  readonly retention?: 'lineage-floor' | 'required-overlay';
+  readonly retention?: 'lineage-floor' | 'required-overlay' | 'daily-floor';
   readonly text: string;
   readonly authority: string;
   readonly supersededBy: string | null;
@@ -1009,9 +1009,9 @@ export type RebirthPackageExecutionPhase = 'rail-active' | 'rail-complete' | 'no
 export const RAIL_COMPLETE_SECTION_OVERRIDES: Readonly<
   Partial<Record<RebirthPackageV6SectionId, number>>
 > = Object.freeze({
-  executionState: 500,
+  executionState: 6_000,
   activeEditDelta: 500,
-  recentConversation: 129_000,
+  recentConversation: 123_500,
 });
 
 /** W1-ratified rail-complete / no-rail backfill priority (recovery/execution first). */
@@ -1230,10 +1230,13 @@ function cognitiveLifeBoundaryStarts(
 }
 
 function cognitiveEntryCapChars(
-  row: Pick<RebirthPackageV6CognitiveArtifact, 'kind' | 'sourceAt'>,
+  row: Pick<RebirthPackageV6CognitiveArtifact, 'kind' | 'sourceAt' | 'retention'>,
   referenceAt: string | null,
   lifeBoundaryStarts: readonly string[] = [],
 ): number {
+  // Daily witnesses retain an exact short prefix during contention; the
+  // demand-first renderer still restores their full bodies when space permits.
+  if (row.retention === 'daily-floor') return 200;
   // Audit-2 A22 kind gate: only flagship register kinds (result/hazard/decision)
   // qualify for an age-elevated cap; other rows (flow/discovery/question/...)
   // stay at the fixed 600 base regardless of age so a non-flagship ad-hoc body
@@ -2760,6 +2763,7 @@ export interface RebirthCaptureDegradedLaneSource {
   } | null;
   boundaryAndActiveTask?: {
     readonly nowCard?: {
+      readonly ops?: { readonly repositories?: readonly { readonly error?: string | null }[] } | null;
       readonly currentRailAvailability?: {
         readonly status?: string;
         readonly reason?: string | null;
@@ -2813,6 +2817,9 @@ export function computeRebirthCaptureDegradedLanes(model: RebirthCaptureDegraded
   if (model.boundaryAndActiveTask?.nowCard?.currentRailAvailability?.status === 'unavailable') {
     degradedLanes.push('task-rail');
   }
+  if (model.boundaryAndActiveTask?.nowCard?.ops?.repositories?.some(repo => Boolean(repo.error))) {
+    degradedLanes.push('repository-checkpoint');
+  }
   return degradedLanes;
 }
 
@@ -2843,6 +2850,7 @@ export function computeRebirthCaptureDegradedLanesFromPackage(pkg: unknown): str
   const boundary = asLaneRecord(model.boundaryAndActiveTask);
   const nowCard = asLaneRecord(boundary?.nowCard);
   const railAvailability = asLaneRecord(nowCard?.currentRailAvailability);
+  const ops = asLaneRecord(nowCard?.ops);
   return computeRebirthCaptureDegradedLanes({
     operatorVault: lane('operatorVault'),
     episodeChapterIndex: lane('episodeChapterIndex'),
@@ -2861,6 +2869,10 @@ export function computeRebirthCaptureDegradedLanesFromPackage(pkg: unknown): str
       ? {
         nowCard: nowCard
           ? {
+            ops: { repositories: Array.isArray(ops?.repositories) ? ops.repositories.map(repo => {
+              const record = asLaneRecord(repo);
+              return { error: typeof record?.error === 'string' ? record.error : null };
+            }) : [] },
             currentRailAvailability: railAvailability
               ? {
                 status: typeof railAvailability.status === 'string' ? railAvailability.status : undefined,
@@ -3908,8 +3920,10 @@ function renderExecution(
   // God Rule 8: unknown source time never participates in the chronology. Known-time
   // execution facts stream chronologically; unknown-time facts are quarantined under
   // an explicit banner (mirroring renderCognition) where they make no recency claim.
-  const known = model.executionState.facts.filter((fact) => fact.sourceAt);
-  const unknown = model.executionState.facts.filter((fact) => !fact.sourceAt);
+  const hasTime = (fact: RebirthPackageV6ExecutionFact) => Boolean(fact.sourceAt && Number.isFinite(Date.parse(fact.sourceAt)));
+  const known = model.executionState.facts.filter(hasTime)
+    .sort((a, b) => Date.parse(b.sourceAt!) - Date.parse(a.sourceAt!) || a.provenanceId.localeCompare(b.provenanceId));
+  const unknown = model.executionState.facts.filter(fact => !hasTime(fact));
   const factPrefix = (fact: RebirthPackageV6ExecutionFact): string => {
     const request = model.boundaryAndActiveTask.activeRequest;
     const text = request && fact.text.trim() === request.text.trim()
@@ -3927,7 +3941,7 @@ function renderExecution(
     `${fact.status === 'exact' ? '' : ` [${fact.status}]`}${fact.predatesActiveRequest ? ' [predates-active-request]' : ''}`
   );
   const renderFact = (fact: RebirthPackageV6ExecutionFact): string => (
-    `- ${factPrefix(fact)}${factLabels(fact)} ${continuityAnchor(fact.provenanceId, fact.sourceAt, model.boundaryAndActiveTask.capturedAt)}`
+    `- ${factPrefix(fact)}${factLabels(fact)}${fact.sourceAt && !hasTime(fact) ? ' [unknown source time; quarantined]' : ''} ${continuityAnchor(fact.provenanceId, hasTime(fact) ? fact.sourceAt : null, model.boundaryAndActiveTask.capturedAt)}`
   );
   const lines = renderExecutionKnownFacts(known, renderFact);
   for (const reason of model.executionState.unknownReasons) {
@@ -3942,7 +3956,8 @@ function renderExecution(
   if (lines.length === 0) lines.push('- execution state captured as empty');
   const full = lines.join('\n');
   if (full.length <= maxChars) return { text: full, complete: true };
-  const recovery = recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle);
+  const recovery = recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'task-rail')?.handle)
+    ?? `task_rail mode="load" operation="list_mine" instance_id=${JSON.stringify(model.boundaryAndActiveTask.instanceId)}`;
   const omitted = (count: number) => `[… ${count} execution entries omitted${recovery ? ` · recover: ${recovery}` : ''} …]`;
   const kept: string[] = [];
   // Admit complete rows. An oversized room roster must not consume the cap
@@ -4159,7 +4174,7 @@ function renderActiveEdits(
     // exact legacy census at presentation, without rewriting stored evidence.
     const legacyPending = /^(\d+) mutation\(s\) in flight$/u.exec(reason);
     trailer.push(`reason=${legacyPending
-      ? `${reason} [unresolved prepared receipts; current liveness unknown]`
+      ? `${legacyPending[1]} unresolved prepared mutation receipt(s); current liveness unknown`
       : reason}`);
   }
   const units = buildActiveEditCollapseUnits(model);
@@ -4303,9 +4318,11 @@ function cognitionRowBody(
     // exact-source closing paragraph. Never pass this display supplement off
     // as the ledger's stored prefix or as a generated historical conclusion.
     const lower = Math.max(row.text.length, sourceText.length - 900);
-    const paragraph = sourceText.indexOf('\n\n', lower);
-    const start = paragraph >= lower && paragraph + 2 < sourceText.length
-      ? paragraph + 2 : sourceText.indexOf(' ', lower) + 1;
+    // Prefer a source-declared ruling over an arbitrary sign-off paragraph.
+    // No prose synthesis: only a complete, explicitly labeled source paragraph.
+    const candidates = [...sourceText.matchAll(/(?:^|\n\n)((?:#{1,6}\s*)?(?:[🏁⚠️▶]\s*)?(?:Decision|Verdict|Findings?|Residuals?|Open items|Strongest rejected alternative|Removals audit|#(?:result|review|decision))\b[^]*?)(?=\n\n|$)/giu)];
+    const candidate = candidates.reverse().find(match => match.index! >= lower);
+    const start = candidate ? candidate.index! + candidate[0].length - candidate[1]!.length : -1;
     if (start > row.text.length && start < sourceText.length) {
       const tail = sourceText.slice(start);
       const hash = createHash('sha256').update(tail).digest('hex');
@@ -4330,7 +4347,10 @@ function cognitionRowBody(
       + `${row.supersededBy ? ` [EXPIRED → ${row.supersededBy}]` : ''}`
       + (row.authority === 'historical_observation' ? '' : ` [${row.authority}]`)
       + (absorbedTag ? ` [absorbed:${absorbedTag}]` : '');
-    return `${row.kind}${labels}\n${row.text}${excerpt}\n${continuityAnchor(compactCognitionSource(row.provenanceId, sourceText ?? row.text), row.sourceAt, referenceAt)}`;
+    const partial = row.projection === 'truncated'
+      ? `[stored excerpt · ${row.text.length}/${row.sourceChars ?? 'unknown'} characters · source range=${sourceText?.startsWith(row.text) ? `0..${row.text.length}` : 'unknown'} · recover=${recovery ?? 'unavailable'}]\n`
+      : '';
+    return `${row.kind}${labels}\n${partial}${row.text}${excerpt}\n${continuityAnchor(compactCognitionSource(row.provenanceId, sourceText ?? row.text), row.sourceAt, referenceAt)}`;
   }
   return `${row.kind} · ${row.text} · source=${compactCognitionSource(row.provenanceId, row.text)} · source-time=${stamp} · authority=${row.authority}${absorbedTag ? ` · author=absorbed:${absorbedTag}` : ''}${retention}${declared}${excerpt}`;
 }
@@ -5366,6 +5386,8 @@ export function degradedCaptureDeclarations(model: RebirthPackageV6Model): Array
       || model.cognitiveArtifactCapture?.missingFamilies.join(' '),
     'active-edit-delta': model.activeEditDelta.reasons.join(' '),
     'task-rail': model.boundaryAndActiveTask.nowCard?.currentRailAvailability?.reason,
+    'repository-checkpoint': model.boundaryAndActiveTask.nowCard?.ops?.repositories
+      ?.filter(repo => repo.error).map(repo => `${repo.name}: ${repo.error}`).join('; '),
   };
   return computeRebirthCaptureDegradedLanes(model).map((lane) => ({ lane, reason: reasonByLane[lane]?.trim() || null }));
 }
@@ -5700,7 +5722,7 @@ function renderLineage(
  */
 const SECTION_SORT_DIRECTION: Readonly<Partial<Record<RebirthPackageV6SectionId, 'asc' | 'desc'>>> =
   Object.freeze({
-    executionState: 'asc',
+    executionState: 'desc',
     activeEditDelta: 'asc',
     cognitiveArtifacts: 'desc',
     recentConversation: 'asc',
@@ -6214,7 +6236,7 @@ function resolveAdaptiveSectionCapsInternal(
     executionSurplus += limits[id] - reserved;
     limits[id] = reserved;
   }
-  const timelinePool = Math.max(0, (phase === 'rail-active' ? 115_000 : 129_000)
+  const timelinePool = Math.max(0, (phase === 'rail-active' ? 115_000 : 123_500)
     + Math.max(0, Math.min(200_000, packageBudgetChars(model, options)) - 150_000)
     - (model.brainMergeSynthesis?.trim() ? 10_000 : 0)
     - Math.max(0, limits.boundaryAndActiveTask - 5_000) + recoverySurplus + executionSurplus);
@@ -6574,7 +6596,7 @@ function buildTimelineCensusLines(
     : '';
   const head = `Timeline census: ${dated} dated, ${quarantined} quarantined${accounting}; `
     + `${partial ? 'partial' : 'captured rows complete'}.`;
-  const populations = 'Populations: dated/quarantined = rendered Timeline rows; captured/not fully rendered = dialogue + cognition; matched upstream = cognition candidates; ledger = all captured unit families.';
+  const populations = 'Populations: dated/quarantined = rendered Timeline rows; captured/not fully rendered = dialogue + cognition; pointer stubs count as rendered rows and not fully rendered units; matched upstream = cognition candidates; ledger = all captured unit families.';
   return commands.length > 0 ? [head, populations, `Omitted units: ${commands.join(' · ')}`] : [head, populations];
 }
 

@@ -258,8 +258,8 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     expect({ delivery: sha(first.text), audit: sha(audit.text) }).toEqual({
       // Length-framed compact request, historical-report qualification, and
       // explicit recovery/population semantics intentionally change both views.
-      delivery: 'da32996f49fcdc807fb60055cc24a0794eda103a03a8f01999adbc4ec2c90774',
-      audit: 'f8572bc58d4bb84f2c0244c5b0c39acb0c63cb506b24de465cc5c24987cacb73',
+      delivery: 'db53e89509ada0ec577298bea66622f8a5a440ac8ff09f04319a4b6aaac7a74f',
+      audit: '9d9b0bfa32a2cbaf98a26b019c9947785aaf1958c50b5ec125b369e5bddf0f5e',
     });
   });
 
