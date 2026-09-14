@@ -33,6 +33,13 @@ describe('continuity timestamp normalization', () => {
   it('retains results through bounded-cache eviction', () => {
     const values = Array.from({ length: 8300 }, (_, index) => new Date(Date.UTC(2040, 0, 1) + index * 1000).toISOString());
     for (const value of values) expect(normalizeContinuityTimestamp(value)).toBe(value);
+    const parse = vi.spyOn(Date, 'parse');
+    expect(normalizeContinuityTimestamp(values[0]!)).toBe(values[0]);
+    expect(parse.mock.calls).toEqual([[values[0]]]);
+    parse.mockClear();
+    expect(normalizeContinuityTimestamp(values[0]!)).toBe(values[0]);
+    expect(normalizeContinuityTimestamp(values[8299]!)).toBe(values[8299]);
+    expect(parse).not.toHaveBeenCalled();
     for (const value of [values[0]!, values[4096]!, values[8299]!]) expect(normalizeContinuityTimestamp(value)).toBe(value);
   });
 });
