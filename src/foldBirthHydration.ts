@@ -38,6 +38,8 @@ export interface BirthFoldSeedMessage {
   sourceIdentities?: readonly string[];
   /** Exact cognitive/tool source when the merged block has one unambiguous candidate. */
   sourceIdentity?: string;
+  /** Original user rows, kept separate from provider-required role grouping. */
+  sourceUserMessages?: readonly { text: string; createdAt?: string; sourceIdentity?: string }[];
 }
 
 /** Structural subset of persistence LocalMessage — deliberately no import. */
@@ -255,6 +257,9 @@ function mergeConsecutiveRoles(messages: BirthFoldSeedMessage[]): BirthFoldSeedM
     const last = out[out.length - 1];
     if (last && last.role === m.role) {
       last.content = `${last.content}\n\n${m.content}`;
+      if (last.sourceUserMessages || m.sourceUserMessages) {
+        last.sourceUserMessages = [...(last.sourceUserMessages ?? []), ...(m.sourceUserMessages ?? [])];
+      }
       const identities = [...new Set([
         ...(last.sourceIdentities ?? []),
         ...(m.sourceIdentities ?? []),
@@ -551,6 +556,7 @@ export function convertLocalMessagesToSeedHistory(
     tsMs?: number;
     sourceIdentities: string[];
     cognitiveSourceIdentities: string[];
+    sourceUserMessages: NonNullable<BirthFoldSeedMessage['sourceUserMessages']>[number][];
   }
   const blocks: MutableBlock[] = [];
   let usedRows = 0;
@@ -563,6 +569,11 @@ export function convertLocalMessagesToSeedHistory(
   ): void => {
     if (!part.trim()) return;
     const sourceIdentity = sourceRowIdentity(row);
+    const sourceUserMessage = role === 'user' && row.ty === 'user' ? {
+      text: clip(row.tx?.trim() ?? '', maxMessageChars),
+      ...(tsMs !== undefined ? { createdAt: new Date(tsMs).toISOString() } : {}),
+      ...(sourceIdentity ? { sourceIdentity } : {}),
+    } : undefined;
     const toolLeaf = typeof row.tn === 'string' ? row.tn.split('__').at(-1)?.split('.').at(-1) : undefined;
     const cognitiveSourceIdentity = row.ty === 'tool_use' && toolLeaf === 'tap_star'
       ? sourceIdentity
@@ -570,12 +581,14 @@ export function convertLocalMessagesToSeedHistory(
     const last = blocks[blocks.length - 1];
     if (last && last.role === role) {
       last.parts.push(part);
+      if (sourceUserMessage) last.sourceUserMessages.push(sourceUserMessage);
       if (sourceIdentity) last.sourceIdentities.push(sourceIdentity);
       if (cognitiveSourceIdentity) last.cognitiveSourceIdentities.push(cognitiveSourceIdentity);
     } else {
       blocks.push({
         role,
         parts: [part],
+        sourceUserMessages: sourceUserMessage ? [sourceUserMessage] : [],
         sourceIdentities: sourceIdentity ? [sourceIdentity] : [],
         cognitiveSourceIdentities: cognitiveSourceIdentity ? [cognitiveSourceIdentity] : [],
         ...(tsMs !== undefined ? { tsMs } : {}),
@@ -602,6 +615,7 @@ export function convertLocalMessagesToSeedHistory(
     return {
       role: b.role,
       content: b.parts.join('\n\n'),
+      ...(b.sourceUserMessages.length ? { sourceUserMessages: b.sourceUserMessages } : {}),
       ...(b.tsMs !== undefined ? { tsMs: b.tsMs } : {}),
       ...(sourceIdentities.length > 0 ? { sourceIdentities } : {}),
       ...(sourceIdentity ? { sourceIdentity } : {}),

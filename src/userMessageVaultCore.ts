@@ -26,6 +26,7 @@ export {
 export interface UserMessageVaultEntry {
   text: string;
   createdAt?: string;
+  sourceIdentity?: string;
   /** Latest genuine operator turn that began the currently active task. */
   taskFrontier?: boolean;
 }
@@ -112,6 +113,7 @@ export type VaultOperatorTaskScope = 'current-task' | 'historical';
 
 interface VaultRenderPayload {
   text: string;
+  sourceIdentity?: string;
   /** Authoritative source time copied from the original row; null is explicit unknown. */
   sourceTime: string | null;
   glyph?: MessageGlyphMode;
@@ -205,7 +207,7 @@ export interface UserMessageVaultCore {
     entries: UserMessageVaultEntry[],
     text: string,
     createdAt?: string,
-    options?: { taskFrontier?: boolean },
+    options?: { taskFrontier?: boolean; sourceIdentity?: string },
   ): void;
   recordAssistantGlyphVaultEntry(
     entries: AssistantGlyphVaultEntry[],
@@ -213,7 +215,7 @@ export interface UserMessageVaultCore {
     createdAt?: string,
   ): void;
   seedUserMessageVaultFromMessages(
-    messages: ReadonlyArray<{ role?: unknown; content?: unknown }>,
+    messages: ReadonlyArray<{ role?: unknown; content?: unknown; tsMs?: number; sourceIdentity?: string; sourceUserMessages?: readonly UserMessageVaultEntry[] }>,
     sanitize: (text: string) => string | { text: string; createdAt?: string },
   ): UserMessageVaultEntry[];
   selectCurrentTaskUserMessageVaultEntries(
@@ -369,12 +371,12 @@ export function selectCurrentTaskUserMessageVaultEntries(
 }
 
 export function vaultRowFingerprint(
-  row: Pick<VaultRenderRow, 'role' | 'text' | 'edit'>,
+  row: Pick<VaultRenderRow, 'role' | 'text' | 'edit' | 'sourceIdentity'>,
 ): string {
   if (row.role === 'edit' && row.edit) {
     return `edit:${editProvenanceVaultFingerprint(row.edit)}`;
   }
-  const normalized = normalizeEntryText(row.text);
+  const normalized = `${row.sourceIdentity ? `${row.sourceIdentity}\0` : ''}${normalizeEntryText(row.text)}`;
   let hash = 0x811c9dc5;
   for (let i = 0; i < normalized.length; i += 1) {
     hash ^= normalized.charCodeAt(i);
@@ -550,12 +552,14 @@ function operatorEvidenceRow(
   createdAt: string | undefined,
   taskScope: VaultOperatorTaskScope,
   liveness: VaultOperatorLiveness = 'answered',
+  sourceIdentity?: string,
 ): VaultOperatorRenderRow {
   return {
     kind: 'evidence',
     role: 'user',
     text,
     sourceTime: createdAt ?? null,
+    ...(sourceIdentity ? { sourceIdentity } : {}),
     liveness,
     authorization: 'expired',
     taskScope,
@@ -629,13 +633,14 @@ export function createUserMessageVaultCore(
     entries: UserMessageVaultEntry[],
     text: string,
     createdAt?: string,
-    options: { taskFrontier?: boolean } = {},
+    options: { taskFrontier?: boolean; sourceIdentity?: string } = {},
   ): void => {
     const normalized = normalizeEntryText(text);
     if (!normalized) return;
     entries.push({
       text: normalized,
       createdAt,
+      ...(options.sourceIdentity ? { sourceIdentity: options.sourceIdentity } : {}),
       ...(options.taskFrontier ? { taskFrontier: true } : {}),
     });
     const maxMessages = resolveUserMessageVaultMaxMessages(process.env);
@@ -657,16 +662,27 @@ export function createUserMessageVaultCore(
   };
 
   const seedUserMessageVaultFromMessages = (
-    messages: ReadonlyArray<{ role?: unknown; content?: unknown }>,
+    messages: ReadonlyArray<{ role?: unknown; content?: unknown; tsMs?: number; sourceIdentity?: string; sourceUserMessages?: readonly UserMessageVaultEntry[] }>,
     sanitize: (text: string) => string | { text: string; createdAt?: string },
   ): UserMessageVaultEntry[] => {
     const entries: UserMessageVaultEntry[] = [];
     for (const message of messages) {
       if (!message || message.role !== 'user' || typeof message.content !== 'string') continue;
+      if (message.sourceUserMessages) {
+        for (const source of message.sourceUserMessages) {
+          const sanitized = sanitize(source.text);
+          const text = typeof sanitized === 'string' ? sanitized : sanitized.text;
+          if (text) recordUserMessageVaultEntry(entries, text, source.createdAt, { sourceIdentity: source.sourceIdentity });
+        }
+        continue;
+      }
       const sanitized = sanitize(message.content);
       const text = typeof sanitized === 'string' ? sanitized : sanitized.text;
-      const createdAt = typeof sanitized === 'string' ? undefined : sanitized.createdAt;
-      if (text) recordUserMessageVaultEntry(entries, text, createdAt);
+      const sourceDate = typeof message.tsMs === 'number' ? new Date(message.tsMs) : null;
+      const createdAt = sourceDate && Number.isFinite(sourceDate.getTime())
+        ? sourceDate.toISOString()
+        : typeof sanitized === 'string' ? undefined : sanitized.createdAt;
+      if (text) recordUserMessageVaultEntry(entries, text, createdAt, { sourceIdentity: message.sourceIdentity });
     }
     if (entries.length > 0) {
       entries[entries.length - 1] = { ...entries[entries.length - 1], taskFrontier: true };
@@ -691,6 +707,7 @@ export function createUserMessageVaultCore(
     compact = resolveUserMessageVaultMaxChars(process.env) < 1_000,
   ): string => {
     const sourceTime = row.sourceTime === null ? 'unknown' : JSON.stringify(row.sourceTime);
+    const sourceId = row.sourceIdentity ? ` source-id=${JSON.stringify(row.sourceIdentity)}` : '';
     const glyph = row.role === 'assistant' ? ` glyph=${row.glyph ?? 'untagged'}` : '';
     const taskScope = row.role === 'user' ? ` task-scope=${row.taskScope}` : '';
     const historicalAuthority = row.role === 'user' && row.taskScope === 'historical'
@@ -710,10 +727,10 @@ export function createUserMessageVaultCore(
       const compactScope = row.role === 'user' && row.taskScope === 'historical'
         ? ' s=h'
         : '';
-      return `[VR1:${role} t=${compactTime} l=${liveness} a=${authorization}${compactScope}]`;
+      return `[VR1:${role} t=${compactTime} l=${liveness} a=${authorization}${compactScope}${sourceId}]`;
     }
     return `[Vault Record] schema=${VAULT_RECORD_SCHEMA_VERSION} kind=${row.kind} role=${row.role}`
-      + ` source-time=${sourceTime} liveness=${row.liveness} authorization=${row.authorization}`
+      + ` source-time=${sourceTime}${sourceId} liveness=${row.liveness} authorization=${row.authorization}`
       + `${taskScope}${historicalAuthority}${glyph} ordinal=${index + 1}/${total}`;
   };
 
@@ -880,7 +897,7 @@ export function createUserMessageVaultCore(
           && taskScope === 'current-task'
           ? 'unanswered'
           : 'answered';
-        return operatorEvidenceRow(entry.text, entry.createdAt, taskScope, liveness);
+        return operatorEvidenceRow(entry.text, entry.createdAt, taskScope, liveness, entry.sourceIdentity);
       });
 
     const assistantRows: VaultRenderRow[] = assistantEntries
@@ -990,7 +1007,7 @@ export function createUserMessageVaultCore(
           && taskScope === 'current-task'
           ? 'unanswered'
           : 'answered';
-        return operatorEvidenceRow(entry.text, entry.createdAt, taskScope, liveness);
+        return operatorEvidenceRow(entry.text, entry.createdAt, taskScope, liveness, entry.sourceIdentity);
       });
       const body = rows
         .map((row, index) => renderVaultRow(row, index, rows.length))
