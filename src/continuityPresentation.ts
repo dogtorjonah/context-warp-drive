@@ -84,6 +84,8 @@ export interface RebirthPackageV6OpenItem {
   readonly kind: 'declared' | 'capture';
   /** The declaration predates the newest genuine operator message (both times known). */
   readonly predatesActiveRequest: boolean;
+  /** Older eligible declarations not displayed within the bounded record. */
+  readonly omittedDeclarations?: number;
 }
 
 /**
@@ -126,8 +128,8 @@ function openItemLabelLine(raw: string): string {
   return debold.replace(/^[>\s]+/u, '').trim();
 }
 
-/** Last declared open item inside one assistant row, clipped to `maxChars`. */
-function declaredOpenItemText(text: string, maxChars = OPEN_ITEMS_MAX_ITEM_CHARS): string | null {
+/** Collect explicit residual sections, or the last navigation signpost. */
+function declaredOpenItemText(text: string): { text: string; explicit: boolean } | null {
   const lines = text.split('\n');
   let found: string | null = null;
   let explicit = false;
@@ -159,12 +161,13 @@ function declaredOpenItemText(text: string, maxChars = OPEN_ITEMS_MAX_ITEM_CHARS
       remainder = parts.join('; ');
     }
     if (remainder) {
-      found = remainder.replace(/\s+/gu, ' ').trim() || null;
+      const next = remainder.replace(/\s+/gu, ' ').trim();
+      found = explicit && marker !== 'signpost:' && found ? `${found}; ${next}` : next || null;
       explicit = marker !== 'signpost:';
     }
   }
   if (!found) return null;
-  return clipOpenItem(found, maxChars);
+  return { text: found, explicit };
 }
 
 /**
@@ -173,18 +176,17 @@ function declaredOpenItemText(text: string, maxChars = OPEN_ITEMS_MAX_ITEM_CHARS
  * `Open items:`/`Outstanding:`) from the delivered conversation pool.
  *
  * Supersession is structural, never prose inference:
- *  - a declaration older than the newest self-authored ship-class rail ACK is
- *    retired — shipped work restates its open set in the ship message;
- *  - a newer declaration replaces older ones — a signpost is the agent's
- *    current open set at that moment, not an accumulating ledger;
+ *  - navigation signposts expire at a newer declaration or ship-class ACK;
+ *  - explicit residuals survive unrelated declarations and ship ACKs;
+ *  - `Resolved open items: <exact provenanceId>` retires only a strictly older
+ *    matching declaration. Generic completion prose never closes residuals;
  *  - a surviving declaration older than the newest genuine operator message is
  *    labeled `predatesActiveRequest`, never silently trusted and never dropped.
  * Degraded-capture lanes render first: they are the newest facts (capture
  * time) and the biggest live gaps, so they can never be absent while an older
  * signpost is present. Undated rows stay quarantined. Bounded by
- * OPEN_ITEMS_MAX_* with no unstated truncation (an over-budget candidate is
- * skipped whole, never silently re-said); the surviving declaration may use
- * the budget the retired ones no longer consume.
+ * OPEN_ITEMS_MAX_* with marked text clipping and an explicit count of
+ * undisplayed declarations; a sole survivor may use all remaining capacity.
  */
 export function extractDeclaredOpenItems(
   rows: readonly Pick<RebirthPackageV6ConversationRow, 'role' | 'text' | 'provenanceId' | 'sourceAt'>[],
@@ -214,29 +216,55 @@ export function extractDeclaredOpenItems(
     .sort((a, b) => Date.parse(b.sourceAt!) - Date.parse(a.sourceAt!)
       || a.provenanceId.localeCompare(b.provenanceId));
   const seen = new Set<string>();
+  const candidates: RebirthPackageV6OpenItem[] = [];
   let newestDeclarationAt: number | null = null;
+  const resolvedAt = new Map<string, number>();
+  // Capture closure references before applying display caps. A full display
+  // must not hide the closure evidence and resurrect an older obligation.
   for (const row of dated) {
-    if (items.length >= OPEN_ITEMS_MAX_ITEMS) break;
+    if (row.role !== 'assistant') continue;
+    for (const line of row.text.split('\n')) {
+      const match = /^Resolved open items:\s*(\S+)\s*$/iu.exec(openItemLabelLine(line));
+      if (match && !resolvedAt.has(match[1]!)) resolvedAt.set(match[1]!, Date.parse(row.sourceAt!));
+    }
+  }
+  for (const row of dated) {
     if (row.role !== 'assistant' || !row.text) continue;
     const at = Date.parse(row.sourceAt!);
-    // Rows are newest-first, so the first retirement boundary crossed ends the scan.
-    if (newestShipAt !== null && at < newestShipAt) break;
-    if (newestDeclarationAt !== null && at < newestDeclarationAt) break;
-    const declared = declaredOpenItemText(row.text, Math.max(OPEN_ITEMS_MAX_ITEM_CHARS, budget - 24));
-    if (!declared) continue;
+    const declaration = declaredOpenItemText(row.text);
+    if (!declaration) continue;
+    if (!declaration.explicit && ((newestShipAt !== null && at < newestShipAt)
+      || (newestDeclarationAt !== null && at < newestDeclarationAt))) continue;
     newestDeclarationAt ??= at;
-    const normalized = declared.toLowerCase().replace(/\s+/gu, ' ');
+    if ((resolvedAt.get(row.provenanceId) ?? Number.NEGATIVE_INFINITY) > at) continue;
+    // A scoped report saying "none" is not a global closure of unrelated work.
+    if (/^none[.!]?$/iu.test(declaration.text)) continue;
+    const normalized = declaration.text.toLowerCase().replace(/\s+/gu, ' ');
     if (seen.has(normalized)) continue;
     seen.add(normalized);
-    if (declared.length + 24 > budget) continue;
-    budget -= declared.length + 24;
-    items.push({
-      text: declared,
+    candidates.push({
+      text: declaration.text,
       provenanceId: row.provenanceId,
       sourceAt: row.sourceAt,
       kind: 'declared',
       predatesActiveRequest: activeRequestAt !== null && at < activeRequestAt,
     });
+  }
+  // Allocate after resolving state, so a long newest note cannot consume the
+  // space needed to represent older obligations. One survivor still gets all
+  // unused capacity; extra declarations are explicitly counted, not closed.
+  const slots = Math.min(candidates.length, OPEN_ITEMS_MAX_ITEMS - items.length);
+  for (const [index, candidate] of candidates.slice(0, slots).entries()) {
+    const available = Math.floor(budget / (slots - index)) - 24;
+    if (available < 2) break;
+    const text = clipOpenItem(candidate.text, available);
+    budget -= text.length + 24;
+    items.push({ ...candidate, text });
+  }
+  const displayed = items.filter(item => item.kind === 'declared').length;
+  const last = items.at(-1);
+  if (last && candidates.length > displayed) {
+    items[items.length - 1] = { ...last, omittedDeclarations: candidates.length - displayed };
   }
   return items;
 }
@@ -252,7 +280,9 @@ export function openItemsCountLabel(items: readonly RebirthPackageV6OpenItem[]):
 
 /** Item text as both views render it: the label carries the supersession state. */
 export function openItemText(item: RebirthPackageV6OpenItem): string {
-  return item.predatesActiveRequest ? `${item.text} (predates the active request)` : item.text;
+  const text = item.predatesActiveRequest ? `${item.text} (predates the active request)` : item.text;
+  return item.omittedDeclarations
+    ? `${text} (+${item.omittedDeclarations} declared records omitted; source history retains their evidence)` : text;
 }
 
 function openItemsLine(items: readonly RebirthPackageV6OpenItem[], referenceAt: string | null): string {
@@ -286,6 +316,24 @@ export function absorbedLineageLabel(
     const mergedAt = donor.mergedAt ? ` merged=${donor.mergedAt.slice(0, 16)}Z` : '';
     return `${label}${ancestor ? ' [also fork ancestor]' : ''}${source}${mergedAt}`;
   }).join(', ');
+}
+
+/** Capture coverage is separate from render admission; every identity keeps a recovery route. */
+export function ancestorCoverageLines(model: RebirthPackageV6Model): string[] {
+  const boundary = model.boundaryAndActiveTask;
+  const ancestors = [...new Set((boundary.nowCard?.lineageChain ?? [])
+    .map(hop => hop.instanceId).filter(id => id && id !== boundary.instanceId))];
+  return ancestors.map(id => {
+    const witnesses = model.cognitiveArtifacts.filter(row => row.sourceInstanceId === id
+      && row.kind === 'result' && !row.supersededBy);
+    const dated = witnesses.filter(row => row.sourceAt && normalizeContinuityTimestamp(row.sourceAt));
+    dated.sort((a, b) => Date.parse(b.sourceAt!) - Date.parse(a.sourceAt!) || a.provenanceId.localeCompare(b.provenanceId));
+    const witness = dated[0] ?? [...witnesses].sort((a, b) => a.provenanceId.localeCompare(b.provenanceId))[0];
+    const evidence = witness
+      ? `captured ${dated.length ? 'dated' : 'undated'} result ${JSON.stringify(witness.provenanceId)} @${witness.sourceAt ?? 'unknown'}; body may be omitted by render budget`
+      : 'unavailable in captured result evidence';
+    return `Ancestor ${JSON.stringify(id)}: ${evidence}; recover: tap_instance_messages action="canonical" target_instance_id=${JSON.stringify(id)}`;
+  });
 }
 
 export function compactBoundary(
@@ -322,6 +370,7 @@ export function compactBoundary(
   // Merge participation can overlap fork ancestry; list it on its own
   // line so its Timeline rows (tagged [absorbed:<id>]) resolve to a name.
   const absorbed = absorbedLineageLabel(now);
+  lines.push(...ancestorCoverageLines(model));
   if (absorbed) lines.push(`Absorbed lineage (brain-merged; ancestry overlaps labeled): ${absorbed}`);
   if (now?.attributionUncertainty) lines.push(`Attribution uncertainty: ${clipOpenItem(now.attributionUncertainty, 400)}`);
   if (now?.parentIdentity) lines.push(`Inherited from ${now.parentIdentity.instanceName ?? now.parentIdentity.instanceId}; fork point ${now.parentIdentity.checkpointMessageId ?? 'unknown'} ${source(now.parentIdentity.source)}`);

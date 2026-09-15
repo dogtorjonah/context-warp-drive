@@ -2852,6 +2852,32 @@ describe('audit-3 A: S5 cognitive-kind model (A model seam)', () => {
 });
 
 describe('audit-4 S4/S7 cognition admission + render byte hygiene', () => {
+  it('addresses each declared ancestor using exact authorship and honest unavailable coverage', () => {
+    const base = model();
+    const value = model({
+      boundaryAndActiveTask: { ...base.boundaryAndActiveTask, nowCard: {
+        ...base.boundaryAndActiveTask.nowCard,
+        lineageChain: ['ancestor', 'undated', 'missing', base.boundaryAndActiveTask.instanceId].map(instanceId => ({
+          instanceId, instanceName: null, sourceAt: null, archived: null,
+        })),
+      } },
+      cognitiveArtifacts: [
+        { provenanceId: 'dated-result', sourceInstanceId: 'ancestor', sourceAt: '2026-08-01T00:00:00Z', kind: 'result', text: 'source result', authority: 'evidence', supersededBy: null, retention: 'ancestor-floor' },
+        { provenanceId: 'undated-result', sourceInstanceId: 'undated', sourceAt: null, kind: 'result', text: 'undated source', authority: 'evidence', supersededBy: null, retention: 'ancestor-floor' },
+        { provenanceId: 'wrong-author', sourceInstanceId: 'peer', sourceAt: null, kind: 'result', text: 'mentions missing', authority: 'evidence', supersededBy: null },
+        { provenanceId: 'withdrawn', sourceInstanceId: 'missing', sourceAt: null, kind: 'result', text: 'withdrawn', authority: 'evidence', supersededBy: 'later' },
+      ],
+    });
+    for (const diagnostic of [false, true]) {
+      const rendered = renderRebirthPackageV6WithReport(value, { diagnostic }).text;
+      expect(rendered).toContain('Ancestor "ancestor": captured dated result "dated-result"');
+      expect(rendered).toContain('Ancestor "undated": captured undated result "undated-result"');
+      expect(rendered).toContain('Ancestor "missing": unavailable in captured result evidence');
+      expect(rendered).toContain('target_instance_id="missing"');
+      expect(rendered).not.toContain('Ancestor "peer":');
+    }
+  });
+
   it('keeps daily witnesses under pressure and restores full source bodies with room', () => {
     const rows = Array.from({ length: 8 }, (_, index) => ({
       provenanceId: `daily:${index}`, sourceAt: `2026-07-${String(index + 20).padStart(2, '0')}T00:00:00Z`,

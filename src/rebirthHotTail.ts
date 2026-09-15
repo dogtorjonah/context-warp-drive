@@ -5,7 +5,13 @@ export interface RebirthHotTailRow {
   readonly id: string;
   readonly sourceAt: string;
   readonly sourceInstanceId: string;
-  readonly kind: 'user' | 'assistant' | 'tool_use' | 'tool_result';
+  /**
+   * 'runtime' = a session-lifecycle notice (stop/interrupt), never dialogue —
+   * matches the Boundary/Timeline's own classification (see
+   * rebirthTraceScrub.isSessionLifecycleNoticeMessage) so the raw tail agrees
+   * with the rest of the package instead of dropping or mislabeling the row.
+   */
+  readonly kind: 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'runtime';
   readonly text: string;
   readonly recover: string;
   /** Canonical correlation identity; absent in legacy captures. */

@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import {
   absorbedLineageLabel,
+  ancestorCoverageLines,
   COMPACT_RECOVERY_PREAMBLE,
   COMPACT_RECOVERY_SUPPRESSED_ROWS,
   compactBoundary,
@@ -578,7 +579,7 @@ export interface RebirthPackageV6CognitiveArtifact {
    *  renderer may label it kept-by=lineage-floor. `required-overlay` = a
    *  deliberately overlaid requirement. Absent = intrinsically current,
    *  ordinary admission. Additive; persisted rows stay valid. */
-  readonly retention?: 'lineage-floor' | 'required-overlay' | 'daily-floor';
+  readonly retention?: 'lineage-floor' | 'required-overlay' | 'daily-floor' | 'ancestor-floor';
   readonly text: string;
   readonly authority: string;
   readonly supersededBy: string | null;
@@ -1236,7 +1237,7 @@ function cognitiveEntryCapChars(
 ): number {
   // Daily witnesses retain an exact short prefix during contention; the
   // demand-first renderer still restores their full bodies when space permits.
-  if (row.retention === 'daily-floor') return 200;
+  if (row.retention === 'daily-floor' || row.retention === 'ancestor-floor') return 200;
   // Audit-2 A22 kind gate: only flagship register kinds (result/hazard/decision)
   // qualify for an age-elevated cap; other rows (flow/discovery/question/...)
   // stay at the fixed 600 base regardless of age so a non-flagship ad-hoc body
@@ -3673,6 +3674,7 @@ function renderBoundary(
   // Absorbed (brain-merged) donors are listed apart from fork ancestors; the
   // delivered Boundary prints the same label through the same helper.
   const absorbedLineage = absorbedLineageLabel(now);
+  lines.push(...ancestorCoverageLines(model));
   if (absorbedLineage) lines.push(`absorbed-lineage=${absorbedLineage}`);
   if (now?.attributionUncertainty) lines.push(`Attribution uncertainty: ${now.attributionUncertainty}`);
   if (now?.ops) {
