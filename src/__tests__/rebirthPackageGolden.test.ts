@@ -258,7 +258,8 @@ describe('rebirth package golden fixture (synthetic renderer model)', () => {
     expect({ delivery: sha(first.text), audit: sha(audit.text) }).toEqual({
       // Length-framed compact request, historical-report qualification, and
       // explicit recovery/population semantics intentionally change both views.
-      delivery: 'db53e89509ada0ec577298bea66622f8a5a440ac8ff09f04319a4b6aaac7a74f',
+      // Delivery population label now describes evictions only and excludes episodes.
+      delivery: '51e1bfd573a7e344884cb5fcc83de1d65f1a5abaed23518312b9768e3495ce0f',
       audit: '9d9b0bfa32a2cbaf98a26b019c9947785aaf1958c50b5ec125b369e5bddf0f5e',
     });
   });

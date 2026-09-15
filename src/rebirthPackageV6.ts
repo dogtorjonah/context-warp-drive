@@ -2459,6 +2459,7 @@ function continuityLedgerOmissionHandle(
   model: RebirthPackageV6Model,
   sectionId: RebirthPackageV6SectionId,
 ): string | null {
+  if (sectionId === 'episodeChapterIndex') return null;
   const ledger = model.recoveryIndex.find((entry) => entry.id === 'continuity-ledger');
   const owner = model.boundaryAndActiveTask.instanceId?.trim();
   const captureId = model.boundaryAndActiveTask.captureId?.trim();
@@ -6598,7 +6599,7 @@ function buildTimelineCensusLines(
     : '';
   const head = `Timeline census: ${dated} dated, ${quarantined} quarantined${accounting}; `
     + `${partial ? 'partial' : 'captured rows complete'}.`;
-  const populations = 'Populations: dated/quarantined = rendered Timeline rows; captured/not fully rendered = dialogue + cognition; pointer stubs count as rendered rows and not fully rendered units; matched upstream = cognition candidates; ledger = all captured unit families.';
+  const populations = 'Populations: dated/quarantined = rendered Timeline rows; captured/not fully rendered = dialogue + cognition; pointer stubs count as rendered rows and not fully rendered units; matched upstream = cognition candidates; ledger = evicted POV units, excluding episodes.';
   return commands.length > 0 ? [head, populations, `Omitted units: ${commands.join(' · ')}`] : [head, populations];
 }
 
@@ -7637,9 +7638,9 @@ function buildCognitiveLedgerUnits(model: RebirthPackageV6Model): readonly Colla
  * The caller decides whether the render was real (delivered to a successor) —
  * previews and ghost taps simply never persist what this returns. Placements
  * come from the render's own CollapseResult, never recomputed, so the ledger
- * records what the shipped package truly did: every unit of every lineage
- * section, tagged with the tier it landed at and why ('rendered' rows keep the
- * census complete and let a later build's upsert supersede a stale demotion).
+ * records evictions and transient rendered placement signals. Persistence uses
+ * rendered signals only to remove stale omissions; it never stores them. Episode
+ * index entries are excluded: episodes have their own source store.
  * Returns null when the model carries no addressable identity or no units —
  * absence of a record, never an invented one.
  */
@@ -7673,6 +7674,7 @@ export function buildContinuityLedgerCaptureFromV6Render(
     });
   }
   for (const sectionReport of report.sections) {
+    if (sectionReport.sectionId === 'episodeChapterIndex') continue;
     const sectionUnits = sectionReport.sectionId === 'activeEditDelta'
       ? buildActiveEditCollapseUnits(model)
       : lineageSection(model, sectionReport.sectionId).units;
@@ -7682,7 +7684,7 @@ export function buildContinuityLedgerCaptureFromV6Render(
       const unit = byId.get(placement.id);
       // A placement without a matching unit would be a collapse-engine bug;
       // skipping is honest (the worker sees fewer rows), inventing is not.
-      if (!unit) continue;
+      if (!unit || unit.kind === 'episode') continue;
       const tierBasis: ContinuityLedgerTierBasis = sectionReport.sectionElided
         ? 'section-elision'
         : sectionReport.droppedToFloorRollup > 0

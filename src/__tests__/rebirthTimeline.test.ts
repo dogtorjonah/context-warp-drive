@@ -41,7 +41,7 @@ describe('unified rebirth timeline', () => {
     expect(result.text).toContain('vault-only');
     expect(result.text.match(/VAULT ONLY OPERATOR WORDS/gu)).toHaveLength(1);
   });
-  it('retains every hidden lineage source and hash across display budgets', () => {
+  it('retains non-episode hidden lineage proofs across display budgets', () => {
     const unit = (id: string, kind: 'life' | 'operator' | 'episode') => ({
       id, kind, sourceAt: at(1), sourceEndAt: at(2), verbatim: `Exact source ${id}`,
       digest: id, claim: id, eraKey: '2026-09-09', recover: 'source-reader',
@@ -58,7 +58,8 @@ describe('unified rebirth timeline', () => {
     const proofs = (result: typeof hidden) => buildContinuityLedgerCaptureFromV6Render(value, result.collapse)!.units
       .filter((row) => ['lifeLedger', 'operatorVault', 'episodeChapterIndex'].includes(row.sectionId))
       .map(({ unitId, sourceTime, verbatim, sha256 }) => ({ unitId, sourceTime, verbatim, sha256 }));
-    expect(proofs(hidden)).toHaveLength(3);
+    expect(proofs(hidden)).toHaveLength(2);
+    expect(proofs(hidden).map((row) => row.unitId)).not.toContain('episode-one');
     expect(proofs(hidden)).toEqual(proofs(visible));
     expect(hidden.text).not.toContain('Exact source life-one');
     expect(hidden.text).not.toContain('Exact source episode-one');

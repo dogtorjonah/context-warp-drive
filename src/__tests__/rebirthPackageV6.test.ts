@@ -730,13 +730,9 @@ describe('Rebirth Package v6', () => {
       expect(text.length).toBeLessThanOrEqual(budget);
     });
 
-    it('covers every one of the five ledger families when the count formula assumes them', () => {
-      // Review F1 left side: the capture writer must persist one row for every
-      // unit of every family the assembler's count formula sums (activeEditDelta
-      // files, cognitiveArtifacts, operatorVault, episodeChapterIndex, lifeLedger).
-      // If a family is added to the formula without being fed to the writer (or
-      // vice versa), the relay-side count===rows invariant fails; this test pins
-      // the writer's family coverage directly.
+    it('captures non-episode families and excludes the episode index', () => {
+      // Capture non-episode families, retaining transient rendered signals for
+      // stale-omission removal. Episode index entries never enter this stream.
       const lineageRow = (
         id: string,
         sourceAt: string,
@@ -768,12 +764,11 @@ describe('Rebirth Package v6', () => {
         'edit-file:one',
         ...value.cognitiveArtifacts.map((entry) => entry.provenanceId),
         'vault:1',
-        'ep:1',
         'life:1',
       ]);
       expect(record.units.map((unit) => unit.unitId).sort()).toEqual([...expectedIds].sort());
       expect(new Set(record.units.map((unit) => unit.sectionId)))
-        .toEqual(new Set(['activeEditDelta', 'cognitiveArtifacts', 'operatorVault', 'episodeChapterIndex', 'lifeLedger']));
+        .toEqual(new Set(['activeEditDelta', 'cognitiveArtifacts', 'operatorVault', 'lifeLedger']));
     });
 
     it('selects deterministically and preserves newest-first chronology with quarantine last', () => {
