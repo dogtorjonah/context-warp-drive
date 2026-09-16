@@ -1192,7 +1192,7 @@ function compareSourceRows(
  * and the continuity ledger's storage economy, NOT a render mandate. While the
  * envelope has room, `renderCognition` ships full bodies untouched by this
  * cap; it binds only in the contended fallback and in the ledger's stored
- * projection of each row.
+ * projection of omitted rows.
  */
 export const REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS = 600;
 
@@ -1294,10 +1294,9 @@ function cognitiveEntryCapChars(
  * fairness under pressure) and the continuity-ledger capture (storage
  * economy). Because both call the SAME function on the SAME row, a contended
  * render and its capture still produce identical bytes by construction — the
- * original reason this projection once lived at normalize time. A
- * full-fidelity render ships a body whose stored ledger copy is a byte-exact
- * declared PREFIX of it, so no sha256 ever attests bytes that are not a
- * declared projection or the entirety of real source bytes.
+ * original reason this projection once lived at normalize time. Fully
+ * delivered bodies bypass storage projection and only retire old omissions.
+ * Hashes attest a declared projection or the entirety of real source bytes.
  *
  * `text` stays a byte-exact PREFIX of the source body — no ellipsis, no
  * summary — so a successor can recover the full artifact through its handle
@@ -3919,7 +3918,7 @@ function renderExecution(
   model: RebirthPackageV6Model,
   maxChars: number,
   references: RebirthRecoveryReferenceCatalog,
-): { text: string; complete: boolean } {
+): RenderedV6SectionBody {
   // God Rule 8: unknown source time never participates in the chronology. Known-time
   // execution facts stream chronologically; unknown-time facts are quarantined under
   // an explicit banner (mirroring renderCognition) where they make no recency claim.
@@ -3958,8 +3957,16 @@ function renderExecution(
   }
   if (lines.length === 0) lines.push('- execution state captured as empty');
   const full = lines.join('\n');
-  if (full.length <= maxChars) return { text: full, complete: true };
-  const recovery = recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'task-rail')?.handle)
+  const placementsFor = (delivered: readonly string[]): RebirthPackageV6UnitPlacement[] => (
+    model.executionState.facts.map((fact) => ({
+      id: fact.provenanceId,
+      placement: delivered.includes(renderFact(fact)) ? 'rendered' : 'elided',
+      projected: false,
+    }))
+  );
+  if (full.length <= maxChars) return { text: full, complete: true, unitPlacements: placementsFor(lines) };
+  const recovery = recoveryReference(references, continuityLedgerOmissionHandle(model, 'executionState'))
+    ?? recoveryReference(references, model.recoveryIndex.find((entry) => entry.id === 'task-rail')?.handle)
     ?? `task_rail mode="load" operation="list_mine" instance_id=${JSON.stringify(model.boundaryAndActiveTask.instanceId)}`;
   const omitted = (count: number) => `[… ${count} execution entries omitted${recovery ? ` · recover: ${recovery}` : ''} …]`;
   const kept: string[] = [];
@@ -3969,7 +3976,8 @@ function renderExecution(
     if ([...kept, line, omitted(lines.length)].join('\n').length <= maxChars) kept.push(line);
   }
   const text = [...kept, omitted(lines.length - kept.length)].join('\n');
-  return { text: text.length <= maxChars ? text : '', complete: false };
+  return { text: text.length <= maxChars ? text : '', complete: false,
+    unitPlacements: placementsFor(text.length <= maxChars ? kept : []) };
 }
 
 function contributorSummary(contributors: readonly RebirthPackageV6EditContributor[]): string {
@@ -6407,7 +6415,7 @@ export interface RebirthPackageV7CollapseReport {
 }
 
 export interface RebirthPackageV6OmissionSectionReport {
-  readonly sectionId: 'cognitiveArtifacts';
+  readonly sectionId: 'cognitiveArtifacts' | 'recentConversation' | 'executionState';
   readonly placements: readonly RebirthPackageV6UnitPlacement[];
   readonly sectionElided: boolean;
 }
@@ -6474,11 +6482,12 @@ function buildCollapseReport(
     })),
     omissionSections: sections
       .filter((section): section is RenderedRebirthPackageV6Section & {
-        id: 'cognitiveArtifacts';
+        id: RebirthPackageV6OmissionSectionReport['sectionId'];
         unitPlacements: readonly RebirthPackageV6UnitPlacement[];
-      } => section.id === 'cognitiveArtifacts' && section.unitPlacements !== undefined)
+      } => (section.id === 'cognitiveArtifacts' || section.id === 'recentConversation' || section.id === 'executionState')
+        && section.unitPlacements !== undefined)
       .map((section) => ({
-        sectionId: 'cognitiveArtifacts',
+        sectionId: section.id,
         placements: section.unitPlacements,
         sectionElided: omitted.has(section.id),
       })),
@@ -7509,6 +7518,8 @@ export type ContinuityLedgerLifecycle = 'rebirth' | 'tail-epoch' | 'hard-epoch';
 export type ContinuityLedgerPlacement = 'rendered' | 'folded' | 'elided';
 export type ContinuityLedgerCaptureSectionId =
   | RebirthPackageV7CollapseSectionId
+  | 'recentConversation'
+  | 'executionState'
   | 'rawHotTail'
   | 'cognitiveArtifacts'
   | 'tailEpoch'
@@ -7576,7 +7587,10 @@ export interface ContinuityLedgerCaptureRecord {
 }
 
 /** Source units behind the budgeted Cognitive Artifacts section. */
-function buildCognitiveLedgerUnits(model: RebirthPackageV6Model): readonly CollapseUnit[] {
+function buildCognitiveLedgerUnits(
+  model: RebirthPackageV6Model,
+  fullyDeliveredIds: ReadonlySet<string> = new Set(),
+): readonly CollapseUnit[] {
   const recover = model.recoveryIndex.find((entry) => entry.id === 'cognition')?.handle
     || 'unavailable (cognition store handle absent at capture)';
   const admittedIds = new Set(model.cognitiveArtifacts.map((row) => row.provenanceId));
@@ -7586,18 +7600,10 @@ function buildCognitiveLedgerUnits(model: RebirthPackageV6Model): readonly Colla
       .filter((row) => !admittedIds.has(row.provenanceId)),
   ];
   return sourceRows.map((sourceRow) => {
-    // Storage economy (dynamic fill, operator directive 2026-08-26): the model
-    // carries FULL bodies so the render can ship them whole while the envelope
-    // has room, but the ledger persists at most the declared per-entry
-    // projection of each row. This is the second of exactly two call sites of
-    // projectCognitiveRow (the other is the contended render fallback), so a
-    // contended render and its capture produce identical bytes by
-    // construction, while a full-fidelity render ships a body whose stored
-    // ledger copy is a byte-exact declared PREFIX of it — sha256 attests the
-    // stored projection or the entirety of real source bytes, never an
-    // undeclared slice. Both call sites share the model's capturedAt as the
-    // projection reference instant (audit-2 A22).
-    const row = projectCognitiveRow(
+    // Project omitted bodies with the same scarcity rule as the renderer.
+    // Fully delivered bodies are transient retirement signals: projecting
+    // them would falsely turn a storage optimization into a POV omission.
+    const row = fullyDeliveredIds.has(sourceRow.provenanceId) ? sourceRow : projectCognitiveRow(
       sourceRow,
       model.boundaryAndActiveTask.capturedAt,
       cognitiveLifeBoundaryStarts(model),
@@ -7661,6 +7667,14 @@ export function buildContinuityLedgerCaptureFromV6Render(
 
   const units: ContinuityLedgerCaptureUnit[] = [];
   const rawIds = new Set(report.rawHotTailIds ?? []);
+  const rawSourceIds = new Set([...rawIds].map(hotTailIdentity));
+  const deliveredDialogueKeys = new Set((report.omissionSections ?? [])
+    .filter((section) => section.sectionId === 'recentConversation' && !section.sectionElided)
+    .flatMap((section) => section.placements
+      .filter((outcome) => outcome.placement === 'rendered' && !outcome.projected)
+      .map((outcome) => dialogueUnitKey(outcome.id))));
+  const deliveredElsewhere = (id: string): boolean => rawSourceIds.has(hotTailIdentity(id))
+    || deliveredDialogueKeys.has(dialogueUnitKey(id));
   for (const row of model.rawHotTail ?? []) {
     const rendered = rawIds.has(row.id);
     units.push({
@@ -7721,16 +7735,40 @@ export function buildContinuityLedgerCaptureFromV6Render(
     }
   }
   for (const sectionReport of report.omissionSections ?? []) {
-    if (sectionReport.sectionId !== 'cognitiveArtifacts') continue;
-    const sourceUnits = buildCognitiveLedgerUnits(model);
+    const sourceUnits: readonly (Omit<CollapseUnit, 'kind' | 'digest'> & { readonly kind: string })[] = sectionReport.sectionId === 'cognitiveArtifacts'
+      ? buildCognitiveLedgerUnits(model, new Set(sectionReport.placements
+          .filter((outcome) => deliveredElsewhere(outcome.id)
+            || (!sectionReport.sectionElided && outcome.placement === 'rendered' && !outcome.projected))
+          .map((outcome) => outcome.id)))
+      : sectionReport.sectionId === 'recentConversation'
+        ? conversationWithVault(model).map((row) => ({
+            id: conversationRowBaseId(row.provenanceId), kind: `dialogue:${row.role}`,
+            sourceAt: knownSourceTime(row.sourceAt), verbatim: row.text,
+            claim: `${row.role} source ${row.provenanceId}`,
+            recover: model.recoveryIndex.find((entry) => entry.id === 'transcript')?.handle
+              || 'unavailable (transcript handle absent at capture)',
+          }))
+        : model.executionState.facts.map((fact) => ({
+            id: fact.provenanceId, kind: `execution:${fact.kind}`,
+            sourceAt: knownSourceTime(fact.sourceAt), verbatim: fact.text,
+            claim: `${fact.kind} source ${fact.provenanceId}`,
+            recover: model.lifeLedger?.units.find((unit) => unit.id === fact.provenanceId)?.recover
+              || 'unavailable (no exact source route for captured execution fact)',
+          }));
     const byId = new Map(sourceUnits.map((unit) => [unit.id, unit]));
     for (const outcome of sectionReport.placements) {
       const unit = byId.get(outcome.id);
       if (!unit) continue;
-      const placement: ContinuityLedgerPlacement = sectionReport.sectionElided
+      // A dialogue pointer into the exact delivered tail is not an eviction.
+      // A partial dialogue body is: retain the source proof, not the excerpt.
+      const deliveredInOtherSection = (sectionReport.sectionId === 'recentConversation'
+        && rawSourceIds.has(hotTailIdentity(unit.id)))
+        || (sectionReport.sectionId === 'cognitiveArtifacts' && deliveredElsewhere(unit.id));
+      const placement: ContinuityLedgerPlacement = deliveredInOtherSection ? 'rendered' : sectionReport.sectionElided
         ? 'elided'
+        : outcome.projected && sectionReport.sectionId !== 'cognitiveArtifacts' ? 'elided'
         : outcome.placement;
-      const tierBasis: ContinuityLedgerTierBasis = sectionReport.sectionElided
+      const tierBasis: ContinuityLedgerTierBasis = deliveredInOtherSection ? 'rendered' : sectionReport.sectionElided
         ? 'section-elision'
         : placement === 'rendered' && !outcome.projected
           ? 'rendered'
@@ -7755,7 +7793,7 @@ export function buildContinuityLedgerCaptureFromV6Render(
         origin: unit.origin ?? null,
         recover: unit.recover,
         workspace,
-        ...(unit.projection ? { projection: unit.projection } : {}),
+        ...(unit.projection && !deliveredInOtherSection ? { projection: unit.projection } : {}),
       });
     }
   }

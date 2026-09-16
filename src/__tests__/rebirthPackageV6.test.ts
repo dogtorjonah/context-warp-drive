@@ -1,4 +1,79 @@
 import { describe, expect, it } from 'vitest';
+
+describe('actual render omission receipts', () => {
+  it.each([0, 200, 1200])('addresses omitted dialogue without cognition or raw-tail input at cap %s', (cap) => {
+    const text = 'historical source '.repeat(600);
+    const value = model({ cognitiveArtifacts: [], recentConversation: [{
+      provenanceId: 'dialogue-only', sourceAt: '2026-08-01T00:00:00.123Z', role: 'assistant', text,
+    }] });
+    const rendered = renderRebirthPackageV6WithReport(value, { sectionMaxChars: { recentConversation: cap } });
+    const record = buildContinuityLedgerCaptureFromV6Render(value, rendered.collapse)!;
+    const unit = record.units.find((row) => row.sectionId === 'recentConversation' && row.unitId === 'dialogue-only');
+    expect(unit).toMatchObject({ placement: 'elided', verbatim: text, sourceTime: '2026-08-01T00:00:00.123Z' });
+    expect(unit?.sha256).toBe(sha256ContinuityLedgerVerbatim(text));
+  });
+
+  it('emits a retirement signal when dialogue is fully delivered', () => {
+    const value = model({ cognitiveArtifacts: [], recentConversation: [{
+      provenanceId: 'short-dialogue', sourceAt: null, role: 'assistant', text: 'Complete source.',
+    }] });
+    const rendered = renderRebirthPackageV6WithReport(value);
+    const record = buildContinuityLedgerCaptureFromV6Render(value, rendered.collapse)!;
+    expect(record.units.find((row) => row.unitId === 'short-dialogue')).toMatchObject({
+      placement: 'rendered', sourceTime: null, verbatim: 'Complete source.',
+    });
+  });
+
+  it('retires dialogue omissions when an aliased source is delivered in the raw tail', () => {
+    const text = 'Complete source in the raw tail.';
+    const sourceAt = '2026-08-01T00:00:00.123Z';
+    const value = model({ cognitiveArtifacts: [], recentConversation: [{
+      provenanceId: 'conversation-message:tail-source', sourceAt, role: 'assistant', text,
+    }], rawHotTail: [{
+      id: 'message:tail-source', sourceAt, sourceInstanceId: 'instance-a', kind: 'assistant', text,
+      recover: 'read-source',
+    }] });
+    const rendered = renderRebirthPackageV6WithReport(value, { sectionMaxChars: { recentConversation: 0 } });
+    const record = buildContinuityLedgerCaptureFromV6Render(value, rendered.collapse)!;
+    expect(rendered.text).toContain(text);
+    expect(record.units.find((row) => row.sectionId === 'recentConversation')).toMatchObject({
+      placement: 'rendered', tierBasis: 'rendered', verbatim: text,
+    });
+  });
+
+  it.each([false, true])('retires cognition delivered outside its elided section (raw tail: %s)', (raw) => {
+    const text = 'Shared complete source. '.repeat(60);
+    const sourceAt = '2026-08-01T00:00:00.123Z';
+    const value = model({ recentConversation: [{
+      provenanceId: 'shared-1', sourceAt, role: 'assistant', text,
+    }], cognitiveArtifacts: [{
+      provenanceId: 'message:shared-1', sourceAt, text, kind: 'result',
+      authority: 'historical_observation', supersededBy: null,
+    }], ...(raw ? { rawHotTail: [{
+      id: 'shared-1', sourceAt, sourceInstanceId: 'instance-a', kind: 'assistant' as const,
+      text, recover: 'read-source',
+    }] } : {}) });
+    const rendered = renderRebirthPackageV6WithReport(value, {
+      sectionMaxChars: { cognitiveArtifacts: 0, ...(raw ? { recentConversation: 0 } : {}) },
+    });
+    const record = buildContinuityLedgerCaptureFromV6Render(value, rendered.collapse)!;
+    expect(rendered.text).toContain(text);
+    const cognition = record.units.find((row) => row.unitId === 'message:shared-1');
+    expect(cognition).toMatchObject({ placement: 'rendered', tierBasis: 'rendered' });
+    expect(cognition?.projection).toBeUndefined();
+  });
+
+  it('keeps each execution fact recoverable when the section has no body budget', () => {
+    const value = model({ executionState: { facts: [{
+      provenanceId: 'validation:unknown-clock', sourceAt: null, status: 'partial', kind: 'validation', text: 'Validation remains unknown.',
+    }], unknownReasons: [] } });
+    const rendered = renderRebirthPackageV6WithReport(value, { sectionMaxChars: { executionState: 0 } });
+    const record = buildContinuityLedgerCaptureFromV6Render(value, rendered.collapse)!;
+    expect(record.units.find((row) => row.unitId === 'validation:unknown-clock')).toMatchObject({
+      sectionId: 'executionState', placement: 'elided', sourceTime: null, verbatim: 'Validation remains unknown.',
+    });
+  });
+});
 import { buildContinuityReceipt } from '../continuityReceipt.ts';
 import { buildRawHardEpochSeed } from '../foldFreeze.ts';
 import {
@@ -363,7 +438,7 @@ describe('Rebirth Package v6', () => {
       expect(rehydrated[0].sourceChars).toBe(body.length);
     });
 
-    it('stores the declared per-entry projection in the ledger even when the render ships the body whole', () => {
+    it('retires long cognition when the renderer delivers the whole body', () => {
       const body = `${'Q'.repeat(1_200)} tail`;
       const value = model({
         cognitiveArtifacts: [artifact({ provenanceId: 'star:economy', text: body })],
@@ -375,17 +450,9 @@ describe('Rebirth Package v6', () => {
 
       const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
       const unit = record.units.find((entry) => entry.unitId === 'star:economy')!;
-      // Storage economy: the persisted ledger copy is the declared byte-exact
-      // PREFIX of the shipped body, and sha256 attests exactly those stored
-      // bytes — never undeclared full-body bytes the store would then discard.
-      // Audit-3 C7: this is a discovery row (non-flagship kind), which keeps the
-      // fixed 600 base cap; the age-tier ladder applies only to result/hazard/
-      // decision.
-      expect(unit.projection?.mode).toBe('truncated');
-      expect(unit.projection?.storedChars).toBe(REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS);
-      expect(unit.projection?.sourceChars).toBe(body.length);
-      expect(unit.verbatim).toContain(body.slice(0, REBIRTH_PACKAGE_V6_COGNITION_ENTRY_MAX_CHARS));
-      expect(unit.verbatim).not.toContain(body);
+      expect(unit.placement).toBe('rendered');
+      expect(unit.projection).toBeUndefined();
+      expect(unit.verbatim).toContain(body);
       expect(unit.sha256).toBe(sha256ContinuityLedgerVerbatim(unit.verbatim));
     });
 
@@ -528,11 +595,11 @@ describe('Rebirth Package v6', () => {
       const cognitive = record.units.filter((unit) => unit.sectionId === 'cognitiveArtifacts');
 
       expect(collapse.omittedSectionIds).toContain('cognitiveArtifacts');
-      expect(collapse.omissionSections).toEqual([{
+      expect(collapse.omissionSections).toEqual(expect.arrayContaining([{
         sectionId: 'cognitiveArtifacts',
         placements: expect.arrayContaining(rows.map((row) => expect.objectContaining({ id: row.provenanceId }))),
         sectionElided: true,
-      }]);
+      }]));
       expect(cognitive).toHaveLength(rows.length);
       expect(cognitive.map((unit) => unit.unitId).sort()).toEqual(rows.map((row) => row.provenanceId).sort());
       expect(cognitive.every((unit) => unit.placement === 'elided' && unit.tierBasis === 'section-elision')).toBe(true);
@@ -766,9 +833,9 @@ describe('Rebirth Package v6', () => {
         'vault:1',
         'life:1',
       ]);
-      expect(record.units.map((unit) => unit.unitId).sort()).toEqual([...expectedIds].sort());
+      expect(record.units.filter((unit) => !['recentConversation', 'executionState'].includes(unit.sectionId)).map((unit) => unit.unitId).sort()).toEqual([...expectedIds].sort());
       expect(new Set(record.units.map((unit) => unit.sectionId)))
-        .toEqual(new Set(['activeEditDelta', 'cognitiveArtifacts', 'operatorVault', 'lifeLedger']));
+        .toEqual(new Set(['activeEditDelta', 'cognitiveArtifacts', 'operatorVault', 'lifeLedger', 'recentConversation', 'executionState']));
     });
 
     it('selects deterministically and preserves newest-first chronology with quarantine last', () => {
@@ -3212,9 +3279,8 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
   it('C7: flagships older than the previous-life window project to the 300 tier at a word boundary (ledger capture)', () => {
     const capturedAt = '2026-08-02T18:00:00.000Z';
     const body = `${'b'.repeat(950)} end-marker`;
-    // The ledger capture always stores the declared per-entry projection, so
-    // this seam deterministically asserts the age-tier cap (render-abundance
-    // independent) — no fragile render-contention budget threshold.
+    // A zero body budget makes this an actual omission and deterministically
+    // exercises the stored age-tier projection.
     const value = model({
       cognitiveArtifacts: [{
         // sourceAt 2026-07-01 is >48h before capturedAt 18:00-08-02, so the
@@ -3227,9 +3293,9 @@ describe('audit-3 C2 density: B12 claim expiry attribution + word-boundary caps 
       cognitiveArtifactCapture: { status: 'complete', capturedAt, totalMatched: 1, overlayCount: 0, missingFamilies: [], warnings: [] },
       lifeLedger: { units: [], rangeRecover: null, partialReason: null },
     });
-    // The ledger capture ALWAYS stores the declared per-entry projection
-    // (render-abundance-independent), asserted at this deterministic seam.
-    const { collapse } = renderRebirthPackageV6WithReport(value, { packageBudget: 200_000 });
+    const { collapse } = renderRebirthPackageV6WithReport(value, {
+      packageBudget: 200_000, sectionMaxChars: { cognitiveArtifacts: 0 },
+    });
     const record = buildContinuityLedgerCaptureFromV6Render(value, collapse)!;
     const unit = record.units.find((entry) => entry.unitId === 'decision:old')!;
     // OLDER tier fallback => stored <= 300.
