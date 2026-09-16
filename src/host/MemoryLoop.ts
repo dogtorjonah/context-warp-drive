@@ -147,6 +147,13 @@ export class MemoryLoop {
   private readonly continuityLedgerStore: StandaloneContinuityLedgerStore | null;
   private readonly continuityOwnerInstanceId: string;
   private readonly continuityWorkspace: string | null;
+  /**
+   * Per-loop identity appended to the minted capture id. The sequence alone
+   * restarts for every MemoryLoop instance, so two loops under one owner would
+   * otherwise mint the same id — and capture identity is immutable, so the
+   * second loop's epochs would be refused as conflicts and silently lost.
+   */
+  private readonly continuityCaptureIdentity: string = crypto.randomUUID();
   private continuityCaptureSequence = 0;
   private readonly pendingContinuityWrites = new Set<Promise<unknown>>();
 
@@ -209,7 +216,7 @@ export class MemoryLoop {
     const ledgerAddress = requestedLedger ?? (this.continuityLedgerStore
       ? {
           ownerInstanceId: this.continuityOwnerInstanceId,
-          captureId: `${this.continuityOwnerInstanceId}:memory-loop-epoch#${this.continuityCaptureSequence + 1}`,
+          captureId: `${this.continuityOwnerInstanceId}:memory-loop-epoch#${this.continuityCaptureSequence + 1}:${this.continuityCaptureIdentity}`,
           workspace: this.continuityWorkspace,
         }
       : undefined);
