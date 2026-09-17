@@ -148,6 +148,8 @@ export interface StandaloneContinuityLedgerPage {
  */
 export interface StandaloneContinuityCaptureSnapshot {
   readonly kind: 'capture-snapshot';
+  /** Full submitted-input proof; absent on legacy snapshots, whose retries fail closed. */
+  readonly inputSha256?: string;
   readonly ownerInstanceId: string;
   readonly captureId: string;
   readonly recordedAt: string;
@@ -219,31 +221,16 @@ function captureOwnerKey(ownerInstanceId: string, captureId: string): string {
   return `${ownerInstanceId}\u0000${captureId}`;
 }
 
-/**
- * Member-eligible signature of a capture's units. Rendered placements are
- * removals and episode rows are never inventory, so neither participates in the
- * identity of a capture's frozen membership.
- */
-function memberSignature(
-  units: readonly {
-    readonly kind: string;
-    readonly sectionId: string;
-    readonly placement: string;
-    readonly unitId: string;
-    readonly sha256: string;
-    readonly projection?: unknown;
-  }[],
-): string {
-  return units
-    .filter((unit) => unit.kind !== 'episode'
-      && unit.sectionId !== 'episodeChapterIndex'
-      // A rendered placement is a member when it carries a projection: the body
-      // was only partially delivered, so the row is an omission, not a removal.
-      && !(unit.placement === 'rendered'
-        && (unit.projection === undefined || unit.projection === null)))
-    .map((unit) => `${unit.kind}\u0000${unit.unitId}\u0000${unit.sha256.toLowerCase()}`)
-    .sort()
-    .join('\u0001');
+/** Preserve array order (including removals) while ignoring object key insertion order. */
+function captureInputSha256(record: ContinuityLedgerCaptureRecord): string {
+  const canonical = JSON.stringify(record, (_key, value: unknown) => {
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)));
+    }
+    return value;
+  });
+  // Only the digest is persisted; source bodies never enter the capture ledger.
+  return sha256ContinuityLedgerVerbatim(canonical);
 }
 
 function chronologicalRows(
@@ -691,7 +678,7 @@ export class StandaloneContinuityLedgerStore {
     // append a second snapshot or overwrite frozen recovery bytes.
     const frozen = this.findCaptureSnapshot(ownerInstanceId, captureId);
     if (frozen) {
-      if (memberSignature(record.units) === memberSignature(frozen.rows)) {
+      if (frozen.inputSha256 === captureInputSha256(record)) {
         return { recorded: 0, replaced: 0, removed: 0, rejected: [] };
       }
       return {
@@ -851,6 +838,7 @@ export class StandaloneContinuityLedgerStore {
   ): Promise<void> {
     const snapshot: StandaloneContinuityCaptureSnapshot = {
       kind: 'capture-snapshot',
+      inputSha256: captureInputSha256(record),
       ownerInstanceId,
       captureId,
       recordedAt,

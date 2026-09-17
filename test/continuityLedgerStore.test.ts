@@ -146,6 +146,43 @@ describe('standalone continuity ledger store', () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
+  it('rejects changed capture metadata and removal inputs on retry, including after reopen', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'context-warp-ledger-retry-'));
+    roots.push(root);
+    const ledgerPath = join(root, 'ledger.jsonl');
+    const record = captureRecord('owner-a', 'retry', [captureUnit('kept')]);
+    let store = await StandaloneContinuityLedgerStore.open({ ledgerPath });
+    expect((await store.record(record)).rejected).toEqual([]);
+    for (const reopen of [false, true]) {
+      if (reopen) store = await StandaloneContinuityLedgerStore.open({ ledgerPath });
+      expect((await store.record(record)).rejected).toEqual([]);
+      const reordered = Object.fromEntries(Object.entries(record).reverse()) as unknown as typeof record;
+      expect((await store.record(reordered)).rejected).toEqual([]);
+      for (const changed of [
+        { ...record, sourceFirstTime: '2026-08-10T19:00:00.000Z' },
+        { ...record, units: [captureUnit('kept', { sourceTime: '2026-08-10T19:30:00.000Z' })] },
+        { ...record, units: [captureUnit('kept', { recover: 'different source route' })] },
+        { ...record, units: [{ ...record.units[0]!, verbatim: 'different bytes with unchanged declared hash' }] },
+        { ...record, units: [...record.units, captureUnit('removed', { placement: 'rendered' })] },
+      ]) {
+        expect((await store.record(changed)).rejected).toEqual([
+          { unitId: '(capture)', reason: 'capture-id-conflict:retry' },
+        ]);
+      }
+      expect(store.index({ ownerInstanceId: 'owner-a', captureId: 'retry' }).rows[0]?.sourceTime)
+        .toBe(record.units[0]?.sourceTime);
+    }
+    const historyPath = `${ledgerPath}.captures`;
+    const snapshot = JSON.parse((await readFile(historyPath, 'utf8')).trim());
+    delete snapshot.inputSha256;
+    await writeFile(historyPath, `${JSON.stringify(snapshot)}\n`);
+    store = await StandaloneContinuityLedgerStore.open({ ledgerPath });
+    expect((await store.record(record)).rejected).toEqual([
+      { unitId: '(capture)', reason: 'capture-id-conflict:retry' },
+    ]);
+    expect(store.index({ ownerInstanceId: 'owner-a', captureId: 'retry' }).rows).toHaveLength(1);
+  });
+
   it('records MemoryLoop tail and hard epochs content-free and recovers exact canonical source bytes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'context-warp-ledger-'));
     roots.push(root);
