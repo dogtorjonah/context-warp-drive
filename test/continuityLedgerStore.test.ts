@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { MemoryLoop } from '../src/host/MemoryLoop.ts';
 import { StandaloneContinuityLedgerStore } from '../src/host/continuityLedgerStore.ts';
@@ -144,6 +144,16 @@ describe('standalone continuity ledger store', () => {
 
   afterEach(async () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  it('constructs without the optional global Web Crypto API', () => {
+    vi.stubGlobal('crypto', undefined);
+    try {
+      const session = new FoldSession({ foldConfig: TEST_FOLD_CONFIG });
+      expect(() => new MemoryLoop({ session })).not.toThrow();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('rejects changed capture metadata and removal inputs on retry, including after reopen', async () => {

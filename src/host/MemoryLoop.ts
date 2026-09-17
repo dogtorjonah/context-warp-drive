@@ -37,6 +37,7 @@
  *   3. At each tool boundary: derives recall signals, builds fold recall
  *      context, recalls episodic cards, and returns everything for injection.
  */
+import { randomUUID } from 'node:crypto';
 import {
   buildFoldIndex,
   buildFoldRecallContext,
@@ -153,7 +154,7 @@ export class MemoryLoop {
    * otherwise mint the same id — and capture identity is immutable, so the
    * second loop's epochs would be refused as conflicts and silently lost.
    */
-  private readonly continuityCaptureIdentity: string = crypto.randomUUID();
+  private readonly continuityCaptureIdentity: string = randomUUID();
   private continuityCaptureSequence = 0;
   private readonly pendingContinuityWrites = new Set<Promise<unknown>>();
 
