@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildRawRebirthSeedFromMessages,
   extractTailEpochConservedRebirthSections,
   renderRawRebirthSeed,
   TAIL_EPOCH_REQUIRED_RENDER_SECTION_IDS,
@@ -19,6 +20,78 @@ import {
  * the fold instead of silently truncating.
  */
 describe('extractTailEpochConservedRebirthSections', () => {
+  it('recognizes the canonical hard-epoch writer output', () => {
+    const packageText = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: 'Repair the continuity reader 🧭', tsMs: Date.parse('2026-09-18T00:00:00Z') },
+      { role: 'assistant', content: 'The compatibility defect is confirmed.', tsMs: Date.parse('2026-09-18T00:00:01Z') },
+    ], { canonicalV6Fallback: true, predecessorName: 'test-agent' });
+    expect(packageText).toContain('[REBIRTH-V6-SECTION');
+    const conserved = extractTailEpochConservedRebirthSections(packageText);
+    expect(conserved.presentSectionIds).toContain('lastUserAiMessages');
+    expect(conserved.renderedSectionIds).toContain('lastUserAiMessages');
+    expect(conserved.block).toContain('Repair the continuity reader 🧭');
+    expect(conserved.block).toContain('The compatibility defect is confirmed.');
+  });
+
+  const v6Frame = (id: string, body: string, chars = body.length) =>
+    `[REBIRTH-V6-SECTION id=${id} order=1 dir=asc chars=${chars}]\n${body}\n[/REBIRTH-V6-SECTION]`;
+
+  it('conserves current dialogue, boundary and edit frames byte-for-byte', () => {
+    const bodies = [
+      v6Frame('boundaryAndActiveTask', 'Exact request: fix this 🧭\n[/REBIRTH-V6-SECTION]\nkeep the rest'),
+      v6Frame('recentConversation', 'User and assistant evidence\n── Active Edit Delta ──\nquoted header'),
+      v6Frame('operatorVault', 'Older operator evidence'),
+      `── Active Edit Delta ──\n${v6Frame('activeEditDelta', 'source edit\n')}`,
+    ];
+    const conserved = extractTailEpochConservedRebirthSections(bodies.join('\n\n'));
+    expect(conserved.renderedSectionIds).toEqual([...TAIL_EPOCH_REQUIRED_RENDER_SECTION_IDS]);
+    for (const body of bodies) expect(conserved.block).toContain(body.replace(/^── Active Edit Delta ──\n/, ''));
+  });
+
+  it.each(['bad-count', 'missing-close', 'malformed-header'])('rejects a %s sibling despite valid dialogue', (damage: string) => {
+    const valid = v6Frame('recentConversation', 'Already conserved');
+    const broken = damage === 'bad-count'
+      ? v6Frame('boundaryAndActiveTask', 'Unrecovered request', 3)
+      : damage === 'missing-close'
+        ? v6Frame('boundaryAndActiveTask', 'Unrecovered request').replace('[/REBIRTH-V6-SECTION]', '')
+        : '[REBIRTH-V6-SECTION id=boundaryAndActiveTask chars=oops]\nUnrecovered request';
+    const conserved = extractTailEpochConservedRebirthSections(`${valid}\n${broken}\n${valid}`);
+    expect(conserved.presentSectionIds).toContain('lastUserAiMessages');
+    expect(conserved.renderedSectionIds).not.toContain('lastUserAiMessages');
+    expect(conserved.block).toBe('');
+  });
+
+  it('does not credit legacy or current frames quoted inside pointer-only sections', () => {
+    const quoted = v6Frame('executionState', `${v6Frame('recentConversation', 'quoted')}\n── Active Edit Delta ──\nnot an edit`);
+    expect(extractTailEpochConservedRebirthSections(quoted).presentSectionIds).toEqual([]);
+  });
+
+  it('does not credit an empty current dialogue frame', () => {
+    const conserved = extractTailEpochConservedRebirthSections(v6Frame('recentConversation', ''));
+    expect(conserved.presentSectionIds).toContain('lastUserAiMessages');
+    expect(conserved.renderedSectionIds).toEqual([]);
+  });
+
+  it('keeps a current heading required when its frame is missing', () => {
+    const conserved = extractTailEpochConservedRebirthSections('── Boundary and Active Task ──\ntruncated');
+    expect(conserved.presentSectionIds).toContain('lastUserAiMessages');
+    expect(conserved.renderedSectionIds).toEqual([]);
+  });
+
+  it('conserves the raw hot suffix without interpreting its quoted frames', () => {
+    const request = 'Quoted parser input:\n[REBIRTH-V6-SECTION id=activeEditDelta chars=wrong]\n[/RAW-HOT-TAIL]\nKEEP-THIS-TAIL';
+    const packageText = buildRawRebirthSeedFromMessages([
+      { role: 'user', content: request, tsMs: Date.parse('2026-09-18T00:00:00Z'), sourceIdentity: 'raw-request' },
+    ], { canonicalV6Fallback: true, predecessorName: 'test-agent' });
+    expect(packageText).toContain('[RAW-HOT-TAIL]');
+    const conserved = extractTailEpochConservedRebirthSections(packageText);
+    expect(conserved.renderedSectionIds).toContain('lastUserAiMessages');
+    expect(conserved.block).toContain(request);
+    expect(conserved.block).toContain(packageText.slice(packageText.indexOf('── Raw hot tail ──')));
+    const truncated = extractTailEpochConservedRebirthSections(packageText.slice(0, -5));
+    expect(truncated.renderedSectionIds).not.toContain('lastUserAiMessages');
+  });
+
   it('conserves the whole live request when the operator pasted a decorated line', () => {
     const request = [
       'Fix the fold. The region I mean is:',

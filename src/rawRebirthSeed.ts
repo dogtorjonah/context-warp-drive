@@ -712,6 +712,11 @@ const TAIL_EPOCH_RENDER_SECTION_HEADER_PREFIXES: Readonly<
     // fail-closed one.
     '── Last AI Message',
     '── Historical AI / Runtime Remainder',
+    // Current headings still declare a requirement if their frame was lost.
+    '── Boundary and Active Task',
+    '── Recent Conversation',
+    '── Timeline',
+    '── Operator Vault',
   ],
   activeEditDelta: ['── Active Edit Delta'],
 });
@@ -950,6 +955,65 @@ export function extractTailEpochConservedRebirthSections(
 
   for (let index = 0; index < lines.length; index += 1) {
     const header = (lines[index] ?? '').trimEnd();
+    if (header === '── Raw hot tail ──') {
+      if (!present.includes('lastUserAiMessages')) present.push('lastUserAiMessages');
+      // The canonical writer appends this suffix LAST. Its payload is raw,
+      // so only the terminal close can delimit it; embedded closes/frames
+      // are historical text. Preserve the entire suffix, never rescan it.
+      const tail = lines.slice(index).join('\n');
+      if (lines[index + 1] !== '[RAW-HOT-TAIL]' || !tail.trimEnd().endsWith('\n[/RAW-HOT-TAIL]')) {
+        unrecoverable.add('lastUserAiMessages');
+      } else {
+        if (!rendered.includes('lastUserAiMessages')) rendered.push('lastUserAiMessages');
+        blocks.push({ sectionId: 'lastUserAiMessages', text: tail });
+      }
+      break;
+    }
+    // Current packages use length-framed sections rather than legacy H1
+    // carriers. Consume every frame (including pointer-only sections) as one
+    // unit so quoted headers and sentinels inside its body remain inert.
+    if (header.startsWith('[REBIRTH-V6-SECTION')) {
+      const frame = /^\[REBIRTH-V6-SECTION id=([A-Za-z0-9]+)(?: order=\d+)?(?: dir=(?:asc|desc))? chars=(\d+)\]$/.exec(header);
+      const id = frame?.[1];
+      const sectionId: RawRebirthSeedSectionId | null = id === 'activeEditDelta'
+        ? 'activeEditDelta'
+        : id === 'boundaryAndActiveTask' || id === 'recentConversation' || id === 'operatorVault'
+          ? 'lastUserAiMessages'
+          : null;
+      if (sectionId && !present.includes(sectionId)) present.push(sectionId);
+      const declared = Number(frame?.[2]);
+      let cursor = index + 1;
+      let consumed = 0;
+      // The v6 writer uses String.length (UTF-16), unlike the legacy live
+      // request's code-point count. Do not substitute countStringChars here.
+      while (cursor < lines.length && consumed < declared) {
+        consumed += (cursor === index + 1 ? 0 : 1) + lines[cursor]!.length;
+        cursor += 1;
+      }
+      if (declared === 0 && lines[cursor] === '') cursor += 1;
+      if (!frame || !Number.isSafeInteger(declared) || declared < 0
+        || consumed !== declared || lines[cursor] !== '[/REBIRTH-V6-SECTION]') {
+        // Without a verified boundary, later apparent frames may be quoted
+        // payload. Never let a valid sibling attest this damaged package.
+        for (const required of TAIL_EPOCH_REQUIRED_RENDER_SECTION_IDS) {
+          if (!present.includes(required)) present.push(required);
+          unrecoverable.add(required);
+        }
+        break;
+      }
+      if (sectionId) {
+        const body = lines.slice(index + 1, cursor).join('\n');
+        if (!body.trim()) unrecoverable.add(sectionId);
+        else {
+          if (!rendered.includes(sectionId)) rendered.push(sectionId);
+          blocks.push({ sectionId, text: lines.slice(index, cursor + 1).join('\n') });
+        }
+      }
+      index = cursor;
+      continue;
+    }
+    // Let the machine frame, not its display title, prove current sections.
+    if ((lines[index + 1] ?? '').startsWith('[REBIRTH-V6-SECTION')) continue;
     const sectionId = matchTailEpochRenderSectionHeader(header);
     if (sectionId === null) continue;
     if (!present.includes(sectionId)) present.push(sectionId);
